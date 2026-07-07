@@ -209,14 +209,26 @@ def main():
         print("必要なライブラリが見つかりません。setup.bat を先に実行してください。")
         input("Enterで終了します。")
         return
+    try:
+        httpd = ThreadingTCPServer(("127.0.0.1", PORT), Handler)
+    except OSError:
+        # ポート使用中（前回のサーバーが残っている等）。親切に案内して終了。
+        print("=" * 52)
+        print(f" ポート {PORT} が既に使用中のため、起動できませんでした。")
+        print(" すでにサーバーが起動している可能性があります。")
+        print(" 前回の黒いウィンドウ（サーバー）を閉じてから、")
+        print(" もう一度 start.bat を実行してください。")
+        print("=" * 52)
+        input("Enterで終了します。")
+        return
     threading.Thread(target=open_browser, daemon=True).start()
     print("=" * 52)
     print(" トレード・コックピット サーバー起動中")
-    print(f"  ブラウザが自動で開きます。開かない場合は下記を開いてください：")
+    print("  ブラウザが自動で開きます。開かない場合は下記を開いてください：")
     print(f"  http://localhost:{PORT}/trade-cockpit.html")
     print("  使い終わったら、このウィンドウを閉じてください。")
     print("=" * 52)
-    with ThreadingTCPServer(("127.0.0.1", PORT), Handler) as httpd:
+    with httpd:
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
