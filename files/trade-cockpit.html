@@ -126,8 +126,8 @@ const MASTER = [
   M("PLTR","Palantir","SaaS","US","NASDAQ:PLTR"),M("CRM","Salesforce","SaaS","US","NYSE:CRM"),
   M("NOW","ServiceNow","SaaS","US","NYSE:NOW"),M("ARM","Arm","半導体","US","NASDAQ:ARM"),
   M("TSM","TSMC","半導体","US","NYSE:TSM"),M("ASML","ASML","半導体製造装置","US","NASDAQ:ASML"),
-  M("NI225","日経225","指数","IDX","TVC:NI225"),M("USDJPY","ドル円","為替","IDX","FX:USDJPY"),
-  M("SOX","SOX半導体株指数","指数","IDX","NASDAQ:SOX"),M("VIX","VIX恐怖指数","指数","IDX","TVC:VIX"),
+  M("NI225","日経225","指数","IDX","INDEX:NKY"),M("USDJPY","ドル円","為替","IDX","FX:USDJPY"),
+  M("SOX","半導体ETF(SOXX)","指数","IDX","NASDAQ:SOXX"),M("VIX","VIX短期ETF(VIXY)","指数","IDX","BATS:VIXY"),
 ];
 
 const METRICS = [
@@ -205,7 +205,7 @@ function App(){
   const [q,setQ]=useState("");
   const [secFilter,setSecFilter]=useState("すべて");
   const [sel,setSel]=useState(null);
-  const [chartSym,setChartSym]=useState("TVC:NI225");
+  const [chartSym,setChartSym]=useState("INDEX:NKY");
   const [cBB,setCBB]=useState(true),[cRSI,setCRSI]=useState(true),[cMA,setCMA]=useState(false);
   const fileRef=useRef();
   const chartRef=useRef();
@@ -285,8 +285,11 @@ function App(){
   const importJSON=(e)=>{const f=e.target.files?.[0];if(!f)return;const r=new FileReader();
     r.onload=()=>{try{setS({...emptyState(),...JSON.parse(r.result)});}catch{alert("読み込み失敗");}};r.readAsText(f);e.target.value="";};
 
+  // 日本の個別株（TSE:xxxx）は無料の埋め込みウィジェットでは表示不可（東証データの再配信制限）。
+  const embeddable=(sym)=>!/^TSE:/i.test(sym||"");
+
   // TradingView chart
-  useEffect(()=>{if(tab!=="chart")return;const c=chartRef.current;if(!c)return;
+  useEffect(()=>{if(tab!=="chart"||!embeddable(chartSym))return;const c=chartRef.current;if(!c)return;
     c.innerHTML='<div class="tradingview-widget-container__widget"></div>';
     const studies=[];if(cBB)studies.push("BB@tv-basicstudies");if(cRSI)studies.push("RSI@tv-basicstudies");if(cMA)studies.push("MASimple@tv-basicstudies");
     const sc=document.createElement("script");sc.src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js";sc.async=true;
@@ -509,19 +512,25 @@ function App(){
       {/* ===== CHART ===== */}
       {tab==="chart" && <div style={{marginTop:18}}>
         <div className="sec-head">チャート（TradingView）</div>
-        <div className="sec-note">登録銘柄を選ぶか、シンボルを直接入力。ボリンジャー・RSI・移動平均を切り替えられます。</div>
+        <div className="sec-note">登録銘柄を選ぶか、シンボルを直接入力。指数・米国株・為替は表示できます。日本の個別株は無料版では埋め込み表示できないため「↗ TradingViewで開く」からご覧ください。</div>
         <div style={{display:"flex",gap:7,flexWrap:"wrap",marginBottom:10}}>
           {s.watchlist.filter(w=>w.tvSymbol).map(w=><button key={w.code} className={"chip"+(chartSym===w.tvSymbol?" on":"")} onClick={()=>setChartSym(w.tvSymbol)}>{w.name}</button>)}
-          {s.watchlist.length===0 && ["TVC:NI225","FX:USDJPY","NASDAQ:NVDA","NASDAQ:SOX"].map(sy=><button key={sy} className={"chip"+(chartSym===sy?" on":"")} onClick={()=>setChartSym(sy)}>{sy}</button>)}
+          {s.watchlist.length===0 && ["INDEX:NKY","FX:USDJPY","NASDAQ:NVDA","NASDAQ:SOXX"].map(sy=><button key={sy} className={"chip"+(chartSym===sy?" on":"")} onClick={()=>setChartSym(sy)}>{sy}</button>)}
         </div>
         <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"center",marginBottom:12}}>
-          <input className="mono" defaultValue="" placeholder="任意シンボル（例 TSE:6976）" onKeyDown={e=>{if(e.key==="Enter"&&e.target.value.trim())setChartSym(e.target.value.trim());}} style={{minWidth:180}}/>
+          <input className="mono" defaultValue="" placeholder="任意シンボル（例 NASDAQ:NVDA）" onKeyDown={e=>{if(e.key==="Enter"&&e.target.value.trim())setChartSym(e.target.value.trim());}} style={{minWidth:180}}/>
           <label style={{fontSize:13,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cBB} onChange={e=>setCBB(e.target.checked)}/>ボリンジャー</label>
           <label style={{fontSize:13,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cRSI} onChange={e=>setCRSI(e.target.checked)}/>RSI</label>
           <label style={{fontSize:13,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cMA} onChange={e=>setCMA(e.target.checked)}/>移動平均</label>
         </div>
-        <div ref={chartRef} style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",background:"var(--card)",minHeight:544}}></div>
-        <p className="foot">※ RCIは無料ウィジェットの標準にないため、ボリンジャー・RSI・移動平均のみ。RCIはTradingView本体で。</p>
+        {embeddable(chartSym)
+          ? <div key="tvchart" ref={chartRef} style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",background:"var(--card)",minHeight:544}}></div>
+          : <div key="jpfallback" style={{border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)",minHeight:544,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14,padding:24,textAlign:"center"}}>
+              <div style={{fontSize:14,fontWeight:700}}>{chartSym}</div>
+              <div style={{fontSize:12.5,color:"var(--inkSoft)",lineHeight:1.7,maxWidth:420}}>日本の個別株は、TradingViewの無料埋め込みチャートでは表示できません（東証データの再配信制限のため）。下のボタンからTradingView本体で開いてください。</div>
+              <button className="btn primary" onClick={()=>openTV(chartSym)}>↗ TradingViewで開く</button>
+            </div>}
+        <p className="foot">※ RCIは無料ウィジェットの標準にないため、ボリンジャー・RSI・移動平均のみ。RCIはTradingView本体で。<br/>※ 日経225は指数（INDEX:NKY）、SOX/VIXは連動ETF（SOXX/VIXY）で表示しています。値の水準は指数そのものと異なる場合があります。</p>
       </div>}
 
       <p className="foot" style={{borderTop:"1px solid var(--ruleSoft)",paddingTop:12,marginTop:24}}>
