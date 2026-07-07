@@ -67,8 +67,9 @@ def _fmt_published(entry):
     if not pp:
         return ""
     try:
-        jst = datetime.datetime.utcfromtimestamp(calendar.timegm(pp)) + datetime.timedelta(hours=9)
-        return jst.strftime("%m/%d %H:%M")
+        jst = datetime.timezone(datetime.timedelta(hours=9))
+        dt = datetime.datetime.fromtimestamp(calendar.timegm(pp), datetime.timezone.utc).astimezone(jst)
+        return dt.strftime("%m/%d %H:%M")
     except Exception:
         return ""
 
