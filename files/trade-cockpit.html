@@ -95,6 +95,7 @@ const MASTER = [
   M("6526","ソシオネクスト","半導体","JP"),M("6723","ルネサスエレクトロニクス","半導体","JP"),
   M("6963","ローム","半導体","JP"),M("4063","信越化学工業","半導体材料","JP"),
   M("3436","SUMCO","半導体材料","JP"),M("285A","キオクシアホールディングス","半導体メモリ","JP"),
+  M("5016","JX金属","非鉄金属","JP"),
   M("9984","ソフトバンクグループ","AI・投資","JP"),M("3778","さくらインターネット","データセンター","JP"),
   M("5803","フジクラ","電線・データセンター","JP"),M("4062","イビデン","電子部品","JP"),
   M("6976","太陽誘電","電子部品","JP"),M("6981","村田製作所","電子部品","JP"),
@@ -109,7 +110,8 @@ const MASTER = [
   M("7203","トヨタ自動車","自動車","JP"),M("7267","ホンダ","自動車","JP"),
   M("6902","デンソー","自動車部品","JP"),M("7270","SUBARU","自動車","JP"),M("7201","日産自動車","自動車","JP"),
   M("8306","三菱UFJフィナンシャルG","銀行","JP"),M("8316","三井住友フィナンシャルG","銀行","JP"),
-  M("8411","みずほフィナンシャルG","銀行","JP"),M("8604","野村ホールディングス","証券","JP"),
+  M("8411","みずほフィナンシャルG","銀行","JP"),M("8308","りそなホールディングス","銀行","JP"),
+  M("8604","野村ホールディングス","証券","JP"),
   M("8766","東京海上ホールディングス","保険","JP"),
   M("8058","三菱商事","商社","JP"),M("8031","三井物産","商社","JP"),
   M("8001","伊藤忠商事","商社","JP"),M("8002","丸紅","商社","JP"),M("8053","住友商事","商社","JP"),
@@ -260,8 +262,15 @@ function App(){
     return MASTER.filter(m=>!regCodes.has(m.code)&&(m.code.toLowerCase().includes(t)||m.name.toLowerCase().includes(t)||m.sector.toLowerCase().includes(t))).slice(0,8);},[q,regCodes]);
   const addStock=(m)=>{if(s.watchlist.length>=MAX){alert("登録は最大"+MAX+"社までです。");return;}
     if(regCodes.has(m.code))return; set({watchlist:[...s.watchlist,{id:Date.now()+Math.random(),...m,watch:"通常",note:""}]});setQ("");};
-  const addManual=()=>{const code=q.trim();if(!code)return;if(s.watchlist.length>=MAX){alert("最大"+MAX+"社");return;}
-    set({watchlist:[...s.watchlist,{id:Date.now()+Math.random(),code,name:code,sector:"未分類",market:"JP",tvSymbol:"TSE:"+code,watch:"通常",note:""}]});setQ("");};
+  const addManual=()=>{
+    const raw=q.trim();if(!raw)return;if(s.watchlist.length>=MAX){alert("最大"+MAX+"社");return;}
+    let code=raw,name=raw;
+    if(!/^[0-9]{4}[0-9A-Za-z]?$/.test(raw)){
+      const input=prompt(`「${raw}」の証券コード（4桁、例：5016）を入力してください`,"");
+      if(!input||!input.trim())return;
+      code=input.trim();
+    }
+    set({watchlist:[...s.watchlist,{id:Date.now()+Math.random(),code,name,sector:"未分類",market:"JP",tvSymbol:"TSE:"+code,watch:"通常",note:""}]});setQ("");};
   const setStock=(id,patch)=>set({watchlist:s.watchlist.map(w=>w.id===id?{...w,...patch}:w)});
   const delStock=(id)=>set({watchlist:s.watchlist.filter(w=>w.id!==id)});
 
