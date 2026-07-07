@@ -9,6 +9,8 @@
   --paper:#E7E8E1; --paperAlt:#EEEFE9; --card:#F3F4EE; --ink:#1B1E1A; --inkSoft:#565A52;
   --rule:#C6C8BF; --ruleSoft:#D6D8CF; --gain:#2C6A48; --loss:#AE3A34; --accent:#2A4A6B;
   --band:#DEDFD7; --star:#B8863B; --warn:#9A6A16; --alarm:#1F5C3A; --alarmEdge:#123A25;
+  /* 株価の上昇/下落は日本の相場慣習（赤=上昇・緑=下落）に合わせる */
+  --up:#AE3A34; --down:#2C6A48; --upBg:#F1DBD8; --downBg:#DCE7DF;
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--paper);color:var(--ink);
@@ -180,7 +182,7 @@ const emptyMetrics=()=>Object.fromEntries(METRICS.map(m=>[m.key,{t:"",p:""}]));
 const emptyState=()=>({
   date:todayISO(), watchlist:[], metrics:emptyMetrics(),
   usMarketNote:"",adrPts:"",sundayDow:"",strongSectors:"",themes:"",stockNews:"",marketNews:"",briefing:"",
-  stockNewsList:[], macroNewsList:[],
+  stockNewsList:[], macroNewsList:[], stockQuotes:{},
   sectorHeat:{}, analysis:{},
 });
 const loadState=()=>{try{const r=localStorage.getItem(KEY);if(!r)return null;const d=JSON.parse(r);return {...emptyState(),...d,metrics:{...emptyMetrics(),...(d.metrics||{})}};}catch{return null;}};
@@ -230,14 +232,21 @@ function App(){
             p:(v.p!=null?String(v.p):nm[k].p)};}
         });
         return {...p,metrics:nm};});
-      setFetchMsg((qd.fetchedAt||"")+" 数値を反映。ニュース取得中…");
+      setFetchMsg((qd.fetchedAt||"")+" 数値を反映。登録銘柄を取得中…");
     }catch(e){
       setFetching(false);setFetchMsg("");
       alert("サーバーに接続できません。start.bat を実行し、開いた http://localhost:8765/trade-cockpit.html のページで使ってください。");
       return;
     }
     try{
-      // (2) ニュース（今の登録銘柄をサーバーへ送って取得）
+      // (2) 登録銘柄の現在値・前日比・高値/安値
+      const sr=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlist)});
+      if(sr.ok){const sd=await sr.json();
+        setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sd.quotes||{})}}));}
+      setFetchMsg("登録銘柄を反映。ニュース取得中…");
+    }catch(e){}
+    try{
+      // (3) ニュース（今の登録銘柄をサーバーへ送って取得）
       const nr=await fetch("/api/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlist)});
       if(nr.ok){const nd=await nr.json();
         setS(p=>({...p,
@@ -357,17 +366,26 @@ function App(){
           <div style={{marginTop:12,border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,overflow:"hidden"}}>
             {shown.length===0 ?
               <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13}}>{s.watchlist.length===0?"上の検索から銘柄を登録してください（最大50社）。":"このセクターの銘柄はありません。"}</div> :
-              <div style={{overflowX:"auto"}}><table style={{minWidth:640}}>
-                <thead><tr style={{background:"var(--band)"}}><th>注目度</th><th>コード</th><th>銘柄</th><th>セクター</th><th>市場</th><th>メモ</th><th></th></tr></thead>
-                <tbody>{shown.map(w=><tr key={w.id} style={{borderTop:"1px solid var(--ruleSoft)"}}>
-                  <td><select value={w.watch} onChange={e=>setStock(w.id,{watch:e.target.value})} style={{fontSize:12,padding:"4px 6px",color:wc(w.watch),fontWeight:w.watch==="優先"?700:400}}>{WATCH.map(x=><option key={x} value={x}>{x}</option>)}</select></td>
-                  <td className="mono" style={{fontWeight:700}}>{w.code}</td>
-                  <td>{w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
-                  <td style={{color:"var(--inkSoft)"}}>{w.sector}</td>
-                  <td className="mono" style={{fontSize:11,color:"var(--inkSoft)"}}>{w.market}</td>
-                  <td><input value={w.note} placeholder="—" onChange={e=>setStock(w.id,{note:e.target.value})} style={{width:"100%",fontSize:13}}/></td>
-                  <td style={{textAlign:"center"}}><button className="iconbtn" onClick={()=>delStock(w.id)}>×</button></td>
-                </tr>)}</tbody>
+              <div style={{overflowX:"auto"}}><table style={{minWidth:760}}>
+                <thead><tr style={{background:"var(--band)"}}><th>注目度</th><th>コード</th><th>銘柄</th><th>セクター</th><th>現在値</th><th>前日比</th><th>高値</th><th>安値</th><th></th></tr></thead>
+                <tbody>{shown.map(w=>{
+                  const qt=s.stockQuotes[w.code]||{};
+                  const ct=num(qt.t),cp=num(qt.p),chi=num(qt.high),clo=num(qt.low);
+                  const delta=ct!=null&&cp!=null?ct-cp:null;
+                  const pct=delta!=null&&cp?delta/cp*100:null;
+                  const rowBg=delta==null||delta===0?"transparent":delta>0?"var(--upBg)":"var(--downBg)";
+                  const numCol=delta==null?"var(--inkSoft)":delta>0?"var(--up)":delta<0?"var(--down)":"var(--inkSoft)";
+                  return <tr key={w.id} style={{borderTop:"1px solid var(--ruleSoft)",background:rowBg}}>
+                    <td><select value={w.watch} onChange={e=>setStock(w.id,{watch:e.target.value})} style={{fontSize:12,padding:"4px 6px",color:wc(w.watch),fontWeight:w.watch==="優先"?700:400}}>{WATCH.map(x=><option key={x} value={x}>{x}</option>)}</select></td>
+                    <td className="mono" style={{fontWeight:700}}>{w.code}</td>
+                    <td>{w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
+                    <td style={{color:"var(--inkSoft)"}}>{w.sector}</td>
+                    <td className="mono" style={{fontWeight:700,color:numCol,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
+                    <td className="mono" style={{color:numCol,whiteSpace:"nowrap"}}>{delta!=null?(delta>0?"+":"")+delta.toLocaleString(undefined,{maximumFractionDigits:2})+(pct!=null?` (${pct>0?"+":""}${pct.toFixed(2)}%)`:""):"—"}</td>
+                    <td className="mono" style={{color:"var(--inkSoft)",whiteSpace:"nowrap"}}>{chi!=null?chi.toLocaleString():"—"}</td>
+                    <td className="mono" style={{color:"var(--inkSoft)",whiteSpace:"nowrap"}}>{clo!=null?clo.toLocaleString():"—"}</td>
+                    <td style={{textAlign:"center"}}><button className="iconbtn" onClick={()=>delStock(w.id)}>×</button></td>
+                  </tr>;})}</tbody>
               </table></div>}
           </div>
         </div>

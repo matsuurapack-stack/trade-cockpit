@@ -61,6 +61,49 @@ def get_index_quotes():
     return out
 
 
+# 登録銘柄（watchlist）の market===IDX 用シンボル上書き（TradingViewシンボルはyfinance非対応のため）
+IDX_YF_OVERRIDE = {"NI225": "^N225", "USDJPY": "JPY=X", "SOX": "SOXX", "VIX": "VIXY"}
+
+
+def _yf_symbol(w):
+    code = w.get("code", "")
+    market = w.get("market", "JP")
+    if market == "US":
+        return code
+    if market == "IDX":
+        return IDX_YF_OVERRIDE.get(code, code)
+    return code + ".T"  # 日本株
+
+
+def get_stock_quotes(watchlist):
+    """登録銘柄それぞれの現在値(t)・前日終値(p)・当日高値(high)・当日安値(low)を返す。"""
+    out = {}
+    if yf is None:
+        return out
+    for w in watchlist:
+        code = w.get("code", "")
+        if not code:
+            continue
+        sym = _yf_symbol(w)
+        try:
+            h = yf.Ticker(sym).history(period="7d")
+            closes = h["Close"].dropna()
+            if len(closes) == 0:
+                continue
+            t = round(float(closes.iloc[-1]), 2)
+            p = round(float(closes.iloc[-2]), 2) if len(closes) >= 2 else None
+            highs = h["High"].dropna()
+            lows = h["Low"].dropna()
+            out[code] = {
+                "t": t, "p": p,
+                "high": round(float(highs.iloc[-1]), 2) if len(highs) else None,
+                "low": round(float(lows.iloc[-1]), 2) if len(lows) else None,
+            }
+        except Exception as e:
+            print("  個別銘柄失敗", code, sym, e)
+    return out
+
+
 def _fmt_published(entry):
     """RSS の pubDate(GMT) を日本時間 'MM/DD HH:MM' に整形。無ければ空。"""
     pp = entry.get("published_parsed")
@@ -194,6 +237,17 @@ class Handler(SimpleHTTPRequestHandler):
                 "stockNewsText": _stock_text(stock),
                 "macroNewsText": _macro_text(macro),
             })
+        elif self.path.startswith("/api/stock-quotes"):
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b"[]"
+            try:
+                watchlist = json.loads(raw.decode("utf-8") or "[]")
+            except Exception:
+                watchlist = []
+            print(f"[取得] 登録銘柄の現在値（{len(watchlist)} 件）…")
+            quotes = get_stock_quotes(watchlist)
+            now = datetime.datetime.now().strftime("%H:%M:%S")
+            self._send_json({"quotes": quotes, "fetchedAt": now})
         else:
             self.send_response(404)
             self.end_headers()
