@@ -33,6 +33,9 @@ except ImportError:
 INDEX = {
     "usdjpy": "JPY=X", "nikkei": "^N225", "dow": "^DJI",
     "nasdaq": "^IXIC", "sox": "^SOX", "us10y": "^TNX",
+    "sp500": "^GSPC", "kospi": "^KS11",
+    "nikkei_fut": "NIY=F", "dow_fut": "YM=F",
+    "wti": "CL=F", "gold": "GC=F", "copper": "HG=F",
 }
 
 

@@ -138,6 +138,9 @@ const METRICS = [
   {key:"usdjpy",label:"ドル円",dp:2,stq:"usdjpy"},{key:"nikkei",label:"日経平均",dp:0,stq:"^nkx"},
   {key:"dow",label:"NYダウ",dp:0,stq:"^dji"},{key:"nasdaq",label:"ナスダック",dp:0,stq:"^ndq"},
   {key:"sox",label:"SOX半導体",dp:0,stq:"^sox"},{key:"us10y",label:"米10年債 %",dp:2},
+  {key:"sp500",label:"S&P500",dp:2},{key:"kospi",label:"KOSPI",dp:2},
+  {key:"nikkei_fut",label:"日経225先物",dp:0},{key:"dow_fut",label:"NYダウ先物",dp:0},
+  {key:"wti",label:"WTI原油",dp:2},{key:"gold",label:"金(Gold)",dp:1},{key:"copper",label:"銅(Copper)",dp:3},
 ];
 const WATCH = ["優先","通常","様子見"];
 const wc = (w)=> w==="優先"?"var(--star)": w==="様子見"?"var(--inkSoft)":"var(--accent)";
@@ -398,12 +401,13 @@ function App(){
               <button className="btn primary" onClick={fetchLive} disabled={fetching}>{fetching?"取得中…":"リアルタイムデータを反映"}</button>
             </div>
           </div>
-          <div className="sec-note">「リアルタイムデータを反映」を押すたびに、ドル円・日経平均・ダウ・ナスダック・SOX・米10年債 を今日値／前日値ともに取得します（数値は遅延あり）。</div>
+          <div className="sec-note">「リアルタイムデータを反映」を押すたびに、ドル円・日経平均・ダウ・ナスダック・SOX・米10年債・S&P500・KOSPI・日経225先物・NYダウ先物・WTI原油・金・銅 を今日値／前日値ともに取得します（数値は遅延あり）。</div>
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:1,background:"var(--rule)",border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden"}}>
             {METRICS.map(m=>{const v=s.metrics[m.key];const t=num(v.t),p=num(v.p);
-              const delta=t!=null&&p!=null?t-p:null;const dCol=delta==null?"var(--inkSoft)":delta>0?"var(--gain)":delta<0?"var(--loss)":"var(--inkSoft)";
+              const delta=t!=null&&p!=null?t-p:null;const dCol=delta==null?"var(--inkSoft)":delta>0?"var(--up)":delta<0?"var(--down)":"var(--inkSoft)";
               const condOn=m.cond&&t!=null&&m.cond(t);
-              return <div key={m.key} style={{background:condOn?"#EAF0EC":"var(--card)",padding:"11px 13px"}}>
+              const cardBg=condOn?"#EAF0EC":delta>0?"var(--upBg)":delta<0?"var(--downBg)":"var(--card)";
+              return <div key={m.key} style={{background:cardBg,padding:"11px 13px"}}>
                 <div style={{fontSize:11,color:"var(--inkSoft)",display:"flex",justifyContent:"space-between"}}><span>{m.label}</span>{condOn&&<span className="mono" style={{fontSize:10,color:"var(--gain)",fontWeight:700}}>条件○</span>}</div>
                 <div style={{display:"flex",alignItems:"baseline",gap:7,marginTop:3}}>
                   <span className="mono" style={{fontSize:21,fontWeight:700}}>{t!=null?t.toFixed(m.dp):"—"}</span>
