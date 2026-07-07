@@ -1,0 +1,170 @@
+# -*- coding: utf-8 -*-
+"""
+トレード・コックピット ローカルサーバー
+- ブラウザの「リアルタイムデータを反映」ボタンから呼ばれ、その場でデータを取得して返す
+- 取得: 指数/為替(yfinance)、ニュース(Googleニュース RSS)
+- 使い方: start.bat をダブルクリック。ブラウザが自動で開きます。
+"""
+import os
+import json
+import time
+import datetime
+import threading
+import webbrowser
+import urllib.parse
+import urllib.request
+from http.server import SimpleHTTPRequestHandler
+from socketserver import ThreadingTCPServer
+
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+PORT = 8765
+
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
+try:
+    import feedparser
+except ImportError:
+    feedparser = None
+
+INDEX = {
+    "usdjpy": "JPY=X", "nikkei": "^N225", "dow": "^DJI",
+    "nasdaq": "^IXIC", "sox": "^SOX", "us10y": "^TNX",
+}
+
+
+def _two_closes(sym):
+    """最新終値(t)と1営業日前(p)を返す"""
+    h = yf.Ticker(sym).history(period="7d")
+    closes = h["Close"].dropna()
+    if len(closes) == 0:
+        return None
+    t = round(float(closes.iloc[-1]), 2)
+    p = round(float(closes.iloc[-2]), 2) if len(closes) >= 2 else None
+    return {"t": t, "p": p}
+
+
+def get_index_quotes():
+    out = {}
+    if yf is None:
+        return out
+    for key, sym in INDEX.items():
+        try:
+            r = _two_closes(sym)
+            if r:
+                out[key] = r
+        except Exception as e:
+            print("  index失敗", key, e)
+    return out
+
+
+def google_news(query, n=2):
+    if feedparser is None:
+        return []
+    url = ("https://news.google.com/rss/search?q="
+           + urllib.parse.quote(query) + "&hl=ja&gl=JP&ceid=JP:ja")
+    try:
+        feed = feedparser.parse(url)
+        return [{"title": e.get("title", ""), "url": e.get("link", "")} for e in feed.entries[:n]]
+    except Exception:
+        return []
+
+
+def build_stock_news(watchlist):
+    order = {"優先": 0, "通常": 1, "様子見": 2}
+    wl = sorted(watchlist, key=lambda w: order.get(w.get("watch", "通常"), 1))[:12]
+    lines = []
+    for w in wl:
+        name = w.get("name", "")
+        code = w.get("code", "")
+        if not name:
+            continue
+        for it in google_news(name + " 株価 決算", 2):
+            lines.append(f"・[{code} {name}] {it['title']}\n  {it['url']}")
+    return "\n".join(lines)
+
+
+def build_macro_news():
+    queries = ["日経平均 見通し", "日銀 金融政策 決定", "FRB 利上げ 金利",
+               "ドル円 相場", "米国株式市場 ダウ"]
+    lines = []
+    for q in queries:
+        for it in google_news(q, 2):
+            lines.append(f"・{it['title']}\n  {it['url']}")
+    return "\n".join(lines)
+
+
+class Handler(SimpleHTTPRequestHandler):
+    def log_message(self, *a):
+        pass  # アクセスログは静かに
+
+    def _send_json(self, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path.startswith("/api/quotes"):
+            print("[取得] 指数・為替 …")
+            quotes = get_index_quotes()
+            now = datetime.datetime.now().strftime("%H:%M:%S")
+            self._send_json({"quotes": quotes, "fetchedAt": now})
+        else:
+            super().do_GET()  # HTMLなどの静的配信
+
+    def do_POST(self):
+        if self.path.startswith("/api/news"):
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b"[]"
+            try:
+                watchlist = json.loads(raw.decode("utf-8") or "[]")
+            except Exception:
+                watchlist = []
+            print(f"[取得] ニュース（登録銘柄 {len(watchlist)} 件 ＋ マクロ）…")
+            self._send_json({
+                "stockNewsText": build_stock_news(watchlist),
+                "macroNewsText": build_macro_news(),
+            })
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+def open_browser():
+    time.sleep(1.5)
+    webbrowser.open(f"http://localhost:{PORT}/trade-cockpit.html")
+
+
+def main():
+    if yf is None or feedparser is None:
+        print("必要なライブラリが見つかりません。setup.bat を先に実行してください。")
+        input("Enterで終了します。")
+        return
+    threading.Thread(target=open_browser, daemon=True).start()
+    print("=" * 52)
+    print(" トレード・コックピット サーバー起動中")
+    print(f"  ブラウザが自動で開きます。開かない場合は下記を開いてください：")
+    print(f"  http://localhost:{PORT}/trade-cockpit.html")
+    print("  使い終わったら、このウィンドウを閉じてください。")
+    print("=" * 52)
+    with ThreadingTCPServer(("127.0.0.1", PORT), Handler) as httpd:
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == "__main__":
+    main()

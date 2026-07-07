@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>トレード・コックピット</title>
+<style>
+:root{
+  --paper:#E7E8E1; --paperAlt:#EEEFE9; --card:#F3F4EE; --ink:#1B1E1A; --inkSoft:#565A52;
+  --rule:#C6C8BF; --ruleSoft:#D6D8CF; --gain:#2C6A48; --loss:#AE3A34; --accent:#2A4A6B;
+  --band:#DEDFD7; --star:#B8863B; --warn:#9A6A16; --alarm:#1F5C3A; --alarmEdge:#123A25;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);
+  font-family:'Helvetica Neue',Arial,'Hiragino Kaku Gothic ProN',Meiryo,sans-serif}
+.mono{font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+.wrap{max-width:980px;margin:0 auto;padding:22px 18px 46px}
+.head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;flex-wrap:wrap;
+  border-bottom:2px solid var(--ink);padding-bottom:12px}
+.kicker{font-size:11px;letter-spacing:3px;color:var(--inkSoft);text-transform:uppercase}
+h1{margin:3px 0 0;font-size:26px;font-weight:700;letter-spacing:-.4px}
+.tabs{display:flex;gap:4px;margin-top:16px;border-bottom:1px solid var(--rule)}
+.tab{background:transparent;border:none;border-bottom:2px solid transparent;color:var(--inkSoft);
+  font-size:14px;padding:9px 16px;cursor:pointer;font-weight:600}
+.tab.on{color:var(--ink);border-bottom-color:var(--accent)}
+.sec-head{font-size:15px;font-weight:700;margin:0 0 3px}
+.sec-note{font-size:11px;color:var(--inkSoft);margin-bottom:10px}
+.card{border:1px solid var(--rule);background:var(--card);border-radius:4px;padding:14px 16px 16px}
+.card-t{font-size:14px;font-weight:700}
+.card-n{font-size:11px;color:var(--inkSoft);margin-top:2px}
+.card-hd{border-bottom:1px solid var(--ruleSoft);padding-bottom:8px;margin-bottom:10px}
+.grid{display:grid;gap:16px}
+.btn{display:inline-flex;align-items:center;gap:6px;border:none;padding:8px 13px;font-size:13px;
+  border-radius:4px;cursor:pointer;font-weight:600}
+.btn.primary{background:var(--accent);color:#fff}
+.ghost{display:inline-flex;align-items:center;gap:6px;background:transparent;color:var(--inkSoft);
+  border:1px solid var(--rule);padding:7px 12px;font-size:13px;border-radius:4px;cursor:pointer}
+.iconbtn{background:transparent;border:none;color:var(--inkSoft);cursor:pointer;padding:4px;font-size:15px}
+input,select,textarea{padding:8px 10px;border:1px solid var(--rule);background:var(--paperAlt);
+  color:var(--ink);font-size:13px;border-radius:3px;font-family:inherit}
+textarea{resize:vertical;line-height:1.6;width:100%}
+label.fld{display:block;margin-top:8px}
+label.fld span{font-size:11px;color:var(--inkSoft);display:block;margin-bottom:4px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{padding:8px 10px;font-size:11px;font-weight:600;text-align:left;white-space:nowrap;color:var(--inkSoft)}
+td{padding:7px 10px;vertical-align:middle}
+.lbl{font-size:11px;color:var(--inkSoft);margin:8px 0 4px}
+.chip{font-size:12px;padding:4px 10px;border-radius:16px;cursor:pointer;border:1px solid var(--rule);
+  background:var(--paperAlt);color:var(--inkSoft)}
+.chip.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.alarm{background:var(--alarm);color:#EFF3EF;border:2px solid var(--alarmEdge);border-radius:6px;
+  padding:16px 18px;display:flex;align-items:center;gap:13px;animation:almPulse 1.2s ease-in-out infinite}
+@keyframes almPulse{0%,100%{opacity:1}50%{opacity:.74}}
+.foot{margin-top:16px;font-size:11.5px;color:var(--inkSoft);line-height:1.7}
+.results{position:absolute;z-index:5;left:0;right:0;margin-top:4px;background:var(--paperAlt);
+  border:1px solid var(--rule);border-radius:4px;box-shadow:0 4px 14px rgba(0,0,0,.12);overflow:hidden}
+.res-row{display:flex;width:100%;align-items:center;gap:10px;padding:9px 12px;background:transparent;
+  border:none;border-bottom:1px solid var(--ruleSoft);cursor:pointer;text-align:left}
+.loading{max-width:400px;margin:80px auto;text-align:center;color:var(--inkSoft)}
+</style>
+</head>
+<body>
+<div id="root"><div class="loading">読み込み中… （初回はライブラリの取得に数秒かかります）</div></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.6/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useMemo } = React;
+
+const num = (v) => (v === "" || v == null || isNaN(+v) ? null : +v);
+const todayISO = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; };
+const WD = ["日","月","火","水","木","金","土"];
+const MAX = 50;
+const KEY = "trade-cockpit-v1";
+
+const M = (code,name,sector,market,tv) => ({code,name,sector,market,tvSymbol: tv || (market==="JP" ? "TSE:"+code : "")});
+const MASTER = [
+  M("8035","東京エレクトロン","半導体製造装置","JP"),M("6857","アドバンテスト","半導体製造装置","JP"),
+  M("6146","ディスコ","半導体製造装置","JP"),M("6920","レーザーテック","半導体製造装置","JP"),
+  M("7735","SCREENホールディングス","半導体製造装置","JP"),M("6525","コクサイエレクトリック","半導体製造装置","JP"),
+  M("6526","ソシオネクスト","半導体","JP"),M("6723","ルネサスエレクトロニクス","半導体","JP"),
+  M("6963","ローム","半導体","JP"),M("4063","信越化学工業","半導体材料","JP"),
+  M("3436","SUMCO","半導体材料","JP"),M("285A","キオクシアホールディングス","半導体メモリ","JP"),
+  M("9984","ソフトバンクグループ","AI・投資","JP"),M("3778","さくらインターネット","データセンター","JP"),
+  M("5803","フジクラ","電線・データセンター","JP"),M("4062","イビデン","電子部品","JP"),
+  M("6976","太陽誘電","電子部品","JP"),M("6981","村田製作所","電子部品","JP"),
+  M("6762","TDK","電子部品","JP"),M("6971","京セラ","電子部品","JP"),
+  M("3994","マネーフォワード","SaaS","JP"),M("4478","freee","SaaS","JP"),
+  M("4443","Sansan","SaaS","JP"),M("3923","ラクス","SaaS","JP"),
+  M("4776","サイボウズ","SaaS","JP"),M("4751","サイバーエージェント","ネット","JP"),
+  M("9613","NTTデータグループ","IT","JP"),
+  M("6758","ソニーグループ","電機","JP"),M("6501","日立製作所","電機","JP"),
+  M("6861","キーエンス","精密","JP"),M("7751","キヤノン","精密","JP"),
+  M("6752","パナソニックHD","電機","JP"),M("6503","三菱電機","電機","JP"),M("7741","HOYA","精密","JP"),
+  M("7203","トヨタ自動車","自動車","JP"),M("7267","ホンダ","自動車","JP"),
+  M("6902","デンソー","自動車部品","JP"),M("7270","SUBARU","自動車","JP"),M("7201","日産自動車","自動車","JP"),
+  M("8306","三菱UFJフィナンシャルG","銀行","JP"),M("8316","三井住友フィナンシャルG","銀行","JP"),
+  M("8411","みずほフィナンシャルG","銀行","JP"),M("8604","野村ホールディングス","証券","JP"),
+  M("8766","東京海上ホールディングス","保険","JP"),
+  M("8058","三菱商事","商社","JP"),M("8031","三井物産","商社","JP"),
+  M("8001","伊藤忠商事","商社","JP"),M("8002","丸紅","商社","JP"),M("8053","住友商事","商社","JP"),
+  M("9432","日本電信電話(NTT)","通信","JP"),M("9433","KDDI","通信","JP"),M("9434","ソフトバンク","通信","JP"),
+  M("7011","三菱重工業","重工・防衛","JP"),M("7013","IHI","重工・防衛","JP"),M("7012","川崎重工業","重工・防衛","JP"),
+  M("9983","ファーストリテイリング","小売","JP"),M("6098","リクルートHD","サービス","JP"),
+  M("7974","任天堂","ゲーム","JP"),M("4568","第一三共","医薬","JP"),
+  M("6954","ファナック","機械","JP"),M("6367","ダイキン工業","機械","JP"),M("9101","日本郵船","海運","JP"),
+  M("NVDA","NVIDIA","半導体","US","NASDAQ:NVDA"),M("AMD","AMD","半導体","US","NASDAQ:AMD"),
+  M("AVGO","Broadcom","半導体","US","NASDAQ:AVGO"),M("MU","Micron","半導体メモリ","US","NASDAQ:MU"),
+  M("AAPL","Apple","テック","US","NASDAQ:AAPL"),M("MSFT","Microsoft","テック","US","NASDAQ:MSFT"),
+  M("GOOGL","Alphabet","テック","US","NASDAQ:GOOGL"),M("AMZN","Amazon","テック","US","NASDAQ:AMZN"),
+  M("META","Meta","テック","US","NASDAQ:META"),M("TSLA","Tesla","自動車","US","NASDAQ:TSLA"),
+  M("PLTR","Palantir","SaaS","US","NASDAQ:PLTR"),M("CRM","Salesforce","SaaS","US","NYSE:CRM"),
+  M("NOW","ServiceNow","SaaS","US","NYSE:NOW"),M("ARM","Arm","半導体","US","NASDAQ:ARM"),
+  M("TSM","TSMC","半導体","US","NYSE:TSM"),M("ASML","ASML","半導体製造装置","US","NASDAQ:ASML"),
+  M("NI225","日経225","指数","IDX","TVC:NI225"),M("USDJPY","ドル円","為替","IDX","FX:USDJPY"),
+  M("SOX","SOX半導体株指数","指数","IDX","NASDAQ:SOX"),M("VIX","VIX恐怖指数","指数","IDX","TVC:VIX"),
+];
+
+const METRICS = [
+  {key:"usdjpy",label:"ドル円",dp:2,stq:"usdjpy"},{key:"nikkei",label:"日経平均",dp:0,stq:"^nkx"},
+  {key:"dow",label:"NYダウ",dp:0,stq:"^dji"},{key:"nasdaq",label:"ナスダック",dp:0,stq:"^ndq"},
+  {key:"sox",label:"SOX半導体",dp:0,stq:"^sox"},{key:"us10y",label:"米10年債 %",dp:2},
+];
+const WATCH = ["優先","通常","様子見"];
+const wc = (w)=> w==="優先"?"var(--star)": w==="様子見"?"var(--inkSoft)":"var(--accent)";
+const wOrder = {"優先":0,"通常":1,"様子見":2};
+
+const SIGNALS = {
+  buy:[
+    {id:"panpakapan",label:"パンパカパン（最優先買い）",strong:true},
+    {id:"triple_bottom",label:"トリプルボトム",strong:true},
+    {id:"island_bottom",label:"アイランドボトム（全力買い）",strong:true},
+    {id:"narabiaka",label:"上放れ並び赤",strong:true},
+    {id:"double_bottom",label:"ダブルボトム"},
+    {id:"cross_low",label:"十字線・安値圏（上昇転換）"},
+    {id:"harami_low",label:"はらみ線・安値圏（上昇期待）"},
+    {id:"tsutsumi_up",label:"陽線抱き線（強い上昇）"},
+    {id:"gap_up",label:"窓開け急騰"},{id:"two_yang",label:"2連続陽線"},
+    {id:"bottom_signal",label:"底打ちシグナル（-3σ/RCI-90/24日線割れ/-2.5%急落の複数重複）"},
+    {id:"jiko",label:"事故は買い（一時的な需給急落）"},
+  ],
+  sell:[
+    {id:"shitawanare",label:"下放れ二本黒（暴落カウントダウン）",strong:true},
+    {id:"island_top",label:"アイランドリバーサル・高値圏（天井）",strong:true},
+    {id:"triple_top",label:"トリプルトップ",strong:true},
+    {id:"double_top",label:"ダブルトップ"},{id:"kubitsuri",label:"首吊り線"},
+    {id:"cross_high",label:"十字線・高値圏（下落転換）"},
+    {id:"tsutsumi_down",label:"陰線抱き線（さらなる下落）"},
+    {id:"jiken",label:"事件は売り（構造的悪材料）"},
+  ],
+  watch:[
+    {id:"panpakapan_3rd",label:"パンパカパン3回目接近（下降警戒／高値更新なら見送り）"},
+    {id:"harami_high",label:"はらみ線・高値圏（上昇終焉警戒）"},
+  ],
+};
+const BB_POS=["","+3σ以上","+2σ付近","中心","-2σ付近","-3σタッチ/張り付き"];
+const FORECAST=["","増収増益","増収減益","減収増益","減収減益","未定"];
+const ANALYST=["","強気","やや強気","中立","やや弱気","弱気"];
+const emptyAnalysis=()=>({signals:{},tech:{bb:"",rsi:"",rci:"",maPanpaka:false},
+  fund:{forecast:"",per:"",pbr:"",divy:"",roe:"",fcf:"",analyst:"",target:"",memo:""},
+  plan:{entry:"",tp:"",sl:"",memo:""}});
+
+const emptyMetrics=()=>Object.fromEntries(METRICS.map(m=>[m.key,{t:"",p:""}]));
+const emptyState=()=>({
+  date:todayISO(), watchlist:[], metrics:emptyMetrics(),
+  usMarketNote:"",adrPts:"",sundayDow:"",strongSectors:"",themes:"",stockNews:"",marketNews:"",briefing:"",
+  sectorHeat:{}, analysis:{},
+});
+const loadState=()=>{try{const r=localStorage.getItem(KEY);if(!r)return null;const d=JSON.parse(r);return {...emptyState(),...d,metrics:{...emptyMetrics(),...(d.metrics||{})}};}catch{return null;}};
+
+function App(){
+  const [s,setS]=useState(()=>loadState()||emptyState());
+  const [tab,setTab]=useState("briefing");
+  const [q,setQ]=useState("");
+  const [secFilter,setSecFilter]=useState("すべて");
+  const [sel,setSel]=useState(null);
+  const [chartSym,setChartSym]=useState("TVC:NI225");
+  const [cBB,setCBB]=useState(true),[cRSI,setCRSI]=useState(true),[cMA,setCMA]=useState(false);
+  const fileRef=useRef();
+  const chartRef=useRef();
+  const [fetching,setFetching]=useState(false);
+  const [fetchMsg,setFetchMsg]=useState("");
+
+  useEffect(()=>{try{localStorage.setItem(KEY,JSON.stringify(s));}catch{}},[s]);
+
+  const fetchLive=async()=>{
+    setFetching(true);setFetchMsg("取得中…（数値→ニュースの順）");
+    try{
+      // (1) 数値（指数・為替）を今日値/前日値ともに反映
+      const qr=await fetch("/api/quotes");
+      if(!qr.ok) throw new Error("quotes");
+      const qd=await qr.json();
+      setS(p=>{const nm={...p.metrics};
+        Object.entries(qd.quotes||{}).forEach(([k,v])=>{
+          if(nm[k]!=null&&v){nm[k]={...nm[k],
+            t:(v.t!=null?String(v.t):nm[k].t),
+            p:(v.p!=null?String(v.p):nm[k].p)};}
+        });
+        return {...p,metrics:nm};});
+      setFetchMsg((qd.fetchedAt||"")+" 数値を反映。ニュース取得中…");
+    }catch(e){
+      setFetching(false);setFetchMsg("");
+      alert("サーバーに接続できません。start.bat を実行し、開いた http://localhost:8765/trade-cockpit.html のページで使ってください。");
+      return;
+    }
+    try{
+      // (2) ニュース（今の登録銘柄をサーバーへ送って取得）
+      const nr=await fetch("/api/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlist)});
+      if(nr.ok){const nd=await nr.json();
+        setS(p=>({...p,stockNews:nd.stockNewsText||p.stockNews,marketNews:nd.macroNewsText||p.marketNews}));}
+    }catch(e){}
+    const now=new Date();
+    setFetchMsg(`${now.getHours()}:${String(now.getMinutes()).padStart(2,"0")} 取得完了`);
+    setFetching(false);
+  };
+
+  const set=(patch)=>setS(p=>({...p,...patch}));
+  const setMetric=(k,f,v)=>setS(p=>({...p,metrics:{...p.metrics,[k]:{...p.metrics[k],[f]:v}}}));
+  const setHeatV=(sec,f,v)=>setS(p=>({...p,sectorHeat:{...p.sectorHeat,[sec]:{...p.sectorHeat[sec],[f]:v}}}));
+
+  const day=useMemo(()=>{const d=new Date(s.date+"T00:00:00");return isNaN(d)?null:d.getDay();},[s.date]);
+  const isMonday=day===1;
+
+  const regCodes=useMemo(()=>new Set(s.watchlist.map(w=>w.code)),[s.watchlist]);
+  const results=useMemo(()=>{const t=q.trim().toLowerCase();if(!t)return[];
+    return MASTER.filter(m=>!regCodes.has(m.code)&&(m.code.toLowerCase().includes(t)||m.name.toLowerCase().includes(t)||m.sector.toLowerCase().includes(t))).slice(0,8);},[q,regCodes]);
+  const addStock=(m)=>{if(s.watchlist.length>=MAX){alert("登録は最大"+MAX+"社までです。");return;}
+    if(regCodes.has(m.code))return; set({watchlist:[...s.watchlist,{id:Date.now()+Math.random(),...m,watch:"通常",note:""}]});setQ("");};
+  const addManual=()=>{const code=q.trim();if(!code)return;if(s.watchlist.length>=MAX){alert("最大"+MAX+"社");return;}
+    set({watchlist:[...s.watchlist,{id:Date.now()+Math.random(),code,name:code,sector:"未分類",market:"JP",tvSymbol:"TSE:"+code,watch:"通常",note:""}]});setQ("");};
+  const setStock=(id,patch)=>set({watchlist:s.watchlist.map(w=>w.id===id?{...w,...patch}:w)});
+  const delStock=(id)=>set({watchlist:s.watchlist.filter(w=>w.id!==id)});
+
+  const sectorsList=useMemo(()=>["すべて",...Array.from(new Set(s.watchlist.map(w=>w.sector)))],[s.watchlist]);
+  const shown=useMemo(()=>{const list=secFilter==="すべて"?s.watchlist:s.watchlist.filter(w=>w.sector===secFilter);
+    return [...list].sort((a,b)=>(wOrder[a.watch]-wOrder[b.watch])||a.code.localeCompare(b.code));},[s.watchlist,secFilter]);
+
+  const analysisSectors=useMemo(()=>{const map={};s.watchlist.forEach(w=>{(map[w.sector]=map[w.sector]||[]).push(w);});
+    return Object.entries(map).map(([sector,items])=>({sector,items,chg:num(s.sectorHeat[sector]?.chg)}))
+      .sort((a,b)=>(b.chg??-999)-(a.chg??-999));},[s.watchlist,s.sectorHeat]);
+
+  const getA=(code)=>s.analysis[code]||emptyAnalysis();
+  const patchA=(code,section,patch)=>setS(p=>{const a=p.analysis[code]||emptyAnalysis();return {...p,analysis:{...p.analysis,[code]:{...a,[section]:{...a[section],...patch}}}};});
+  const toggleSig=(code,id)=>setS(p=>{const a=p.analysis[code]||emptyAnalysis();return {...p,analysis:{...p.analysis,[code]:{...a,signals:{...a.signals,[id]:!a.signals[id]}}}};});
+
+  const rollToNextDay=()=>{if(!confirm("今日の値を前日値へ繰り越し、新しい一日にします（登録銘柄・分析は保持）。よろしいですか？"))return;
+    setS(p=>({...emptyState(),date:todayISO(),watchlist:p.watchlist,sectorHeat:p.sectorHeat,analysis:p.analysis,
+      metrics:Object.fromEntries(Object.entries(p.metrics).map(([k,v])=>[k,{t:"",p:v.t}]))}));};
+  const exportJSON=()=>{const blob=new Blob([JSON.stringify(s,null,2)],{type:"application/json"});
+    const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="trade-cockpit-"+s.date+".json";a.click();URL.revokeObjectURL(url);};
+  const importJSON=(e)=>{const f=e.target.files?.[0];if(!f)return;const r=new FileReader();
+    r.onload=()=>{try{setS({...emptyState(),...JSON.parse(r.result)});}catch{alert("読み込み失敗");}};r.readAsText(f);e.target.value="";};
+
+  // TradingView chart
+  useEffect(()=>{if(tab!=="chart")return;const c=chartRef.current;if(!c)return;
+    c.innerHTML='<div class="tradingview-widget-container__widget"></div>';
+    const studies=[];if(cBB)studies.push("BB@tv-basicstudies");if(cRSI)studies.push("RSI@tv-basicstudies");if(cMA)studies.push("MASimple@tv-basicstudies");
+    const sc=document.createElement("script");sc.src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js";sc.async=true;
+    sc.innerHTML=JSON.stringify({symbol:chartSym,interval:"D",timezone:"Asia/Tokyo",theme:"light",style:"1",locale:"ja",studies,width:"100%",height:540,allow_symbol_change:true});
+    c.appendChild(sc);},[tab,chartSym,cBB,cRSI,cMA]);
+
+  const openTV=(tv)=>{if(tv)window.open("https://jp.tradingview.com/chart/?symbol="+encodeURIComponent(tv),"_blank");};
+  const jp=s.watchlist.filter(w=>w.market==="JP").length, us=s.watchlist.filter(w=>w.market==="US").length;
+
+  return (
+    <div className="wrap">
+      <div className="head">
+        <div><div className="kicker">Trade Cockpit</div><h1>トレード・コックピット</h1></div>
+        <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+          <input type="date" className="mono" value={s.date} onChange={e=>set({date:e.target.value})} style={{fontSize:13}}/>
+          <span className="mono" style={{fontSize:14,fontWeight:700,width:22,textAlign:"center",color:isMonday?"var(--accent)":"var(--ink)"}}>{day!=null?WD[day]:"―"}</span>
+          <button className="ghost" onClick={rollToNextDay}>翌朝へ</button>
+          <button className="ghost" onClick={exportJSON}>バックアップ↓</button>
+          <button className="ghost" onClick={()=>fileRef.current.click()}>復元↑</button>
+          <input ref={fileRef} type="file" accept="application/json,.json" onChange={importJSON} style={{display:"none"}}/>
+        </div>
+      </div>
+
+      <div className="tabs">
+        <button className={"tab"+(tab==="briefing"?" on":"")} onClick={()=>setTab("briefing")}>ブリーフィング</button>
+        <button className={"tab"+(tab==="news"?" on":"")} onClick={()=>setTab("news")}>ニュース</button>
+        <button className={"tab"+(tab==="analysis"?" on":"")} onClick={()=>{setTab("analysis");setSel(null);}}>分析</button>
+        <button className={"tab"+(tab==="chart"?" on":"")} onClick={()=>setTab("chart")}>チャート</button>
+      </div>
+
+      {/* ===== BRIEFING ===== */}
+      {tab==="briefing" && <div>
+        <div style={{marginTop:18}}>
+          <div className="sec-head">登録銘柄　{s.watchlist.length}/{MAX}</div>
+          <div className="sec-note">日本株 {jp} ・ 米国株 {us} ・ 指数/為替 {s.watchlist.length-jp-us}（全タブ共通・自動保存）</div>
+          <div style={{position:"relative"}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,padding:"8px 12px"}}>
+              <input value={q} onChange={e=>setQ(e.target.value)} placeholder="銘柄コード・企業名・セクターで検索（例：6981、村田、半導体、NVDA）"
+                style={{flex:1,border:"none",background:"transparent",outline:"none",fontSize:14}}/>
+              {q && <button className="iconbtn" onClick={()=>setQ("")}>×</button>}
+            </div>
+            {q.trim() && <div className="results">
+              {results.map(m=>
+                <button key={m.code} className="res-row" onClick={()=>addStock(m)}>
+                  <span className="mono" style={{fontSize:12,width:60,color:"var(--inkSoft)"}}>{m.code}</span>
+                  <span style={{flex:1,fontSize:13}}>{m.name}</span>
+                  <span style={{fontSize:11,color:"var(--inkSoft)"}}>{m.sector}</span>
+                  <span style={{color:"var(--accent)",fontWeight:700}}>＋</span>
+                </button>)}
+              <button className="res-row" style={{background:"var(--band)",fontSize:12.5,color:"var(--inkSoft)"}} onClick={addManual}>＋ リストにない「{q.trim()}」を手動登録</button>
+            </div>}
+          </div>
+          {s.watchlist.length>0 && <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:12}}>
+            {sectorsList.map(sec=><button key={sec} className={"chip"+(secFilter===sec?" on":"")} onClick={()=>setSecFilter(sec)}>{sec}</button>)}
+          </div>}
+          <div style={{marginTop:12,border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,overflow:"hidden"}}>
+            {shown.length===0 ?
+              <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13}}>{s.watchlist.length===0?"上の検索から銘柄を登録してください（最大50社）。":"このセクターの銘柄はありません。"}</div> :
+              <div style={{overflowX:"auto"}}><table style={{minWidth:640}}>
+                <thead><tr style={{background:"var(--band)"}}><th>注目度</th><th>コード</th><th>銘柄</th><th>セクター</th><th>市場</th><th>メモ</th><th></th></tr></thead>
+                <tbody>{shown.map(w=><tr key={w.id} style={{borderTop:"1px solid var(--ruleSoft)"}}>
+                  <td><select value={w.watch} onChange={e=>setStock(w.id,{watch:e.target.value})} style={{fontSize:12,padding:"4px 6px",color:wc(w.watch),fontWeight:w.watch==="優先"?700:400}}>{WATCH.map(x=><option key={x} value={x}>{x}</option>)}</select></td>
+                  <td className="mono" style={{fontWeight:700}}>{w.code}</td>
+                  <td>{w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
+                  <td style={{color:"var(--inkSoft)"}}>{w.sector}</td>
+                  <td className="mono" style={{fontSize:11,color:"var(--inkSoft)"}}>{w.market}</td>
+                  <td><input value={w.note} placeholder="—" onChange={e=>setStock(w.id,{note:e.target.value})} style={{width:"100%",fontSize:13}}/></td>
+                  <td style={{textAlign:"center"}}><button className="iconbtn" onClick={()=>delStock(w.id)}>×</button></td>
+                </tr>)}</tbody>
+              </table></div>}
+          </div>
+        </div>
+
+        <div style={{marginTop:22}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+            <div className="sec-head">日次モニター</div>
+            <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+              {fetchMsg && <span style={{fontSize:11,color:"var(--inkSoft)"}}>{fetchMsg}</span>}
+              <button className="btn primary" onClick={fetchLive} disabled={fetching}>{fetching?"取得中…":"リアルタイムデータを反映"}</button>
+            </div>
+          </div>
+          <div className="sec-note">「リアルタイムデータを反映」を押すたびに、ドル円・日経平均・ダウ・ナスダック・SOX・米10年債 を今日値／前日値ともに取得します（数値は遅延あり）。</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:1,background:"var(--rule)",border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden"}}>
+            {METRICS.map(m=>{const v=s.metrics[m.key];const t=num(v.t),p=num(v.p);
+              const delta=t!=null&&p!=null?t-p:null;const dCol=delta==null?"var(--inkSoft)":delta>0?"var(--gain)":delta<0?"var(--loss)":"var(--inkSoft)";
+              const condOn=m.cond&&t!=null&&m.cond(t);
+              return <div key={m.key} style={{background:condOn?"#EAF0EC":"var(--card)",padding:"11px 13px"}}>
+                <div style={{fontSize:11,color:"var(--inkSoft)",display:"flex",justifyContent:"space-between"}}><span>{m.label}</span>{condOn&&<span className="mono" style={{fontSize:10,color:"var(--gain)",fontWeight:700}}>条件○</span>}</div>
+                <div style={{display:"flex",alignItems:"baseline",gap:7,marginTop:3}}>
+                  <span className="mono" style={{fontSize:21,fontWeight:700}}>{t!=null?t.toFixed(m.dp):"—"}</span>
+                  {delta!=null&&<span className="mono" style={{fontSize:12,color:dCol}}>{delta>0?"▲":delta<0?"▼":""}{delta>0?"+":""}{delta.toFixed(m.dp)}</span>}
+                </div>
+                <div style={{marginTop:7,fontSize:12,color:"var(--inkSoft)"}}>前日 <span className="mono">{p!=null?p.toFixed(m.dp):"—"}</span></div>
+              </div>;})}
+          </div>
+        </div>
+
+        <div className="grid" style={{gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",marginTop:20}}>
+          <div className="card"><div className="card-hd"><div className="card-t">市況メモ</div><div className="card-n">{isMonday?"月曜：サンデーダウ欄あり":"数値の補足・気配"}</div></div>
+            <div className="lbl">米国市場（内訳・コメント）</div><textarea rows={2} value={s.usMarketNote} onChange={e=>set({usMarketNote:e.target.value})} placeholder="ダウ/Nasdaq/S&P、SOX、セクターの強弱など"/>
+            <div className="lbl">ADR・PTS</div><input style={{width:"100%"}} value={s.adrPts} onChange={e=>set({adrPts:e.target.value})} placeholder="主要銘柄のADR乖離・PTS気配"/>
+            {isMonday&&<div><div className="lbl">サンデーダウ</div><input style={{width:"100%",borderColor:"var(--accent)"}} value={s.sundayDow} onChange={e=>set({sundayDow:e.target.value})} placeholder="週明けの先行き・先物"/></div>}
+          </div>
+          <div className="card"><div className="card-hd"><div className="card-t">地合い・テーマ</div><div className="card-n">前日強かったセクター / 今日の注目テーマ</div></div>
+            <div className="lbl">前日強かった日米セクター</div><textarea rows={2} value={s.strongSectors} onChange={e=>set({strongSectors:e.target.value})} placeholder="例）半導体、SaaS、海運…"/>
+            <div className="lbl">今日の注目テーマ</div><textarea rows={2} value={s.themes} onChange={e=>set({themes:e.target.value})} placeholder="日本市場で今日意識されるテーマ"/>
+          </div>
+        </div>
+        <div className="card" style={{marginTop:16}}><div className="card-hd"><div className="card-t">今朝のブリーフィング</div><div className="card-n">Claude と相談した内容をここに貼り付け</div></div>
+          <textarea rows={6} value={s.briefing} onChange={e=>set({briefing:e.target.value})} placeholder="米国市場・注目テーマ・優先順位など、毎朝の相談結果をメモ" style={{minHeight:120}}/></div>
+        <p className="foot">※ 「リアルタイムデータを反映」は、start.bat で起動したローカルサーバー経由で取得します。数値は遅延あり（前営業日終値〜数十分遅れ）でリアルタイムの板ではありません。<br/>※ ニュースはGoogleニュースRSSを利用しています。売買を推奨するものではなく、最終判断はご自身で。</p>
+      </div>}
+
+      {/* ===== NEWS ===== */}
+      {tab==="news" && <div style={{marginTop:18}}>
+        <div className="sec-head">ニュース</div>
+        <div className="sec-note">ブリーフィングの「リアルタイムデータを反映」を押すと、登録銘柄とマクロのニュースがGoogleニュースRSSから取得されます。ここで手編集もできます。</div>
+        <div className="grid" style={{gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",marginTop:12}}>
+          <div className="card"><div className="card-hd"><div className="card-t">登録銘柄のニュース</div><div className="card-n">決算・月次・材料</div></div>
+            <textarea rows={10} value={s.stockNews} onChange={e=>set({stockNews:e.target.value})} placeholder="登録銘柄に関する決算・月次報告・観測など"/></div>
+          <div className="card"><div className="card-hd"><div className="card-t">マクロ・大きなニュース</div><div className="card-n">戦争・利上げ・経済指標・日銀/FRB</div></div>
+            <textarea rows={10} value={s.marketNews} onChange={e=>set({marketNews:e.target.value})} placeholder="金利、為替、地政学、日銀・FRBの動きなど"/></div>
+        </div>
+      </div>}
+
+      {/* ===== ANALYSIS ===== */}
+      {tab==="analysis" && !sel && <div style={{marginTop:18}}>
+        <div className="sec-head">盛り上がりセクター</div>
+        <div className="sec-note">値上がり率（%）を入れると盛り上がり順に並びます（半自動）。銘柄クリックで分析へ。</div>
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          {analysisSectors.map(({sector,items,chg})=>
+            <div key={sector} style={{border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,overflow:"hidden"}}>
+              <div style={{display:"flex",alignItems:"center",gap:12,padding:"10px 14px",background:chg!=null&&chg>=3?"#EAF0EC":"var(--band)",flexWrap:"wrap"}}>
+                <div style={{display:"flex",alignItems:"center",gap:7,minWidth:140}}>
+                  {chg!=null&&chg>=3&&<span style={{color:"var(--loss)",fontWeight:700,fontSize:11}}>HOT</span>}
+                  <span style={{fontSize:15,fontWeight:700}}>{sector}</span><span style={{fontSize:11,color:"var(--inkSoft)"}}>{items.length}銘柄</span>
+                </div>
+                <div style={{display:"flex",alignItems:"center",gap:6}}>
+                  <span style={{fontSize:11,color:"var(--inkSoft)"}}>値上がり率</span>
+                  <input className="mono" value={s.sectorHeat[sector]?.chg||""} onChange={e=>setHeatV(sector,"chg",e.target.value)} placeholder="%" inputMode="decimal" style={{width:64,textAlign:"right",fontSize:13}}/>
+                  <span className="mono" style={{fontSize:14,fontWeight:700,color:chg==null?"var(--inkSoft)":chg>=0?"var(--gain)":"var(--loss)"}}>{chg!=null?(chg>0?"+":"")+chg+"%":""}</span>
+                </div>
+                <input value={s.sectorHeat[sector]?.vol||""} onChange={e=>setHeatV(sector,"vol",e.target.value)} placeholder="出来高メモ" style={{width:150,fontSize:13}}/>
+              </div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:8,padding:"12px 14px"}}>
+                {[...items].sort((a,b)=>wOrder[a.watch]-wOrder[b.watch]).map(w=>{
+                  const a=s.analysis[w.code];const has=a&&(Object.values(a.signals||{}).some(Boolean)||a.fund?.forecast);
+                  return <button key={w.code} onClick={()=>setSel(w.code)} style={{display:"flex",alignItems:"center",gap:7,border:"1px solid "+(w.watch==="優先"?"var(--star)":"var(--rule)"),background:"var(--paperAlt)",borderRadius:6,padding:"7px 11px",cursor:"pointer",fontSize:13}}>
+                    <span className="mono" style={{fontSize:11,color:"var(--inkSoft)"}}>{w.code}</span><span>{w.name}</span>
+                    <span style={{color:has?"var(--gain)":"var(--rule)",fontSize:12}}>{has?"●":"○"}</span></button>;})}
+              </div>
+            </div>)}
+          {analysisSectors.length===0 && <div style={{padding:30,textAlign:"center",color:"var(--inkSoft)"}}>ブリーフィングタブで銘柄を登録してください。</div>}
+        </div>
+      </div>}
+
+      {tab==="analysis" && sel && (()=>{
+        const w=s.watchlist.find(x=>x.code===sel);if(!w)return null;const a=getA(sel);
+        const buyN=SIGNALS.buy.filter(x=>a.signals[x.id]).length,sellN=SIGNALS.sell.filter(x=>a.signals[x.id]).length,watchN=SIGNALS.watch.filter(x=>a.signals[x.id]).length;
+        const roe=num(a.fund.roe),fcf=num(a.fund.fcf);
+        const fScore=[roe!=null&&roe>=10,fcf!=null&&fcf>0,a.fund.forecast==="増収増益"||a.fund.forecast==="減収増益",a.fund.analyst==="強気"||a.fund.analyst==="やや強気"];
+        const fN=fScore.filter(Boolean).length;
+        const sigRow=(x,color)=><button key={x.id} onClick={()=>toggleSig(sel,x.id)} style={{display:"flex",width:"100%",alignItems:"center",gap:9,padding:"7px 4px",background:"transparent",border:"none",borderTop:"1px solid var(--ruleSoft)",cursor:"pointer",textAlign:"left"}}>
+          <span style={{width:18,height:18,flexShrink:0,borderRadius:4,border:"1px solid "+(a.signals[x.id]?color:"var(--rule)"),background:a.signals[x.id]?color:"transparent",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:12}}>{a.signals[x.id]?"✓":""}</span>
+          <span style={{fontSize:12.5,color:a.signals[x.id]?"var(--ink)":"var(--inkSoft)",fontWeight:a.signals[x.id]&&x.strong?700:400}}>{x.label}{x.strong&&<span style={{color,marginLeft:4}}>★</span>}</span></button>;
+        return <div style={{marginTop:16}}>
+          <button className="ghost" onClick={()=>setSel(null)} style={{marginBottom:14}}>← 一覧へ戻る</button>
+          <div className="head">
+            <div><div className="mono" style={{fontSize:13,color:"var(--inkSoft)"}}>{w.code} · {w.sector} · {w.market}</div><h1>{w.name}</h1></div>
+            <button className="btn primary" onClick={()=>openTV(w.tvSymbol)}>↗ TradingView</button>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:1,background:"var(--rule)",border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",marginTop:16}}>
+            {[["買いサイン",buyN,"var(--gain)"],["売りサイン",sellN,"var(--loss)"],["警戒",watchN,"var(--warn)"]].map(([l,n,c])=>
+              <div key={l} style={{background:"var(--card)",padding:"12px 14px",textAlign:"center"}}><div style={{fontSize:11,color:"var(--inkSoft)"}}>{l}</div><div className="mono" style={{fontSize:24,fontWeight:700,color:n>0?c:"var(--inkSoft)",marginTop:2}}>{n}</div></div>)}
+          </div>
+          <div style={{fontSize:11,color:"var(--inkSoft)",marginTop:6}}>※ サインの数は状況整理用で、売買の指示ではありません。総合判断はご自身で（頭と尻尾はくれてやる）。</div>
+          <div className="grid" style={{gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",marginTop:18}}>
+            <div className="card"><div className="card-hd"><div className="card-t">買いサイン照合</div></div>{SIGNALS.buy.map(x=>sigRow(x,"var(--gain)"))}</div>
+            <div style={{display:"flex",flexDirection:"column",gap:14}}>
+              <div className="card"><div className="card-hd"><div className="card-t">売りサイン照合</div></div>{SIGNALS.sell.map(x=>sigRow(x,"var(--loss)"))}</div>
+              <div className="card"><div className="card-hd"><div className="card-t">警戒サイン</div></div>{SIGNALS.watch.map(x=>sigRow(x,"var(--warn)"))}</div>
+            </div>
+          </div>
+          <div className="card" style={{marginTop:14}}><div className="card-hd"><div className="card-t">指標</div><div className="card-n">ボリンジャー / RSI / RCI / 移動平均</div></div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:12}}>
+              <label className="fld"><span>ボリンジャー位置</span><select style={{width:"100%"}} value={a.tech.bb} onChange={e=>patchA(sel,"tech",{bb:e.target.value})}>{BB_POS.map(x=><option key={x} value={x}>{x||"—"}</option>)}</select></label>
+              <label className="fld"><span>RSI</span><input className="mono" style={{width:"100%"}} value={a.tech.rsi} onChange={e=>patchA(sel,"tech",{rsi:e.target.value})} placeholder="例）28" inputMode="decimal"/></label>
+              <label className="fld"><span>RCI</span><input className="mono" style={{width:"100%"}} value={a.tech.rci} onChange={e=>patchA(sel,"tech",{rci:e.target.value})} placeholder="例）-92" inputMode="decimal"/></label>
+              <label className="fld"><span>移動平均</span><label style={{display:"flex",alignItems:"center",gap:7,fontSize:13,cursor:"pointer",padding:"8px 0"}}><input type="checkbox" checked={a.tech.maPanpaka} onChange={e=>patchA(sel,"tech",{maPanpaka:e.target.checked})}/>パンパカパン配列</label></label>
+            </div></div>
+          <div className="card" style={{marginTop:14}}><div className="card-hd"><div className="card-t">ファンダメンタル</div><div className="card-n">業績の良くない企業は無視するための材料</div></div>
+            <div style={{marginBottom:12,display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+              <span style={{fontSize:12,color:"var(--inkSoft)"}}>業績スコア</span>
+              <div style={{display:"flex",gap:5}}>{[0,1,2,3].map(i=><span key={i} style={{width:26,height:8,borderRadius:4,background:i<fN?"var(--gain)":"var(--ruleSoft)"}}></span>)}</div>
+              <span className="mono" style={{fontSize:14,fontWeight:700,color:fN>=3?"var(--gain)":fN>=2?"var(--warn)":"var(--inkSoft)"}}>{fN} / 4</span>
+              <span style={{fontSize:11,color:"var(--inkSoft)"}}>（ROE≥10%・フリーCF＞0・増益予想・アナリスト強気）</span>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:12}}>
+              <label className="fld"><span>会社の決算予想</span><select style={{width:"100%"}} value={a.fund.forecast} onChange={e=>patchA(sel,"fund",{forecast:e.target.value})}>{FORECAST.map(x=><option key={x} value={x}>{x||"—"}</option>)}</select></label>
+              <label className="fld"><span>ROE %</span><input className="mono" style={{width:"100%"}} value={a.fund.roe} onChange={e=>patchA(sel,"fund",{roe:e.target.value})} placeholder="例）15" inputMode="decimal"/></label>
+              <label className="fld"><span>フリーCF（億円）</span><input className="mono" style={{width:"100%"}} value={a.fund.fcf} onChange={e=>patchA(sel,"fund",{fcf:e.target.value})} placeholder="例）320 / -50" inputMode="decimal"/></label>
+              <label className="fld"><span>PER（倍）</span><input className="mono" style={{width:"100%"}} value={a.fund.per} onChange={e=>patchA(sel,"fund",{per:e.target.value})} placeholder="例）22" inputMode="decimal"/></label>
+              <label className="fld"><span>PBR（倍）</span><input className="mono" style={{width:"100%"}} value={a.fund.pbr} onChange={e=>patchA(sel,"fund",{pbr:e.target.value})} placeholder="例）3.1" inputMode="decimal"/></label>
+              <label className="fld"><span>配当利回り %</span><input className="mono" style={{width:"100%"}} value={a.fund.divy} onChange={e=>patchA(sel,"fund",{divy:e.target.value})} placeholder="例）2.4" inputMode="decimal"/></label>
+              <label className="fld"><span>アナリスト評価</span><select style={{width:"100%"}} value={a.fund.analyst} onChange={e=>patchA(sel,"fund",{analyst:e.target.value})}>{ANALYST.map(x=><option key={x} value={x}>{x||"—"}</option>)}</select></label>
+              <label className="fld"><span>目標株価</span><input className="mono" style={{width:"100%"}} value={a.fund.target} onChange={e=>patchA(sel,"fund",{target:e.target.value})} placeholder="アナリスト目標"/></label>
+            </div>
+            <label className="fld"><span>売上・利益トレンドのメモ</span><input style={{width:"100%"}} value={a.fund.memo} onChange={e=>patchA(sel,"fund",{memo:e.target.value})} placeholder="前年比、進捗率、上振れ/下振れなど"/></label>
+          </div>
+          <div className="card" style={{marginTop:14}}><div className="card-hd"><div className="card-t">トレードプラン</div><div className="card-n">ラインは『頭と尻尾はくれてやる』前提の目安</div></div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:12}}>
+              <label className="fld"><span>エントリー</span><input className="mono" style={{width:"100%"}} value={a.plan.entry} onChange={e=>patchA(sel,"plan",{entry:e.target.value})}/></label>
+              <label className="fld"><span>利確</span><input className="mono" style={{width:"100%",color:"var(--gain)"}} value={a.plan.tp} onChange={e=>patchA(sel,"plan",{tp:e.target.value})}/></label>
+              <label className="fld"><span>損切</span><input className="mono" style={{width:"100%",color:"var(--loss)"}} value={a.plan.sl} onChange={e=>patchA(sel,"plan",{sl:e.target.value})}/></label>
+            </div>
+            <label className="fld"><span>判断メモ</span><textarea rows={3} value={a.plan.memo} onChange={e=>patchA(sel,"plan",{memo:e.target.value})} placeholder="デイ/スイングの別、決算跨ぎの可否、根拠など"/></label>
+          </div>
+        </div>;})()}
+
+      {/* ===== CHART ===== */}
+      {tab==="chart" && <div style={{marginTop:18}}>
+        <div className="sec-head">チャート（TradingView）</div>
+        <div className="sec-note">登録銘柄を選ぶか、シンボルを直接入力。ボリンジャー・RSI・移動平均を切り替えられます。</div>
+        <div style={{display:"flex",gap:7,flexWrap:"wrap",marginBottom:10}}>
+          {s.watchlist.filter(w=>w.tvSymbol).map(w=><button key={w.code} className={"chip"+(chartSym===w.tvSymbol?" on":"")} onClick={()=>setChartSym(w.tvSymbol)}>{w.name}</button>)}
+          {s.watchlist.length===0 && ["TVC:NI225","FX:USDJPY","NASDAQ:NVDA","NASDAQ:SOX"].map(sy=><button key={sy} className={"chip"+(chartSym===sy?" on":"")} onClick={()=>setChartSym(sy)}>{sy}</button>)}
+        </div>
+        <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"center",marginBottom:12}}>
+          <input className="mono" defaultValue="" placeholder="任意シンボル（例 TSE:6976）" onKeyDown={e=>{if(e.key==="Enter"&&e.target.value.trim())setChartSym(e.target.value.trim());}} style={{minWidth:180}}/>
+          <label style={{fontSize:13,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cBB} onChange={e=>setCBB(e.target.checked)}/>ボリンジャー</label>
+          <label style={{fontSize:13,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cRSI} onChange={e=>setCRSI(e.target.checked)}/>RSI</label>
+          <label style={{fontSize:13,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cMA} onChange={e=>setCMA(e.target.checked)}/>移動平均</label>
+        </div>
+        <div ref={chartRef} style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",background:"var(--card)",minHeight:544}}></div>
+        <p className="foot">※ RCIは無料ウィジェットの標準にないため、ボリンジャー・RSI・移動平均のみ。RCIはTradingView本体で。</p>
+      </div>}
+
+      <p className="foot" style={{borderTop:"1px solid var(--ruleSoft)",paddingTop:12,marginTop:24}}>
+        データはこのブラウザに自動保存されます（同じファイルを同じブラウザで開けば継続）。念のため時々「バックアップ↓」でJSON保存を。<br/>
+        このツールは判断材料の整理用で、売買を推奨するものではありません。最終判断はご自身で。
+      </p>
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>

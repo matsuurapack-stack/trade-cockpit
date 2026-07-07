@@ -1,0 +1,15 @@
+# Archives (redundant with source files)
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Claude local settings
+.claude/settings.local.json
