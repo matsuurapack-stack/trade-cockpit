@@ -57,6 +57,18 @@ td{padding:7px 10px;vertical-align:middle}
 .res-row{display:flex;width:100%;align-items:center;gap:10px;padding:9px 12px;background:transparent;
   border:none;border-bottom:1px solid var(--ruleSoft);cursor:pointer;text-align:left}
 .loading{max-width:400px;margin:80px auto;text-align:center;color:var(--inkSoft)}
+.news-list{display:block}
+.news-item{display:flex;gap:9px;align-items:baseline;padding:10px 4px;
+  border-bottom:1px solid var(--ruleSoft);text-decoration:none;color:var(--ink)}
+.news-item:last-child{border-bottom:none}
+.news-item:hover{background:var(--band)}
+.news-item:hover .news-title{color:var(--accent);text-decoration:underline}
+.news-tag{flex:none;font-size:11px;font-weight:700;color:var(--accent);background:var(--paperAlt);
+  border:1px solid var(--rule);border-radius:3px;padding:1px 6px;white-space:nowrap}
+.news-body{flex:1;min-width:0}
+.news-title{font-size:13.5px;line-height:1.5}
+.news-meta{display:block;font-size:11px;color:var(--inkSoft);margin-top:3px}
+.news-empty{font-size:12px;color:var(--inkSoft);padding:16px 4px}
 </style>
 </head>
 <body>
@@ -166,9 +178,26 @@ const emptyMetrics=()=>Object.fromEntries(METRICS.map(m=>[m.key,{t:"",p:""}]));
 const emptyState=()=>({
   date:todayISO(), watchlist:[], metrics:emptyMetrics(),
   usMarketNote:"",adrPts:"",sundayDow:"",strongSectors:"",themes:"",stockNews:"",marketNews:"",briefing:"",
+  stockNewsList:[], macroNewsList:[],
   sectorHeat:{}, analysis:{},
 });
 const loadState=()=>{try{const r=localStorage.getItem(KEY);if(!r)return null;const d=JSON.parse(r);return {...emptyState(),...d,metrics:{...emptyMetrics(),...(d.metrics||{})}};}catch{return null;}};
+
+function NewsList({items,showName}){
+  if(!items||!items.length) return <div className="news-empty">まだ取得していません。ブリーフィングの「リアルタイムデータを反映」を押してください。</div>;
+  return <div className="news-list">
+    {items.map((it,i)=>{
+      const meta=[showName?it.name:null,it.source,it.published].filter(Boolean).join(" ・ ");
+      return <a key={i} className="news-item" href={it.url} target="_blank" rel="noopener noreferrer">
+        {showName&&it.code&&<span className="news-tag">{it.code}</span>}
+        <span className="news-body">
+          <span className="news-title">{it.title}</span>
+          {meta&&<span className="news-meta">{meta}</span>}
+        </span>
+      </a>;
+    })}
+  </div>;
+}
 
 function App(){
   const [s,setS]=useState(()=>loadState()||emptyState());
@@ -209,7 +238,10 @@ function App(){
       // (2) ニュース（今の登録銘柄をサーバーへ送って取得）
       const nr=await fetch("/api/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlist)});
       if(nr.ok){const nd=await nr.json();
-        setS(p=>({...p,stockNews:nd.stockNewsText||p.stockNews,marketNews:nd.macroNewsText||p.marketNews}));}
+        setS(p=>({...p,
+          stockNewsList:Array.isArray(nd.stockNews)?nd.stockNews:p.stockNewsList,
+          macroNewsList:Array.isArray(nd.macroNews)?nd.macroNews:p.macroNewsList,
+          stockNews:nd.stockNewsText||p.stockNews,marketNews:nd.macroNewsText||p.marketNews}));}
     }catch(e){}
     const now=new Date();
     setFetchMsg(`${now.getHours()}:${String(now.getMinutes()).padStart(2,"0")} 取得完了`);
@@ -371,12 +403,12 @@ function App(){
       {/* ===== NEWS ===== */}
       {tab==="news" && <div style={{marginTop:18}}>
         <div className="sec-head">ニュース</div>
-        <div className="sec-note">ブリーフィングの「リアルタイムデータを反映」を押すと、登録銘柄とマクロのニュースがGoogleニュースRSSから取得されます。ここで手編集もできます。</div>
-        <div className="grid" style={{gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",marginTop:12}}>
-          <div className="card"><div className="card-hd"><div className="card-t">登録銘柄のニュース</div><div className="card-n">決算・月次・材料</div></div>
-            <textarea rows={10} value={s.stockNews} onChange={e=>set({stockNews:e.target.value})} placeholder="登録銘柄に関する決算・月次報告・観測など"/></div>
-          <div className="card"><div className="card-hd"><div className="card-t">マクロ・大きなニュース</div><div className="card-n">戦争・利上げ・経済指標・日銀/FRB</div></div>
-            <textarea rows={10} value={s.marketNews} onChange={e=>set({marketNews:e.target.value})} placeholder="金利、為替、地政学、日銀・FRBの動きなど"/></div>
+        <div className="sec-note">ブリーフィングの「リアルタイムデータを反映」を押すと、登録銘柄とマクロのニュースがGoogleニュースRSSから取得されます。見出しをクリックすると元記事が開きます。</div>
+        <div className="grid" style={{gridTemplateColumns:"repeat(auto-fit,minmax(320px,1fr))",marginTop:12}}>
+          <div className="card" style={{padding:"14px 16px 6px"}}><div className="card-hd"><div className="card-t">登録銘柄のニュース</div><div className="card-n">決算・月次・材料</div></div>
+            <NewsList items={s.stockNewsList} showName/></div>
+          <div className="card" style={{padding:"14px 16px 6px"}}><div className="card-hd"><div className="card-t">マクロ・大きなニュース</div><div className="card-n">戦争・利上げ・経済指標・日銀/FRB</div></div>
+            <NewsList items={s.macroNewsList}/></div>
         </div>
       </div>}
 

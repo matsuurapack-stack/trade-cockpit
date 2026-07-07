@@ -8,6 +8,7 @@
 import os
 import json
 import time
+import calendar
 import datetime
 import threading
 import webbrowser
@@ -60,6 +61,37 @@ def get_index_quotes():
     return out
 
 
+def _fmt_published(entry):
+    """RSS の pubDate(GMT) を日本時間 'MM/DD HH:MM' に整形。無ければ空。"""
+    pp = entry.get("published_parsed")
+    if not pp:
+        return ""
+    try:
+        jst = datetime.datetime.utcfromtimestamp(calendar.timegm(pp)) + datetime.timedelta(hours=9)
+        return jst.strftime("%m/%d %H:%M")
+    except Exception:
+        return ""
+
+
+def _source_of(entry, title):
+    """出典（媒体名）を取り出す。Google ニュースの見出しは末尾が ' - 媒体名'。"""
+    src = entry.get("source")
+    if isinstance(src, dict):
+        s = src.get("title") or src.get("value")
+        if s:
+            return s
+    if " - " in title:
+        return title.rsplit(" - ", 1)[1].strip()
+    return ""
+
+
+def _clean_title(title):
+    """見出し末尾の ' - 媒体名' を除いた本文だけを返す。"""
+    if " - " in title:
+        return title.rsplit(" - ", 1)[0].strip()
+    return title
+
+
 def google_news(query, n=2):
     if feedparser is None:
         return []
@@ -67,33 +99,52 @@ def google_news(query, n=2):
            + urllib.parse.quote(query) + "&hl=ja&gl=JP&ceid=JP:ja")
     try:
         feed = feedparser.parse(url)
-        return [{"title": e.get("title", ""), "url": e.get("link", "")} for e in feed.entries[:n]]
+        out = []
+        for e in feed.entries[:n]:
+            raw = e.get("title", "")
+            out.append({
+                "title": _clean_title(raw),
+                "url": e.get("link", ""),
+                "source": _source_of(e, raw),
+                "published": _fmt_published(e),
+            })
+        return out
     except Exception:
         return []
 
 
 def build_stock_news(watchlist):
+    """登録銘柄ニュースを配列で返す（各要素 code/name/title/url/source/published）。"""
     order = {"優先": 0, "通常": 1, "様子見": 2}
     wl = sorted(watchlist, key=lambda w: order.get(w.get("watch", "通常"), 1))[:12]
-    lines = []
+    items = []
     for w in wl:
         name = w.get("name", "")
         code = w.get("code", "")
         if not name:
             continue
         for it in google_news(name + " 株価 決算", 2):
-            lines.append(f"・[{code} {name}] {it['title']}\n  {it['url']}")
-    return "\n".join(lines)
+            items.append({**it, "code": code, "name": name})
+    return items
 
 
 def build_macro_news():
+    """マクロニュースを配列で返す。"""
     queries = ["日経平均 見通し", "日銀 金融政策 決定", "FRB 利上げ 金利",
                "ドル円 相場", "米国株式市場 ダウ"]
-    lines = []
+    items = []
     for q in queries:
         for it in google_news(q, 2):
-            lines.append(f"・{it['title']}\n  {it['url']}")
-    return "\n".join(lines)
+            items.append(it)
+    return items
+
+
+def _stock_text(items):
+    return "\n".join(f"・[{it['code']} {it['name']}] {it['title']}\n  {it['url']}" for it in items)
+
+
+def _macro_text(items):
+    return "\n".join(f"・{it['title']}\n  {it['url']}" for it in items)
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -133,9 +184,14 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception:
                 watchlist = []
             print(f"[取得] ニュース（登録銘柄 {len(watchlist)} 件 ＋ マクロ）…")
+            stock = build_stock_news(watchlist)
+            macro = build_macro_news()
             self._send_json({
-                "stockNewsText": build_stock_news(watchlist),
-                "macroNewsText": build_macro_news(),
+                "stockNews": stock,
+                "macroNews": macro,
+                # 旧フロント・バックアップ互換のためテキスト版も返す
+                "stockNewsText": _stock_text(stock),
+                "macroNewsText": _macro_text(macro),
             })
         else:
             self.send_response(404)
