@@ -5,43 +5,74 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>トレード・コックピット</title>
 <style>
+/* ===== デザイントークン（design_renewal_instruction.md）=====
+   ムームー証券アプリを参考にした鮮やかな配色・タイポグラフィ・ダークモード対応。
+   単体HTML構成（ビルド工程なし、CLAUDE.md方針）を維持するため、別ファイルの
+   design-tokens.jsonではなくこのCSS変数群に集約する。
+   注意：上昇/下落の色は日本の相場慣習（赤=上昇・緑=下落）を維持するため、
+   指示書の「上昇=緑系」の鮮やかな数値は当アプリの赤(--up)に、
+   「下落=赤系」の数値は当アプリの緑(--down)に、意味を保ったまま割り当てている。 */
 :root{
-  --paper:#E7E8E1; --paperAlt:#EEEFE9; --card:#F3F4EE; --ink:#1B1E1A; --inkSoft:#565A52;
-  --rule:#C6C8BF; --ruleSoft:#D6D8CF; --gain:#2C6A48; --loss:#AE3A34; --accent:#2A4A6B;
-  --band:#DEDFD7; --star:#B8863B; --warn:#9A6A16; --alarm:#1F5C3A; --alarmEdge:#123A25;
-  /* 株価の上昇/下落は日本の相場慣習（赤=上昇・緑=下落）に合わせる。明るく彩度高めのコントラスト重視配色 */
-  --up:#C62828; --down:#2E7D32; --upBg:#FBDADA; --downBg:#D7F2DD;
+  --paper:#F5F5F5; --paperAlt:#FFFFFF; --card:#FFFFFF; --ink:#1A1A1A; --inkSoft:#666666; --inkFaint:#999999;
+  --rule:#DDDDDD; --ruleSoft:#EAEAEA; --band:#F0F0F0;
+  --gain:#00A868; --loss:#E0334A; --accent:#2D5C8A; --accentSoft:rgba(45,92,138,.15);
+  --star:#B8863B; --warn:#FFA500;
+  --alarm:#FFF3D6; --alarmEdge:#B8860B; --alarmText:#1A1A1A;
+  --up:#FF4D5C; --down:#00B366; --upBg:#FFE3E5; --downBg:#DFF7EC;
+  --shadow:0 2px 8px rgba(0,0,0,.08); --shadowLg:0 12px 32px rgba(0,0,0,.16);
+}
+:root[data-theme="dark"]{
+  --paper:#121212; --paperAlt:#1E1E1E; --card:#1A1A1A; --ink:#FFFFFF; --inkSoft:#CCCCCC; --inkFaint:#909090;
+  --rule:#333333; --ruleSoft:#2A2A2A; --band:#242424;
+  --gain:#00D084; --loss:#FF6B78; --accent:#5B9BD5; --accentSoft:rgba(91,155,213,.2);
+  --star:#D9A64E; --warn:#FFB84D;
+  --alarm:#3A2A0A; --alarmEdge:#FFA500; --alarmText:#FFF3D6;
+  --up:#FF8A93; --down:#4DFFB0; --upBg:rgba(255,77,92,.22); --downBg:rgba(0,208,132,.2);
+  --shadow:0 2px 10px rgba(0,0,0,.5); --shadowLg:0 16px 40px rgba(0,0,0,.6);
 }
 *{box-sizing:border-box}
-body{margin:0;background:var(--paper);color:var(--ink);
-  font-family:'Helvetica Neue',Arial,'Hiragino Kaku Gothic ProN',Meiryo,sans-serif}
+html{background-color:var(--paper)}
+body{margin:0;background-color:var(--paper);color:var(--ink);font-size:14px;min-height:100vh;
+  font-family:'Segoe UI','Hiragino Sans','Hiragino Kaku Gothic ProN','Yu Gothic',Meiryo,Arial,sans-serif}
 .mono{font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
 .wrap{max-width:980px;margin:0 auto;padding:22px 18px 46px}
 .head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;flex-wrap:wrap;
   border-bottom:2px solid var(--ink);padding-bottom:12px}
 .kicker{font-size:11px;letter-spacing:3px;color:var(--inkSoft);text-transform:uppercase}
-h1{margin:3px 0 0;font-size:26px;font-weight:700;letter-spacing:-.4px}
-/* 10-1章：タブ数が増えても横スクロールで収まるようにする */
-.tabs{display:flex;gap:4px;margin-top:16px;border-bottom:1px solid var(--rule);
-  overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch;scrollbar-width:thin}
-.tab{background:transparent;border:none;border-bottom:2px solid transparent;color:var(--inkSoft);
-  font-size:14px;padding:9px 16px;cursor:pointer;font-weight:600;flex:none;white-space:nowrap}
+h1{margin:3px 0 0;font-size:28px;font-weight:700;line-height:1.2;letter-spacing:-.4px}
+/* テーマ切り替えトグル（3-1章） */
+.theme-toggle{display:inline-flex;align-items:center;gap:6px;background:var(--paperAlt);color:var(--inkSoft);
+  border:1px solid var(--rule);padding:7px 12px;font-size:13px;border-radius:8px;cursor:pointer}
+.theme-toggle:hover{background:var(--band)}
+/* 10-1章：タブ数が増えても横スクロールで収まるようにする（4-3章：タブバーのスタイル統一） */
+.tabs{display:flex;gap:4px;margin-top:16px;background:var(--band);border-radius:8px 8px 0 0;
+  padding:2px 4px 0;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch;scrollbar-width:thin}
+.tabs::-webkit-scrollbar{height:6px}
+.tabs::-webkit-scrollbar-thumb{background:var(--rule);border-radius:3px}
+.tab{background:transparent;border:none;border-bottom:3px solid transparent;color:var(--inkSoft);
+  font-size:14px;padding:9px 16px;cursor:pointer;font-weight:600;flex:none;white-space:nowrap;transition:color .15s}
+.tab:hover{color:var(--ink)}
 .tab.on{color:var(--ink);border-bottom-color:var(--accent)}
-.sec-head{font-size:15px;font-weight:700;margin:0 0 3px}
-.sec-note{font-size:11px;color:var(--inkSoft);margin-bottom:10px}
-.card{border:1px solid var(--rule);background:var(--card);border-radius:4px;padding:14px 16px 16px}
-.card-t{font-size:14px;font-weight:700}
-.card-n{font-size:11px;color:var(--inkSoft);margin-top:2px}
+.sec-head{font-size:22px;font-weight:600;line-height:1.3;margin:0 0 4px}
+.sec-note{font-size:12px;color:var(--inkSoft);margin-bottom:10px}
+.card{border:1px solid var(--rule);background:var(--card);border-radius:8px;padding:14px 16px 16px;
+  box-shadow:var(--shadow);transition:background-color .2s ease,border-color .2s ease}
+.card-t{font-size:18px;font-weight:600;line-height:1.4}
+.card-n{font-size:12px;color:var(--inkSoft);margin-top:2px}
 .card-hd{border-bottom:1px solid var(--ruleSoft);padding-bottom:8px;margin-bottom:10px}
 .grid{display:grid;gap:16px}
-.btn{display:inline-flex;align-items:center;gap:6px;border:none;padding:8px 13px;font-size:13px;
-  border-radius:4px;cursor:pointer;font-weight:600}
+.btn{display:inline-flex;align-items:center;gap:6px;border:none;padding:10px 18px;font-size:13px;
+  border-radius:8px;cursor:pointer;font-weight:600;transition:filter .15s,box-shadow .15s}
 .btn.primary{background:var(--accent);color:#fff}
+.btn.primary:hover{filter:brightness(1.1)}
 .ghost{display:inline-flex;align-items:center;gap:6px;background:transparent;color:var(--inkSoft);
-  border:1px solid var(--rule);padding:7px 12px;font-size:13px;border-radius:4px;cursor:pointer}
+  border:1px solid var(--rule);padding:9px 14px;font-size:13px;border-radius:8px;cursor:pointer;transition:background-color .15s}
+.ghost:hover{background:var(--band)}
 .iconbtn{background:transparent;border:none;color:var(--inkSoft);cursor:pointer;padding:4px;font-size:15px}
-input,select,textarea{padding:8px 10px;border:1px solid var(--rule);background:var(--paperAlt);
-  color:var(--ink);font-size:13px;border-radius:3px;font-family:inherit}
+input,select,textarea{padding:10px 12px;border:1px solid var(--rule);background:var(--paperAlt);
+  color:var(--ink);font-size:13px;border-radius:6px;font-family:inherit;transition:border-color .15s,box-shadow .15s}
+input::placeholder,textarea::placeholder{color:var(--inkFaint)}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accentSoft)}
 textarea{resize:vertical;line-height:1.6;width:100%}
 label.fld{display:block;margin-top:8px}
 label.fld span{font-size:11px;color:var(--inkSoft);display:block;margin-bottom:4px}
@@ -50,16 +81,18 @@ th{padding:8px 10px;font-size:11px;font-weight:600;text-align:left;white-space:n
 td{padding:7px 10px;vertical-align:middle}
 .lbl{font-size:11px;color:var(--inkSoft);margin:8px 0 4px}
 .chip{font-size:12px;padding:4px 10px;border-radius:16px;cursor:pointer;border:1px solid var(--rule);
-  background:var(--paperAlt);color:var(--inkSoft)}
+  background:var(--paperAlt);color:var(--inkSoft);transition:background-color .15s,color .15s}
+.chip:hover{background:var(--band)}
 .chip.on{background:var(--accent);color:#fff;border-color:var(--accent)}
-.alarm{background:var(--alarm);color:#EFF3EF;border:2px solid var(--alarmEdge);border-radius:6px;
+.alarm{background:var(--alarm);color:var(--alarmText);border:2px solid var(--alarmEdge);border-radius:8px;
   padding:16px 18px;display:flex;align-items:center;gap:13px;animation:almPulse 1.2s ease-in-out infinite}
-@keyframes almPulse{0%,100%{opacity:1}50%{opacity:.74}}
-.foot{margin-top:16px;font-size:11.5px;color:var(--inkSoft);line-height:1.7}
+@keyframes almPulse{0%,100%{opacity:1}50%{opacity:.82}}
+.foot{margin-top:16px;font-size:12px;color:var(--inkSoft);line-height:1.7}
 .results{position:absolute;z-index:5;left:0;right:0;margin-top:4px;background:var(--paperAlt);
-  border:1px solid var(--rule);border-radius:4px;box-shadow:0 4px 14px rgba(0,0,0,.12);overflow:hidden}
+  border:1px solid var(--rule);border-radius:8px;box-shadow:var(--shadowLg);overflow:hidden}
 .res-row{display:flex;width:100%;align-items:center;gap:10px;padding:9px 12px;background:transparent;
   border:none;border-bottom:1px solid var(--ruleSoft);cursor:pointer;text-align:left}
+.res-row:hover{background:var(--band)}
 .loading{max-width:400px;margin:80px auto;text-align:center;color:var(--inkSoft)}
 .news-list{display:block}
 .news-item{display:flex;gap:9px;align-items:center;padding:10px 4px;
@@ -70,26 +103,27 @@ td{padding:7px 10px;vertical-align:middle}
 .news-tag{flex:none;font-size:11px;font-weight:700;color:var(--accent);background:var(--paperAlt);
   border:1px solid var(--rule);border-radius:3px;padding:1px 6px;white-space:nowrap}
 .news-body{flex:1;min-width:0}
-.news-title{font-size:13.5px;line-height:1.5}
-.news-meta{display:block;font-size:11px;color:var(--inkSoft);margin-top:3px}
+.news-title{font-size:14px;line-height:1.5}
+.news-meta{display:block;font-size:11px;color:var(--inkFaint);margin-top:3px}
 .news-empty{font-size:12px;color:var(--inkSoft);padding:16px 4px}
-/* 9-2章：重大ニュースの強調表示 */
+/* 9-2章：重大ニュースの強調表示（4-6章：アラート仕様に統一） */
 .news-item.important{background:var(--upBg);border-left:3px solid var(--up);padding-left:8px;margin-left:-1px}
 .news-item.important:hover{background:var(--upBg)}
 .news-alert-badge{flex:none;font-size:10.5px;font-weight:700;color:#fff;background:var(--up);
   border-radius:3px;padding:2px 6px;white-space:nowrap;align-self:center}
 .subtabs{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}
 /* 10-5章：ニュース項目のサムネイル（実画像は取得できないため、出典名の頭文字によるアバター） */
-.news-thumb{flex:none;width:42px;height:42px;border-radius:4px;background:var(--band);color:var(--inkSoft);
-  display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;align-self:center}
+.news-thumb{flex:none;width:42px;height:42px;border-radius:6px;background:var(--band);color:var(--inkSoft);
+  display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;align-self:center;
+  box-shadow:var(--shadow)}
 /* 10-5章：運営からの「新着情報」お知らせをニュース一覧に自然に挟み込むための行 */
 .news-announce{display:flex;gap:9px;align-items:center;padding:9px 4px;border-bottom:1px solid var(--ruleSoft);
   background:var(--paperAlt);border-left:3px solid var(--accent);padding-left:8px;margin-left:-1px}
 .news-announce-badge{flex:none;font-size:10.5px;font-weight:700;color:#fff;background:var(--accent);
   border-radius:3px;padding:2px 6px;white-space:nowrap}
-/* 10-5章：重要ニュース通知バナー（ページ最上部に常設、オン/オフ切り替え可） */
+/* 10-5章：重要ニュース通知バナー（ページ最上部に常設、オン/オフ切り替え可。4-6章：warning系に統一） */
 .notify-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;
-  background:var(--alarm);color:#EFF3EF;border:2px solid var(--alarmEdge);border-radius:6px;padding:10px 14px;margin-bottom:12px}
+  background:var(--alarm);color:var(--alarmText);border:2px solid var(--alarmEdge);border-radius:8px;padding:10px 14px;margin-bottom:12px}
 </style>
 </head>
 <body>
@@ -107,6 +141,12 @@ const todayISO = () => { const d = new Date(); return `${d.getFullYear()}-${Stri
 const WD = ["日","月","火","水","木","金","土"];
 const MAX = 300;
 const KEY = "trade-cockpit-v1";
+const THEME_KEY = "trade-cockpit-theme"; // 3-1章：テーマ切り替えは登録銘柄等の本体データと別キーで保存する
+// 3-3章：保存済みの設定があればそれを優先し、なければOSのprefers-color-schemeを検出する
+const getInitialTheme=()=>{
+  try{const saved=localStorage.getItem(THEME_KEY);if(saved==="light"||saved==="dark")return saved;}catch{}
+  return (window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches)?"dark":"light";
+};
 
 // 東証33業種分類。この33種類+「その他」（日経225+時価総額上位30社の255社に含まれない銘柄用の特別枠）で運用する。
 const SECTORS_33 = [
@@ -322,23 +362,38 @@ const THEMES = [
 // レベル1（0%超〜0.5%）は現状使用している --up / --down の色そのものを「最も薄い色」の基準として使う。
 const CHANGE_STEP = 0.5;
 const CHANGE_MAX_LEVEL = 6; // 0.5%刻み6段階。2.5%超は全て最終段階（最大濃度）
-const UP_BASE="#C62828", UP_DARK="#6B0F10";     // 赤：レベル1(既存--up、明るく彩度高め)→レベル6(最濃)
-const DOWN_BASE="#2E7D32", DOWN_DARK="#123A25"; // 緑：レベル1(既存--down、明るく彩度高め)→レベル6（既存--alarmEdgeと同色を再利用）
-const UP_BG_BASE="#FBDADA", DOWN_BG_BASE="#D7F2DD"; // 既存の --upBg / --downBg をレベル1の背景基準に使う
 
-const hexToRgb=(h)=>{const n=parseInt(h.slice(1),16);return [(n>>16)&255,(n>>8)&255,n&255];};
+// design_renewal_instruction.md：ムームー証券を参考にした鮮やかな配色をライト/ダークそれぞれで定義。
+// 日本の相場慣習（赤=上昇・緑=下落）は維持し、指示書の「上昇=緑系」の数値は当アプリの赤に、
+// 「下落=赤系」の数値は当アプリの緑に、意味を保ったまま割り当てている。
+// ダークモードでは背景が暗いため、レベル6（最濃）を黒に近づけるのではなく、より明るく彩度の高い
+// 色にすることで視認性を確保する（3-4章：ダークモード時のコントラスト確認）。
+const COLOR_PALETTE = {
+  light: {upBase:"#FF4D5C", upDark:"#8B0000", downBase:"#00B366", downDark:"#00522E", upBg:"#FFE3E5", downBg:"#DFF7EC"},
+  dark:  {upBase:"#FF8A93", upDark:"#FF3B4E", downBase:"#4DFFB0", downDark:"#00E676", upBg:"rgba(255,77,92,.22)", downBg:"rgba(0,208,132,.22)"},
+};
+// 3-2章：CSS変数だけでなくJS側の色計算（changeColor/Sparkline）もテーマに応じて出し分ける必要があるため、
+// App内のテーマ切り替えエフェクトでこのモジュール変数を更新する（single-file構成のためprops経由にせず共有）。
+let CURRENT_THEME = "light";
+const setColorTheme=(t)=>{CURRENT_THEME=(t==="dark")?"dark":"light";};
+
+const hexToRgb=(h)=>{
+  if(h.startsWith("rgba")){const m=h.match(/[\d.]+/g);return [+m[0],+m[1],+m[2]];}
+  const n=parseInt(h.slice(1),16);return [(n>>16)&255,(n>>8)&255,n&255];
+};
 const rgbToHex=(r,g,b)=>"#"+[r,g,b].map(v=>Math.max(0,Math.min(255,Math.round(v))).toString(16).padStart(2,"0")).join("");
 const mixHex=(a,b,t)=>{const[ar,ag,ab]=hexToRgb(a),[br,bg,bb]=hexToRgb(b);return rgbToHex(ar+(br-ar)*t,ag+(bg-ag)*t,ab+(bb-ab)*t);};
 
 // pct(%)を受け取り、セクター・銘柄どちらでも使う共通のカラー情報を返す。pctがnull/0はニュートラル。
 const changeColor=(pct)=>{
   if(pct==null||pct===0) return {level:0,dir:null,fg:"var(--inkSoft)",bg:"transparent"};
+  const pal=COLOR_PALETTE[CURRENT_THEME];
   const level=Math.min(CHANGE_MAX_LEVEL,Math.ceil(Math.abs(pct)/CHANGE_STEP));
   const t=(level-1)/(CHANGE_MAX_LEVEL-1);
   const up=pct>0;
-  const fg=mixHex(up?UP_BASE:DOWN_BASE, up?UP_DARK:DOWN_DARK, t);
+  const fg=mixHex(up?pal.upBase:pal.downBase, up?pal.upDark:pal.downDark, t);
   // 背景は薄いトーンに留め、濃淡の主な表現は文字色(fg)側で担う（濃い背景+濃い文字は視認性が落ちるため）
-  const bg=mixHex(up?UP_BG_BASE:DOWN_BG_BASE, fg, 0.05+t*0.15);
+  const bg=mixHex(up?pal.upBg:pal.downBg, fg, 0.05+t*0.15);
   return {level,dir:up?"up":"down",fg,bg};
 };
 
@@ -434,7 +489,7 @@ function StockCard({name,code,quote,onClick}){
   const delta=t!=null&&p!=null?t-p:null;
   const pct=t!=null&&p!=null&&p?(t-p)/p*100:null;
   const c=changeColor(pct);
-  const sparkColor=delta==null||delta===0?"#9aa093":(delta>0?UP_BASE:DOWN_BASE);
+  const sparkColor=delta==null||delta===0?"#8a8f86":(delta>0?COLOR_PALETTE[CURRENT_THEME].upBase:COLOR_PALETTE[CURRENT_THEME].downBase);
   return <button onClick={onClick} className="card" style={{textAlign:"left",cursor:onClick?"pointer":"default",width:"100%",font:"inherit",color:"var(--ink)"}}>
     <div style={{display:"flex",justifyContent:"space-between",gap:8}}>
       <div><div className="card-t">{name}</div><div className="card-n mono">{code}</div></div>
@@ -648,6 +703,17 @@ const MAX_US=50; // 6-1章：アメリカ市場タブの登録上限（ダウ30 
 
 function App(){
   const [s,setS]=useState(()=>loadState()||emptyState());
+  // 3章：ダーク/ライトモード切り替え。CSS変数(:root[data-theme])とJS側の色計算(changeColor等)の両方に反映する
+  const [theme,setTheme]=useState(getInitialTheme);
+  // useEffectはレンダー後に発火するため、そこでCURRENT_THEMEを更新すると今回のレンダーで
+  // 呼ばれるchangeColor()等が古いテーマ色のまま描画されてしまう。DOM属性への反映やlocalStorage
+  // 保存は副作用としてuseEffectで行うが、色計算用のモジュール変数はレンダー中に同期更新する。
+  setColorTheme(theme);
+  useEffect(()=>{
+    document.documentElement.dataset.theme=theme;
+    try{localStorage.setItem(THEME_KEY,theme);}catch{}
+  },[theme]);
+  const toggleTheme=()=>setTheme(t=>t==="dark"?"light":"dark");
   const [tab,setTab]=useState("briefing");
   const [newsSubTab,setNewsSubTab]=useState("summary"); // 9-1章：ニュースタブのサブ切り替え
   const [chartModal,setChartModal]=useState(null); // {symbol,name} 5章：登録銘柄行の「チャート」ボタン用モーダル
@@ -856,6 +922,8 @@ function App(){
           <button className="ghost" onClick={exportJSON}>バックアップ↓</button>
           <button className="ghost" onClick={()=>fileRef.current.click()}>復元↑</button>
           <input ref={fileRef} type="file" accept="application/json,.json" onChange={importJSON} style={{display:"none"}}/>
+          {/* 3-1章：テーマ切り替えトグル */}
+          <button className="theme-toggle" onClick={toggleTheme} title="ダーク/ライト切り替え">{theme==="dark"?"🌙 ダーク":"☀️ ライト"}</button>
         </div>
       </div>
 
@@ -901,7 +969,7 @@ function App(){
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:1,background:"var(--rule)",border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden"}}>
             {METRICS.map(m=>{const v=s.metrics[m.key];const t=num(v.t),p=num(v.p);
               const delta=t!=null&&p!=null?t-p:null;const dCol=delta==null?"var(--inkSoft)":delta>0?"var(--up)":delta<0?"var(--down)":"var(--inkSoft)";
-              const sparkColor=delta==null||delta===0?"#9aa093":(delta>0?UP_BASE:DOWN_BASE);
+              const sparkColor=delta==null||delta===0?"#8a8f86":(delta>0?COLOR_PALETTE[CURRENT_THEME].upBase:COLOR_PALETTE[CURRENT_THEME].downBase);
               const condOn=m.cond&&t!=null&&m.cond(t);
               const cardBg=condOn?"#EAF0EC":delta>0?"var(--upBg)":delta<0?"var(--downBg)":"var(--card)";
               const isOpen=openMetrics.has(m.key);
@@ -1056,10 +1124,10 @@ function App(){
       })()}
 
       {/* 5章：登録銘柄行の「チャート」ボタンで開くモーダル（タブに依存しない。6章でタブ内チャートは廃止） */}
-      {chartModal && <div onClick={()=>setChartModal(null)} style={{position:"fixed",inset:0,background:"rgba(27,30,26,.55)",zIndex:20,
+      {chartModal && <div onClick={()=>setChartModal(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,.5)",zIndex:20,
           display:"flex",alignItems:"center",justifyContent:"center",padding:18}}>
-        <div onClick={e=>e.stopPropagation()} style={{background:"var(--paper)",border:"1px solid var(--rule)",borderRadius:6,
-            width:"100%",maxWidth:760,maxHeight:"92vh",overflowY:"auto",padding:18,boxShadow:"0 12px 32px rgba(0,0,0,.3)"}}>
+        <div onClick={e=>e.stopPropagation()} style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:12,
+            width:"100%",maxWidth:760,maxHeight:"92vh",overflowY:"auto",padding:24,boxShadow:"var(--shadowLg)"}}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
             <div><div className="kicker">Chart</div><div style={{fontSize:17,fontWeight:700}}>{chartModal.name}</div>
               <div className="mono" style={{fontSize:11.5,color:"var(--inkSoft)"}}>{chartModal.symbol}</div></div>
@@ -1086,6 +1154,8 @@ function App(){
     </div>
   );
 }
+// 初回レンダー前にテーマを確定させ、ダークモード利用者でのライト表示のちらつきを防ぐ
+(()=>{const t=getInitialTheme();setColorTheme(t);document.documentElement.dataset.theme=t;})();
 ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
 </script>
 </body>
