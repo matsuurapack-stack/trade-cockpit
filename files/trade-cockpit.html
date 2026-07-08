@@ -749,7 +749,9 @@ function App(){
   };
   // 銘柄追加時：analysisDataにまだ結果がない対象銘柄だけを取得する
   useEffect(()=>{
-    const missing=analysisItems.filter(w=>!s.analysisData[w.code]);
+    // technical_analysis_rules.md反映でスキーマ変更（strengthフィールド追加）したため、
+    // 旧スキーマのキャッシュ済みデータ（strength未定義）も再取得対象に含める
+    const missing=analysisItems.filter(w=>!s.analysisData[w.code]||s.analysisData[w.code].strength===undefined);
     if(missing.length)fetchAnalysisFor(missing);
   },[s.analysisTargets]);
 
@@ -981,7 +983,17 @@ function App(){
                     {!a
                       ? <div style={{fontSize:12.5,color:"var(--inkSoft)"}}>{analyzing?"計算中…":"データを取得できませんでした。"}</div>
                       : <div>
-                          <div className="mono" style={{fontSize:12,color:"var(--inkSoft)",marginBottom:8}}>現在値 {a.current.toLocaleString()}</div>
+                          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
+                            <div className="mono" style={{fontSize:12,color:"var(--inkSoft)"}}>現在値 {a.current.toLocaleString()}</div>
+                            <div title="シグナル強度" style={{color:"var(--star)",fontSize:13,letterSpacing:1}}>{"★".repeat(a.strength||0)}{"☆".repeat(5-(a.strength||0))}</div>
+                          </div>
+                          {a.marketEnv && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>{a.marketEnv}</div>}
+                          {(a.signals?.buy?.length>0) && <div style={{marginBottom:8}}>
+                            {a.signals.buy.map(sig=><div key={sig.key} className="chip" style={{background:"var(--upBg)",borderColor:"var(--up)",color:"var(--up)",marginRight:4,marginBottom:4,display:"inline-block",fontSize:11}}>▲ {sig.label}</div>)}
+                          </div>}
+                          {(a.signals?.sell?.length>0) && <div style={{marginBottom:8}}>
+                            {a.signals.sell.map(sig=><div key={sig.key} className="chip" style={{background:"var(--downBg)",borderColor:"var(--down)",color:"var(--down)",marginRight:4,marginBottom:4,display:"inline-block",fontSize:11}}>▼ {sig.label}</div>)}
+                          </div>}
                           <table style={{fontSize:12.5}}><tbody>
                             <tr><td style={{color:"var(--inkSoft)",whiteSpace:"nowrap"}}>購入単価(目安)</td>
                               <td className="mono" style={{fontWeight:700}}>{a.entry.toLocaleString()}</td></tr>
@@ -994,9 +1006,11 @@ function App(){
                             <tr><td colSpan={2} style={{color:"var(--inkSoft)",fontSize:11,paddingTop:0}}>{a.targetReason}</td></tr>
                           </tbody></table>
                           <div style={{marginTop:10,paddingTop:8,borderTop:"1px solid var(--ruleSoft)",fontSize:11,color:"var(--inkSoft)",lineHeight:1.6}}>
-                            MA20 {a.indicators.ma20??"—"}　MA50 {a.indicators.ma50??"—"}　RSI14 {a.indicators.rsi??"—"}<br/>
-                            BB上限 {a.indicators.bbUpper??"—"}　BB下限 {a.indicators.bbLower??"—"}<br/>
+                            25日線 {a.indicators.ma25??"—"}　75日線 {a.indicators.ma75??"—"}　100日線 {a.indicators.ma100??"—"}<br/>
+                            RSI14 {a.indicators.rsi??"—"}　RCI26 {a.indicators.rci26??"—"}<br/>
+                            BB-2σ {a.indicators.bbLower2??"—"}　BB-3σ {a.indicators.bbLower3??"—"}<br/>
                             直近サポート {a.indicators.support}　直近レジスタンス {a.indicators.resistance}<br/>
+                            52週高値 {a.indicators.high52w}　52週安値 {a.indicators.low52w}<br/>
                             {a.fundamentalNote}
                           </div>
                         </div>}
@@ -1004,7 +1018,7 @@ function App(){
                 })}
               </div>
             </div>}
-        <p className="foot" style={{marginTop:16}}>※ テクニカル指標は過去6ヶ月の日足終値から算出（20日/50日移動平均・RSI14・ボリンジャーバンド20,2σ・直近60営業日の高値安値）。ファンダメンタルはyfinance取得可能な範囲（PER・PBR・配当利回り・予想EPS)を使用しています。</p>
+        <p className="foot" style={{marginTop:16}}>※ テクニカル指標は過去1年の日足終値から算出（25日/75日/100日移動平均・RSI14・RCI26・ボリンジャーバンド20,±2σ/±3σ・52週高値安値）。パンパカパン・ゴールデンクロス・複合底打ち等のシグナル判定を含みます。ファンダメンタルはyfinance取得可能な範囲（PER・PBR・配当利回り・予想EPS)を使用しています。</p>
       </div>}
 
       {/* ===== テーマ（10-3章） ===== */}

@@ -217,12 +217,24 @@ def build_macro_news():
     return domestic, overseas
 
 
-# 12-1章：分析タブのテクニカル指標（移動平均・RSI・ボリンジャーバンド）計算。
-# 外部ライブラリ(ta-lib等)を追加せず、既存のyfinance終値配列から素朴に計算する。
+# 12-1章：分析タブのテクニカル指標計算。外部ライブラリ(ta-lib等)を追加せず、
+# 既存のyfinance終値配列から素朴に計算する。
 def _sma(values, n):
     if len(values) < n:
         return None
     return sum(values[-n:]) / n
+
+
+def _sma_series(values, n):
+    """values と同じ長さのリストを返す。各要素は直近n件の単純移動平均（不足時はNone）。
+    技術分析ルール指示書のパンパカパン／ゴールデンクロス判定など、系列としての推移が必要な箇所で使う。"""
+    out = []
+    for i in range(len(values)):
+        if i + 1 < n:
+            out.append(None)
+        else:
+            out.append(sum(values[i + 1 - n:i + 1]) / n)
+    return out
 
 
 def _rsi(closes, period=14):
@@ -251,25 +263,184 @@ def _bollinger(closes, n=20, k=2):
     return mean, mean + k * std, mean - k * std  # mid, upper, lower
 
 
-def analyze_stock(w):
-    """12-1章：テクニカル(20日/50日移動平均・RSI14・ボリンジャーバンド・直近サポート/レジスタンス)と
-    ファンダメンタル(PER・PBR・配当利回り・予想EPSの実績比乖離)を組み合わせて、購入・損切り・利確の
-    目安単価と、それぞれの算出根拠を返す。値は目安であり断定的な推奨ではない(12-2章の方針)。"""
+def _rci(values, n=26):
+    """順位相関指数(RCI)。直近n日の「日付順位」と「価格順位」の相関を-100〜+100で返す。
+    価格順位は安い順に1〜n（上昇トレンドで日付順位と一致し+100に近づく、一般的な定義）。"""
+    if len(values) < n:
+        return None
+    window = values[-n:]
+    date_rank = list(range(1, n + 1))  # 1=最も古い i.e. window[0] 〜 n=最新
+    order = sorted(range(n), key=lambda i: window[i])  # 価格が安い順のインデックス列
+    price_rank = [0] * n
+    for r, idx in enumerate(order):
+        price_rank[idx] = r + 1
+    d2 = sum((date_rank[i] - price_rank[i]) ** 2 for i in range(n))
+    return (1 - 6 * d2 / (n * (n * n - 1))) * 100
+
+
+def _market_environment():
+    """技術分析ルール指示書 1-7章・4-3章：相場環境（日経平均のトレンド）を判定し、
+    地合いの良し悪しに応じたコメントを返す。分析対象銘柄ごとに毎回取得すると重いため、
+    build_analysis() 内で1回だけ計算して全銘柄で使い回す。"""
+    try:
+        h = yf.Ticker("^N225").history(period="3mo")
+        closes = h["Close"].dropna().tolist()
+        if len(closes) < 25:
+            return "相場環境：データ不足のため判定できません"
+        ma25 = _sma(closes, 25)
+        current = closes[-1]
+        if current > ma25 * 1.01:
+            return "地合い良好（日経平均が25日線より上で上昇トレンド）"
+        if current < ma25 * 0.99:
+            return "地合い不安定（日経平均が25日線より下で下落トレンド）→ デイトレード推奨"
+        return "地合い中立（日経平均は25日線付近で横ばい）"
+    except Exception:
+        return "相場環境：取得できませんでした"
+
+
+def analyze_stock(w, market_env=""):
+    """12-1章・technical_analysis_rules.md：ローソク足パターン・移動平均線の並び／クロス・
+    ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
+    最有力のシグナルに基づいて購入・損切り・利確の目安単価と算出根拠を返す。
+    値はあくまで目安であり断定的な推奨ではない(12-2章の方針)。"""
     sym = _yf_symbol(w)
     tk = yf.Ticker(sym)
-    h = tk.history(period="6mo")
+    h = tk.history(period="1y")
     closes = h["Close"].dropna().tolist()
+    opens = h["Open"].dropna().tolist()
+    highs = h["High"].dropna().tolist()
+    lows = h["Low"].dropna().tolist()
+    volumes = h["Volume"].dropna().tolist()
     if len(closes) < 20:
         return None
+    n = len(closes)
     current = closes[-1]
-    ma20 = _sma(closes, 20)
-    ma50 = _sma(closes, 50)
+    prev = closes[-2] if n >= 2 else current
+    change_pct = (current - prev) / prev * 100 if prev else 0
+
+    ma25_s, ma75_s, ma100_s = _sma_series(closes, 25), _sma_series(closes, 75), _sma_series(closes, 100)
+    ma25, ma75, ma100 = ma25_s[-1], ma75_s[-1], ma100_s[-1]
     rsi = _rsi(closes, 14)
-    bb_mid, bb_upper, bb_lower = _bollinger(closes, 20, 2)
-    lookback = min(60, len(closes))
+    bb_mid, bb_upper2, bb_lower2 = _bollinger(closes, 20, 2)
+    _, bb_upper3, bb_lower3 = _bollinger(closes, 20, 3)
+    rci26 = _rci(closes, 26)
+    lookback = min(60, n)
     support = min(closes[-lookback:])
     resistance = max(closes[-lookback:])
+    high52w = max(highs[-min(252, len(highs)):]) if highs else current
+    low52w = min(lows[-min(252, len(lows)):]) if lows else current
+    vol_avg5 = sum(volumes[-6:-1]) / 5 if len(volumes) >= 6 else None
+    vol_surge = vol_avg5 is not None and volumes[-1] > vol_avg5 * 1.5
 
+    low_zone = current <= high52w * 0.8   # 条件C等：52週高値の-20%以下＝安値圏
+    high_zone = current >= high52w * 0.95  # 条件B等：52週高値の-5%以内＝高値圏
+
+    # ---- ローソク足の形（直近1本）----
+    o, c, hi, lo = opens[-1], closes[-1], highs[-1], lows[-1]
+    body = abs(c - o)
+    rng = max(hi - lo, 0.0001)
+    is_bull, is_bear = c > o, c < o
+    lower_shadow, upper_shadow = min(o, c) - lo, hi - max(o, c)
+    is_doji = body <= rng * 0.1
+    is_long_lower_shadow = lower_shadow >= body * 1.5 and body > 0
+    is_hanging_man = high_zone and is_long_lower_shadow and (hi - max(o, c)) <= body * 0.5
+
+    # はらみ線：直近足の実体が前の足の実体に完全に収まる
+    is_harami = False
+    if n >= 2:
+        o2, c2 = opens[-2], closes[-2]
+        body1_hi, body1_lo = max(o2, c2), min(o2, c2)
+        body2_hi, body2_lo = max(o, c), min(o, c)
+        is_harami = body1_hi - body1_lo > 0 and body2_hi <= body1_hi and body2_lo >= body1_lo
+
+    buy_signals, sell_signals = [], []
+
+    # 条件A/B：下落トレンド中の出来高急増＋陽線／下ヒゲ
+    downtrend = ma25 is not None and current < ma25
+    if downtrend and vol_surge and is_bull:
+        buy_signals.append({"key": "volBull", "label": "出来高急増を伴う陽線（下落局面の反転）", "price": c})
+    if downtrend and vol_surge and is_long_lower_shadow:
+        buy_signals.append({"key": "volShadow", "label": "出来高急増を伴う下ヒゲ（売り圧力の底打ち）", "price": lo})
+
+    # 条件C/D：安値圏での十字線／はらみ線
+    if low_zone and is_doji:
+        buy_signals.append({"key": "dojiLow", "label": "安値圏での十字線（上昇転換の前触れ）", "price": c})
+    if low_zone and is_harami:
+        buy_signals.append({"key": "haramiLow", "label": "安値圏でのはらみ線", "price": c})
+
+    # 条件G：パンパカパン（25>75>100が全て右肩上がり）
+    panpakapan = False
+    if ma25 and ma75 and ma100 and ma25 > ma75 > ma100:
+        rising = all(s[-1] is not None and s[-6] is not None and s[-1] > s[-6]
+                     for s in (ma25_s, ma75_s, ma100_s)) if n >= 6 else False
+        if rising:
+            panpakapan = True
+            buy_signals.append({
+                "key": "panpakapan",
+                "label": f"パンパカパン形成（25日線{ma25:.1f}＞75日線{ma75:.1f}＞100日線{ma100:.1f}が全て上昇）",
+                "price": ma25,
+            })
+
+    # 条件H／2-4条件G：ゴールデンクロス／デッドクロス（直近5日以内）
+    golden_cross = dead_cross = False
+    if n >= 6:
+        for i in range(-5, 0):
+            a0, b0, a1, b1 = ma25_s[i - 1], ma75_s[i - 1], ma25_s[i], ma75_s[i]
+            if None in (a0, b0, a1, b1):
+                continue
+            if a0 <= b0 and a1 > b1:
+                golden_cross = True
+            if a0 >= b0 and a1 < b1:
+                dead_cross = True
+    if golden_cross:
+        buy_signals.append({"key": "goldenCross", "label": "ゴールデンクロス（25日線が75日線を上抜け）", "price": current})
+    if dead_cross:
+        sell_signals.append({"key": "deadCross", "label": "デッドクロス（25日線が75日線を下抜け）", "price": current})
+
+    # 条件I：ボリンジャーバンド-3σタッチ
+    bb3_touch = bb_lower3 is not None and current <= bb_lower3
+    if bb3_touch:
+        buy_signals.append({"key": "bb3", "label": f"ボリンジャーバンド-3σ（{bb_lower3:.1f}）にタッチ", "price": bb_lower3})
+
+    # 条件（複合底打ち）：4条件のうち2つ以上
+    bottom_conditions = [
+        change_pct <= -2.5,
+        ma25 is not None and current <= ma25 * 0.97,
+        bb3_touch,
+        rci26 is not None and rci26 <= -90,
+    ]
+    bottom_count = sum(1 for x in bottom_conditions if x)
+    if bottom_count >= 2:
+        buy_signals.append({"key": "compoundBottom", "label": f"複合底打ちシグナル（4条件中{bottom_count}件が該当）", "price": current})
+
+    # ---- 売りシグナル ----
+    if high_zone and is_doji:
+        sell_signals.append({"key": "dojiHigh", "label": "高値圏での十字線（下落転換の前触れ）", "price": c})
+    if is_hanging_man:
+        sell_signals.append({"key": "hangingMan", "label": "高値圏での首吊り線", "price": c})
+    if high_zone and is_harami:
+        sell_signals.append({"key": "haramiHigh", "label": "高値圏でのはらみ線", "price": c})
+    if ma100 is not None and current < ma100:
+        sell_signals.append({"key": "ma100Break", "label": f"100日移動平均線（{ma100:.1f}）を割り込み（最終防衛線突破）", "price": ma100})
+    # 上値抵抗線での売り：直近レジスタンス付近で複数回跳ね返されている
+    near_resistance_count = sum(1 for x in closes[-20:] if resistance > 0 and x >= resistance * 0.98)
+    if near_resistance_count >= 3 and current < resistance * 0.98:
+        sell_signals.append({"key": "resistanceReject", "label": f"上値抵抗線（{resistance:.1f}）に複数回はね返される", "price": resistance})
+
+    # ---- 強度（★1〜5）：最有力シグナルの種類で判定 ----
+    signal_keys = {s["key"] for s in buy_signals}
+    if "panpakapan" in signal_keys:
+        strength = 5
+    elif "compoundBottom" in signal_keys and bottom_count >= 3:
+        strength = 4
+    elif {"goldenCross", "bb3", "compoundBottom"} & signal_keys:
+        strength = 3
+    elif buy_signals:
+        strength = 2
+    else:
+        strength = 1
+
+    # ---- ファンダメンタル ----
     fundamentals = {}
     try:
         info = tk.info or {}
@@ -283,39 +454,61 @@ def analyze_stock(w):
     except Exception:
         pass
 
-    # 購入単価(目安): 20日移動平均線付近への押し目を基準に、ボリンジャー下限を下回らないよう調整。
-    # RSIが70以上(買われすぎ)の場合はやや低めに調整する。
-    entry_reasons = []
-    if ma20:
-        entry = ma20
-        entry_reasons.append(f"20日移動平均線({ma20:.1f})付近への押し目を想定")
+    # ---- 購入単価(目安)：買いシグナルの優先度順に採用。該当なしなら20日線基準にフォールバック ----
+    priority = ["panpakapan", "compoundBottom", "goldenCross", "bb3", "volBull", "volShadow", "dojiLow", "haramiLow"]
+    primary = None
+    for key in priority:
+        primary = next((s for s in buy_signals if s["key"] == key), None)
+        if primary:
+            break
+
+    if primary:
+        entry = primary["price"]
+        entry_reasons = [primary["label"] + f"（{entry:.1f}）"]
     else:
-        entry = current
-        entry_reasons.append("移動平均線データ不足のため現在値を採用")
-    if bb_lower and entry < bb_lower:
-        entry = bb_lower
-        entry_reasons.append(f"ボリンジャーバンド下限({bb_lower:.1f})を下回らない水準に調整")
+        entry = ma25 if ma25 else current
+        entry_reasons = [f"該当する買いシグナルなし。25日移動平均線({entry:.1f})付近への押し目を暫定的に採用" if ma25 else "データ不足のため現在値を採用"]
     if rsi is not None and rsi >= 70:
         entry = min(entry, current * 0.98)
         entry_reasons.append(f"RSI({rsi:.0f})が買われすぎ水準のためやや低めに調整")
 
-    # 損切り単価(目安): 直近安値(サポート)の-2%。ボリンジャー下限がさらに下ならそちらを採用。
-    stop = support * 0.98
-    stop_reasons = [f"直近{lookback}営業日の安値({support:.1f})の-2%を下限目安に設定"]
-    if bb_lower and bb_lower < stop:
-        stop = bb_lower * 0.99
-        stop_reasons.append(f"ボリンジャーバンド下限({bb_lower:.1f})がさらに下のため、その-1%を採用")
+    # ---- 損切り単価(目安)：4-2章の優先順位（100日線割れ+3% → -3σ-2% → 購入値-5% → サポート-2%）----
+    stop, stop_reasons = None, []
+    if ma100 is not None:
+        stop = ma100 * 0.97
+        stop_reasons.append(f"100日移動平均線（{ma100:.1f}）を明確に割り込んだ水準（-3%）を最終防衛ラインに設定")
+    elif bb_lower3 is not None:
+        stop = bb_lower3 * 0.98
+        stop_reasons.append(f"ボリンジャーバンド-3σ（{bb_lower3:.1f}）をさらに下回った水準（-2%）を設定")
+    elif entry:
+        stop = entry * 0.95
+        stop_reasons.append("移動平均線データ不足のため、購入単価から-5%をデフォルトの損切り水準に設定")
+    else:
+        stop = support * 0.98
+        stop_reasons.append(f"直近{lookback}営業日の安値({support:.1f})の-2%を下限目安に設定")
 
-    # 利確単価(目安): 直近高値(レジスタンス)と、損切り幅の2倍のリスクリワード目標のうち高い方。
-    risk = max(entry - stop, 0.01)
-    rr_target = entry + risk * 2
-    target = max(resistance, rr_target)
-    target_reasons = [f"直近{lookback}営業日の高値({resistance:.1f})、または損切り幅の2倍のリスクリワード目標({rr_target:.1f})のうち高い方を採用"]
+    # ---- 利確単価(目安)：買い理由の種類に応じたルール(3章)を適用 ----
+    if primary and primary["key"] == "compoundBottom":
+        target = entry * 1.025
+        target_reasons = ["急落・底打ちからの買いのため、+2.5%（下落分を取り戻す水準）を利確目安に設定"]
+    elif primary and primary["key"] == "bb3":
+        target = bb_mid if bb_mid else entry * 1.05
+        target_reasons = [f"ボリンジャーバンド中央線（{target:.1f}）までの戻りを利確目安に設定"]
+    elif primary and primary["key"] == "panpakapan":
+        risk = max(entry - stop, 0.01)
+        target = max(resistance, entry + risk * 2)
+        target_reasons = [f"トレンド継続中のため、直近高値（{resistance:.1f}）またはリスクリワード2倍（{entry + risk * 2:.1f}）を暫定目標に設定。"
+                           "短期線・中期線の接近が3回発生、または100日線割れが出たタイミングで見直してください"]
+    else:
+        risk = max(entry - stop, 0.01)
+        rr_target = entry + risk * 2
+        target = max(resistance, rr_target)
+        target_reasons = [f"直近{lookback}営業日の高値({resistance:.1f})、またはリスクリワード2倍の目標({rr_target:.1f})のうち高い方を採用"]
 
     fund_notes = []
     per, pbr, div = fundamentals.get("per"), fundamentals.get("pbr"), fundamentals.get("dividendYield")
     if per:
-        fund_notes.append(f"PER {per:.1f}倍")
+        fund_notes.append(f"PER {per:.1f}倍" + ("（60倍超のため成長期待の織り込み過ぎに注意）" if per > 60 else ""))
     if pbr:
         fund_notes.append(f"PBR {pbr:.2f}倍")
     if div:
@@ -333,29 +526,41 @@ def analyze_stock(w):
         "entry": round(entry, 2), "entryReason": "・".join(entry_reasons),
         "stop": round(stop, 2), "stopReason": "・".join(stop_reasons),
         "target": round(target, 2), "targetReason": "・".join(target_reasons),
+        "strength": strength,
+        "marketEnv": market_env,
+        "signals": {
+            "buy": [{"key": s["key"], "label": s["label"]} for s in buy_signals],
+            "sell": [{"key": s["key"], "label": s["label"]} for s in sell_signals],
+        },
         "indicators": {
-            "ma20": round(ma20, 2) if ma20 else None,
-            "ma50": round(ma50, 2) if ma50 else None,
+            "ma25": round(ma25, 2) if ma25 else None,
+            "ma75": round(ma75, 2) if ma75 else None,
+            "ma100": round(ma100, 2) if ma100 else None,
             "rsi": round(rsi, 1) if rsi is not None else None,
-            "bbUpper": round(bb_upper, 2) if bb_upper else None,
-            "bbLower": round(bb_lower, 2) if bb_lower else None,
+            "rci26": round(rci26, 1) if rci26 is not None else None,
+            "bbUpper2": round(bb_upper2, 2) if bb_upper2 else None,
+            "bbLower2": round(bb_lower2, 2) if bb_lower2 else None,
+            "bbLower3": round(bb_lower3, 2) if bb_lower3 else None,
             "support": round(support, 2), "resistance": round(resistance, 2),
+            "high52w": round(high52w, 2), "low52w": round(low52w, 2),
         },
         "fundamentalNote": "・".join(fund_notes) if fund_notes else "取得できるファンダメンタルデータがありません",
     }
 
 
 def build_analysis(watchlist):
-    """12章：分析タブ対象銘柄それぞれの購入/損切り/利確の目安を返す。"""
+    """12章：分析タブ対象銘柄それぞれの購入/損切り/利確の目安を返す。
+    相場環境（日経平均のトレンド）は全銘柄共通のため1回だけ計算する。"""
     out = {}
     if yf is None:
         return out
+    market_env = _market_environment()
     for w in watchlist:
         code = w.get("code", "")
         if not code:
             continue
         try:
-            r = analyze_stock(w)
+            r = analyze_stock(w, market_env)
             if r:
                 out[code] = r
         except Exception as e:
