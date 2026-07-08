@@ -9,8 +9,8 @@
   --paper:#E7E8E1; --paperAlt:#EEEFE9; --card:#F3F4EE; --ink:#1B1E1A; --inkSoft:#565A52;
   --rule:#C6C8BF; --ruleSoft:#D6D8CF; --gain:#2C6A48; --loss:#AE3A34; --accent:#2A4A6B;
   --band:#DEDFD7; --star:#B8863B; --warn:#9A6A16; --alarm:#1F5C3A; --alarmEdge:#123A25;
-  /* 株価の上昇/下落は日本の相場慣習（赤=上昇・緑=下落）に合わせる */
-  --up:#AE3A34; --down:#2C6A48; --upBg:#F1DBD8; --downBg:#DCE7DF;
+  /* 株価の上昇/下落は日本の相場慣習（赤=上昇・緑=下落）に合わせる。明るく彩度高めのコントラスト重視配色 */
+  --up:#C62828; --down:#2E7D32; --upBg:#FBDADA; --downBg:#D7F2DD;
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--paper);color:var(--ink);
@@ -21,9 +21,11 @@ body{margin:0;background:var(--paper);color:var(--ink);
   border-bottom:2px solid var(--ink);padding-bottom:12px}
 .kicker{font-size:11px;letter-spacing:3px;color:var(--inkSoft);text-transform:uppercase}
 h1{margin:3px 0 0;font-size:26px;font-weight:700;letter-spacing:-.4px}
-.tabs{display:flex;gap:4px;margin-top:16px;border-bottom:1px solid var(--rule)}
+/* 10-1章：タブ数が増えても横スクロールで収まるようにする */
+.tabs{display:flex;gap:4px;margin-top:16px;border-bottom:1px solid var(--rule);
+  overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch;scrollbar-width:thin}
 .tab{background:transparent;border:none;border-bottom:2px solid transparent;color:var(--inkSoft);
-  font-size:14px;padding:9px 16px;cursor:pointer;font-weight:600}
+  font-size:14px;padding:9px 16px;cursor:pointer;font-weight:600;flex:none;white-space:nowrap}
 .tab.on{color:var(--ink);border-bottom-color:var(--accent)}
 .sec-head{font-size:15px;font-weight:700;margin:0 0 3px}
 .sec-note{font-size:11px;color:var(--inkSoft);margin-bottom:10px}
@@ -60,7 +62,7 @@ td{padding:7px 10px;vertical-align:middle}
   border:none;border-bottom:1px solid var(--ruleSoft);cursor:pointer;text-align:left}
 .loading{max-width:400px;margin:80px auto;text-align:center;color:var(--inkSoft)}
 .news-list{display:block}
-.news-item{display:flex;gap:9px;align-items:baseline;padding:10px 4px;
+.news-item{display:flex;gap:9px;align-items:center;padding:10px 4px;
   border-bottom:1px solid var(--ruleSoft);text-decoration:none;color:var(--ink)}
 .news-item:last-child{border-bottom:none}
 .news-item:hover{background:var(--band)}
@@ -71,6 +73,23 @@ td{padding:7px 10px;vertical-align:middle}
 .news-title{font-size:13.5px;line-height:1.5}
 .news-meta{display:block;font-size:11px;color:var(--inkSoft);margin-top:3px}
 .news-empty{font-size:12px;color:var(--inkSoft);padding:16px 4px}
+/* 9-2章：重大ニュースの強調表示 */
+.news-item.important{background:var(--upBg);border-left:3px solid var(--up);padding-left:8px;margin-left:-1px}
+.news-item.important:hover{background:var(--upBg)}
+.news-alert-badge{flex:none;font-size:10.5px;font-weight:700;color:#fff;background:var(--up);
+  border-radius:3px;padding:2px 6px;white-space:nowrap;align-self:center}
+.subtabs{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}
+/* 10-5章：ニュース項目のサムネイル（実画像は取得できないため、出典名の頭文字によるアバター） */
+.news-thumb{flex:none;width:42px;height:42px;border-radius:4px;background:var(--band);color:var(--inkSoft);
+  display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;align-self:center}
+/* 10-5章：運営からの「新着情報」お知らせをニュース一覧に自然に挟み込むための行 */
+.news-announce{display:flex;gap:9px;align-items:center;padding:9px 4px;border-bottom:1px solid var(--ruleSoft);
+  background:var(--paperAlt);border-left:3px solid var(--accent);padding-left:8px;margin-left:-1px}
+.news-announce-badge{flex:none;font-size:10.5px;font-weight:700;color:#fff;background:var(--accent);
+  border-radius:3px;padding:2px 6px;white-space:nowrap}
+/* 10-5章：重要ニュース通知バナー（ページ最上部に常設、オン/オフ切り替え可） */
+.notify-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;
+  background:var(--alarm);color:#EFF3EF;border:2px solid var(--alarmEdge);border-radius:6px;padding:10px 14px;margin-bottom:12px}
 </style>
 </head>
 <body>
@@ -86,136 +105,559 @@ const { useState, useEffect, useRef, useMemo } = React;
 const num = (v) => (v === "" || v == null || isNaN(+v) ? null : +v);
 const todayISO = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; };
 const WD = ["日","月","火","水","木","金","土"];
-const MAX = 50;
+const MAX = 300;
 const KEY = "trade-cockpit-v1";
 
+// 東証33業種分類。この33種類+「その他」（日経225+時価総額上位30社の255社に含まれない銘柄用の特別枠）で運用する。
+const SECTORS_33 = [
+  "水産・農林業","鉱業","建設業","食料品","繊維製品","パルプ・紙","化学","医薬品","石油・石炭製品","ゴム製品",
+  "ガラス・土石製品","鉄鋼","非鉄金属","金属製品","機械","電気機器","輸送用機器","精密機器","その他製品","電気・ガス業",
+  "陸運業","海運業","空運業","倉庫・運輸関連業","情報・通信業","卸売業","小売業","銀行業","証券、商品先物取引業","保険業",
+  "その他金融業","不動産業","サービス業",
+];
+const SECTOR_OTHER = "その他";
+
 const M = (code,name,sector,market,tv) => ({code,name,sector,market,tvSymbol: tv || (market==="JP" ? "TSE:"+code : "")});
+
+// 日経225構成銘柄225社は東証33業種で分類。255社に含まれない銘柄（米国株・指数/為替・
+// ユーザーが手入力で追加した銘柄）は業種を問わず SECTOR_OTHER に分類する（1章の仕様）。
 const MASTER = [
-  M("8035","東京エレクトロン","半導体製造装置","JP"),M("6857","アドバンテスト","半導体製造装置","JP"),
-  M("6146","ディスコ","半導体製造装置","JP"),M("6920","レーザーテック","半導体製造装置","JP"),
-  M("7735","SCREENホールディングス","半導体製造装置","JP"),M("6525","コクサイエレクトリック","半導体製造装置","JP"),
-  M("6526","ソシオネクスト","半導体","JP"),M("6723","ルネサスエレクトロニクス","半導体","JP"),
-  M("6963","ローム","半導体","JP"),M("4063","信越化学工業","半導体材料","JP"),
-  M("3436","SUMCO","半導体材料","JP"),M("285A","キオクシアホールディングス","半導体メモリ","JP"),
-  M("5016","JX金属","非鉄金属","JP"),
-  M("9984","ソフトバンクグループ","AI・投資","JP"),M("3778","さくらインターネット","データセンター","JP"),
-  M("5803","フジクラ","電線・データセンター","JP"),M("4062","イビデン","電子部品","JP"),
-  M("6976","太陽誘電","電子部品","JP"),M("6981","村田製作所","電子部品","JP"),
-  M("6762","TDK","電子部品","JP"),M("6971","京セラ","電子部品","JP"),
-  M("3994","マネーフォワード","SaaS","JP"),M("4478","freee","SaaS","JP"),
-  M("4443","Sansan","SaaS","JP"),M("3923","ラクス","SaaS","JP"),
-  M("4776","サイボウズ","SaaS","JP"),M("4751","サイバーエージェント","ネット","JP"),
-  M("9613","NTTデータグループ","IT","JP"),
-  M("6758","ソニーグループ","電機","JP"),M("6501","日立製作所","電機","JP"),
-  M("6861","キーエンス","精密","JP"),M("7751","キヤノン","精密","JP"),
-  M("6752","パナソニックHD","電機","JP"),M("6503","三菱電機","電機","JP"),M("7741","HOYA","精密","JP"),
-  M("7203","トヨタ自動車","自動車","JP"),M("7267","ホンダ","自動車","JP"),
-  M("6902","デンソー","自動車部品","JP"),M("7270","SUBARU","自動車","JP"),M("7201","日産自動車","自動車","JP"),
-  M("8306","三菱UFJフィナンシャルG","銀行","JP"),M("8316","三井住友フィナンシャルG","銀行","JP"),
-  M("8411","みずほフィナンシャルG","銀行","JP"),M("8308","りそなホールディングス","銀行","JP"),
-  M("8604","野村ホールディングス","証券","JP"),
-  M("8766","東京海上ホールディングス","保険","JP"),
-  M("8058","三菱商事","商社","JP"),M("8031","三井物産","商社","JP"),
-  M("8001","伊藤忠商事","商社","JP"),M("8002","丸紅","商社","JP"),M("8053","住友商事","商社","JP"),
-  M("9432","日本電信電話(NTT)","通信","JP"),M("9433","KDDI","通信","JP"),M("9434","ソフトバンク","通信","JP"),
-  M("7011","三菱重工業","重工・防衛","JP"),M("7013","IHI","重工・防衛","JP"),M("7012","川崎重工業","重工・防衛","JP"),
-  M("9983","ファーストリテイリング","小売","JP"),M("6098","リクルートHD","サービス","JP"),
-  M("7974","任天堂","ゲーム","JP"),M("4568","第一三共","医薬","JP"),
-  M("6954","ファナック","機械","JP"),M("6367","ダイキン工業","機械","JP"),M("9101","日本郵船","海運","JP"),
-  M("NVDA","NVIDIA","半導体","US","NASDAQ:NVDA"),M("AMD","AMD","半導体","US","NASDAQ:AMD"),
-  M("AVGO","Broadcom","半導体","US","NASDAQ:AVGO"),M("MU","Micron","半導体メモリ","US","NASDAQ:MU"),
-  M("AAPL","Apple","テック","US","NASDAQ:AAPL"),M("MSFT","Microsoft","テック","US","NASDAQ:MSFT"),
-  M("GOOGL","Alphabet","テック","US","NASDAQ:GOOGL"),M("AMZN","Amazon","テック","US","NASDAQ:AMZN"),
-  M("META","Meta","テック","US","NASDAQ:META"),M("TSLA","Tesla","自動車","US","NASDAQ:TSLA"),
-  M("PLTR","Palantir","SaaS","US","NASDAQ:PLTR"),M("CRM","Salesforce","SaaS","US","NYSE:CRM"),
-  M("NOW","ServiceNow","SaaS","US","NYSE:NOW"),M("ARM","Arm","半導体","US","NASDAQ:ARM"),
-  M("TSM","TSMC","半導体","US","NYSE:TSM"),M("ASML","ASML","半導体製造装置","US","NASDAQ:ASML"),
-  M("NI225","日経225","指数","IDX","INDEX:NKY"),M("USDJPY","ドル円","為替","IDX","FX:USDJPY"),
-  M("SOX","半導体ETF(SOXX)","指数","IDX","NASDAQ:SOXX"),M("VIX","VIX短期ETF(VIXY)","指数","IDX","BATS:VIXY"),
+  // ===== 日経225構成銘柄 (225) =====
+  M("1332","ニッスイ","水産・農林業","JP"),M("1605","INPEX","鉱業","JP"),
+  M("1721","コムシスホールディングス","建設業","JP"),M("1801","大成建設","建設業","JP"),
+  M("1802","大林組","建設業","JP"),M("1803","清水建設","建設業","JP"),
+  M("1808","長谷工コーポレーション","建設業","JP"),M("1812","鹿島","建設業","JP"),
+  M("1925","大和ハウス工業","建設業","JP"),M("1928","積水ハウス","建設業","JP"),
+  M("1963","日揮ホールディングス","建設業","JP"),M("2002","日清製粉グループ本社","食料品","JP"),
+  M("2269","明治ホールディングス","食料品","JP"),M("2282","日本ハム","食料品","JP"),
+  M("2413","エムスリー","サービス業","JP"),M("2432","ディー・エヌ・エー","情報・通信業","JP"),
+  M("2501","サッポロホールディングス","食料品","JP"),M("2502","アサヒグループホールディングス","食料品","JP"),
+  M("2503","キリンホールディングス","食料品","JP"),M("2768","双日","卸売業","JP"),
+  M("2801","キッコーマン","食料品","JP"),M("2802","味の素","食料品","JP"),
+  M("285A","キオクシアホールディングス","電気機器","JP"),M("2871","ニチレイ","食料品","JP"),
+  M("2914","JT","食料品","JP"),M("3086","J.フロント リテイリング","小売業","JP"),
+  M("3092","ZOZO","小売業","JP"),M("3099","三越伊勢丹ホールディングス","小売業","JP"),
+  M("3289","東急不動産ホールディングス","不動産業","JP"),M("3382","セブン&アイ・ホールディングス","小売業","JP"),
+  M("3401","帝人","繊維製品","JP"),M("3402","東レ","繊維製品","JP"),
+  M("3405","クラレ","化学","JP"),M("3407","旭化成","化学","JP"),
+  M("3436","SUMCO","非鉄金属","JP"),M("3659","ネクソン","情報・通信業","JP"),
+  M("3697","SHIFT","情報・通信業","JP"),M("3861","王子ホールディングス","パルプ・紙","JP"),
+  M("4004","レゾナック・ホールディングス","化学","JP"),M("4005","住友化学","化学","JP"),
+  M("4021","日産化学","化学","JP"),M("4042","東ソー","化学","JP"),
+  M("4043","トクヤマ","化学","JP"),M("4061","デンカ","化学","JP"),
+  M("4062","イビデン","電気機器","JP"),M("4063","信越化学工業","化学","JP"),
+  M("4151","協和キリン","医薬品","JP"),M("4183","三井化学","化学","JP"),
+  M("4188","三菱ケミカルグループ","化学","JP"),M("4208","UBE","化学","JP"),
+  M("4307","野村総合研究所","情報・通信業","JP"),M("4324","電通グループ","サービス業","JP"),
+  M("4385","メルカリ","情報・通信業","JP"),M("4452","花王","化学","JP"),
+  M("4502","武田薬品工業","医薬品","JP"),M("4503","アステラス製薬","医薬品","JP"),
+  M("4506","住友ファーマ","医薬品","JP"),M("4507","塩野義製薬","医薬品","JP"),
+  M("4519","中外製薬","医薬品","JP"),M("4523","エーザイ","医薬品","JP"),
+  M("4543","テルモ","精密機器","JP"),M("4568","第一三共","医薬品","JP"),
+  M("4578","大塚ホールディングス","医薬品","JP"),M("4661","オリエンタルランド","サービス業","JP"),
+  M("4689","LINEヤフー","情報・通信業","JP"),M("4704","トレンドマイクロ","情報・通信業","JP"),
+  M("4751","サイバーエージェント","サービス業","JP"),M("4755","楽天グループ","サービス業","JP"),
+  M("4901","富士フイルムホールディングス","化学","JP"),M("4902","コニカミノルタ","精密機器","JP"),
+  M("4911","資生堂","化学","JP"),M("5019","出光興産","石油・石炭製品","JP"),
+  M("5020","ENEOSホールディングス","石油・石炭製品","JP"),M("5101","横浜ゴム","ゴム製品","JP"),
+  M("5108","ブリヂストン","ゴム製品","JP"),M("5201","AGC","ガラス・土石製品","JP"),
+  M("5214","日本電気硝子","ガラス・土石製品","JP"),M("5233","太平洋セメント","ガラス・土石製品","JP"),
+  M("5301","東海カーボン","ガラス・土石製品","JP"),M("5332","TOTO","ガラス・土石製品","JP"),
+  M("5333","NGK","ガラス・土石製品","JP"),M("5401","日本製鉄","鉄鋼","JP"),
+  M("5406","神戸製鋼所","鉄鋼","JP"),M("5411","JFEホールディングス","鉄鋼","JP"),
+  M("543A","ARCHION","輸送用機器","JP"),M("5631","日本製鋼所","機械","JP"),
+  M("5706","三井金属","非鉄金属","JP"),M("5711","三菱マテリアル","非鉄金属","JP"),
+  M("5713","住友金属鉱山","非鉄金属","JP"),M("5714","DOWAホールディングス","非鉄金属","JP"),
+  M("5801","古河電気工業","非鉄金属","JP"),M("5802","住友電気工業","非鉄金属","JP"),
+  M("5803","フジクラ","非鉄金属","JP"),M("5831","しずおかフィナンシャルグループ","銀行業","JP"),
+  M("6098","リクルートホールディングス","サービス業","JP"),M("6103","オークマ","機械","JP"),
+  M("6113","アマダ","機械","JP"),M("6146","ディスコ","精密機器","JP"),
+  M("6178","日本郵政","サービス業","JP"),M("6273","SMC","機械","JP"),
+  M("6301","コマツ","機械","JP"),M("6302","住友重機械工業","機械","JP"),
+  M("6305","日立建機","機械","JP"),M("6326","クボタ","機械","JP"),
+  M("6361","荏原","機械","JP"),M("6367","ダイキン工業","機械","JP"),
+  M("6471","日本精工","機械","JP"),M("6472","NTN","機械","JP"),
+  M("6473","ジェイテクト","機械","JP"),M("6479","ミネベアミツミ","電気機器","JP"),
+  M("6501","日立製作所","電気機器","JP"),M("6503","三菱電機","電気機器","JP"),
+  M("6504","富士電機","電気機器","JP"),M("6506","安川電機","電気機器","JP"),
+  M("6526","ソシオネクスト","電気機器","JP"),M("6532","ベイカレント","サービス業","JP"),
+  M("6645","オムロン","電気機器","JP"),M("6701","NEC","電気機器","JP"),
+  M("6702","富士通","電気機器","JP"),M("6723","ルネサスエレクトロニクス","電気機器","JP"),
+  M("6724","セイコーエプソン","電気機器","JP"),M("6752","パナソニック ホールディングス","電気機器","JP"),
+  M("6753","シャープ","電気機器","JP"),M("6758","ソニーグループ","電気機器","JP"),
+  M("6762","TDK","電気機器","JP"),M("6770","アルプスアルパイン","電気機器","JP"),
+  M("6841","横河電機","電気機器","JP"),M("6857","アドバンテスト","電気機器","JP"),
+  M("6861","キーエンス","電気機器","JP"),M("6902","デンソー","電気機器","JP"),
+  M("6920","レーザーテック","電気機器","JP"),M("6954","ファナック","電気機器","JP"),
+  M("6963","ローム","電気機器","JP"),M("6971","京セラ","電気機器","JP"),
+  M("6976","太陽誘電","電気機器","JP"),M("6981","村田製作所","電気機器","JP"),
+  M("6988","日東電工","化学","JP"),M("7004","カナデビア","機械","JP"),
+  M("7011","三菱重工業","機械","JP"),M("7012","川崎重工業","輸送用機器","JP"),
+  M("7013","IHI","機械","JP"),M("7186","横浜フィナンシャルグループ","銀行業","JP"),
+  M("7201","日産自動車","輸送用機器","JP"),M("7202","いすゞ自動車","輸送用機器","JP"),
+  M("7203","トヨタ自動車","輸送用機器","JP"),M("7211","三菱自動車","輸送用機器","JP"),
+  M("7261","マツダ","輸送用機器","JP"),M("7267","ホンダ","輸送用機器","JP"),
+  M("7269","スズキ","輸送用機器","JP"),M("7270","SUBARU","輸送用機器","JP"),
+  M("7272","ヤマハ発動機","輸送用機器","JP"),M("7453","良品計画","小売業","JP"),
+  M("7532","パン・パシフィック・インターナショナルホールディングス","小売業","JP"),M("7731","ニコン","精密機器","JP"),
+  M("7733","オリンパス","精密機器","JP"),M("7735","SCREENホールディングス","電気機器","JP"),
+  M("7741","HOYA","精密機器","JP"),M("7751","キヤノン","電気機器","JP"),
+  M("7752","リコー","電気機器","JP"),M("7832","バンダイナムコホールディングス","その他製品","JP"),
+  M("7911","TOPPANホールディングス","その他製品","JP"),M("7912","大日本印刷","その他製品","JP"),
+  M("7951","ヤマハ","その他製品","JP"),M("7974","任天堂","その他製品","JP"),
+  M("8001","伊藤忠商事","卸売業","JP"),M("8002","丸紅","卸売業","JP"),
+  M("8015","豊田通商","卸売業","JP"),M("8031","三井物産","卸売業","JP"),
+  M("8035","東京エレクトロン","電気機器","JP"),M("8053","住友商事","卸売業","JP"),
+  M("8058","三菱商事","卸売業","JP"),M("8233","高島屋","小売業","JP"),
+  M("8252","丸井グループ","小売業","JP"),M("8253","クレディセゾン","その他金融業","JP"),
+  M("8267","イオン","小売業","JP"),M("8304","あおぞら銀行","銀行業","JP"),
+  M("8306","三菱UFJフィナンシャル・グループ","銀行業","JP"),M("8308","りそなホールディングス","銀行業","JP"),
+  M("8309","三井住友トラストグループ","銀行業","JP"),M("8316","三井住友フィナンシャルグループ","銀行業","JP"),
+  M("8331","千葉銀行","銀行業","JP"),M("8354","ふくおかフィナンシャルグループ","銀行業","JP"),
+  M("8411","みずほフィナンシャルグループ","銀行業","JP"),M("8591","オリックス","その他金融業","JP"),
+  M("8601","大和証券グループ本社","証券、商品先物取引業","JP"),M("8604","野村ホールディングス","証券、商品先物取引業","JP"),
+  M("8630","SOMPOホールディングス","保険業","JP"),M("8697","日本取引所グループ","その他金融業","JP"),
+  M("8725","MS&ADインシュアランスグループホールディングス","保険業","JP"),M("8750","第一ライフグループ","保険業","JP"),
+  M("8766","東京海上ホールディングス","保険業","JP"),M("8795","T&Dホールディングス","保険業","JP"),
+  M("8801","三井不動産","不動産業","JP"),M("8802","三菱地所","不動産業","JP"),
+  M("8804","東京建物","不動産業","JP"),M("8830","住友不動産","不動産業","JP"),
+  M("9001","東武鉄道","陸運業","JP"),M("9005","東急","陸運業","JP"),
+  M("9007","小田急電鉄","陸運業","JP"),M("9008","京王電鉄","陸運業","JP"),
+  M("9009","京成電鉄","陸運業","JP"),M("9020","東日本旅客鉄道","陸運業","JP"),
+  M("9021","西日本旅客鉄道","陸運業","JP"),M("9022","東海旅客鉄道","陸運業","JP"),
+  M("9064","ヤマトホールディングス","陸運業","JP"),M("9101","日本郵船","海運業","JP"),
+  M("9104","商船三井","海運業","JP"),M("9107","川崎汽船","海運業","JP"),
+  M("9147","NIPPON EXPRESSホールディングス","陸運業","JP"),M("9201","日本航空","空運業","JP"),
+  M("9202","ANAホールディングス","空運業","JP"),M("9432","NTT","情報・通信業","JP"),
+  M("9433","KDDI","情報・通信業","JP"),M("9434","ソフトバンク","情報・通信業","JP"),
+  M("9501","東京電力ホールディングス","電気・ガス業","JP"),M("9502","中部電力","電気・ガス業","JP"),
+  M("9503","関西電力","電気・ガス業","JP"),M("9531","東京ガス","電気・ガス業","JP"),
+  M("9532","大阪ガス","電気・ガス業","JP"),M("9602","東宝","情報・通信業","JP"),
+  M("9735","セコム","サービス業","JP"),M("9766","コナミグループ","情報・通信業","JP"),
+  M("9843","ニトリホールディングス","小売業","JP"),M("9983","ファーストリテイリング","小売業","JP"),
+  M("9984","ソフトバンクグループ","情報・通信業","JP"),
+
+  // ===== 日経225以外・東証プライム時価総額上位30社 (追加30。日経225と合わせて255社) =====
+  M("7182","ゆうちょ銀行","銀行業","JP"),M("5016","JX金属","非鉄金属","JP"),
+  M("7936","アシックス","その他製品","JP"),M("6594","ニデック","電気機器","JP"),
+  M("4091","日本酸素ホールディングス","化学","JP"),M("4612","日本ペイントホールディングス","化学","JP"),
+  M("6383","ダイフク","機械","JP"),M("6525","KOKUSAI ELECTRIC","電気機器","JP"),
+  M("5334","日本特殊陶業","ガラス・土石製品","JP"),M("8593","三菱HCキャピタル","その他金融業","JP"),
+  M("4684","オービック","情報・通信業","JP"),M("8113","ユニ・チャーム","化学","JP"),
+  M("8473","SBIホールディングス","証券、商品先物取引業","JP"),M("7181","かんぽ生命保険","保険業","JP"),
+  M("9697","カプコン","情報・通信業","JP"),M("7259","アイシン","輸送用機器","JP"),
+  M("6586","マキタ","機械","JP"),M("9435","光通信","情報・通信業","JP"),
+  M("7309","シマノ","輸送用機器","JP"),M("8136","サンリオ","卸売業","JP"),
+  M("7550","ゼンショーホールディングス","小売業","JP"),M("7167","めぶきフィナンシャルグループ","銀行業","JP"),
+  M("2587","サントリー食品インターナショナル","食料品","JP"),M("5844","京都フィナンシャルグループ","銀行業","JP"),
+  M("1942","関電工","建設業","JP"),M("3003","ヒューリック","不動産業","JP"),
+  M("1944","きんでん","建設業","JP"),M("4186","東京応化工業","化学","JP"),
+  M("8359","八十二銀行","銀行業","JP"),M("8439","東京センチュリー","その他金融業","JP"),
+
+  // ===== NYダウ工業株30種平均 構成銘柄 (30)。6-1章：東証33業種と同じ枠組みで分類（GICSではなく統一） =====
+  // 基準日2026-07-08時点。2026-06-29にAlphabetがVerizonと入れ替わり採用（直近の入替）。
+  M("NVDA","NVIDIA",  "電気機器","US","NASDAQ:NVDA"),
+  M("AAPL","Apple",   "電気機器","US","NASDAQ:AAPL"),
+  M("GOOGL","Alphabet","情報・通信業","US","NASDAQ:GOOGL"),
+  M("MSFT","Microsoft","情報・通信業","US","NASDAQ:MSFT"),
+  M("AMZN","Amazon",  "小売業","US","NASDAQ:AMZN"),
+  M("JPM","JPモルガン・チェース","銀行業","US","NYSE:JPM"),
+  M("WMT","ウォルマート","小売業","US","NYSE:WMT"),
+  M("V","ビザ","その他金融業","US","NYSE:V"),
+  M("JNJ","ジョンソン・エンド・ジョンソン","医薬品","US","NYSE:JNJ"),
+  M("CSCO","シスコシステムズ","電気機器","US","NASDAQ:CSCO"),
+  M("CAT","キャタピラー","機械","US","NYSE:CAT"),
+  M("UNH","ユナイテッドヘルス・グループ","保険業","US","NYSE:UNH"),
+  M("KO","コカ・コーラ","食料品","US","NYSE:KO"),
+  M("PG","プロクター・アンド・ギャンブル","化学","US","NYSE:PG"),
+  M("HD","ホーム・デポ","小売業","US","NYSE:HD"),
+  M("CVX","シェブロン","石油・石炭製品","US","NYSE:CVX"),
+  M("GS","ゴールドマン・サックス","証券、商品先物取引業","US","NYSE:GS"),
+  M("MRK","メルク","医薬品","US","NYSE:MRK"),
+  M("IBM","IBM","情報・通信業","US","NYSE:IBM"),
+  M("AXP","アメリカン・エキスプレス","その他金融業","US","NYSE:AXP"),
+  M("MCD","マクドナルド","小売業","US","NYSE:MCD"),
+  M("AMGN","アムジェン","医薬品","US","NASDAQ:AMGN"),
+  M("BA","ボーイング","輸送用機器","US","NYSE:BA"),
+  M("DIS","ウォルト・ディズニー","情報・通信業","US","NYSE:DIS"),
+  M("CRM","セールスフォース","情報・通信業","US","NYSE:CRM"),
+  M("SHW","シャーウィン・ウィリアムズ","化学","US","NYSE:SHW"),
+  M("MMM","スリーエム","化学","US","NYSE:MMM"),
+  M("TRV","トラベラーズ","保険業","US","NYSE:TRV"),
+  M("HON","ハネウェル","機械","US","NASDAQ:HON"),
+  M("NKE","ナイキ","繊維製品","US","NYSE:NKE"),
+
+  // ===== 255社・ダウ30に含まれない銘柄（米国株・指数/為替）。業種は SECTOR_OTHER 固定 =====
+  M("AMD","AMD",SECTOR_OTHER,"US","NASDAQ:AMD"),
+  M("AVGO","Broadcom",SECTOR_OTHER,"US","NASDAQ:AVGO"),M("MU","Micron",SECTOR_OTHER,"US","NASDAQ:MU"),
+  M("META","Meta",SECTOR_OTHER,"US","NASDAQ:META"),M("TSLA","Tesla",SECTOR_OTHER,"US","NASDAQ:TSLA"),
+  M("PLTR","Palantir",SECTOR_OTHER,"US","NASDAQ:PLTR"),
+  M("NOW","ServiceNow",SECTOR_OTHER,"US","NYSE:NOW"),M("ARM","Arm",SECTOR_OTHER,"US","NASDAQ:ARM"),
+  M("TSM","TSMC",SECTOR_OTHER,"US","NYSE:TSM"),M("ASML","ASML",SECTOR_OTHER,"US","NASDAQ:ASML"),
+  M("NI225","日経225",SECTOR_OTHER,"IDX","INDEX:NKY"),M("USDJPY","ドル円",SECTOR_OTHER,"IDX","FX:USDJPY"),
+  M("SOX","半導体ETF(SOXX)",SECTOR_OTHER,"IDX","NASDAQ:SOXX"),M("VIX","VIX短期ETF(VIXY)",SECTOR_OTHER,"IDX","BATS:VIXY"),
+];
+const MASTER_BY_CODE=Object.fromEntries(MASTER.map(m=>[m.code,m]));
+
+// 10-3章：テーマ別銘柄グリッド。MASTERに実在する銘柄コードのみで構成する。
+// 銘柄のテーマ分類はセクター分類のように公式な基準があるわけではなく、名称・事業内容からの
+// 近似的な選定（キュレーション）である点に留意。アイコンはAI画像生成の3Dイラストではなく、
+// 実装簡易化のため絵文字を使用（著作権のあるロゴ等は使用していない）。
+const THEMES = [
+  {key:"ai",label:"AI関連",icon:"🤖",codes:["6758","4689","6501","6702","NVDA","MSFT","GOOGL","META","PLTR"]},
+  {key:"semi",label:"半導体",icon:"🔬",codes:["8035","6857","6920","3436","6526","6525","NVDA","AMD","AVGO","MU","TSM","ASML","ARM"]},
+  {key:"defense",label:"防衛",icon:"🛡️",codes:["7011","7013","7012","6701"]},
+  {key:"space",label:"宇宙ビジネス",icon:"🚀",codes:["7011","7013","6701","4307"]},
+  {key:"ev",label:"EV",icon:"🔋",codes:["7203","7267","7201","6752","6902","TSLA"]},
+  {key:"crypto",label:"暗号資産",icon:"₿",codes:["8473"]},
+  {key:"nisa",label:"NISA人気銘柄",icon:"📈",codes:["8306","9432","7203","6758","9983"]},
+  {key:"dividend",label:"高配当",icon:"💰",codes:["2914","8306","8411","8316","8766"]},
+  {key:"genai",label:"生成AI",icon:"✨",codes:["4751","4755","6098","MSFT","GOOGL","META"]},
+  {key:"yen",label:"円安関連(輸出)",icon:"💴",codes:["7203","7267","6758","6902","8035"]},
 ];
 
+// ===== カラールール（セクター・銘柄共通。3章の仕様）=====
+// 上昇率(%)は0.5%刻みで6段階(0-0.5/0.5-1.0/1.0-1.5/1.5-2.0/2.0-2.5/2.5超)に区分し、1段階ずつ赤/緑を濃くする。
+// 最終段階(2.5%超)は上限なくすべて同じ最も濃い色で頭打ちにする。
+// レベル1（0%超〜0.5%）は現状使用している --up / --down の色そのものを「最も薄い色」の基準として使う。
+const CHANGE_STEP = 0.5;
+const CHANGE_MAX_LEVEL = 6; // 0.5%刻み6段階。2.5%超は全て最終段階（最大濃度）
+const UP_BASE="#C62828", UP_DARK="#6B0F10";     // 赤：レベル1(既存--up、明るく彩度高め)→レベル6(最濃)
+const DOWN_BASE="#2E7D32", DOWN_DARK="#123A25"; // 緑：レベル1(既存--down、明るく彩度高め)→レベル6（既存--alarmEdgeと同色を再利用）
+const UP_BG_BASE="#FBDADA", DOWN_BG_BASE="#D7F2DD"; // 既存の --upBg / --downBg をレベル1の背景基準に使う
+
+const hexToRgb=(h)=>{const n=parseInt(h.slice(1),16);return [(n>>16)&255,(n>>8)&255,n&255];};
+const rgbToHex=(r,g,b)=>"#"+[r,g,b].map(v=>Math.max(0,Math.min(255,Math.round(v))).toString(16).padStart(2,"0")).join("");
+const mixHex=(a,b,t)=>{const[ar,ag,ab]=hexToRgb(a),[br,bg,bb]=hexToRgb(b);return rgbToHex(ar+(br-ar)*t,ag+(bg-ag)*t,ab+(bb-ab)*t);};
+
+// pct(%)を受け取り、セクター・銘柄どちらでも使う共通のカラー情報を返す。pctがnull/0はニュートラル。
+const changeColor=(pct)=>{
+  if(pct==null||pct===0) return {level:0,dir:null,fg:"var(--inkSoft)",bg:"transparent"};
+  const level=Math.min(CHANGE_MAX_LEVEL,Math.ceil(Math.abs(pct)/CHANGE_STEP));
+  const t=(level-1)/(CHANGE_MAX_LEVEL-1);
+  const up=pct>0;
+  const fg=mixHex(up?UP_BASE:DOWN_BASE, up?UP_DARK:DOWN_DARK, t);
+  // 背景は薄いトーンに留め、濃淡の主な表現は文字色(fg)側で担う（濃い背景+濃い文字は視認性が落ちるため）
+  const bg=mixHex(up?UP_BG_BASE:DOWN_BG_BASE, fg, 0.05+t*0.15);
+  return {level,dir:up?"up":"down",fg,bg};
+};
+
+// 8章：日次モニターの各項目をクリックした時に開くリアルタイムチャート用シンボル。
+// tvEmbed=trueのものだけ無料埋め込みで表示（CLAUDE.mdの検証済みルールに合わせ、指数は連動ETF/CFDで代用）。
+// falseのものは埋め込み表示できないシンボル（先物・KOSPI・米10年債・銅など）のため「TradingViewで開く」のみ提供。
 const METRICS = [
-  {key:"usdjpy",label:"ドル円",dp:2,stq:"usdjpy"},{key:"nikkei",label:"日経平均",dp:0,stq:"^nkx"},
-  {key:"dow",label:"NYダウ",dp:0,stq:"^dji"},{key:"nasdaq",label:"ナスダック",dp:0,stq:"^ndq"},
-  {key:"sox",label:"SOX半導体",dp:0,stq:"^sox"},{key:"us10y",label:"米10年債 %",dp:2},
-  {key:"sp500",label:"S&P500",dp:2},{key:"kospi",label:"KOSPI",dp:2},
-  {key:"nikkei_fut",label:"日経225先物",dp:0},{key:"dow_fut",label:"NYダウ先物",dp:0},
-  {key:"wti",label:"WTI原油",dp:2},{key:"gold",label:"金(Gold)",dp:1},{key:"copper",label:"銅(Copper)",dp:3},
+  {key:"usdjpy",label:"ドル円",dp:2,stq:"usdjpy",tv:"FX:USDJPY",tvEmbed:true},
+  {key:"nikkei",label:"日経平均",dp:0,stq:"^nkx",tv:"INDEX:NKY",tvEmbed:true},
+  {key:"dow",label:"NYダウ",dp:0,stq:"^dji",tv:"AMEX:DIA",tvEmbed:true},
+  {key:"nasdaq",label:"ナスダック",dp:0,stq:"^ndq",tv:"NASDAQ:QQQ",tvEmbed:true},
+  {key:"sox",label:"SOX半導体",dp:0,stq:"^sox",tv:"NASDAQ:SOXX",tvEmbed:true},
+  {key:"us10y",label:"米10年債 %",dp:2,tv:"TVC:US10Y",tvEmbed:false},
+  {key:"sp500",label:"S&P500",dp:2,tv:"AMEX:SPY",tvEmbed:true},
+  {key:"kospi",label:"KOSPI",dp:2,tv:"KRX:KOSPI",tvEmbed:false},
+  {key:"nikkei_fut",label:"日経225先物",dp:0,tv:"OSE:NK225M1!",tvEmbed:false},
+  {key:"dow_fut",label:"NYダウ先物",dp:0,tv:"CBOT_MINI:YM1!",tvEmbed:false},
+  {key:"wti",label:"WTI原油",dp:2,tv:"OANDA:WTICOUSD",tvEmbed:true},
+  {key:"gold",label:"金(Gold)",dp:1,tv:"OANDA:XAUUSD",tvEmbed:true},
+  {key:"copper",label:"銅(Copper)",dp:3,tv:"CAPITALCOM:COPPER",tvEmbed:false},
 ];
-const WATCH = ["優先","通常","様子見"];
-const wc = (w)=> w==="優先"?"var(--star)": w==="様子見"?"var(--inkSoft)":"var(--accent)";
 const wOrder = {"優先":0,"通常":1,"様子見":2};
 
-const SIGNALS = {
-  buy:[
-    {id:"panpakapan",label:"パンパカパン（最優先買い）",strong:true},
-    {id:"triple_bottom",label:"トリプルボトム",strong:true},
-    {id:"island_bottom",label:"アイランドボトム（全力買い）",strong:true},
-    {id:"narabiaka",label:"上放れ並び赤",strong:true},
-    {id:"double_bottom",label:"ダブルボトム"},
-    {id:"cross_low",label:"十字線・安値圏（上昇転換）"},
-    {id:"harami_low",label:"はらみ線・安値圏（上昇期待）"},
-    {id:"tsutsumi_up",label:"陽線抱き線（強い上昇）"},
-    {id:"gap_up",label:"窓開け急騰"},{id:"two_yang",label:"2連続陽線"},
-    {id:"bottom_signal",label:"底打ちシグナル（-3σ/RCI-90/24日線割れ/-2.5%急落の複数重複）"},
-    {id:"jiko",label:"事故は買い（一時的な需給急落）"},
-  ],
-  sell:[
-    {id:"shitawanare",label:"下放れ二本黒（暴落カウントダウン）",strong:true},
-    {id:"island_top",label:"アイランドリバーサル・高値圏（天井）",strong:true},
-    {id:"triple_top",label:"トリプルトップ",strong:true},
-    {id:"double_top",label:"ダブルトップ"},{id:"kubitsuri",label:"首吊り線"},
-    {id:"cross_high",label:"十字線・高値圏（下落転換）"},
-    {id:"tsutsumi_down",label:"陰線抱き線（さらなる下落）"},
-    {id:"jiken",label:"事件は売り（構造的悪材料）"},
-  ],
-  watch:[
-    {id:"panpakapan_3rd",label:"パンパカパン3回目接近（下降警戒／高値更新なら見送り）"},
-    {id:"harami_high",label:"はらみ線・高値圏（上昇終焉警戒）"},
-  ],
-};
-const BB_POS=["","+3σ以上","+2σ付近","中心","-2σ付近","-3σタッチ/張り付き"];
-const FORECAST=["","増収増益","増収減益","減収増益","減収減益","未定"];
-const ANALYST=["","強気","やや強気","中立","やや弱気","弱気"];
-const emptyAnalysis=()=>({signals:{},tech:{bb:"",rsi:"",rci:"",maPanpaka:false},
-  fund:{forecast:"",per:"",pbr:"",divy:"",roe:"",fcf:"",analyst:"",target:"",memo:""},
-  plan:{entry:"",tp:"",sl:"",memo:""}});
+// 6-2章：SNSタブ対象アカウント。X公式の無料埋め込みタイムライン（1アカウントずつ切り替え表示）を使用。
+// 有料APIは従量課金（読み取り$0.005/件、無料枠なし）のため見送り、費用のかからないこの方式を採用。
+const SNS_ACCOUNTS = [
+  "kabu_st0ck","aryarya","kanpo_blog","4ki4","sak_07_",
+  "sou_btc","min_fx","nicosokufx","nikkei","hitsuzikai",
+];
 
-const emptyMetrics=()=>Object.fromEntries(METRICS.map(m=>[m.key,{t:"",p:""}]));
+const emptyMetrics=()=>Object.fromEntries(METRICS.map(m=>[m.key,{t:"",p:"",spark:[]}]));
+// 初期登録銘柄（日本市場）：MASTERの日経225+時価総額上位30社(255社)を、重複コードなしでそのまま初期値にする（1章のマスタと1:1）。
+const DEFAULT_WATCHLIST=(()=>{const seen=new Set();return MASTER.filter(m=>m.market==="JP"&&m.sector!==SECTOR_OTHER&&m.code&&!seen.has(m.code)&&seen.add(m.code))
+  .map(m=>({id:m.code,...m,watch:"通常",note:""}));})();
+// 初期登録銘柄（アメリカ市場）：MASTERのダウ平均構成30社をそのまま初期値にする（6-1章）。
+const DEFAULT_WATCHLIST_US=(()=>{const seen=new Set();return MASTER.filter(m=>m.market==="US"&&m.sector!==SECTOR_OTHER&&m.code&&!seen.has(m.code)&&seen.add(m.code))
+  .map(m=>({id:m.code,...m,watch:"通常",note:""}));})();
 const emptyState=()=>({
-  date:todayISO(), watchlist:[], metrics:emptyMetrics(),
-  usMarketNote:"",adrPts:"",sundayDow:"",strongSectors:"",themes:"",stockNews:"",marketNews:"",briefing:"",
-  stockNewsList:[], macroNewsList:[], stockQuotes:{},
-  sectorHeat:{}, analysis:{},
+  date:todayISO(), watchlist:DEFAULT_WATCHLIST, watchlistUS:DEFAULT_WATCHLIST_US, metrics:emptyMetrics(),
+  stockNews:"",marketNews:"", // 旧フロント・バックアップ互換のためのテキスト版ニュース（7章で市況メモ等のUIは削除済み、フィールドのみ残置）
+  stockNewsList:[], macroNewsList:[], macroNewsDomestic:[], macroNewsOverseas:[], usStockNewsList:[], stockQuotes:{},
+  analysisTargets:[], // analysisTargets: 5章「分析」ボタンで追加した銘柄コード一覧（12章の分析タブで使用）
+  analysisData:{}, // analysisData: 12-1章の分析結果（購入/損切り/利確の目安・算出根拠）をコードごとに保持
+  notifyEnabled:true, // 10-5章：重要ニュース通知バナーのオン/オフ
 });
 const loadState=()=>{try{const r=localStorage.getItem(KEY);if(!r)return null;const d=JSON.parse(r);return {...emptyState(),...d,metrics:{...emptyMetrics(),...(d.metrics||{})}};}catch{return null;}};
 
-function NewsList({items,showName}){
+// 9-2章：重大ニュースの強調表示（サプライズ決算・戦争紛争・パンデミック・大規模自然災害・株価暴落）。
+// Googleニュースの見出しに構造化データがないため、見出し文字列に含まれるキーワードでの近似判定。
+const IMPORTANT_KEYWORDS = [
+  // サプライズ決算（市場予想との大幅な乖離）
+  "上方修正","下方修正","予想を上回る","予想を下回る","予想上振れ","予想下振れ","増額修正","減額修正","サプライズ決算",
+  // 戦争・紛争
+  "戦争","侵攻","紛争","ミサイル","軍事衝突","空爆","停戦",
+  // パンデミック
+  "パンデミック","感染拡大","新型ウイルス","変異株","ロックダウン","緊急事態宣言",
+  // 大規模自然災害
+  "巨大地震","大地震","震度7","震度6","大津波","大噴火","大規模災害","記録的豪雨",
+  // 株価暴落
+  "暴落","急落","ブラックマンデー","サーキットブレーカー",
+];
+const isImportantNews=(title)=>IMPORTANT_KEYWORDS.some(k=>(title||"").includes(k));
+
+// 10-5章：運営からの「新着情報」お知らせ。ニュース一覧に自然に挟み込む（機能追加時にここへ追記していく）。
+const ANNOUNCEMENTS = [
+  {title:"「分析」タブを追加しました。テクニカル・ファンダメンタル指標をもとに購入/損切り/利確の目安を表示します。", date:"2026-07"},
+  {title:"ニュースタブに「サマリー」「国内市況」「海外市況」「適時開示」のサブタブを追加しました。", date:"2026-07"},
+];
+
+// 10-1章：カードUI基盤。ミニスパークライン（値上がり/値下がりでグラデーション色を変える）
+function Sparkline({data,color,width=140,height=36}){
+  const gid=(React.useId?React.useId():"spark")+"-g";
+  if(!data||data.length<2) return <svg width={width} height={height}></svg>;
+  const min=Math.min(...data),max=Math.max(...data);
+  const range=(max-min)||1;
+  const stepX=width/(data.length-1);
+  const pts=data.map((v,i)=>[i*stepX,height-((v-min)/range)*height]);
+  const line=pts.map(([x,y],i)=>(i===0?"M":"L")+x.toFixed(1)+","+y.toFixed(1)).join(" ");
+  const area=line+` L${width},${height} L0,${height} Z`;
+  return <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} style={{display:"block",width:"100%",height}} preserveAspectRatio="none">
+    <defs><linearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stopColor={color} stopOpacity="0.32"/>
+      <stop offset="100%" stopColor={color} stopOpacity="0"/>
+    </linearGradient></defs>
+    <path d={area} fill={`url(#${gid})`} stroke="none"/>
+    <path d={line} fill="none" stroke={color} strokeWidth="1.6"/>
+  </svg>;
+}
+
+// 10-1章：カードUI基盤（名称・現在値・前日比・ミニスパークラインの4点セット）。テーマ別グリッド(10-3章)等で再利用する。
+function StockCard({name,code,quote,onClick}){
+  const t=num(quote?.t),p=num(quote?.p);
+  const delta=t!=null&&p!=null?t-p:null;
+  const pct=t!=null&&p!=null&&p?(t-p)/p*100:null;
+  const c=changeColor(pct);
+  const sparkColor=delta==null||delta===0?"#9aa093":(delta>0?UP_BASE:DOWN_BASE);
+  return <button onClick={onClick} className="card" style={{textAlign:"left",cursor:onClick?"pointer":"default",width:"100%",font:"inherit",color:"var(--ink)"}}>
+    <div style={{display:"flex",justifyContent:"space-between",gap:8}}>
+      <div><div className="card-t">{name}</div><div className="card-n mono">{code}</div></div>
+      <div style={{textAlign:"right"}}>
+        <div className="mono" style={{fontSize:16,fontWeight:700}}>{t!=null?t.toLocaleString():"—"}</div>
+        <div className="mono" style={{fontSize:12,color:c.fg}}>{pct!=null?(pct>0?"+":"")+pct.toFixed(2)+"%":"—"}</div>
+      </div>
+    </div>
+    <div style={{marginTop:8}}><Sparkline data={quote?.spark} color={sparkColor}/></div>
+  </button>;
+}
+
+// 10-3章：テーマ別銘柄グリッド（テーマ名+騰落率+アイコンのカードを2列グリッド表示）。
+// テーマをタップすると、そのテーマに属する銘柄一覧（10-1章のカードUI）に遷移する。
+function ThemeGrid({stockQuotes,onFetchCodes}){
+  const [selected,setSelected]=useState(null); // 選択中のテーマkey（null=一覧表示）
+  const [sort,setSort]=useState("popular"); // popular=人気順(定義順) / change=騰落率順
+
+  const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
+    return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
+
+  const themeStats=useMemo(()=>THEMES.map(th=>{
+    const pcts=th.codes.map(pctOf).filter(v=>v!=null);
+    const avgPct=pcts.length?pcts.reduce((a,b)=>a+b,0)/pcts.length:null;
+    return {...th,avgPct};
+  }),[stockQuotes]);
+
+  const sorted=useMemo(()=>{
+    if(sort==="change") return [...themeStats].sort((a,b)=>(b.avgPct??-Infinity)-(a.avgPct??-Infinity));
+    return themeStats; // 人気順：THEMES定義順をそのまま採用
+  },[themeStats,sort]);
+
+  const theme=selected?THEMES.find(t=>t.key===selected):null;
+
+  useEffect(()=>{if(theme)onFetchCodes(theme.codes);},[selected]);
+
+  if(theme){
+    const members=theme.codes.map(code=>MASTER_BY_CODE[code]).filter(Boolean);
+    return <div>
+      <button className="ghost" style={{marginBottom:12}} onClick={()=>setSelected(null)}>← テーマ一覧へ戻る</button>
+      <div className="sec-head">{theme.icon} {theme.label}</div>
+      <div className="sec-note">このテーマに関連する銘柄（{members.length}銘柄）。分類は名称・事業内容に基づく近似的な選定です。</div>
+      <div className="grid" style={{gridTemplateColumns:"repeat(auto-fit,minmax(240px,1fr))",marginTop:10}}>
+        {members.map(m=><StockCard key={m.code} name={m.name} code={m.code} quote={stockQuotes[m.code]}/>)}
+      </div>
+    </div>;
+  }
+
+  return <div>
+    <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:14}}>
+      <button className={"chip"+(sort==="popular"?" on":"")} onClick={()=>setSort("popular")}>人気順</button>
+      <button className={"chip"+(sort==="change"?" on":"")} onClick={()=>setSort("change")}>騰落率順</button>
+    </div>
+    <div className="grid" style={{gridTemplateColumns:"repeat(2,1fr)"}}>
+      {sorted.map(th=>{const c=changeColor(th.avgPct);
+        return <button key={th.key} className="card" style={{textAlign:"left",cursor:"pointer",font:"inherit",color:"var(--ink)"}} onClick={()=>setSelected(th.key)}>
+          <div style={{fontSize:26,marginBottom:6}}>{th.icon}</div>
+          <div className="card-t">{th.label}</div>
+          <div className="mono" style={{fontSize:13,fontWeight:700,color:c.fg,marginTop:4}}>{th.avgPct!=null?(th.avgPct>0?"+":"")+th.avgPct.toFixed(2)+"%":"—"}</div>
+        </button>;})}
+    </div>
+  </div>;
+}
+
+// 10-5章：出典名の頭文字によるサムネイル代わりのアバター（実画像はGoogleニュースRSSから取得できないため代替）
+function SourceThumb({source}){
+  const ch=(source||"?").trim().charAt(0).toUpperCase()||"?";
+  return <div className="news-thumb">{ch}</div>;
+}
+
+// 10-5章：announcements(運営からの新着情報)を渡すと、ニュース一覧の間に自然に挟み込んで表示する。
+// interval件ごとに1件挟む（末尾到達で先頭に戻る簡易ローテーション）。
+function NewsList({items,showName,announcements,announceInterval=5}){
   if(!items||!items.length) return <div className="news-empty">まだ取得していません。ブリーフィングの「リアルタイムデータを反映」を押してください。</div>;
+  let annIdx=0;
   return <div className="news-list">
     {items.map((it,i)=>{
       const meta=[showName?it.name:null,it.source,it.published].filter(Boolean).join(" ・ ");
-      return <a key={i} className="news-item" href={it.url} target="_blank" rel="noopener noreferrer">
-        {showName&&it.code&&<span className="news-tag">{it.code}</span>}
-        <span className="news-body">
-          <span className="news-title">{it.title}</span>
-          {meta&&<span className="news-meta">{meta}</span>}
-        </span>
-      </a>;
+      const important=isImportantNews(it.title);
+      const showAnnounce=announcements&&announcements.length&&i>0&&i%announceInterval===0;
+      const ann=showAnnounce?announcements[annIdx++%announcements.length]:null;
+      return <React.Fragment key={i}>
+        {ann&&<div className="news-announce">
+          <span className="news-announce-badge">お知らせ</span>
+          <span className="news-body"><span className="news-title">{ann.title}</span><span className="news-meta">{ann.date}</span></span>
+        </div>}
+        <a className={"news-item"+(important?" important":"")} href={it.url} target="_blank" rel="noopener noreferrer">
+          {important&&<span className="news-alert-badge">⚠ 重要</span>}
+          {showName&&it.code&&<span className="news-tag">{it.code}</span>}
+          <span className="news-body">
+            <span className="news-title">{it.title}</span>
+            {meta&&<span className="news-meta">{meta}</span>}
+          </span>
+          <SourceThumb source={it.source}/>
+        </a>
+      </React.Fragment>;
     })}
   </div>;
 }
 
+// 6-1章：銘柄検索・登録＋セクター別アコーディオン表示（2〜5章の仕様）を市場ごとに再利用するための共通コンポーネント。
+// 日本市場・アメリカ市場タブの両方で、このコンポーネントをそのまま使い回すことで「全く同じ仕様・UI」を担保する。
+function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuotes,analysisTargets,onToggleAnalysis,onOpenChart}){
+  const [q,setQ]=useState("");
+  const [openSectors,setOpenSectors]=useState(()=>new Set());
+
+  const regCodes=useMemo(()=>new Set(watchlist.map(w=>w.code)),[watchlist]);
+  const results=useMemo(()=>{const t=q.trim().toLowerCase();if(!t)return[];
+    return candidates.filter(m=>!regCodes.has(m.code)&&(m.code.toLowerCase().includes(t)||m.name.toLowerCase().includes(t)||m.sector.toLowerCase().includes(t))).slice(0,8);},[q,regCodes,candidates]);
+  const addStock=(m)=>{if(watchlist.length>=max){alert("登録は最大"+max+"社までです。");return;}
+    if(regCodes.has(m.code))return; setWatchlist([...watchlist,{id:m.code,...m,watch:"通常",note:""}]);setQ("");};
+  const addManual=()=>{
+    const raw=q.trim();if(!raw)return;if(watchlist.length>=max){alert("最大"+max+"社");return;}
+    let code=raw,name=raw;
+    if(!/^[0-9]{4}[0-9A-Za-z]?$/.test(raw)){
+      const input=prompt(`「${raw}」の証券コード（例：5016、AAPL）を入力してください`,"");
+      if(!input||!input.trim())return;
+      code=input.trim();
+    }
+    setWatchlist([...watchlist,{id:Date.now()+Math.random(),code,name,sector:SECTOR_OTHER,market,tvSymbol:(market==="JP"?"TSE:"+code:code),watch:"通常",note:""}]);setQ("");};
+  const delStock=(id)=>setWatchlist(watchlist.filter(w=>w.id!==id));
+
+  // 銘柄コードの前日比(%)・売買代金（3章カラールール・セクター並び替えで共通利用）
+  const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
+    return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
+  const turnoverOf=(code)=>{const v=num(stockQuotes[code]?.turnover);return v!=null&&v>0?v:null;};
+
+  // セクターの並び順は「セクター内合計売買代金の降順」。銘柄追加・株価更新のたびに再計算され、
+  // 売買代金の変動に応じて自動的に入れ替わる。未取得時はSECTORS_33の定義順+その他にフォールバック。
+  const sectorOrder=useMemo(()=>[...SECTORS_33,SECTOR_OTHER],[]);
+  const sectorGroups=useMemo(()=>{
+    const map={};
+    watchlist.forEach(w=>{(map[w.sector]=map[w.sector]||[]).push(w);});
+    return Object.entries(map)
+      .map(([sector,items])=>{
+        const pcts=items.map(w=>pctOf(w.code)).filter(v=>v!=null);
+        const avgPct=pcts.length?pcts.reduce((a,b)=>a+b,0)/pcts.length:null;
+        const totalTurnover=items.reduce((sum,w)=>sum+(turnoverOf(w.code)||0),0);
+        return {sector,avgPct,totalTurnover,items:[...items].sort((a,b)=>(wOrder[a.watch]-wOrder[b.watch])||a.code.localeCompare(b.code))};
+      })
+      .sort((a,b)=>(b.totalTurnover-a.totalTurnover)||(sectorOrder.indexOf(a.sector)-sectorOrder.indexOf(b.sector)));
+  },[watchlist,stockQuotes,sectorOrder]);
+  const toggleSector=(sec)=>setOpenSectors(prev=>{const n=new Set(prev);n.has(sec)?n.delete(sec):n.add(sec);return n;});
+
+  return <div style={{marginTop:18}}>
+    <div className="sec-head">登録銘柄　{watchlist.length}/{max}</div>
+    <div className="sec-note">自動保存されます。</div>
+    <div style={{position:"relative"}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,padding:"8px 12px"}}>
+        <input value={q} onChange={e=>setQ(e.target.value)} placeholder={market==="JP"?"銘柄コード・企業名・セクターで検索（例：6981、村田、化学）":"ティッカー・企業名・セクターで検索（例：AAPL、Apple、電気機器）"}
+          style={{flex:1,border:"none",background:"transparent",outline:"none",fontSize:14}}/>
+        {q && <button className="iconbtn" onClick={()=>setQ("")}>×</button>}
+      </div>
+      {q.trim() && <div className="results">
+        {results.map(m=>
+          <button key={m.code} className="res-row" onClick={()=>addStock(m)}>
+            <span className="mono" style={{fontSize:12,width:60,color:"var(--inkSoft)"}}>{m.code}</span>
+            <span style={{flex:1,fontSize:13}}>{m.name}</span>
+            <span style={{fontSize:11,color:"var(--inkSoft)"}}>{m.sector}</span>
+            <span style={{color:"var(--accent)",fontWeight:700}}>＋</span>
+          </button>)}
+        <button className="res-row" style={{background:"var(--band)",fontSize:12.5,color:"var(--inkSoft)"}} onClick={addManual}>＋ リストにない「{q.trim()}」を手動登録</button>
+      </div>}
+    </div>
+    <div style={{marginTop:12,border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,overflow:"hidden"}}>
+      {sectorGroups.length===0 ?
+        <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13}}>{`上の検索から銘柄を登録してください（最大${max}社）。`}</div> :
+        sectorGroups.map(({sector,avgPct,items},i)=>{
+          const isOpen=openSectors.has(sector);
+          const avgC=changeColor(avgPct);
+          return <div key={sector} style={{borderTop:i===0?"none":"1px solid var(--ruleSoft)"}}>
+            <button onClick={()=>toggleSector(sector)} style={{display:"flex",alignItems:"center",width:"100%",gap:10,padding:"11px 14px",
+              background:avgC.level>0?avgC.bg:(isOpen?"var(--band)":"transparent"),border:"none",cursor:"pointer",textAlign:"left",font:"inherit",color:"var(--ink)"}}>
+              <span className="mono" style={{fontSize:11,color:"var(--inkSoft)",width:14}}>{isOpen?"▾":"▸"}</span>
+              <span style={{flex:1,fontSize:14,fontWeight:700}}>{sector}</span>
+              <span className="mono" style={{fontSize:13,fontWeight:700,color:avgC.fg,minWidth:56,textAlign:"right"}}>
+                {avgPct!=null?(avgPct>0?"+":"")+avgPct.toFixed(2)+"%":"—"}
+              </span>
+              <span style={{fontSize:11.5,color:"var(--inkSoft)"}}>{items.length}銘柄</span>
+            </button>
+            {isOpen && <div style={{overflowX:"auto"}}><table style={{minWidth:860}}>
+              <thead><tr style={{background:"var(--band)"}}><th>コード</th><th>銘柄</th><th>現在値</th><th>前日比</th><th>高値</th><th>安値</th><th></th></tr></thead>
+              <tbody>{items.map(w=>{
+                const qt=stockQuotes[w.code]||{};
+                const ct=num(qt.t),cp=num(qt.p),chi=num(qt.high),clo=num(qt.low);
+                const delta=ct!=null&&cp!=null?ct-cp:null;
+                const pct=pctOf(w.code);
+                const c=changeColor(pct);
+                const inAnalysis=analysisTargets.includes(w.code);
+                return <tr key={w.id} style={{borderTop:"1px solid var(--ruleSoft)",background:c.bg}}>
+                  <td className="mono" style={{fontWeight:700}}>{w.code}</td>
+                  <td>{w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
+                  <td className="mono" style={{fontWeight:700,color:c.fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
+                  <td className="mono" style={{color:c.fg,whiteSpace:"nowrap"}}>{delta!=null?(delta>0?"+":"")+delta.toLocaleString(undefined,{maximumFractionDigits:2})+(pct!=null?` (${pct>0?"+":""}${pct.toFixed(2)}%)`:""):"—"}</td>
+                  <td className="mono" style={{color:"var(--inkSoft)",whiteSpace:"nowrap"}}>{chi!=null?chi.toLocaleString():"—"}</td>
+                  <td className="mono" style={{color:"var(--inkSoft)",whiteSpace:"nowrap"}}>{clo!=null?clo.toLocaleString():"—"}</td>
+                  <td style={{textAlign:"center",whiteSpace:"nowrap"}}>
+                    <button className="ghost" style={{padding:"4px 9px",fontSize:11.5,marginRight:5}} onClick={()=>onOpenChart(w)}>チャート</button>
+                    <button className={inAnalysis?"btn primary":"ghost"} style={{padding:"4px 9px",fontSize:11.5,marginRight:5}} onClick={()=>onToggleAnalysis(w.code)}>{inAnalysis?"✓ 分析中":"分析"}</button>
+                    <button className="iconbtn" onClick={()=>delStock(w.id)}>×</button>
+                  </td>
+                </tr>;})}</tbody>
+            </table></div>}
+          </div>;
+        })}
+    </div>
+  </div>;
+}
+
+const MAX_US=50; // 6-1章：アメリカ市場タブの登録上限（ダウ30 + 手動追加の余地）
+
 function App(){
   const [s,setS]=useState(()=>loadState()||emptyState());
   const [tab,setTab]=useState("briefing");
-  const [q,setQ]=useState("");
-  const [secFilter,setSecFilter]=useState("すべて");
-  const [sel,setSel]=useState(null);
-  const [chartSym,setChartSym]=useState("INDEX:NKY");
+  const [newsSubTab,setNewsSubTab]=useState("summary"); // 9-1章：ニュースタブのサブ切り替え
+  const [chartModal,setChartModal]=useState(null); // {symbol,name} 5章：登録銘柄行の「チャート」ボタン用モーダル
   const [cBB,setCBB]=useState(true),[cRSI,setCRSI]=useState(true),[cMA,setCMA]=useState(false);
+  const [snsHandle,setSnsHandle]=useState(SNS_ACCOUNTS[0]); // 6-2章：SNSタブで選択中のXアカウント
+  const [openMetrics,setOpenMetrics]=useState(()=>new Set()); // 8章：日次モニターでチャートを開いている項目
   const fileRef=useRef();
-  const chartRef=useRef();
+  const modalChartRef=useRef();
+  const snsRef=useRef();
+  const metricRefs=useRef({});
   const [fetching,setFetching]=useState(false);
   const [fetchMsg,setFetchMsg]=useState("");
 
@@ -232,7 +674,8 @@ function App(){
         Object.entries(qd.quotes||{}).forEach(([k,v])=>{
           if(nm[k]!=null&&v){nm[k]={...nm[k],
             t:(v.t!=null?String(v.t):nm[k].t),
-            p:(v.p!=null?String(v.p):nm[k].p)};}
+            p:(v.p!=null?String(v.p):nm[k].p),
+            spark:(Array.isArray(v.spark)?v.spark:nm[k].spark)};}
         });
         return {...p,metrics:nm};});
       setFetchMsg((qd.fetchedAt||"")+" 数値を反映。登録銘柄を取得中…");
@@ -242,20 +685,42 @@ function App(){
       return;
     }
     try{
-      // (2) 登録銘柄の現在値・前日比・高値/安値
+      // (2) 登録銘柄の現在値・前日比・高値/安値（日本市場・アメリカ市場それぞれ取得し、同じstockQuotesに統合）
       const sr=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlist)});
       if(sr.ok){const sd=await sr.json();
         setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sd.quotes||{})}}));}
+      setFetchMsg("日本株を反映。アメリカ株を取得中…");
+    }catch(e){}
+    try{
+      const sru=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlistUS)});
+      if(sru.ok){const sdu=await sru.json();
+        setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sdu.quotes||{})}}));}
       setFetchMsg("登録銘柄を反映。ニュース取得中…");
     }catch(e){}
     try{
-      // (3) ニュース（今の登録銘柄をサーバーへ送って取得）
+      // (3) ニュース（日本市場の登録銘柄＋マクロ）
       const nr=await fetch("/api/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlist)});
       if(nr.ok){const nd=await nr.json();
         setS(p=>({...p,
           stockNewsList:Array.isArray(nd.stockNews)?nd.stockNews:p.stockNewsList,
           macroNewsList:Array.isArray(nd.macroNews)?nd.macroNews:p.macroNewsList,
+          macroNewsDomestic:Array.isArray(nd.macroNewsDomestic)?nd.macroNewsDomestic:p.macroNewsDomestic,
+          macroNewsOverseas:Array.isArray(nd.macroNewsOverseas)?nd.macroNewsOverseas:p.macroNewsOverseas,
           stockNews:nd.stockNewsText||p.stockNews,marketNews:nd.macroNewsText||p.marketNews}));}
+    }catch(e){}
+    try{
+      // (4) ニュース（6-1章：アメリカ市場＝ダウ30の登録銘柄向け）
+      const nru=await fetch("/api/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlistUS)});
+      if(nru.ok){const ndu=await nru.json();
+        setS(p=>({...p,usStockNewsList:Array.isArray(ndu.stockNews)?ndu.stockNews:p.usStockNewsList}));}
+    }catch(e){}
+    try{
+      // (5) 分析タブ対象銘柄（12-1章：株価・指標データの更新に合わせて再計算）
+      if(s.analysisTargets.length){
+        setFetchMsg("分析データを再計算中…");
+        const items=s.analysisTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean);
+        await fetchAnalysisFor(items);
+      }
     }catch(e){}
     const now=new Date();
     setFetchMsg(`${now.getHours()}:${String(now.getMinutes()).padStart(2,"0")} 取得完了`);
@@ -264,42 +729,72 @@ function App(){
 
   const set=(patch)=>setS(p=>({...p,...patch}));
   const setMetric=(k,f,v)=>setS(p=>({...p,metrics:{...p.metrics,[k]:{...p.metrics[k],[f]:v}}}));
-  const setHeatV=(sec,f,v)=>setS(p=>({...p,sectorHeat:{...p.sectorHeat,[sec]:{...p.sectorHeat[sec],[f]:v}}}));
+  const setWatchlistJP=(wl)=>set({watchlist:wl});
+  const setWatchlistUS=(wl)=>set({watchlistUS:wl});
+  const masterJP=useMemo(()=>MASTER.filter(m=>m.market==="JP"||m.market==="IDX"),[]);
+  const masterUS=useMemo(()=>MASTER.filter(m=>m.market==="US"),[]);
+
+  // 12章：分析タブの対象銘柄（日本市場・アメリカ市場どちらの登録銘柄からも追加され得る）
+  const allWatch=useMemo(()=>[...s.watchlist,...s.watchlistUS],[s.watchlist,s.watchlistUS]);
+  const analysisItems=useMemo(()=>s.analysisTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean),[s.analysisTargets,allWatch]);
+  const [analyzing,setAnalyzing]=useState(false);
+  const fetchAnalysisFor=async(items)=>{
+    if(!items||!items.length)return;
+    setAnalyzing(true);
+    try{
+      const ar=await fetch("/api/analysis",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(items)});
+      if(ar.ok){const ad=await ar.json();setS(p=>({...p,analysisData:{...p.analysisData,...(ad.analysis||{})}}));}
+    }catch(e){}
+    setAnalyzing(false);
+  };
+  // 銘柄追加時：analysisDataにまだ結果がない対象銘柄だけを取得する
+  useEffect(()=>{
+    const missing=analysisItems.filter(w=>!s.analysisData[w.code]);
+    if(missing.length)fetchAnalysisFor(missing);
+  },[s.analysisTargets]);
+
+  // 10-3章：テーマ画面で銘柄を開いた時、登録銘柄かどうかに関わらずその場で現在値・前日比・スパークラインを取得する
+  const fetchThemeQuotes=async(codes)=>{
+    const missing=codes.filter(c=>!s.stockQuotes[c]).map(c=>MASTER_BY_CODE[c]).filter(Boolean);
+    if(!missing.length)return;
+    try{
+      const tr=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(missing)});
+      if(tr.ok){const td=await tr.json();setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(td.quotes||{})}}));}
+    }catch(e){}
+  };
 
   const day=useMemo(()=>{const d=new Date(s.date+"T00:00:00");return isNaN(d)?null:d.getDay();},[s.date]);
   const isMonday=day===1;
 
-  const regCodes=useMemo(()=>new Set(s.watchlist.map(w=>w.code)),[s.watchlist]);
-  const results=useMemo(()=>{const t=q.trim().toLowerCase();if(!t)return[];
-    return MASTER.filter(m=>!regCodes.has(m.code)&&(m.code.toLowerCase().includes(t)||m.name.toLowerCase().includes(t)||m.sector.toLowerCase().includes(t))).slice(0,8);},[q,regCodes]);
-  const addStock=(m)=>{if(s.watchlist.length>=MAX){alert("登録は最大"+MAX+"社までです。");return;}
-    if(regCodes.has(m.code))return; set({watchlist:[...s.watchlist,{id:Date.now()+Math.random(),...m,watch:"通常",note:""}]});setQ("");};
-  const addManual=()=>{
-    const raw=q.trim();if(!raw)return;if(s.watchlist.length>=MAX){alert("最大"+MAX+"社");return;}
-    let code=raw,name=raw;
-    if(!/^[0-9]{4}[0-9A-Za-z]?$/.test(raw)){
-      const input=prompt(`「${raw}」の証券コード（4桁、例：5016）を入力してください`,"");
-      if(!input||!input.trim())return;
-      code=input.trim();
-    }
-    set({watchlist:[...s.watchlist,{id:Date.now()+Math.random(),code,name,sector:"未分類",market:"JP",tvSymbol:"TSE:"+code,watch:"通常",note:""}]});setQ("");};
-  const setStock=(id,patch)=>set({watchlist:s.watchlist.map(w=>w.id===id?{...w,...patch}:w)});
-  const delStock=(id)=>set({watchlist:s.watchlist.filter(w=>w.id!==id)});
+  // 9-1章：「サマリー」の中身の方針。既存に該当機能がなかったため新規に決定：
+  // (1) 重大ニュース（9-2章の判定に該当）を全カテゴリから最優先で集約し、(2) 残り枠を
+  // 適時開示・国内市況・海外市況からバランスよく抜粋する。重複URLは除外する。
+  const newsSummary=useMemo(()=>{
+    const seen=new Set();
+    const push=(arr,list)=>{for(const it of list){if(!it.url||seen.has(it.url))continue;seen.add(it.url);arr.push(it);}};
+    const important=[];push(important,[...s.stockNewsList,...s.macroNewsDomestic,...s.macroNewsOverseas].filter(it=>isImportantNews(it.title)));
+    const rest=[];
+    push(rest,s.stockNewsList.slice(0,4));
+    push(rest,s.macroNewsDomestic.slice(0,4));
+    push(rest,s.macroNewsOverseas.slice(0,4));
+    return [...important,...rest];
+  },[s.stockNewsList,s.macroNewsDomestic,s.macroNewsOverseas]);
 
-  const sectorsList=useMemo(()=>["すべて",...Array.from(new Set(s.watchlist.map(w=>w.sector)))],[s.watchlist]);
-  const shown=useMemo(()=>{const list=secFilter==="すべて"?s.watchlist:s.watchlist.filter(w=>w.sector===secFilter);
-    return [...list].sort((a,b)=>(wOrder[a.watch]-wOrder[b.watch])||a.code.localeCompare(b.code));},[s.watchlist,secFilter]);
+  // 10-5章：ページ最上部の重要ニュース通知バナー用（全カテゴリを対象に件数を集計）
+  const importantNewsAll=useMemo(()=>{
+    const seen=new Set();const out=[];
+    [...s.stockNewsList,...s.usStockNewsList,...s.macroNewsDomestic,...s.macroNewsOverseas].forEach(it=>{
+      if(isImportantNews(it.title)&&it.url&&!seen.has(it.url)){seen.add(it.url);out.push(it);}
+    });
+    return out;
+  },[s.stockNewsList,s.usStockNewsList,s.macroNewsDomestic,s.macroNewsOverseas]);
 
-  const analysisSectors=useMemo(()=>{const map={};s.watchlist.forEach(w=>{(map[w.sector]=map[w.sector]||[]).push(w);});
-    return Object.entries(map).map(([sector,items])=>({sector,items,chg:num(s.sectorHeat[sector]?.chg)}))
-      .sort((a,b)=>(b.chg??-999)-(a.chg??-999));},[s.watchlist,s.sectorHeat]);
+  // 5章：「分析」ボタン。押すたびに分析タブ（12章）の対象銘柄リストに追加/削除をトグルする
+  const toggleAnalysisTarget=(code)=>setS(p=>({...p,analysisTargets:p.analysisTargets.includes(code)
+    ?p.analysisTargets.filter(c=>c!==code):[...p.analysisTargets,code]}));
 
-  const getA=(code)=>s.analysis[code]||emptyAnalysis();
-  const patchA=(code,section,patch)=>setS(p=>{const a=p.analysis[code]||emptyAnalysis();return {...p,analysis:{...p.analysis,[code]:{...a,[section]:{...a[section],...patch}}}};});
-  const toggleSig=(code,id)=>setS(p=>{const a=p.analysis[code]||emptyAnalysis();return {...p,analysis:{...p.analysis,[code]:{...a,signals:{...a.signals,[id]:!a.signals[id]}}}};});
-
-  const rollToNextDay=()=>{if(!confirm("今日の値を前日値へ繰り越し、新しい一日にします（登録銘柄・分析は保持）。よろしいですか？"))return;
-    setS(p=>({...emptyState(),date:todayISO(),watchlist:p.watchlist,sectorHeat:p.sectorHeat,analysis:p.analysis,
+  const rollToNextDay=()=>{if(!confirm("今日の値を前日値へ繰り越し、新しい一日にします（登録銘柄・分析対象銘柄は保持）。よろしいですか？"))return;
+    setS(p=>({...emptyState(),date:todayISO(),watchlist:p.watchlist,watchlistUS:p.watchlistUS,analysisTargets:p.analysisTargets,
       metrics:Object.fromEntries(Object.entries(p.metrics).map(([k,v])=>[k,{t:"",p:v.t}]))}));};
   const exportJSON=()=>{const blob=new Blob([JSON.stringify(s,null,2)],{type:"application/json"});
     const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="trade-cockpit-"+s.date+".json";a.click();URL.revokeObjectURL(url);};
@@ -309,16 +804,44 @@ function App(){
   // 日本の個別株（TSE:xxxx）は無料の埋め込みウィジェットでは表示不可（東証データの再配信制限）。
   const embeddable=(sym)=>!/^TSE:/i.test(sym||"");
 
-  // TradingView chart
-  useEffect(()=>{if(tab!=="chart"||!embeddable(chartSym))return;const c=chartRef.current;if(!c)return;
+  // 5章：登録銘柄行の「チャート」ボタンから開くモーダル用チャート（6章でタブ内チャートは廃止、モーダルのみ）
+  useEffect(()=>{if(!chartModal||!embeddable(chartModal.symbol))return;const c=modalChartRef.current;if(!c)return;
     c.innerHTML='<div class="tradingview-widget-container__widget"></div>';
     const studies=[];if(cBB)studies.push("BB@tv-basicstudies");if(cRSI)studies.push("RSI@tv-basicstudies");if(cMA)studies.push("MASimple@tv-basicstudies");
     const sc=document.createElement("script");sc.src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js";sc.async=true;
-    sc.innerHTML=JSON.stringify({symbol:chartSym,interval:"D",timezone:"Asia/Tokyo",theme:"light",style:"1",locale:"ja",studies,width:"100%",height:540,allow_symbol_change:true});
-    c.appendChild(sc);},[tab,chartSym,cBB,cRSI,cMA]);
+    sc.innerHTML=JSON.stringify({symbol:chartModal.symbol,interval:"D",timezone:"Asia/Tokyo",theme:"light",style:"1",locale:"ja",studies,width:"100%",height:480,allow_symbol_change:false});
+    c.appendChild(sc);},[chartModal,cBB,cRSI,cMA]);
+
+  // 6-2章：X公式の埋め込みタイムラインスクリプトを一度だけ読み込む（無料枠。有料APIは不使用）
+  const loadTwitterWidgets=()=>new Promise(resolve=>{
+    if(window.twttr&&window.twttr.widgets){resolve(window.twttr);return;}
+    const existing=document.getElementById("twitter-wjs");
+    if(existing){existing.addEventListener("load",()=>resolve(window.twttr));return;}
+    const sc=document.createElement("script");
+    sc.id="twitter-wjs";sc.src="https://platform.twitter.com/widgets.js";sc.async=true;
+    sc.onload=()=>resolve(window.twttr);
+    document.body.appendChild(sc);
+  });
+  useEffect(()=>{if(tab!=="sns")return;const c=snsRef.current;if(!c)return;
+    c.innerHTML=`<a class="twitter-timeline" data-height="600" data-theme="light" href="https://twitter.com/${snsHandle}?ref_src=twsrc%5Etfw">Tweets by @${snsHandle}</a>`;
+    loadTwitterWidgets().then(twttr=>{if(twttr&&twttr.widgets)twttr.widgets.load(c);});
+  },[tab,snsHandle]);
 
   const openTV=(tv)=>{if(tv)window.open("https://jp.tradingview.com/chart/?symbol="+encodeURIComponent(tv),"_blank");};
-  const jp=s.watchlist.filter(w=>w.market==="JP").length, us=s.watchlist.filter(w=>w.market==="US").length;
+
+  // 8章：日次モニターの項目クリックでチャートをトグル開閉
+  const toggleMetric=(key)=>setOpenMetrics(prev=>{const n=new Set(prev);n.has(key)?n.delete(key):n.add(key);return n;});
+  const openMetricsKey=useMemo(()=>[...openMetrics].sort().join(","),[openMetrics]);
+  useEffect(()=>{
+    METRICS.forEach(m=>{
+      if(!openMetrics.has(m.key)||!m.tvEmbed)return;
+      const c=metricRefs.current[m.key];if(!c)return;
+      c.innerHTML='<div class="tradingview-widget-container__widget"></div>';
+      const sc=document.createElement("script");sc.src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js";sc.async=true;
+      sc.innerHTML=JSON.stringify({symbol:m.tv,interval:"D",timezone:"Asia/Tokyo",theme:"light",style:"1",locale:"ja",studies:[],width:"100%",height:320,allow_symbol_change:false});
+      c.appendChild(sc);
+    });
+  },[openMetricsKey]);
 
   return (
     <div className="wrap">
@@ -334,64 +857,34 @@ function App(){
         </div>
       </div>
 
-      <div className="tabs">
-        <button className={"tab"+(tab==="briefing"?" on":"")} onClick={()=>setTab("briefing")}>ブリーフィング</button>
-        <button className={"tab"+(tab==="news"?" on":"")} onClick={()=>setTab("news")}>ニュース</button>
-        <button className={"tab"+(tab==="analysis"?" on":"")} onClick={()=>{setTab("analysis");setSel(null);}}>分析</button>
-        <button className={"tab"+(tab==="chart"?" on":"")} onClick={()=>setTab("chart")}>チャート</button>
+      {/* 10-5章：重要ニュース通知バナー（ページ最上部に常設、オン/オフ切り替え可） */}
+      <div className="notify-bar" style={{marginTop:14}}>
+        <span style={{fontSize:12.5,fontWeight:700}}>
+          {s.notifyEnabled
+            ? (importantNewsAll.length ? `⚠ 重要ニュース ${importantNewsAll.length}件（「ニュース」タブで確認）` : "重要ニュース通知：オン（該当ニュースなし）")
+            : "重要ニュース通知：オフ"}
+        </span>
+        <label style={{display:"flex",alignItems:"center",gap:6,fontSize:12,cursor:"pointer"}}>
+          <input type="checkbox" checked={s.notifyEnabled} onChange={e=>set({notifyEnabled:e.target.checked})}/>通知を有効にする
+        </label>
       </div>
 
-      {/* ===== BRIEFING ===== */}
+      {/* タブ並び順（6章）：ニュース→アメリカ市場(6-1)→SNS(6-2)→日本市場→分析(12章)。
+          テーマ(10-3章)は6章の並びに含まれない追加画面のため末尾に配置。 */}
+      <div className="tabs">
+        <button className={"tab"+(tab==="news"?" on":"")} onClick={()=>setTab("news")}>ニュース</button>
+        <button className={"tab"+(tab==="us"?" on":"")} onClick={()=>setTab("us")}>アメリカ市場</button>
+        <button className={"tab"+(tab==="sns"?" on":"")} onClick={()=>setTab("sns")}>SNS</button>
+        <button className={"tab"+(tab==="briefing"?" on":"")} onClick={()=>setTab("briefing")}>日本市場</button>
+        <button className={"tab"+(tab==="analysis"?" on":"")} onClick={()=>setTab("analysis")}>分析</button>
+        <button className={"tab"+(tab==="theme"?" on":"")} onClick={()=>setTab("theme")}>テーマ</button>
+      </div>
+
+      {/* ===== BRIEFING（日本市場） ===== */}
       {tab==="briefing" && <div>
-        <div style={{marginTop:18}}>
-          <div className="sec-head">登録銘柄　{s.watchlist.length}/{MAX}</div>
-          <div className="sec-note">日本株 {jp} ・ 米国株 {us} ・ 指数/為替 {s.watchlist.length-jp-us}（全タブ共通・自動保存）</div>
-          <div style={{position:"relative"}}>
-            <div style={{display:"flex",alignItems:"center",gap:8,border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,padding:"8px 12px"}}>
-              <input value={q} onChange={e=>setQ(e.target.value)} placeholder="銘柄コード・企業名・セクターで検索（例：6981、村田、半導体、NVDA）"
-                style={{flex:1,border:"none",background:"transparent",outline:"none",fontSize:14}}/>
-              {q && <button className="iconbtn" onClick={()=>setQ("")}>×</button>}
-            </div>
-            {q.trim() && <div className="results">
-              {results.map(m=>
-                <button key={m.code} className="res-row" onClick={()=>addStock(m)}>
-                  <span className="mono" style={{fontSize:12,width:60,color:"var(--inkSoft)"}}>{m.code}</span>
-                  <span style={{flex:1,fontSize:13}}>{m.name}</span>
-                  <span style={{fontSize:11,color:"var(--inkSoft)"}}>{m.sector}</span>
-                  <span style={{color:"var(--accent)",fontWeight:700}}>＋</span>
-                </button>)}
-              <button className="res-row" style={{background:"var(--band)",fontSize:12.5,color:"var(--inkSoft)"}} onClick={addManual}>＋ リストにない「{q.trim()}」を手動登録</button>
-            </div>}
-          </div>
-          {s.watchlist.length>0 && <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:12}}>
-            {sectorsList.map(sec=><button key={sec} className={"chip"+(secFilter===sec?" on":"")} onClick={()=>setSecFilter(sec)}>{sec}</button>)}
-          </div>}
-          <div style={{marginTop:12,border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,overflow:"hidden"}}>
-            {shown.length===0 ?
-              <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13}}>{s.watchlist.length===0?"上の検索から銘柄を登録してください（最大50社）。":"このセクターの銘柄はありません。"}</div> :
-              <div style={{overflowX:"auto"}}><table style={{minWidth:760}}>
-                <thead><tr style={{background:"var(--band)"}}><th>注目度</th><th>コード</th><th>銘柄</th><th>セクター</th><th>現在値</th><th>前日比</th><th>高値</th><th>安値</th><th></th></tr></thead>
-                <tbody>{shown.map(w=>{
-                  const qt=s.stockQuotes[w.code]||{};
-                  const ct=num(qt.t),cp=num(qt.p),chi=num(qt.high),clo=num(qt.low);
-                  const delta=ct!=null&&cp!=null?ct-cp:null;
-                  const pct=delta!=null&&cp?delta/cp*100:null;
-                  const rowBg=delta==null||delta===0?"transparent":delta>0?"var(--upBg)":"var(--downBg)";
-                  const numCol=delta==null?"var(--inkSoft)":delta>0?"var(--up)":delta<0?"var(--down)":"var(--inkSoft)";
-                  return <tr key={w.id} style={{borderTop:"1px solid var(--ruleSoft)",background:rowBg}}>
-                    <td><select value={w.watch} onChange={e=>setStock(w.id,{watch:e.target.value})} style={{fontSize:12,padding:"4px 6px",color:wc(w.watch),fontWeight:w.watch==="優先"?700:400}}>{WATCH.map(x=><option key={x} value={x}>{x}</option>)}</select></td>
-                    <td className="mono" style={{fontWeight:700}}>{w.code}</td>
-                    <td>{w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
-                    <td style={{color:"var(--inkSoft)"}}>{w.sector}</td>
-                    <td className="mono" style={{fontWeight:700,color:numCol,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
-                    <td className="mono" style={{color:numCol,whiteSpace:"nowrap"}}>{delta!=null?(delta>0?"+":"")+delta.toLocaleString(undefined,{maximumFractionDigits:2})+(pct!=null?` (${pct>0?"+":""}${pct.toFixed(2)}%)`:""):"—"}</td>
-                    <td className="mono" style={{color:"var(--inkSoft)",whiteSpace:"nowrap"}}>{chi!=null?chi.toLocaleString():"—"}</td>
-                    <td className="mono" style={{color:"var(--inkSoft)",whiteSpace:"nowrap"}}>{clo!=null?clo.toLocaleString():"—"}</td>
-                    <td style={{textAlign:"center"}}><button className="iconbtn" onClick={()=>delStock(w.id)}>×</button></td>
-                  </tr>;})}</tbody>
-              </table></div>}
-          </div>
-        </div>
+        <SectorWatchlist market="JP" watchlist={s.watchlist} setWatchlist={setWatchlistJP} candidates={masterJP} max={MAX}
+          stockQuotes={s.stockQuotes} analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
+          onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name})}/>
 
         <div style={{marginTop:22}}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
@@ -402,166 +895,174 @@ function App(){
             </div>
           </div>
           <div className="sec-note">「リアルタイムデータを反映」を押すたびに、ドル円・日経平均・ダウ・ナスダック・SOX・米10年債・S&P500・KOSPI・日経225先物・NYダウ先物・WTI原油・金・銅 を今日値／前日値ともに取得します（数値は遅延あり）。</div>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:1,background:"var(--rule)",border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden"}}>
+          <div className="sec-note" style={{marginTop:-4}}>項目をクリックするとリアルタイムチャートが下に開きます。</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:1,background:"var(--rule)",border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden"}}>
             {METRICS.map(m=>{const v=s.metrics[m.key];const t=num(v.t),p=num(v.p);
               const delta=t!=null&&p!=null?t-p:null;const dCol=delta==null?"var(--inkSoft)":delta>0?"var(--up)":delta<0?"var(--down)":"var(--inkSoft)";
+              const sparkColor=delta==null||delta===0?"#9aa093":(delta>0?UP_BASE:DOWN_BASE);
               const condOn=m.cond&&t!=null&&m.cond(t);
               const cardBg=condOn?"#EAF0EC":delta>0?"var(--upBg)":delta<0?"var(--downBg)":"var(--card)";
-              return <div key={m.key} style={{background:cardBg,padding:"11px 13px"}}>
-                <div style={{fontSize:11,color:"var(--inkSoft)",display:"flex",justifyContent:"space-between"}}><span>{m.label}</span>{condOn&&<span className="mono" style={{fontSize:10,color:"var(--gain)",fontWeight:700}}>条件○</span>}</div>
-                <div style={{display:"flex",alignItems:"baseline",gap:7,marginTop:3}}>
-                  <span className="mono" style={{fontSize:21,fontWeight:700}}>{t!=null?t.toFixed(m.dp):"—"}</span>
-                  {delta!=null&&<span className="mono" style={{fontSize:12,color:dCol}}>{delta>0?"▲":delta<0?"▼":""}{delta>0?"+":""}{delta.toFixed(m.dp)}</span>}
-                </div>
-                <div style={{marginTop:7,fontSize:12,color:"var(--inkSoft)"}}>前日 <span className="mono">{p!=null?p.toFixed(m.dp):"—"}</span></div>
-              </div>;})}
+              const isOpen=openMetrics.has(m.key);
+              return <React.Fragment key={m.key}>
+                <button onClick={()=>toggleMetric(m.key)} style={{width:"100%",background:cardBg,padding:"11px 13px",border:"none",textAlign:"left",cursor:"pointer",font:"inherit",color:"var(--ink)"}}>
+                  <div style={{fontSize:11,color:"var(--inkSoft)",display:"flex",justifyContent:"space-between"}}><span>{m.label}</span>{condOn&&<span className="mono" style={{fontSize:10,color:"var(--gain)",fontWeight:700}}>条件○</span>}</div>
+                  <div style={{display:"flex",alignItems:"baseline",gap:7,marginTop:3}}>
+                    <span className="mono" style={{fontSize:21,fontWeight:700}}>{t!=null?t.toFixed(m.dp):"—"}</span>
+                    {delta!=null&&<span className="mono" style={{fontSize:12,color:dCol}}>{delta>0?"▲":delta<0?"▼":""}{delta>0?"+":""}{delta.toFixed(m.dp)}</span>}
+                  </div>
+                  <div style={{marginTop:7,fontSize:12,color:"var(--inkSoft)"}}>前日 <span className="mono">{p!=null?p.toFixed(m.dp):"—"}</span></div>
+                  <div style={{marginTop:8}}><Sparkline data={v.spark} color={sparkColor}/></div>
+                </button>
+                {isOpen && <div style={{gridColumn:"1 / -1",background:"var(--card)",padding:12}}>
+                  {m.tvEmbed
+                    ? <div ref={el=>metricRefs.current[m.key]=el} style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",background:"var(--card)",minHeight:324}}></div>
+                    : <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10,padding:"8px 4px"}}>
+                        <span style={{fontSize:12.5,color:"var(--inkSoft)"}}>{m.label}は無料埋め込みでは表示できないシンボルです。</span>
+                        <button className="btn primary" onClick={()=>openTV(m.tv)}>↗ TradingViewで開く</button>
+                      </div>}
+                </div>}
+              </React.Fragment>;})}
           </div>
         </div>
 
-        <div className="grid" style={{gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",marginTop:20}}>
-          <div className="card"><div className="card-hd"><div className="card-t">市況メモ</div><div className="card-n">{isMonday?"月曜：サンデーダウ欄あり":"数値の補足・気配"}</div></div>
-            <div className="lbl">米国市場（内訳・コメント）</div><textarea rows={2} value={s.usMarketNote} onChange={e=>set({usMarketNote:e.target.value})} placeholder="ダウ/Nasdaq/S&P、SOX、セクターの強弱など"/>
-            <div className="lbl">ADR・PTS</div><input style={{width:"100%"}} value={s.adrPts} onChange={e=>set({adrPts:e.target.value})} placeholder="主要銘柄のADR乖離・PTS気配"/>
-            {isMonday&&<div><div className="lbl">サンデーダウ</div><input style={{width:"100%",borderColor:"var(--accent)"}} value={s.sundayDow} onChange={e=>set({sundayDow:e.target.value})} placeholder="週明けの先行き・先物"/></div>}
-          </div>
-          <div className="card"><div className="card-hd"><div className="card-t">地合い・テーマ</div><div className="card-n">前日強かったセクター / 今日の注目テーマ</div></div>
-            <div className="lbl">前日強かった日米セクター</div><textarea rows={2} value={s.strongSectors} onChange={e=>set({strongSectors:e.target.value})} placeholder="例）半導体、SaaS、海運…"/>
-            <div className="lbl">今日の注目テーマ</div><textarea rows={2} value={s.themes} onChange={e=>set({themes:e.target.value})} placeholder="日本市場で今日意識されるテーマ"/>
-          </div>
-        </div>
-        <div className="card" style={{marginTop:16}}><div className="card-hd"><div className="card-t">今朝のブリーフィング</div><div className="card-n">Claude と相談した内容をここに貼り付け</div></div>
-          <textarea rows={6} value={s.briefing} onChange={e=>set({briefing:e.target.value})} placeholder="米国市場・注目テーマ・優先順位など、毎朝の相談結果をメモ" style={{minHeight:120}}/></div>
         <p className="foot">※ 「リアルタイムデータを反映」は、start.bat で起動したローカルサーバー経由で取得します。数値は遅延あり（前営業日終値〜数十分遅れ）でリアルタイムの板ではありません。<br/>※ ニュースはGoogleニュースRSSを利用しています。売買を推奨するものではなく、最終判断はご自身で。</p>
       </div>}
 
-      {/* ===== NEWS ===== */}
-      {tab==="news" && <div style={{marginTop:18}}>
-        <div className="sec-head">ニュース</div>
-        <div className="sec-note">ブリーフィングの「リアルタイムデータを反映」を押すと、登録銘柄とマクロのニュースがGoogleニュースRSSから取得されます。見出しをクリックすると元記事が開きます。</div>
-        <div className="grid" style={{gridTemplateColumns:"repeat(auto-fit,minmax(320px,1fr))",marginTop:12}}>
-          <div className="card" style={{padding:"14px 16px 6px"}}><div className="card-hd"><div className="card-t">登録銘柄のニュース</div><div className="card-n">決算・月次・材料</div></div>
-            <NewsList items={s.stockNewsList} showName/></div>
-          <div className="card" style={{padding:"14px 16px 6px"}}><div className="card-hd"><div className="card-t">マクロ・大きなニュース</div><div className="card-n">戦争・利上げ・経済指標・日銀/FRB</div></div>
-            <NewsList items={s.macroNewsList}/></div>
+      {/* ===== US（アメリカ市場・6-1章） ===== */}
+      {tab==="us" && <div>
+        <SectorWatchlist market="US" watchlist={s.watchlistUS} setWatchlist={setWatchlistUS} candidates={masterUS} max={MAX_US}
+          stockQuotes={s.stockQuotes} analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
+          onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name})}/>
+        <div style={{marginTop:22}}>
+          <div className="sec-head">ニュース・決算・IR（ダウ平均構成30社）</div>
+          <div className="sec-note">「日本市場」タブの「リアルタイムデータを反映」を押すと、この一覧も同時に更新されます。決算関連のクエリを含めて取得しており、9章でニュースタブ全体のIR・適時開示フィルタを整備する際にあわせて精度を見直します。</div>
+          <div className="card" style={{padding:"14px 16px 6px",marginTop:10}}>
+            <NewsList items={s.usStockNewsList} showName/>
+          </div>
         </div>
+        <p className="foot" style={{marginTop:16}}>※ 対象は現行のダウ工業株30種平均構成銘柄。業種分類は日本市場と同じ東証33業種の枠組みで統一しています（GICSセクターではありません）。</p>
       </div>}
 
-      {/* ===== ANALYSIS ===== */}
-      {tab==="analysis" && !sel && <div style={{marginTop:18}}>
-        <div className="sec-head">盛り上がりセクター</div>
-        <div className="sec-note">値上がり率（%）を入れると盛り上がり順に並びます（半自動）。銘柄クリックで分析へ。</div>
-        <div style={{display:"flex",flexDirection:"column",gap:12}}>
-          {analysisSectors.map(({sector,items,chg})=>
-            <div key={sector} style={{border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,overflow:"hidden"}}>
-              <div style={{display:"flex",alignItems:"center",gap:12,padding:"10px 14px",background:chg!=null&&chg>=3?"#EAF0EC":"var(--band)",flexWrap:"wrap"}}>
-                <div style={{display:"flex",alignItems:"center",gap:7,minWidth:140}}>
-                  {chg!=null&&chg>=3&&<span style={{color:"var(--loss)",fontWeight:700,fontSize:11}}>HOT</span>}
-                  <span style={{fontSize:15,fontWeight:700}}>{sector}</span><span style={{fontSize:11,color:"var(--inkSoft)"}}>{items.length}銘柄</span>
-                </div>
-                <div style={{display:"flex",alignItems:"center",gap:6}}>
-                  <span style={{fontSize:11,color:"var(--inkSoft)"}}>値上がり率</span>
-                  <input className="mono" value={s.sectorHeat[sector]?.chg||""} onChange={e=>setHeatV(sector,"chg",e.target.value)} placeholder="%" inputMode="decimal" style={{width:64,textAlign:"right",fontSize:13}}/>
-                  <span className="mono" style={{fontSize:14,fontWeight:700,color:chg==null?"var(--inkSoft)":chg>=0?"var(--gain)":"var(--loss)"}}>{chg!=null?(chg>0?"+":"")+chg+"%":""}</span>
-                </div>
-                <input value={s.sectorHeat[sector]?.vol||""} onChange={e=>setHeatV(sector,"vol",e.target.value)} placeholder="出来高メモ" style={{width:150,fontSize:13}}/>
-              </div>
-              <div style={{display:"flex",flexWrap:"wrap",gap:8,padding:"12px 14px"}}>
-                {[...items].sort((a,b)=>wOrder[a.watch]-wOrder[b.watch]).map(w=>{
-                  const a=s.analysis[w.code];const has=a&&(Object.values(a.signals||{}).some(Boolean)||a.fund?.forecast);
-                  return <button key={w.code} onClick={()=>setSel(w.code)} style={{display:"flex",alignItems:"center",gap:7,border:"1px solid "+(w.watch==="優先"?"var(--star)":"var(--rule)"),background:"var(--paperAlt)",borderRadius:6,padding:"7px 11px",cursor:"pointer",fontSize:13}}>
-                    <span className="mono" style={{fontSize:11,color:"var(--inkSoft)"}}>{w.code}</span><span>{w.name}</span>
-                    <span style={{color:has?"var(--gain)":"var(--rule)",fontSize:12}}>{has?"●":"○"}</span></button>;})}
-              </div>
-            </div>)}
-          {analysisSectors.length===0 && <div style={{padding:30,textAlign:"center",color:"var(--inkSoft)"}}>ブリーフィングタブで銘柄を登録してください。</div>}
+      {/* ===== SNS（6-2章） ===== */}
+      {tab==="sns" && <div style={{marginTop:18}}>
+        <div className="sec-head">SNS</div>
+        <div className="sec-note">指定10アカウントの投稿をX公式の埋め込みタイムラインで表示します（無料枠。有料APIは不使用のため複数アカウントを1本に統合した時系列表示はできません）。アカウントを選んで切り替えてください。</div>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",margin:"12px 0"}}>
+          {SNS_ACCOUNTS.map(h=><button key={h} className={"chip"+(snsHandle===h?" on":"")} onClick={()=>setSnsHandle(h)}>@{h}</button>)}
         </div>
+        <div style={{border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)",minHeight:420,padding:"4px 8px"}}>
+          <div key={snsHandle} ref={snsRef}></div>
+        </div>
+        <p className="foot">※ 表示件数はXの仕様により直近20件程度に限られます。鍵アカウントの投稿は表示できません。<br/>※ 有料のX APIを契約すれば複数アカウント統合タイムラインも実装できますが、従量課金（読み取り$0.005/件、無料枠なし）のため今回は見送っています。必要であればご相談ください。</p>
       </div>}
 
-      {tab==="analysis" && sel && (()=>{
-        const w=s.watchlist.find(x=>x.code===sel);if(!w)return null;const a=getA(sel);
-        const buyN=SIGNALS.buy.filter(x=>a.signals[x.id]).length,sellN=SIGNALS.sell.filter(x=>a.signals[x.id]).length,watchN=SIGNALS.watch.filter(x=>a.signals[x.id]).length;
-        const roe=num(a.fund.roe),fcf=num(a.fund.fcf);
-        const fScore=[roe!=null&&roe>=10,fcf!=null&&fcf>0,a.fund.forecast==="増収増益"||a.fund.forecast==="減収増益",a.fund.analyst==="強気"||a.fund.analyst==="やや強気"];
-        const fN=fScore.filter(Boolean).length;
-        const sigRow=(x,color)=><button key={x.id} onClick={()=>toggleSig(sel,x.id)} style={{display:"flex",width:"100%",alignItems:"center",gap:9,padding:"7px 4px",background:"transparent",border:"none",borderTop:"1px solid var(--ruleSoft)",cursor:"pointer",textAlign:"left"}}>
-          <span style={{width:18,height:18,flexShrink:0,borderRadius:4,border:"1px solid "+(a.signals[x.id]?color:"var(--rule)"),background:a.signals[x.id]?color:"transparent",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:12}}>{a.signals[x.id]?"✓":""}</span>
-          <span style={{fontSize:12.5,color:a.signals[x.id]?"var(--ink)":"var(--inkSoft)",fontWeight:a.signals[x.id]&&x.strong?700:400}}>{x.label}{x.strong&&<span style={{color,marginLeft:4}}>★</span>}</span></button>;
-        return <div style={{marginTop:16}}>
-          <button className="ghost" onClick={()=>setSel(null)} style={{marginBottom:14}}>← 一覧へ戻る</button>
-          <div className="head">
-            <div><div className="mono" style={{fontSize:13,color:"var(--inkSoft)"}}>{w.code} · {w.sector} · {w.market}</div><h1>{w.name}</h1></div>
-            <button className="btn primary" onClick={()=>openTV(w.tvSymbol)}>↗ TradingView</button>
-          </div>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:1,background:"var(--rule)",border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",marginTop:16}}>
-            {[["買いサイン",buyN,"var(--gain)"],["売りサイン",sellN,"var(--loss)"],["警戒",watchN,"var(--warn)"]].map(([l,n,c])=>
-              <div key={l} style={{background:"var(--card)",padding:"12px 14px",textAlign:"center"}}><div style={{fontSize:11,color:"var(--inkSoft)"}}>{l}</div><div className="mono" style={{fontSize:24,fontWeight:700,color:n>0?c:"var(--inkSoft)",marginTop:2}}>{n}</div></div>)}
-          </div>
-          <div style={{fontSize:11,color:"var(--inkSoft)",marginTop:6}}>※ サインの数は状況整理用で、売買の指示ではありません。総合判断はご自身で（頭と尻尾はくれてやる）。</div>
-          <div className="grid" style={{gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",marginTop:18}}>
-            <div className="card"><div className="card-hd"><div className="card-t">買いサイン照合</div></div>{SIGNALS.buy.map(x=>sigRow(x,"var(--gain)"))}</div>
-            <div style={{display:"flex",flexDirection:"column",gap:14}}>
-              <div className="card"><div className="card-hd"><div className="card-t">売りサイン照合</div></div>{SIGNALS.sell.map(x=>sigRow(x,"var(--loss)"))}</div>
-              <div className="card"><div className="card-hd"><div className="card-t">警戒サイン</div></div>{SIGNALS.watch.map(x=>sigRow(x,"var(--warn)"))}</div>
-            </div>
-          </div>
-          <div className="card" style={{marginTop:14}}><div className="card-hd"><div className="card-t">指標</div><div className="card-n">ボリンジャー / RSI / RCI / 移動平均</div></div>
-            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:12}}>
-              <label className="fld"><span>ボリンジャー位置</span><select style={{width:"100%"}} value={a.tech.bb} onChange={e=>patchA(sel,"tech",{bb:e.target.value})}>{BB_POS.map(x=><option key={x} value={x}>{x||"—"}</option>)}</select></label>
-              <label className="fld"><span>RSI</span><input className="mono" style={{width:"100%"}} value={a.tech.rsi} onChange={e=>patchA(sel,"tech",{rsi:e.target.value})} placeholder="例）28" inputMode="decimal"/></label>
-              <label className="fld"><span>RCI</span><input className="mono" style={{width:"100%"}} value={a.tech.rci} onChange={e=>patchA(sel,"tech",{rci:e.target.value})} placeholder="例）-92" inputMode="decimal"/></label>
-              <label className="fld"><span>移動平均</span><label style={{display:"flex",alignItems:"center",gap:7,fontSize:13,cursor:"pointer",padding:"8px 0"}}><input type="checkbox" checked={a.tech.maPanpaka} onChange={e=>patchA(sel,"tech",{maPanpaka:e.target.checked})}/>パンパカパン配列</label></label>
-            </div></div>
-          <div className="card" style={{marginTop:14}}><div className="card-hd"><div className="card-t">ファンダメンタル</div><div className="card-n">業績の良くない企業は無視するための材料</div></div>
-            <div style={{marginBottom:12,display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
-              <span style={{fontSize:12,color:"var(--inkSoft)"}}>業績スコア</span>
-              <div style={{display:"flex",gap:5}}>{[0,1,2,3].map(i=><span key={i} style={{width:26,height:8,borderRadius:4,background:i<fN?"var(--gain)":"var(--ruleSoft)"}}></span>)}</div>
-              <span className="mono" style={{fontSize:14,fontWeight:700,color:fN>=3?"var(--gain)":fN>=2?"var(--warn)":"var(--inkSoft)"}}>{fN} / 4</span>
-              <span style={{fontSize:11,color:"var(--inkSoft)"}}>（ROE≥10%・フリーCF＞0・増益予想・アナリスト強気）</span>
-            </div>
-            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:12}}>
-              <label className="fld"><span>会社の決算予想</span><select style={{width:"100%"}} value={a.fund.forecast} onChange={e=>patchA(sel,"fund",{forecast:e.target.value})}>{FORECAST.map(x=><option key={x} value={x}>{x||"—"}</option>)}</select></label>
-              <label className="fld"><span>ROE %</span><input className="mono" style={{width:"100%"}} value={a.fund.roe} onChange={e=>patchA(sel,"fund",{roe:e.target.value})} placeholder="例）15" inputMode="decimal"/></label>
-              <label className="fld"><span>フリーCF（億円）</span><input className="mono" style={{width:"100%"}} value={a.fund.fcf} onChange={e=>patchA(sel,"fund",{fcf:e.target.value})} placeholder="例）320 / -50" inputMode="decimal"/></label>
-              <label className="fld"><span>PER（倍）</span><input className="mono" style={{width:"100%"}} value={a.fund.per} onChange={e=>patchA(sel,"fund",{per:e.target.value})} placeholder="例）22" inputMode="decimal"/></label>
-              <label className="fld"><span>PBR（倍）</span><input className="mono" style={{width:"100%"}} value={a.fund.pbr} onChange={e=>patchA(sel,"fund",{pbr:e.target.value})} placeholder="例）3.1" inputMode="decimal"/></label>
-              <label className="fld"><span>配当利回り %</span><input className="mono" style={{width:"100%"}} value={a.fund.divy} onChange={e=>patchA(sel,"fund",{divy:e.target.value})} placeholder="例）2.4" inputMode="decimal"/></label>
-              <label className="fld"><span>アナリスト評価</span><select style={{width:"100%"}} value={a.fund.analyst} onChange={e=>patchA(sel,"fund",{analyst:e.target.value})}>{ANALYST.map(x=><option key={x} value={x}>{x||"—"}</option>)}</select></label>
-              <label className="fld"><span>目標株価</span><input className="mono" style={{width:"100%"}} value={a.fund.target} onChange={e=>patchA(sel,"fund",{target:e.target.value})} placeholder="アナリスト目標"/></label>
-            </div>
-            <label className="fld"><span>売上・利益トレンドのメモ</span><input style={{width:"100%"}} value={a.fund.memo} onChange={e=>patchA(sel,"fund",{memo:e.target.value})} placeholder="前年比、進捗率、上振れ/下振れなど"/></label>
-          </div>
-          <div className="card" style={{marginTop:14}}><div className="card-hd"><div className="card-t">トレードプラン</div><div className="card-n">ラインは『頭と尻尾はくれてやる』前提の目安</div></div>
-            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:12}}>
-              <label className="fld"><span>エントリー</span><input className="mono" style={{width:"100%"}} value={a.plan.entry} onChange={e=>patchA(sel,"plan",{entry:e.target.value})}/></label>
-              <label className="fld"><span>利確</span><input className="mono" style={{width:"100%",color:"var(--gain)"}} value={a.plan.tp} onChange={e=>patchA(sel,"plan",{tp:e.target.value})}/></label>
-              <label className="fld"><span>損切</span><input className="mono" style={{width:"100%",color:"var(--loss)"}} value={a.plan.sl} onChange={e=>patchA(sel,"plan",{sl:e.target.value})}/></label>
-            </div>
-            <label className="fld"><span>判断メモ</span><textarea rows={3} value={a.plan.memo} onChange={e=>patchA(sel,"plan",{memo:e.target.value})} placeholder="デイ/スイングの別、決算跨ぎの可否、根拠など"/></label>
-          </div>
-        </div>;})()}
-
-      {/* ===== CHART ===== */}
-      {tab==="chart" && <div style={{marginTop:18}}>
-        <div className="sec-head">チャート（TradingView）</div>
-        <div className="sec-note">登録銘柄を選ぶか、シンボルを直接入力。指数・米国株・為替は表示できます。日本の個別株は無料版では埋め込み表示できないため「↗ TradingViewで開く」からご覧ください。</div>
-        <div style={{display:"flex",gap:7,flexWrap:"wrap",marginBottom:10}}>
-          {s.watchlist.filter(w=>w.tvSymbol).map(w=><button key={w.code} className={"chip"+(chartSym===w.tvSymbol?" on":"")} onClick={()=>setChartSym(w.tvSymbol)}>{w.name}</button>)}
-          {s.watchlist.length===0 && ["INDEX:NKY","FX:USDJPY","NASDAQ:NVDA","NASDAQ:SOXX"].map(sy=><button key={sy} className={"chip"+(chartSym===sy?" on":"")} onClick={()=>setChartSym(sy)}>{sy}</button>)}
+      {/* ===== 分析（12章） ===== */}
+      {tab==="analysis" && <div style={{marginTop:18}}>
+        <div className="sec-head">分析</div>
+        {/* 12-2章：免責表示（必須・常時表示・断定的表現を避ける） */}
+        <div style={{background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14,fontSize:12.5,lineHeight:1.7,color:"var(--inkSoft)"}}>
+          本分析は算出根拠の一つに過ぎず、投資判断は必ずご自身の判断で行ってください。数値を鵜呑みにせず、最終判断はご自身の責任で行ってください。
+          購入・損切り・利確の各単価は「推奨」ではなく、あくまで目安・参考値です。
         </div>
-        <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"center",marginBottom:12}}>
-          <input className="mono" defaultValue="" placeholder="任意シンボル（例 NASDAQ:NVDA）" onKeyDown={e=>{if(e.key==="Enter"&&e.target.value.trim())setChartSym(e.target.value.trim());}} style={{minWidth:180}}/>
-          <label style={{fontSize:13,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cBB} onChange={e=>setCBB(e.target.checked)}/>ボリンジャー</label>
-          <label style={{fontSize:13,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cRSI} onChange={e=>setCRSI(e.target.checked)}/>RSI</label>
-          <label style={{fontSize:13,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cMA} onChange={e=>setCMA(e.target.checked)}/>移動平均</label>
-        </div>
-        {embeddable(chartSym)
-          ? <div key="tvchart" ref={chartRef} style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",background:"var(--card)",minHeight:544}}></div>
-          : <div key="jpfallback" style={{border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)",minHeight:544,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14,padding:24,textAlign:"center"}}>
-              <div style={{fontSize:14,fontWeight:700}}>{chartSym}</div>
-              <div style={{fontSize:12.5,color:"var(--inkSoft)",lineHeight:1.7,maxWidth:420}}>日本の個別株は、TradingViewの無料埋め込みチャートでは表示できません（東証データの再配信制限のため）。下のボタンからTradingView本体で開いてください。</div>
-              <button className="btn primary" onClick={()=>openTV(chartSym)}>↗ TradingViewで開く</button>
+        {analysisItems.length===0
+          ? <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13,border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)"}}>
+              分析対象の銘柄がありません。「日本市場」「アメリカ市場」タブの登録銘柄一覧で「分析」ボタンを押すと、ここに追加されます。
+            </div>
+          : <div>
+              {analyzing && <div className="sec-note">分析データを計算中…</div>}
+              <div className="grid" style={{gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))"}}>
+                {analysisItems.map(w=>{
+                  const a=s.analysisData[w.code];
+                  return <div key={w.code} className="card">
+                    <div className="card-hd" style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                      <div><div className="card-t">{w.name}</div><div className="card-n mono">{w.code}</div></div>
+                      <button className="iconbtn" title="分析対象から外す" onClick={()=>toggleAnalysisTarget(w.code)}>×</button>
+                    </div>
+                    {!a
+                      ? <div style={{fontSize:12.5,color:"var(--inkSoft)"}}>{analyzing?"計算中…":"データを取得できませんでした。"}</div>
+                      : <div>
+                          <div className="mono" style={{fontSize:12,color:"var(--inkSoft)",marginBottom:8}}>現在値 {a.current.toLocaleString()}</div>
+                          <table style={{fontSize:12.5}}><tbody>
+                            <tr><td style={{color:"var(--inkSoft)",whiteSpace:"nowrap"}}>購入単価(目安)</td>
+                              <td className="mono" style={{fontWeight:700}}>{a.entry.toLocaleString()}</td></tr>
+                            <tr><td colSpan={2} style={{color:"var(--inkSoft)",fontSize:11,paddingTop:0}}>{a.entryReason}</td></tr>
+                            <tr><td style={{color:"var(--inkSoft)",whiteSpace:"nowrap"}}>損切り単価(目安)</td>
+                              <td className="mono" style={{fontWeight:700,color:"var(--down)"}}>{a.stop.toLocaleString()}</td></tr>
+                            <tr><td colSpan={2} style={{color:"var(--inkSoft)",fontSize:11,paddingTop:0}}>{a.stopReason}</td></tr>
+                            <tr><td style={{color:"var(--inkSoft)",whiteSpace:"nowrap"}}>利確単価(目安)</td>
+                              <td className="mono" style={{fontWeight:700,color:"var(--up)"}}>{a.target.toLocaleString()}</td></tr>
+                            <tr><td colSpan={2} style={{color:"var(--inkSoft)",fontSize:11,paddingTop:0}}>{a.targetReason}</td></tr>
+                          </tbody></table>
+                          <div style={{marginTop:10,paddingTop:8,borderTop:"1px solid var(--ruleSoft)",fontSize:11,color:"var(--inkSoft)",lineHeight:1.6}}>
+                            MA20 {a.indicators.ma20??"—"}　MA50 {a.indicators.ma50??"—"}　RSI14 {a.indicators.rsi??"—"}<br/>
+                            BB上限 {a.indicators.bbUpper??"—"}　BB下限 {a.indicators.bbLower??"—"}<br/>
+                            直近サポート {a.indicators.support}　直近レジスタンス {a.indicators.resistance}<br/>
+                            {a.fundamentalNote}
+                          </div>
+                        </div>}
+                  </div>;
+                })}
+              </div>
             </div>}
-        <p className="foot">※ RCIは無料ウィジェットの標準にないため、ボリンジャー・RSI・移動平均のみ。RCIはTradingView本体で。<br/>※ 日経225は指数（INDEX:NKY）、SOX/VIXは連動ETF（SOXX/VIXY）で表示しています。値の水準は指数そのものと異なる場合があります。</p>
+        <p className="foot" style={{marginTop:16}}>※ テクニカル指標は過去6ヶ月の日足終値から算出（20日/50日移動平均・RSI14・ボリンジャーバンド20,2σ・直近60営業日の高値安値）。ファンダメンタルはyfinance取得可能な範囲（PER・PBR・配当利回り・予想EPS)を使用しています。</p>
+      </div>}
+
+      {/* ===== テーマ（10-3章） ===== */}
+      {tab==="theme" && <div style={{marginTop:18}}>
+        <div className="sec-head">テーマ</div>
+        <div className="sec-note">AI関連・半導体・防衛など、テーマ別に銘柄をまとめて確認できます。テーマ分類は名称・事業内容に基づく近似的な選定です。</div>
+        <ThemeGrid stockQuotes={s.stockQuotes} onFetchCodes={fetchThemeQuotes}/>
+      </div>}
+
+      {/* ===== NEWS（9章・9-1章・9-2章） ===== */}
+      {tab==="news" && (()=>{
+        const NEWS_SUBTABS=[
+          {key:"summary",label:"サマリー"},
+          {key:"domestic",label:"国内市況"},
+          {key:"overseas",label:"海外市況"},
+          {key:"disclosure",label:"適時開示"},
+        ];
+        const listFor={summary:newsSummary,domestic:s.macroNewsDomestic,overseas:s.macroNewsOverseas,disclosure:s.stockNewsList}[newsSubTab];
+        const showCode=newsSubTab==="summary"||newsSubTab==="disclosure";
+        const hasImportant=listFor.some(it=>isImportantNews(it.title));
+        return <div style={{marginTop:18}}>
+          <div className="sec-head">ニュース</div>
+          <div className="sec-note">「日本市場」タブの「リアルタイムデータを反映」を押すと、各サブタブのニュースがGoogleニュースRSSから更新されます。「適時開示」は決算・IR関連キーワードで絞り込んでいます。見出しをクリックすると元記事が開きます。</div>
+          <div className="subtabs">
+            {NEWS_SUBTABS.map(t=><button key={t.key} className={"chip"+(newsSubTab===t.key?" on":"")} onClick={()=>setNewsSubTab(t.key)}>{t.label}</button>)}
+          </div>
+          {hasImportant && <div style={{display:"flex",alignItems:"center",gap:10,background:"var(--upBg)",border:"1px solid var(--up)",borderRadius:4,padding:"10px 14px",marginBottom:12}}>
+            <span style={{fontSize:13,fontWeight:700,color:"var(--up)"}}>⚠ 重要ニュースを含みます</span>
+            <span style={{fontSize:12,color:"var(--inkSoft)"}}>サプライズ決算・戦争紛争・パンデミック・大規模災害・株価暴落に関連する見出しに印を付けています。</span>
+          </div>}
+          <div className="card" style={{padding:"14px 16px 6px"}}>
+            <NewsList items={listFor} showName={showCode} announcements={ANNOUNCEMENTS}/>
+          </div>
+        </div>;
+      })()}
+
+      {/* 5章：登録銘柄行の「チャート」ボタンで開くモーダル（タブに依存しない。6章でタブ内チャートは廃止） */}
+      {chartModal && <div onClick={()=>setChartModal(null)} style={{position:"fixed",inset:0,background:"rgba(27,30,26,.55)",zIndex:20,
+          display:"flex",alignItems:"center",justifyContent:"center",padding:18}}>
+        <div onClick={e=>e.stopPropagation()} style={{background:"var(--paper)",border:"1px solid var(--rule)",borderRadius:6,
+            width:"100%",maxWidth:760,maxHeight:"92vh",overflowY:"auto",padding:18,boxShadow:"0 12px 32px rgba(0,0,0,.3)"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+            <div><div className="kicker">Chart</div><div style={{fontSize:17,fontWeight:700}}>{chartModal.name}</div>
+              <div className="mono" style={{fontSize:11.5,color:"var(--inkSoft)"}}>{chartModal.symbol}</div></div>
+            <button className="iconbtn" style={{fontSize:20}} onClick={()=>setChartModal(null)}>×</button>
+          </div>
+          {embeddable(chartModal.symbol) && <div style={{display:"flex",gap:14,flexWrap:"wrap",marginBottom:10}}>
+            <label style={{fontSize:12.5,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cBB} onChange={e=>setCBB(e.target.checked)}/>ボリンジャー</label>
+            <label style={{fontSize:12.5,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cRSI} onChange={e=>setCRSI(e.target.checked)}/>RSI</label>
+            <label style={{fontSize:12.5,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cMA} onChange={e=>setCMA(e.target.checked)}/>移動平均</label>
+          </div>}
+          {embeddable(chartModal.symbol)
+            ? <div key="modaltvchart" ref={modalChartRef} style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",background:"var(--card)",minHeight:484}}></div>
+            : <div key="modaljpfallback" style={{border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)",minHeight:300,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14,padding:24,textAlign:"center"}}>
+                <div style={{fontSize:12.5,color:"var(--inkSoft)",lineHeight:1.7,maxWidth:420}}>日本の個別株は、TradingViewの無料埋め込みチャートでは表示できません（東証データの再配信制限のため）。下のボタンからTradingView本体で開いてください。</div>
+                <button className="btn primary" onClick={()=>openTV(chartModal.symbol)}>↗ TradingViewで開く</button>
+              </div>}
+        </div>
       </div>}
 
       <p className="foot" style={{borderTop:"1px solid var(--ruleSoft)",paddingTop:12,marginTop:24}}>
