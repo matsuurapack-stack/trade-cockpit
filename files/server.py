@@ -301,6 +301,12 @@ def _is_ir_news(title):
     return any(k in title for k in IR_KEYWORDS)
 
 
+def _title_mentions_name(name, title):
+    """Googleニュースの検索結果はクエリ語の一部だけに一致した無関係記事（noteの個人ブログ等）も
+    紛れ込むため、IRキーワードだけでなく銘柄名自体が見出しに含まれているかも確認する。"""
+    return name.lower() in title.lower()
+
+
 def _sort_and_strip(items):
     """複数クエリの結果を連結したリストを公開日時の降順に並べ替え、ソート用の内部フィールドを除く。"""
     items = sorted(items, key=lambda it: it.get("_ts", 0), reverse=True)
@@ -321,7 +327,7 @@ def build_stock_news(watchlist):
         if not name:
             continue
         candidates = google_news(name + " 決算 適時開示 業績", 4, max_age_days=STOCK_NEWS_MAX_AGE_DAYS)
-        ir_only = [it for it in candidates if _is_ir_news(it["title"])]
+        ir_only = [it for it in candidates if _is_ir_news(it["title"]) and _title_mentions_name(name, it["title"])]
         for it in ir_only[:2]:
             items.append({**it, "code": code, "name": name})
     return _sort_and_strip(items)
@@ -714,19 +720,42 @@ def analyze_stock(w, market_env=""):
     if rsi_5m is not None and rsi_5m >= 75:
         entry -= atr_ref * 0.1
         entry_reasons.append(f"5分足RSI({rsi_5m:.0f})も過熱気味のため、ザラ場の短期的な買われすぎを加味してやや低めに調整")
+    if rsi_15m is not None and rsi_15m >= 75:
+        entry -= atr_ref * 0.1
+        entry_reasons.append(f"15分足RSI({rsi_15m:.0f})も過熱気味のため、やや低めに調整")
     if vwap is not None and current > vwap * 1.01:
         entry_reasons.append(f"現在値はVWAP({vwap:.1f})より上（当日の平均的な出来高加重コストより高め）")
 
-    # ---- 損切り単価(目安)：ATR相当(当日実測 or 日次ATR)の1倍を損切り幅の目安とする（ザラ場内で許容できる下振れ）----
+    # ---- entryは「今日、実際にその価格で約定し得たか」を保証するため、当日の実測値幅
+    # （intraday_low〜intraday_high）の中に必ず収める。ATRから逆算した押し目が当日の実際の安値
+    # より深い場合、一度も付いていない非現実的な価格になってしまうため、当日安値を下限とする。----
+    if intraday_low is not None and entry < intraday_low:
+        entry = intraday_low
+        entry_reasons.append(f"当日安値({intraday_low:.1f})を下限として調整（未達水準は避ける）")
+    if intraday_high is not None and entry > intraday_high:
+        entry = intraday_high
+        entry_reasons.append(f"当日高値({intraday_high:.1f})を上限として調整")
+
+    # ---- 損切り単価(目安)：ATR相当(当日実測 or 日次ATR)の1倍を損切り幅の目安とする（ザラ場内で許容できる下振れ）。
+    # entry確定後に算出するため、当日安値による下限調整をentryにも先に反映済み（旧実装は
+    # entry未調整のままstopだけ当日安値でかさ上げしていたため、entryより高いstopが出る不具合があった）。----
     stop = entry - atr_ref
     stop_reasons = [f"{atr_label}({atr_ref:.1f})の1倍を損切り幅の目安に設定"]
-    if intraday_low is not None and stop < intraday_low and intraday_low < current:
-        stop = max(stop, intraday_low)
+    if intraday_low is not None and stop < intraday_low < entry:
+        stop = intraday_low
         stop_reasons.append(f"当日安値({intraday_low:.1f})を下限目安として調整")
+    # entryより低いことを必ず保証する（浅めの最小値幅を最低ラインとして確保）
+    min_gap = max(entry * 0.002, 1)
+    if stop >= entry:
+        stop = entry - min_gap
+        stop_reasons.append("損切りが購入水準を下回るよう調整")
 
     # ---- 利確単価(目安)：ATR相当の1.5倍（リスクリワード概ね1:1.5）を利確目安とする ----
     target = entry + atr_ref * 1.5
     target_reasons = [f"{atr_label}({atr_ref:.1f})の1.5倍（リスクリワード概ね1:1.5）を利確目安に設定"]
+    if target <= entry:
+        target = entry + min_gap
+        target_reasons.append("利確が購入水準を上回るよう調整")
 
     # ---- 東証の値幅制限（ストップ高・ストップ安）を必ず超えないようにする（日本株のみ）----
     if w.get("market", "JP") != "US":
@@ -744,6 +773,13 @@ def analyze_stock(w, market_env=""):
             if target > day_hi:
                 target = day_hi
                 target_reasons.append(f"ストップ高({day_hi:.1f})を上限として調整")
+
+    # ---- 最終安全確認：ここまでの調整後も stop < entry < target の順序を必ず保証する ----
+    min_gap = max(entry * 0.002, 1)
+    if stop >= entry:
+        stop = entry - min_gap
+    if target <= entry:
+        target = entry + min_gap
 
     # ---- trading_rules.md：エントリー適性・見送り条件のチェックリスト（自動判定できる範囲のみ）----
     is_uptrend = ma25 is not None and current > ma25
