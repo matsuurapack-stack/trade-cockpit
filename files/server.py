@@ -66,6 +66,16 @@ def get_index_quotes():
     return out
 
 
+def num_or_none(v):
+    """フロントから渡ってくる可能性のある文字列/空文字/Noneをfloatか、変換不可ならNoneに正規化する。"""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 # 登録銘柄（watchlist）の market===IDX 用シンボル上書き（TradingViewシンボルはyfinance非対応のため）
 IDX_YF_OVERRIDE = {"NI225": "^N225", "USDJPY": "JPY=X", "SOX": "SOXX", "VIX": "VIXY"}
 
@@ -413,7 +423,15 @@ def analyze_stock(w, market_env=""):
     if len(closes) < 20:
         return None
     n = len(closes)
-    current = closes[-1]
+    # フロント側が直前の「リアルタイムデータを反映」で取得済みの現在値(w["current"])があれば、
+    # そちらを優先して使う。analyze_stock()はここで別途yfinanceに問い合わせるため、タイミング次第で
+    # 登録銘柄テーブルの現在値とズレることがあり、「反映直後に分析してもテーブルの最新値と
+    # 一致しない」という不整合の原因になっていた。現在値を上書きすることで、直近の終値を使う
+    # 移動平均線・RSI等の指標にも最新値が反映されるようにする。
+    current_override = num_or_none(w.get("current"))
+    current = current_override if current_override is not None else closes[-1]
+    if current_override is not None:
+        closes[-1] = current_override
     prev = closes[-2] if n >= 2 else current
     change_pct = (current - prev) / prev * 100 if prev else 0
 
