@@ -796,6 +796,11 @@ function App(){
     try{ await fetchNewsOnly(); }catch(e){hadError=true;}
     setNewsFetching(false);
 
+    // SNSはNitter側インスタンスが元々不安定で失敗も想定内のため、取得できなくてもhadErrorには
+    // 含めない（「サーバーに接続できません」の誤アラートを出さないため。失敗時はSNSタブ側の
+    // 既存フォールバック表示＝Xで直接開くボタンに任せる）。
+    await fetchSnsFor(snsHandle);
+
     if(analysisItems.length){
       setJpMsg("分析データを再計算中…");setUsMsg("分析データを再計算中…");
       await fetchAnalysisFor(analysisItems,mergedQuotes);
@@ -805,7 +810,7 @@ function App(){
     setMonitorFetching(false);setJpFetching(false);setUsFetching(false);
     if(hadError)showConnError();
   };
-  const anyFetching=monitorFetching||jpFetching||usFetching||newsFetching;
+  const anyFetching=monitorFetching||jpFetching||usFetching||newsFetching||snsLoading;
 
   const set=(patch)=>setS(p=>({...p,...patch}));
   const setMetric=(k,f,v)=>setS(p=>({...p,metrics:{...p.metrics,[k]:{...p.metrics[k],[f]:v}}}));
@@ -930,17 +935,21 @@ function App(){
   // 6-2章：X公式の埋め込みタイムライン(widgets.js)はsyndication.twitter.comが429(レート制限)を
   // 頻発して安定して表示できなかったため、Nitter RSS経由でサーバー側から投稿一覧を取得する方式に
   // 変更（ニュースタブのGoogleニュースRSSと同じ手法。server.pyの/api/sns参照）。
-  useEffect(()=>{
-    if(tab!=="sns")return;
-    let cancelled=false;
-    setSnsLoading(true);setSnsFailed(false);setSnsPosts([]);
-    fetch("/api/sns?handle="+encodeURIComponent(snsHandle)).then(r=>r.json()).then(d=>{
-      if(cancelled)return;
+  // refreshAll（全タブ連動）からも呼べるよう関数化してある（SNSタブを開いていなくても更新される）。
+  const fetchSnsFor=async(handle)=>{
+    setSnsLoading(true);setSnsFailed(false);
+    try{
+      const r=await fetch("/api/sns?handle="+encodeURIComponent(handle));
+      const d=await r.json();
       const posts=Array.isArray(d.posts)?d.posts:[];
       setSnsPosts(posts);
       if(!posts.length)setSnsFailed(true);
-    }).catch(()=>{if(!cancelled)setSnsFailed(true);}).finally(()=>{if(!cancelled)setSnsLoading(false);});
-    return ()=>{cancelled=true;};
+    }catch(e){setSnsFailed(true);}
+    setSnsLoading(false);
+  };
+  useEffect(()=>{
+    if(tab!=="sns")return;
+    fetchSnsFor(snsHandle);
   },[tab,snsHandle]);
 
   const openTV=(tv)=>{if(tv)window.open("https://jp.tradingview.com/chart/?symbol="+encodeURIComponent(tv),"_blank");};
@@ -1076,7 +1085,10 @@ function App(){
 
       {/* ===== SNS（6-2章） ===== */}
       {tab==="sns" && <div style={{marginTop:18}}>
-        <div className="sec-head">SNS</div>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+          <div className="sec-head">SNS</div>
+          <button className="btn primary" onClick={refreshAll} disabled={anyFetching}>{snsLoading?"取得中…":"リアルタイムデータを反映"}</button>
+        </div>
         <div className="sec-note">指定10アカウントの投稿文を一覧表示します（X公式の埋め込みが安定して表示できないため、Nitter RSS経由でサーバーから取得しています）。アカウントを選んで切り替えてください。</div>
         <div style={{display:"flex",gap:6,flexWrap:"wrap",margin:"12px 0"}}>
           {SNS_ACCOUNTS.map(h=><button key={h} className={"chip"+(snsHandle===h?" on":"")} onClick={()=>setSnsHandle(h)}>@{h}</button>)}
@@ -1108,7 +1120,10 @@ function App(){
 
       {/* ===== 分析（12章） ===== */}
       {tab==="analysis" && <div style={{marginTop:18}}>
-        <div className="sec-head">分析</div>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+          <div className="sec-head">分析</div>
+          <button className="btn primary" onClick={refreshAll} disabled={anyFetching}>{analyzing?"取得中…":"リアルタイムデータを反映"}</button>
+        </div>
         {/* 12-2章：免責表示（必須・常時表示・断定的表現を避ける） */}
         <div style={{background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14,fontSize:12.5,lineHeight:1.7,color:"var(--inkSoft)"}}>
           本分析は算出根拠の一つに過ぎず、投資判断は必ずご自身の判断で行ってください。数値を鵜呑みにせず、最終判断はご自身の責任で行ってください。
