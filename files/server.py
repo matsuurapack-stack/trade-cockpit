@@ -488,6 +488,21 @@ def _vwap(closes, volumes):
     return sum(c * v for c, v in zip(closes, volumes)) / total_vol
 
 
+def _days_to_earnings(tk):
+    """trading_rules.mdの決算またぎルール判定に使う、次回決算発表までの日数。
+    取得できない場合はNoneを返す（銘柄によっては非開示・データなしのことがある）。"""
+    try:
+        cal = tk.calendar or {}
+        dates = cal.get("Earnings Date")
+        if not dates:
+            return None
+        future = [d for d in dates if d >= datetime.date.today()]
+        target = min(future) if future else min(dates)
+        return (target - datetime.date.today()).days
+    except Exception:
+        return None
+
+
 def analyze_stock(w, market_env=""):
     """12-1章・technical_analysis_rules.md：ローソク足パターン・移動平均線の並び／クロス・
     ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
@@ -542,6 +557,8 @@ def analyze_stock(w, market_env=""):
     low52w = min(lows[-min(252, len(lows)):]) if lows else current
     vol_avg5 = sum(volumes[-6:-1]) / 5 if len(volumes) >= 6 else None
     vol_surge = vol_avg5 is not None and volumes[-1] > vol_avg5 * 1.5
+    vol_thin = vol_avg5 is not None and volumes[-1] < vol_avg5 * 0.7
+    change_1w = (current - closes[-6]) / closes[-6] * 100 if n >= 6 and closes[-6] else None
 
     low_zone = current <= high52w * 0.8   # 条件C等：52週高値の-20%以下＝安値圏
     high_zone = current >= high52w * 0.95  # 条件B等：52週高値の-5%以内＝高値圏
@@ -728,6 +745,39 @@ def analyze_stock(w, market_env=""):
                 target = day_hi
                 target_reasons.append(f"ストップ高({day_hi:.1f})を上限として調整")
 
+    # ---- trading_rules.md：エントリー適性・見送り条件のチェックリスト（自動判定できる範囲のみ）----
+    is_uptrend = ma25 is not None and current > ma25
+    is_pullback = is_uptrend and not high_zone  # 上昇トレンド中で直近高値からは離れている＝押し目
+    above_vwap = vwap is not None and current > vwap
+    market_env_bad = "不安定" in (market_env or "")
+    entry_checklist = [
+        {"key": "uptrend", "label": "上昇トレンド（現在値が25日線より上）", "pass": bool(is_uptrend)},
+        {"key": "volume", "label": "出来高増加", "pass": bool(vol_surge)},
+        {"key": "pullback", "label": "押し目（高値圏で買い急いでいない）", "pass": bool(is_pullback)},
+        {"key": "vwap", "label": "VWAPより上", "pass": bool(above_vwap) if vwap is not None else None},
+    ]
+    avoid_checklist = [
+        {"key": "thinVolume", "label": "出来高が少ない", "hit": bool(vol_thin)},
+        {"key": "badMarket", "label": "地合いが悪い", "hit": bool(market_env_bad)},
+        {"key": "weakSector", "label": "セクターが弱い（日次モニターのセクター順で要確認）", "hit": None},
+    ]
+
+    # ---- 決算またぎルール：決算発表が近い場合、直近1週間の値動きから「またぐ／またがない」の目安を出す ----
+    days_to_earnings = _days_to_earnings(tk)
+    earnings_note = None
+    if days_to_earnings is not None and 0 <= days_to_earnings <= 7:
+        if change_1w is not None and change_1w >= 5:
+            earnings_note = (f"決算まで{days_to_earnings}日。直近1週間で{change_1w:+.1f}%上昇しており、"
+                              f"期待が既に織り込み済みの可能性→またがない候補")
+            avoid_checklist.append({"key": "earningsPriced", "label": "決算直前で期待が織り込み済み", "hit": True})
+        elif change_1w is not None and change_1w <= 0:
+            earnings_note = (f"決算まで{days_to_earnings}日。直近1週間{change_1w:+.1f}%で市場の期待は低め→"
+                              f"またぐ候補（自身の確信度・業界の追い風・受注等の先行指標と合わせて判断）")
+        else:
+            earnings_note = f"決算まで{days_to_earnings}日。またぐかどうかは方針の基準に照らして判断してください"
+    elif days_to_earnings is not None and 7 < days_to_earnings <= 30:
+        earnings_note = f"次回決算まで{days_to_earnings}日"
+
     fund_notes = []
     per, pbr, div = fundamentals.get("per"), fundamentals.get("pbr"), fundamentals.get("dividendYield")
     if per:
@@ -775,6 +825,11 @@ def analyze_stock(w, market_env=""):
             "rsi15m": round(rsi_15m, 1) if rsi_15m is not None else None,
         },
         "fundamentalNote": "・".join(fund_notes) if fund_notes else "取得できるファンダメンタルデータがありません",
+        "tradeRules": {
+            "entryChecklist": entry_checklist,
+            "avoidChecklist": avoid_checklist,
+            "earningsNote": earnings_note,
+        },
     }
 
 

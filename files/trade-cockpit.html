@@ -1044,6 +1044,11 @@ function App(){
           本分析は算出根拠の一つに過ぎず、投資判断は必ずご自身の判断で行ってください。数値を鵜呑みにせず、最終判断はご自身の責任で行ってください。
           購入・損切り・利確の各単価は「推奨」ではなく、あくまで目安・参考値です。
         </div>
+        {/* 自身のトレードルール（trading_rules.md）：常に忘れないための固定リマインド */}
+        <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14,fontSize:12,lineHeight:1.8,color:"var(--inkSoft)"}}>
+          <div style={{fontWeight:700,color:"var(--ink)",marginBottom:4}}>自分のトレードルール（要点）</div>
+          最優先は負けないこと・利確は欲張らず+3〜5%が目安・<b style={{color:"var(--ink)"}}>逆指値は絶対に下げない</b>・基本は持ち越さない（自信ある銘柄のみ例外）・地合いが悪い/弱いセクターでは無理をしない・ノートレードも立派な判断。
+        </div>
         {analysisItems.length===0
           ? <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13,border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)"}}>
               分析対象の銘柄がありません。「日本市場」「アメリカ市場」タブの登録銘柄一覧で「分析」ボタンを押すと、ここに追加されます。
@@ -1066,6 +1071,16 @@ function App(){
                             <div title="シグナル強度" style={{color:"var(--star)",fontSize:13,letterSpacing:1}}>{"★".repeat(a.strength||0)}{"☆".repeat(5-(a.strength||0))}</div>
                           </div>
                           {a.marketEnv && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>{a.marketEnv}</div>}
+                          {a.tradeRules?.earningsNote && <div style={{fontSize:11.5,color:"var(--ink)",background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"6px 8px",marginBottom:8,lineHeight:1.6}}>📅 {a.tradeRules.earningsNote}</div>}
+                          {a.tradeRules && <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:8}}>
+                            {a.tradeRules.entryChecklist.filter(c=>c.pass!=null).map(c=>
+                              <span key={c.key} className="chip" style={{fontSize:10.5,display:"inline-block",
+                                background:c.pass?"var(--upBg)":"var(--band)",borderColor:c.pass?"var(--up)":"var(--rule)",
+                                color:c.pass?"var(--up)":"var(--inkSoft)"}}>{c.pass?"✓":"・"} {c.label}</span>)}
+                            {a.tradeRules.avoidChecklist.filter(c=>c.hit).map(c=>
+                              <span key={c.key} className="chip" style={{fontSize:10.5,display:"inline-block",
+                                background:"var(--downBg)",borderColor:"var(--down)",color:"var(--down)"}}>⚠ {c.label}</span>)}
+                          </div>}
                           {(a.signals?.buy?.length>0) && <div style={{marginBottom:8}}>
                             {a.signals.buy.map(sig=><div key={sig.key} className="chip" style={{background:"var(--upBg)",borderColor:"var(--up)",color:"var(--up)",marginRight:4,marginBottom:4,display:"inline-block",fontSize:11}}>▲ {sig.label}</div>)}
                           </div>}
@@ -1106,7 +1121,7 @@ function App(){
                 })}
               </div>
             </div>}
-        <p className="foot" style={{marginTop:16}}>※ テクニカル指標は過去1年の日足終値（25日/75日/100日移動平均・RSI14・RCI26・ATR14・ボリンジャーバンド20,±2σ/±3σ・52週高値安値）に加え、当日の1分足・5分足・15分足をリアルタイムに取得し、当日高値安値・VWAP・短期RSIを購入/損切り/利確単価の算出に反映しています（市場時間外は分足データなしで日足のみの算出になります）。パンパカパン・ゴールデンクロス・複合底打ち等のシグナル判定を含みます。ファンダメンタルはyfinance取得可能な範囲（PER・PBR・配当利回り・予想EPS)を使用しています。</p>
+        <p className="foot" style={{marginTop:16}}>※ テクニカル指標は過去1年の日足終値（25日/75日/100日移動平均・RSI14・RCI26・ATR14・ボリンジャーバンド20,±2σ/±3σ・52週高値安値）に加え、当日の1分足・5分足・15分足をリアルタイムに取得し、当日高値安値・VWAP・短期RSIを購入/損切り/利確単価の算出に反映しています（市場時間外は分足データなしで日足のみの算出になります）。パンパカパン・ゴールデンクロス・複合底打ち等のシグナル判定を含みます。エントリー適性チェック（上昇トレンド・出来高増加・押し目・VWAP）、見送り条件（出来高過少・地合い不安定）、決算またぎの目安（yfinance取得可能な場合のみ）も自動判定しています。ファンダメンタルはyfinance取得可能な範囲（PER・PBR・配当利回り・予想EPS)を使用しています。</p>
       </div>}
 
       {/* ===== NEWS（9章・9-1章・9-2章） ===== */}
