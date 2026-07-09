@@ -448,7 +448,21 @@ const emptyState=()=>({
   analysisData:{}, // analysisData: 12-1章の分析結果（購入/損切り/利確の目安・算出根拠）をコードごとに保持
   notifyEnabled:true, // 10-5章：重要ニュース通知バナーのオン/オフ
 });
-const loadState=()=>{try{const r=localStorage.getItem(KEY);if(!r)return null;const d=JSON.parse(r);return {...emptyState(),...d,metrics:{...emptyMetrics(),...(d.metrics||{})}};}catch{return null;}};
+// 1章：255社デフォルトを後から追加したため、既にlocalStorageに保存済みだったユーザーは
+// 保存データの登録銘柄がそのまま優先され、新しいデフォルト銘柄が反映されないケースがある。
+// 保存データに存在しない銘柄コードだけを追加する形で移行し、既存の登録銘柄・設定は保持する。
+const mergeDefaults=(saved,defaults,max)=>{
+  if(!Array.isArray(saved))return saved;
+  const seen=new Set(saved.map(w=>w.code));
+  const toAdd=defaults.filter(m=>!seen.has(m.code)).map(m=>({id:m.code,...m,watch:"通常",note:""}));
+  return [...saved,...toAdd].slice(0,max);
+};
+const loadState=()=>{try{const r=localStorage.getItem(KEY);if(!r)return null;const d=JSON.parse(r);
+  const merged={...emptyState(),...d,metrics:{...emptyMetrics(),...(d.metrics||{})}};
+  merged.watchlist=mergeDefaults(d.watchlist,DEFAULT_WATCHLIST,MAX);
+  merged.watchlistUS=mergeDefaults(d.watchlistUS,DEFAULT_WATCHLIST_US,MAX_US);
+  return merged;
+}catch{return null;}};
 
 // 9-2章：重大ニュースの強調表示（サプライズ決算・戦争紛争・パンデミック・大規模自然災害・株価暴落）。
 // Googleニュースの見出しに構造化データがないため、見出し文字列に含まれるキーワードでの近似判定。
