@@ -13,3 +13,6 @@ Thumbs.db
 
 # Claude local settings
 .claude/settings.local.json
+
+# 決算またぎ期待値の星評価（ユーザーデータ。OneDrive共有フォルダ経由で共有する運用のためgit管理はしない）
+files/earnings_ratings.json

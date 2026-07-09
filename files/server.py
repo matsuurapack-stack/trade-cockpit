@@ -262,26 +262,10 @@ def _nitter_tweet_url(handle, nitter_link):
     return f"https://x.com/{handle}"
 
 
-def _nitter_image_url(host, description):
-    """Nitter RSSのdescription(HTML)に埋め込まれた添付画像の<img src>を抜き出す。
-    src はホスト相対パス（例: /pic/orig/media%2Fxxx.jpg）で来ることが多いため、その場合はhostを補う。
-    プロフィールアイコン（avatar/pic/pbs.twimg.com/profile_images等）は投稿画像ではないため除外する。"""
-    if not description:
-        return None
-    for src in re.findall(r'<img[^>]+src="([^"]+)"', description):
-        if "profile_images" in src or "/avatar" in src:
-            continue
-        if src.startswith("/"):
-            return f"https://{host}{src}"
-        if src.startswith("http"):
-            return src
-    return None
-
-
 def get_sns_posts(handle, n=15):
     """指定アカウントの直近投稿をNitter RSS経由で取得する。全インスタンス失敗時は空配列を返し、
-    フロント側で「Xで開く」フォールバック表示に切り替える。投稿に画像が添付されていればimageも返す
-    （取得元インスタンスが不安定なため、画像URLが切れている場合はフロント側で非表示にフォールバックする）。"""
+    フロント側で「Xで開く」フォールバック表示に切り替える。投稿文だけのシンプル表示のため、
+    画像等の付加情報は取得しない（安定性優先）。"""
     if feedparser is None:
         return []
     for host in NITTER_INSTANCES:
@@ -292,12 +276,10 @@ def get_sns_posts(handle, n=15):
                 continue
             out = []
             for e in feed.entries[:n]:
-                description = e.get("description", "") or e.get("summary", "")
                 out.append({
                     "title": e.get("title", ""),
                     "url": _nitter_tweet_url(handle, e.get("link", "")),
                     "published": _fmt_published(e),
-                    "image": _nitter_image_url(host, description),
                 })
             if out:
                 return out
@@ -513,6 +495,24 @@ def _vwap(closes, volumes):
     return sum(c * v for c, v in zip(closes, volumes)) / total_vol
 
 
+EARNINGS_RATINGS_FILE = "earnings_ratings.json"
+
+
+def _load_earnings_ratings():
+    """決算またぎ期待値の星評価（銘柄コード→{stars, updatedAt}）。JSONファイルはfiles/直下に置き、
+    OneDrive共有フォルダ経由でアプリ自体と一緒に共有されるようにする（1章の仕様）。"""
+    try:
+        with open(EARNINGS_RATINGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_earnings_ratings(data):
+    with open(EARNINGS_RATINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 def _days_to_earnings(tk):
     """trading_rules.mdの決算またぎルール判定に使う、次回決算発表までの日数。
     取得できない場合はNoneを返す（銘柄によっては非開示・データなしのことがある）。"""
@@ -719,7 +719,10 @@ def analyze_stock(w, market_env=""):
         atr_ref = intraday_range
         used_intraday_range = True
 
-    priority = ["panpakapan", "compoundBottom", "goldenCross", "bb3", "volBull", "volShadow", "dojiLow", "haramiLow"]
+    # trading_rules.mdのチャート確認優先順位（出来高→移動平均線→VWAP→ボリンジャーバンド→RSI）に合わせ、
+    # 複数シグナルが同時点灯した場合はこの順で「最有力の根拠」を選ぶ（VWAP/RSIは単独の買いシグナルを
+    # 持たず、entry調整の理由として別途entry_reasonsに追記される）。
+    priority = ["volBull", "volShadow", "panpakapan", "goldenCross", "bb3", "compoundBottom", "dojiLow", "haramiLow"]
     primary = None
     for key in priority:
         primary = next((s for s in buy_signals if s["key"] == key), None)
@@ -775,6 +778,12 @@ def analyze_stock(w, market_env=""):
     if target <= entry:
         target = entry + min_gap
         target_reasons.append("利確が購入水準を上回るよう調整")
+    # trading_rules.mdの利確ルール（+3〜5%、欲張らない）：ATR基準の利確目安がそれを超える場合は
+    # +5%水準を上限としてキャップする（値幅の大きい銘柄でリスクリワード優先の目標が膨らみ過ぎるのを防ぐ）。
+    target_cap = entry * 1.05
+    if target > target_cap:
+        target = target_cap
+        target_reasons.append("trading_rules.mdの利確目安(+3〜5%、欲張らない)に基づき+5%水準を上限にキャップ")
 
     # ---- 東証の値幅制限（ストップ高・ストップ安）を必ず超えないようにする（日本株のみ）----
     if w.get("market", "JP") != "US":
@@ -880,6 +889,7 @@ def analyze_stock(w, market_env=""):
             "rsi15m": round(rsi_15m, 1) if rsi_15m is not None else None,
         },
         "fundamentalNote": "・".join(fund_notes) if fund_notes else "取得できるファンダメンタルデータがありません",
+        "daysToEarnings": days_to_earnings,  # 決算またぎ期待値機能：10日前からのカウントダウン表示に使う
         "tradeRules": {
             "entryChecklist": entry_checklist,
             "avoidChecklist": avoid_checklist,
@@ -947,6 +957,8 @@ class Handler(SimpleHTTPRequestHandler):
             print(f"[取得] SNS（@{handle}）…")
             posts = get_sns_posts(handle) if handle else []
             self._send_json({"posts": posts})
+        elif self.path.startswith("/api/earnings-rating"):
+            self._send_json({"ratings": _load_earnings_ratings()})
         else:
             super().do_GET()  # HTMLなどの静的配信
 
@@ -992,6 +1004,22 @@ class Handler(SimpleHTTPRequestHandler):
             print(f"[取得] 分析（対象 {len(targets)} 銘柄）…")
             analysis = build_analysis(targets)
             self._send_json({"analysis": analysis})
+        elif self.path.startswith("/api/earnings-rating"):
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                body = {}
+            code = str(body.get("code", "")).strip()
+            stars = body.get("stars")
+            if code and isinstance(stars, (int, float)) and 0 <= stars <= 5:
+                ratings = _load_earnings_ratings()
+                ratings[code] = {"stars": stars, "updatedAt": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")}
+                _save_earnings_ratings(ratings)
+                self._send_json({"ok": True, "ratings": ratings})
+            else:
+                self._send_json({"ok": False})
         else:
             self.send_response(404)
             self.end_headers()
