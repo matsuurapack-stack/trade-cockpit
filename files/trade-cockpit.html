@@ -756,14 +756,14 @@ function App(){
     setUsFetching(true);setUsMsg("取得中…");
     setNewsFetching(true);
     let mergedQuotes=s.stockQuotes;
+    let hadError=false;
+    // 指数・日本株(277社)・米国株(30社)を同時並行で叩くとyfinance/Yahoo側のレート制限に
+    // 引っかかりやすく、1つの失敗がPromise.allで全体を巻き込んで「サーバーに接続できません」
+    // が誤って出てしまっていたため、逐次実行にし、1つ失敗しても他は続行するようにした。
     try{
-      const [qr,srJP,srUS]=await Promise.all([
-        fetch("/api/quotes"),
-        fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlist)}),
-        fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlistUS)}),
-      ]);
-      if(!qr.ok||!srJP.ok||!srUS.ok) throw new Error("quotes");
-      const qd=await qr.json(), sdJP=await srJP.json(), sdUS=await srUS.json();
+      const qr=await fetch("/api/quotes");
+      if(!qr.ok) throw new Error("quotes");
+      const qd=await qr.json();
       setS(p=>{const nm={...p.metrics};
         Object.entries(qd.quotes||{}).forEach(([k,v])=>{
           if(nm[k]!=null&&v){nm[k]={...nm[k],
@@ -771,16 +771,31 @@ function App(){
             p:(v.p!=null?String(v.p):nm[k].p),
             spark:(Array.isArray(v.spark)?v.spark:nm[k].spark)};}
         });
-        return {...p,metrics:nm,stockQuotes:{...p.stockQuotes,...(sdJP.quotes||{}),...(sdUS.quotes||{})}};});
-      mergedQuotes={...s.stockQuotes,...(sdJP.quotes||{}),...(sdUS.quotes||{})};
-      const doneAt=qd.fetchedAt||nowHHMM();
-      setMonitorMsg(doneAt+" 取得完了");setJpMsg(doneAt+" 取得完了");setUsMsg(doneAt+" 取得完了");
-    }catch(e){
-      setMonitorMsg("");setJpMsg("");setUsMsg("");
-      showConnError();
-    }
-    await fetchNewsOnly();
+        return {...p,metrics:nm};});
+      setMonitorMsg((qd.fetchedAt||nowHHMM())+" 取得完了");
+    }catch(e){hadError=true;setMonitorMsg("");}
+
+    try{
+      const srJP=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlist)});
+      if(!srJP.ok) throw new Error("stock-quotes-jp");
+      const sdJP=await srJP.json();
+      mergedQuotes={...mergedQuotes,...(sdJP.quotes||{})};
+      setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sdJP.quotes||{})}}));
+      setJpMsg(nowHHMM()+" 取得完了");
+    }catch(e){hadError=true;setJpMsg("");}
+
+    try{
+      const srUS=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlistUS)});
+      if(!srUS.ok) throw new Error("stock-quotes-us");
+      const sdUS=await srUS.json();
+      mergedQuotes={...mergedQuotes,...(sdUS.quotes||{})};
+      setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sdUS.quotes||{})}}));
+      setUsMsg(nowHHMM()+" 取得完了");
+    }catch(e){hadError=true;setUsMsg("");}
+
+    try{ await fetchNewsOnly(); }catch(e){hadError=true;}
     setNewsFetching(false);
+
     if(analysisItems.length){
       setJpMsg("分析データを再計算中…");setUsMsg("分析データを再計算中…");
       await fetchAnalysisFor(analysisItems,mergedQuotes);
@@ -788,6 +803,7 @@ function App(){
       setJpMsg(doneAt);setUsMsg(doneAt);
     }
     setMonitorFetching(false);setJpFetching(false);setUsFetching(false);
+    if(hadError)showConnError();
   };
   const anyFetching=monitorFetching||jpFetching||usFetching||newsFetching;
 
