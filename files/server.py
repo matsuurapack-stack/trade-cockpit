@@ -20,7 +20,9 @@ from socketserver import ThreadingTCPServer
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-PORT = 8765
+IS_CLOUD = bool(os.environ.get("RENDER") or os.environ.get("PORT"))
+PORT = int(os.environ.get("PORT", 8765))
+HOST = "0.0.0.0" if IS_CLOUD else "127.0.0.1"
 
 try:
     import yfinance as yf
@@ -893,10 +895,11 @@ def open_browser():
 def main():
     if yf is None or feedparser is None:
         print("必要なライブラリが見つかりません。setup.bat を先に実行してください。")
-        input("Enterで終了します。")
+        if not IS_CLOUD:
+            input("Enterで終了します。")
         return
     try:
-        httpd = ThreadingTCPServer(("127.0.0.1", PORT), Handler)
+        httpd = ThreadingTCPServer((HOST, PORT), Handler)
     except OSError:
         # ポート使用中（前回のサーバーが残っている等）。親切に案内して終了。
         print("=" * 52)
@@ -905,14 +908,19 @@ def main():
         print(" 前回の黒いウィンドウ（サーバー）を閉じてから、")
         print(" もう一度 start.bat を実行してください。")
         print("=" * 52)
-        input("Enterで終了します。")
+        if not IS_CLOUD:
+            input("Enterで終了します。")
         return
-    threading.Thread(target=open_browser, daemon=True).start()
+    if not IS_CLOUD:
+        threading.Thread(target=open_browser, daemon=True).start()
     print("=" * 52)
     print(" トレード・コックピット サーバー起動中")
-    print("  ブラウザが自動で開きます。開かない場合は下記を開いてください：")
-    print(f"  http://localhost:{PORT}/trade-cockpit.html")
-    print("  使い終わったら、このウィンドウを閉じてください。")
+    if IS_CLOUD:
+        print(f"  ポート {PORT} で待受中（クラウド環境）")
+    else:
+        print("  ブラウザが自動で開きます。開かない場合は下記を開いてください：")
+        print(f"  http://localhost:{PORT}/trade-cockpit.html")
+        print("  使い終わったら、このウィンドウを閉じてください。")
     print("=" * 52)
     with httpd:
         try:
