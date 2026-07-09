@@ -308,7 +308,7 @@ const MASTER = [
   // ===== 追加銘柄（2026-07-10の指示書。既存255社に含まれない銘柄を業種分類の上で追加。
   //       日本郵船・三井住友フィナンシャルグループ・第一ライフグループ・日立製作所・古河電気工業は
   //       既に日経225枠に登録済みのため、重複を避けてここには追加していない） =====
-  M("6227","AIメカテック","機械","JP"),M("6323","ローツェ","機械","JP"),
+  M("6227","AIメカテック","機械","JP"),M("6323","ローツェ","電気機器","JP"),
   M("6996","ニチコン","電気機器","JP"),M("6997","日本ケミコン","電気機器","JP"),
   M("7068","フィードフォースグループ","サービス業","JP"),M("485A","パワーエックス","電気機器","JP"),
   M("3186","ネクステージ","小売業","JP"),
@@ -467,10 +467,22 @@ const mergeDefaults=(saved,defaults,max)=>{
   const toAdd=defaults.filter(m=>!seen.has(m.code)).map(m=>({id:m.code,...m,watch:"通常",note:""}));
   return [...saved,...toAdd].slice(0,max);
 };
+// 「その他」セクター撤去（3章）より前に登録された銘柄は、保存データに古い sector:"その他" が
+// そのまま残っている。SECTORS_33/SECTOR_INDEX以外の値が入っている項目は、MASTERの現在の
+// 業種分類で上書きして移行する（MASTERに無い手動登録銘柄はそのまま据え置く）。
+const VALID_SECTORS=new Set([...SECTORS_33,SECTOR_INDEX]);
+const migrateSectors=(list)=>{
+  if(!Array.isArray(list))return list;
+  return list.map(w=>{
+    if(VALID_SECTORS.has(w.sector))return w;
+    const m=MASTER.find(x=>x.code===w.code);
+    return m?{...w,sector:m.sector}:w;
+  });
+};
 const loadState=()=>{try{const r=localStorage.getItem(KEY);if(!r)return null;const d=JSON.parse(r);
   const merged={...emptyState(),...d,metrics:{...emptyMetrics(),...(d.metrics||{})}};
-  merged.watchlist=mergeDefaults(d.watchlist,DEFAULT_WATCHLIST,MAX);
-  merged.watchlistUS=mergeDefaults(d.watchlistUS,DEFAULT_WATCHLIST_US,MAX_US);
+  merged.watchlist=migrateSectors(mergeDefaults(d.watchlist,DEFAULT_WATCHLIST,MAX));
+  merged.watchlistUS=migrateSectors(mergeDefaults(d.watchlistUS,DEFAULT_WATCHLIST_US,MAX_US));
   return merged;
 }catch{return null;}};
 
@@ -925,7 +937,9 @@ function App(){
   const exportJSON=()=>{const blob=new Blob([JSON.stringify(s,null,2)],{type:"application/json"});
     const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="trade-cockpit-"+s.date+".json";a.click();URL.revokeObjectURL(url);};
   const importJSON=(e)=>{const f=e.target.files?.[0];if(!f)return;const r=new FileReader();
-    r.onload=()=>{try{setS({...emptyState(),...JSON.parse(r.result)});}catch{alert("読み込み失敗");}};r.readAsText(f);e.target.value="";};
+    r.onload=()=>{try{const d=JSON.parse(r.result);
+      setS({...emptyState(),...d,watchlist:migrateSectors(d.watchlist),watchlistUS:migrateSectors(d.watchlistUS)});
+    }catch{alert("読み込み失敗");}};r.readAsText(f);e.target.value="";};
 
   // 日本の個別株（TSE:xxxx）は無料の埋め込みウィジェットでは表示不可（東証データの再配信制限）。
   const embeddable=(sym)=>!/^TSE:/i.test(sym||"");
