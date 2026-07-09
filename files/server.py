@@ -202,10 +202,25 @@ def _published_ts(entry):
         return 0
 
 
-def google_news(query, n=2):
+# キーワード一致度優先のGoogleニュース検索では、関連記事が少ないクエリだと数週間〜数ヶ月前の
+# 古い記事まで拾ってしまうことがある（重大ニュースのキーワードに偶然一致した過去記事等）。
+# 「重要ニュース」表示も含め、鮮度の低い記事が紛れ込まないよう取得時点でここまで絞り込む。
+# 個別銘柄の決算・IRは四半期に一度など元々頻度が低いため、マクロニュースより長めの期間を許容する。
+NEWS_MAX_AGE_DAYS = 14
+STOCK_NEWS_MAX_AGE_DAYS = 45
+
+
+def _is_recent(entry, max_age_days=NEWS_MAX_AGE_DAYS):
+    ts = _published_ts(entry)
+    if ts <= 0:
+        return False
+    return (time.time() - ts) <= max_age_days * 86400
+
+
+def google_news(query, n=2, max_age_days=NEWS_MAX_AGE_DAYS):
     """GoogleニュースRSSは検索クエリ単位では関連度寄りの順序で返り、必ずしも新しい順ではないため、
-    ここで公開日時の降順（新しい記事が先頭）に並べ替えてから返す。
-    複数クエリの結果を連結して使う呼び出し元（build_stock_news/build_macro_news）でも、
+    ここで公開日時の降順（新しい記事が先頭）に並べ替えてから返す。古い記事（max_age_days超）は
+    ここで除外する。複数クエリの結果を連結して使う呼び出し元（build_stock_news/build_macro_news）でも、
     連結後に改めて全体を日時順に並べ替えている。"""
     if feedparser is None:
         return []
@@ -213,7 +228,8 @@ def google_news(query, n=2):
            + urllib.parse.quote(query) + "&hl=ja&gl=JP&ceid=JP:ja")
     try:
         feed = feedparser.parse(url)
-        entries = sorted(feed.entries, key=_published_ts, reverse=True)
+        recent_entries = [e for e in feed.entries if _is_recent(e, max_age_days)]
+        entries = sorted(recent_entries, key=_published_ts, reverse=True)
         out = []
         for e in entries[:n]:
             raw = e.get("title", "")
@@ -302,7 +318,7 @@ def build_stock_news(watchlist):
         code = w.get("code", "")
         if not name:
             continue
-        candidates = google_news(name + " 決算 適時開示 業績", 4)
+        candidates = google_news(name + " 決算 適時開示 業績", 4, max_age_days=STOCK_NEWS_MAX_AGE_DAYS)
         ir_only = [it for it in candidates if _is_ir_news(it["title"])]
         for it in ir_only[:2]:
             items.append({**it, "code": code, "name": name})
