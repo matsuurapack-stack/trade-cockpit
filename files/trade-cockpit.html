@@ -938,9 +938,13 @@ function App(){
     return out;
   },[s.stockNewsList,s.usStockNewsList,s.macroNewsDomestic,s.macroNewsOverseas]);
 
-  // 5章：「分析」ボタン。押すたびに分析タブ（12章）の対象銘柄リストに追加/削除をトグルする
-  const toggleAnalysisTarget=(code)=>setS(p=>({...p,analysisTargets:p.analysisTargets.includes(code)
-    ?p.analysisTargets.filter(c=>c!==code):[...p.analysisTargets,code]}));
+  // 5章：「分析」ボタン。押すたびに分析タブ（12章）の対象銘柄リストに追加/削除をトグルし、
+  // 追加・削除いずれの場合も結果をすぐ確認できるよう「分析」タブに遷移する。
+  const toggleAnalysisTarget=(code)=>{
+    setS(p=>({...p,analysisTargets:p.analysisTargets.includes(code)
+      ?p.analysisTargets.filter(c=>c!==code):[...p.analysisTargets,code]}));
+    setTab("analysis");
+  };
 
   const rollToNextDay=()=>{if(!confirm("今日の値を前日値へ繰り越し、新しい一日にします（登録銘柄・分析対象銘柄は保持）。よろしいですか？"))return;
     setS(p=>({...emptyState(),date:todayISO(),watchlist:p.watchlist,watchlistUS:p.watchlistUS,analysisTargets:p.analysisTargets,
