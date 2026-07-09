@@ -372,6 +372,46 @@ def _bollinger(closes, n=20, k=2):
     return mean, mean + k * std, mean - k * std  # mid, upper, lower
 
 
+def _atr(highs, lows, closes, period=14):
+    """ATR（Average True Range）。前日終値を考慮したTrue Rangeの移動平均で、
+    「その日のうちに現実的に動きうる値幅」の目安として使う。"""
+    n = len(closes)
+    if n < period + 1:
+        return None
+    trs = []
+    for i in range(1, n):
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+        trs.append(tr)
+    if len(trs) < period:
+        return None
+    return sum(trs[-period:]) / period
+
+
+# 12-1章：分析の購入/損切り/利確単価は「その日の売買時間内」で現実的な値である必要がある。
+# 東証には前日終値を基準にした値幅制限（ストップ高・ストップ安）があり、以前はMA100や60営業日高値
+# など複数日単位の水準をそのまま目安に使っていたため、この制限を超える非現実的な価格になることが
+# あった。日本株についてはこの値幅制限テーブルで上限・下限を算出し、必ずその範囲内に収める。
+TSE_PRICE_LIMIT_TABLE = [
+    (100, 30), (200, 50), (500, 80), (700, 100), (1000, 150), (1500, 300), (2000, 400),
+    (3000, 500), (5000, 700), (7000, 1000), (10000, 1500), (15000, 3000), (20000, 4000),
+    (30000, 5000), (50000, 7000), (70000, 10000), (100000, 15000), (150000, 30000),
+    (200000, 40000), (300000, 50000), (500000, 70000), (700000, 100000), (1000000, 150000),
+    (1500000, 300000), (2000000, 400000), (3000000, 500000), (5000000, 700000),
+    (7000000, 1000000), (10000000, 1500000),
+]
+
+
+def tse_price_limit(prev_close):
+    """前日終値からその日の値幅制限（ストップ安値, ストップ高値）を返す。"""
+    if prev_close is None or prev_close <= 0:
+        return None, None
+    for threshold, width in TSE_PRICE_LIMIT_TABLE:
+        if prev_close < threshold:
+            return max(prev_close - width, 1), prev_close + width
+    width = TSE_PRICE_LIMIT_TABLE[-1][1]
+    return prev_close - width, prev_close + width
+
+
 def _rci(values, n=26):
     """順位相関指数(RCI)。直近n日の「日付順位」と「価格順位」の相関を-100〜+100で返す。
     価格順位は安い順に1〜n（上昇トレンドで日付順位と一致し+100に近づく、一般的な定義）。"""
@@ -571,7 +611,13 @@ def analyze_stock(w, market_env=""):
     except Exception:
         pass
 
-    # ---- 購入単価(目安)：買いシグナルの優先度順に採用。該当なしなら20日線基準にフォールバック ----
+    # ---- 購入単価(目安)：ATR(当日の現実的な値幅)を基準に、現在値からの押し目水準を設定する。
+    # 60営業日高値やMA100等の複数日単位の水準をそのまま使うと、値幅制限（ストップ高安）を
+    # 超える非現実的な価格になるため、シグナルは「どの根拠で買いと判定したか」の説明にのみ使い、
+    # 実際の価格はその日のATRから逆算する。----
+    atr14 = _atr(highs, lows, closes, 14)
+    atr_ref = atr14 if atr14 else current * 0.02  # ATRが計算できない場合は現在値の2%を代用
+
     priority = ["panpakapan", "compoundBottom", "goldenCross", "bb3", "volBull", "volShadow", "dojiLow", "haramiLow"]
     primary = None
     for key in priority:
@@ -580,47 +626,39 @@ def analyze_stock(w, market_env=""):
             break
 
     if primary:
-        entry = primary["price"]
-        entry_reasons = [primary["label"] + f"（{entry:.1f}）"]
+        entry = current - atr_ref * 0.3
+        entry_reasons = [f"{primary['label']}が点灯。当日のATR({atr_ref:.1f})から見た現実的な押し目水準として{entry:.1f}を採用"]
     else:
-        entry = ma25 if ma25 else current
-        entry_reasons = [f"該当する買いシグナルなし。25日移動平均線({entry:.1f})付近への押し目を暫定的に採用" if ma25 else "データ不足のため現在値を採用"]
+        entry = current - atr_ref * 0.2
+        entry_reasons = ["該当する買いシグナルなし。当日のATRから見た現在値近辺のわずかな押し目を暫定的に採用"]
     if rsi is not None and rsi >= 70:
-        entry = min(entry, current * 0.98)
+        entry -= atr_ref * 0.2
         entry_reasons.append(f"RSI({rsi:.0f})が買われすぎ水準のためやや低めに調整")
 
-    # ---- 損切り単価(目安)：4-2章の優先順位（100日線割れ+3% → -3σ-2% → 購入値-5% → サポート-2%）----
-    stop, stop_reasons = None, []
-    if ma100 is not None:
-        stop = ma100 * 0.97
-        stop_reasons.append(f"100日移動平均線（{ma100:.1f}）を明確に割り込んだ水準（-3%）を最終防衛ラインに設定")
-    elif bb_lower3 is not None:
-        stop = bb_lower3 * 0.98
-        stop_reasons.append(f"ボリンジャーバンド-3σ（{bb_lower3:.1f}）をさらに下回った水準（-2%）を設定")
-    elif entry:
-        stop = entry * 0.95
-        stop_reasons.append("移動平均線データ不足のため、購入単価から-5%をデフォルトの損切り水準に設定")
-    else:
-        stop = support * 0.98
-        stop_reasons.append(f"直近{lookback}営業日の安値({support:.1f})の-2%を下限目安に設定")
+    # ---- 損切り単価(目安)：当日のATRの1倍を損切り幅の目安とする（ザラ場内で許容できる下振れ）----
+    stop = entry - atr_ref
+    stop_reasons = [f"当日のATR({atr_ref:.1f})の1倍を損切り幅の目安に設定"]
 
-    # ---- 利確単価(目安)：買い理由の種類に応じたルール(3章)を適用 ----
-    if primary and primary["key"] == "compoundBottom":
-        target = entry * 1.025
-        target_reasons = ["急落・底打ちからの買いのため、+2.5%（下落分を取り戻す水準）を利確目安に設定"]
-    elif primary and primary["key"] == "bb3":
-        target = bb_mid if bb_mid else entry * 1.05
-        target_reasons = [f"ボリンジャーバンド中央線（{target:.1f}）までの戻りを利確目安に設定"]
-    elif primary and primary["key"] == "panpakapan":
-        risk = max(entry - stop, 0.01)
-        target = max(resistance, entry + risk * 2)
-        target_reasons = [f"トレンド継続中のため、直近高値（{resistance:.1f}）またはリスクリワード2倍（{entry + risk * 2:.1f}）を暫定目標に設定。"
-                           "短期線・中期線の接近が3回発生、または100日線割れが出たタイミングで見直してください"]
-    else:
-        risk = max(entry - stop, 0.01)
-        rr_target = entry + risk * 2
-        target = max(resistance, rr_target)
-        target_reasons = [f"直近{lookback}営業日の高値({resistance:.1f})、またはリスクリワード2倍の目標({rr_target:.1f})のうち高い方を採用"]
+    # ---- 利確単価(目安)：当日のATRの1.5倍（リスクリワード概ね1:1.5）を利確目安とする ----
+    target = entry + atr_ref * 1.5
+    target_reasons = [f"当日のATR({atr_ref:.1f})の1.5倍（リスクリワード概ね1:1.5）を利確目安に設定"]
+
+    # ---- 東証の値幅制限（ストップ高・ストップ安）を必ず超えないようにする（日本株のみ）----
+    if w.get("market", "JP") != "US":
+        day_lo, day_hi = tse_price_limit(prev)
+        if day_lo is not None and day_hi is not None:
+            if entry > day_hi:
+                entry = day_hi
+                entry_reasons.append(f"ストップ高({day_hi:.1f})を上限として調整")
+            if entry < day_lo:
+                entry = day_lo
+                entry_reasons.append(f"ストップ安({day_lo:.1f})を下限として調整")
+            if stop < day_lo:
+                stop = day_lo
+                stop_reasons.append(f"ストップ安({day_lo:.1f})を下限として調整")
+            if target > day_hi:
+                target = day_hi
+                target_reasons.append(f"ストップ高({day_hi:.1f})を上限として調整")
 
     fund_notes = []
     per, pbr, div = fundamentals.get("per"), fundamentals.get("pbr"), fundamentals.get("dividendYield")
