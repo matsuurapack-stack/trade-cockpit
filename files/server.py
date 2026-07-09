@@ -6,6 +6,7 @@
 - 使い方: start.bat をダブルクリック。ブラウザが自動で開きます。
 """
 import os
+import re
 import json
 import time
 import calendar
@@ -199,6 +200,46 @@ def google_news(query, n=2):
         return out
     except Exception:
         return []
+
+
+# 6-2章：SNSタブ。X公式の埋め込みタイムライン(widgets.js)はsyndication.twitter.comが
+# 429(レート制限)を頻発して表示できないため、Nitter(Xの代替フロントエンド)のRSSフィードを
+# サーバー側で取得する方式に切り替えた（ニュースタブのGoogleニュースRSSと同じ手法）。
+# Nitterの公開インスタンスは不安定なため、複数インスタンスを順に試す。
+NITTER_INSTANCES = ["nitter.net", "xcancel.com", "nitter.privacyredirect.com"]
+
+
+def _nitter_tweet_url(handle, nitter_link):
+    """NitterのURL(https://nitter.net/handle/status/12345#m)から実際のXの投稿URLを組み立てる。"""
+    m = re.search(r"/status/(\d+)", nitter_link or "")
+    if m:
+        return f"https://x.com/{handle}/status/{m.group(1)}"
+    return f"https://x.com/{handle}"
+
+
+def get_sns_posts(handle, n=15):
+    """指定アカウントの直近投稿をNitter RSS経由で取得する。全インスタンス失敗時は空配列を返し、
+    フロント側で「Xで開く」フォールバック表示に切り替える。"""
+    if feedparser is None:
+        return []
+    for host in NITTER_INSTANCES:
+        url = f"https://{host}/{handle}/rss"
+        try:
+            feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
+            if feed.bozo or not feed.entries:
+                continue
+            out = []
+            for e in feed.entries[:n]:
+                out.append({
+                    "title": e.get("title", ""),
+                    "url": _nitter_tweet_url(handle, e.get("link", "")),
+                    "published": _fmt_published(e),
+                })
+            if out:
+                return out
+        except Exception as ex:
+            print("  SNS取得失敗", host, handle, ex)
+    return []
 
 
 #  9章：登録銘柄ニュースは「決算を含むIR・適時開示」のみに絞る。GoogleニュースRSSには構造化
@@ -633,6 +674,12 @@ class Handler(SimpleHTTPRequestHandler):
             quotes = get_index_quotes()
             now = datetime.datetime.now().strftime("%H:%M:%S")
             self._send_json({"quotes": quotes, "fetchedAt": now})
+        elif self.path.startswith("/api/sns"):
+            qs = urllib.parse.urlparse(self.path).query
+            handle = urllib.parse.parse_qs(qs).get("handle", [""])[0]
+            print(f"[取得] SNS（@{handle}）…")
+            posts = get_sns_posts(handle) if handle else []
+            self._send_json({"posts": posts})
         else:
             super().do_GET()  # HTMLなどの静的配信
 

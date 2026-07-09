@@ -750,11 +750,12 @@ function App(){
   const [chartModal,setChartModal]=useState(null); // {symbol,name} 5章：登録銘柄行の「チャート」ボタン用モーダル
   const [cBB,setCBB]=useState(true),[cRSI,setCRSI]=useState(true),[cMA,setCMA]=useState(false);
   const [snsHandle,setSnsHandle]=useState(SNS_ACCOUNTS[0]); // 6-2章：SNSタブで選択中のXアカウント
-  const [snsFailed,setSnsFailed]=useState(false); // X埋め込みが読み込めなかった場合のフォールバック表示用
+  const [snsPosts,setSnsPosts]=useState([]); // Nitter RSS経由で取得した投稿一覧
+  const [snsLoading,setSnsLoading]=useState(false);
+  const [snsFailed,setSnsFailed]=useState(false); // 取得できなかった場合のフォールバック表示用
   const [openMetrics,setOpenMetrics]=useState(()=>new Set()); // 8章：日次モニターでチャートを開いている項目
   const fileRef=useRef();
   const modalChartRef=useRef();
-  const snsRef=useRef();
   const metricRefs=useRef({});
   const [fetching,setFetching]=useState(false);
   const [fetchMsg,setFetchMsg]=useState("");
@@ -912,37 +913,21 @@ function App(){
     sc.innerHTML=JSON.stringify({symbol:chartModal.symbol,interval:"D",timezone:"Asia/Tokyo",theme:"light",style:"1",locale:"ja",studies,width:"100%",height:480,allow_symbol_change:false});
     c.appendChild(sc);},[chartModal,cBB,cRSI,cMA]);
 
-  // 6-2章：X公式の埋め込みタイムラインスクリプトを一度だけ読み込む（無料枠。有料APIは不使用）
-  const loadTwitterWidgets=()=>new Promise(resolve=>{
-    if(window.twttr&&window.twttr.widgets){resolve(window.twttr);return;}
-    const existing=document.getElementById("twitter-wjs");
-    if(existing){existing.addEventListener("load",()=>resolve(window.twttr));return;}
-    const sc=document.createElement("script");
-    sc.id="twitter-wjs";sc.src="https://platform.twitter.com/widgets.js";sc.async=true;
-    sc.onload=()=>resolve(window.twttr);
-    document.body.appendChild(sc);
-  });
-  // X側の無料埋め込み(syndication.twitter.com)は近年レート制限(429)で失敗することが多く、
-  // その場合iframe自体は生成されても中身が空のままになる。一定時間後もiframeの高さが0なら
-  // 失敗とみなし、「Xで開く」への代替リンクを表示する（日本株チャートのTradingView代替と同じ方針）。
+  // 6-2章：X公式の埋め込みタイムライン(widgets.js)はsyndication.twitter.comが429(レート制限)を
+  // 頻発して安定して表示できなかったため、Nitter RSS経由でサーバー側から投稿一覧を取得する方式に
+  // 変更（ニュースタブのGoogleニュースRSSと同じ手法。server.pyの/api/sns参照）。
   useEffect(()=>{
     if(tab!=="sns")return;
-    const c=snsRef.current;if(!c)return;
-    setSnsFailed(false);
-    c.innerHTML=`<a class="twitter-timeline" data-height="600" data-theme="${theme}" href="https://twitter.com/${snsHandle}?ref_src=twsrc%5Etfw">Tweets by @${snsHandle}</a>`;
     let cancelled=false;
-    loadTwitterWidgets().then(twttr=>{
+    setSnsLoading(true);setSnsFailed(false);setSnsPosts([]);
+    fetch("/api/sns?handle="+encodeURIComponent(snsHandle)).then(r=>r.json()).then(d=>{
       if(cancelled)return;
-      if(!twttr||!twttr.widgets){setSnsFailed(true);return;}
-      twttr.widgets.load(c);
-    });
-    const timer=setTimeout(()=>{
-      if(cancelled)return;
-      const iframe=c.querySelector("iframe");
-      if(!iframe||iframe.clientHeight===0)setSnsFailed(true);
-    },4500);
-    return ()=>{cancelled=true;clearTimeout(timer);};
-  },[tab,snsHandle,theme]);
+      const posts=Array.isArray(d.posts)?d.posts:[];
+      setSnsPosts(posts);
+      if(!posts.length)setSnsFailed(true);
+    }).catch(()=>{if(!cancelled)setSnsFailed(true);}).finally(()=>{if(!cancelled)setSnsLoading(false);});
+    return ()=>{cancelled=true;};
+  },[tab,snsHandle]);
 
   const openTV=(tv)=>{if(tv)window.open("https://jp.tradingview.com/chart/?symbol="+encodeURIComponent(tv),"_blank");};
 
@@ -1070,21 +1055,23 @@ function App(){
       {/* ===== SNS（6-2章） ===== */}
       {tab==="sns" && <div style={{marginTop:18}}>
         <div className="sec-head">SNS</div>
-        <div className="sec-note">指定10アカウントの投稿をX公式の埋め込みタイムラインで表示します（無料枠。有料APIは不使用のため複数アカウントを1本に統合した時系列表示はできません）。アカウントを選んで切り替えてください。</div>
+        <div className="sec-note">指定10アカウントの投稿を表示します（X公式の埋め込みが安定して表示できないため、Nitter RSS経由でサーバーから取得しています）。アカウントを選んで切り替えてください。</div>
         <div style={{display:"flex",gap:6,flexWrap:"wrap",margin:"12px 0"}}>
           {SNS_ACCOUNTS.map(h=><button key={h} className={"chip"+(snsHandle===h?" on":"")} onClick={()=>setSnsHandle(h)}>@{h}</button>)}
         </div>
-        <div style={{position:"relative",border:"1px solid var(--rule)",borderRadius:8,background:"var(--card)",minHeight:420,padding:"4px 8px"}}>
-          <div key={snsHandle} ref={snsRef}></div>
-          {snsFailed && <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",
-              justifyContent:"center",gap:14,padding:24,textAlign:"center",background:"var(--card)"}}>
-            <div style={{fontSize:12.5,color:"var(--inkSoft)",lineHeight:1.7,maxWidth:420}}>
-              X（旧Twitter）の無料埋め込みタイムラインが混雑等の理由で読み込めませんでした（配信元の一時的な制限の可能性があります）。下のボタンからXで直接確認してください。
-            </div>
-            <a className="btn primary" href={`https://x.com/${snsHandle}`} target="_blank" rel="noopener noreferrer">↗ @{snsHandle} をXで開く</a>
-          </div>}
+        <div className="card" style={{padding:"14px 16px 6px",minHeight:300}}>
+          {snsLoading
+            ? <div className="news-empty">読み込み中…</div>
+            : snsFailed
+            ? <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14,padding:24,textAlign:"center"}}>
+                <div style={{fontSize:12.5,color:"var(--inkSoft)",lineHeight:1.7,maxWidth:420}}>
+                  投稿を取得できませんでした（配信元の一時的な制限の可能性があります）。下のボタンからXで直接確認してください。
+                </div>
+                <a className="btn primary" href={`https://x.com/${snsHandle}`} target="_blank" rel="noopener noreferrer">↗ @{snsHandle} をXで開く</a>
+              </div>
+            : <NewsList items={snsPosts}/>}
         </div>
-        <p className="foot">※ 表示件数はXの仕様により直近20件程度に限られます。鍵アカウントの投稿は表示できません。<br/>※ X側の無料埋め込みは制限により表示できないことがあります（その場合は上の「Xで開く」をご利用ください）。<br/>※ 有料のX APIを契約すれば複数アカウント統合タイムラインも実装できますが、従量課金（読み取り$0.005/件、無料枠なし）のため今回は見送っています。必要であればご相談ください。</p>
+        <p className="foot">※ 投稿の取得元はNitter（Xの代替フロントエンド）のRSSフィードのため、表示が遅れる・欠落することがあります。鍵アカウントの投稿は表示できません。<br/>※ 有料のX APIを契約すれば複数アカウント統合タイムラインも実装できますが、従量課金（読み取り$0.005/件、無料枠なし）のため今回は見送っています。必要であればご相談ください。</p>
       </div>}
 
       {/* ===== 分析（12章） ===== */}
