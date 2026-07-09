@@ -344,24 +344,6 @@ const MASTER = [
   M("NI225","日経225",SECTOR_OTHER,"IDX","INDEX:NKY"),M("USDJPY","ドル円",SECTOR_OTHER,"IDX","FX:USDJPY"),
   M("SOX","半導体ETF(SOXX)",SECTOR_OTHER,"IDX","NASDAQ:SOXX"),M("VIX","VIX短期ETF(VIXY)",SECTOR_OTHER,"IDX","BATS:VIXY"),
 ];
-const MASTER_BY_CODE=Object.fromEntries(MASTER.map(m=>[m.code,m]));
-
-// 10-3章：テーマ別銘柄グリッド。MASTERに実在する銘柄コードのみで構成する。
-// 銘柄のテーマ分類はセクター分類のように公式な基準があるわけではなく、名称・事業内容からの
-// 近似的な選定（キュレーション）である点に留意。アイコンはAI画像生成の3Dイラストではなく、
-// 実装簡易化のため絵文字を使用（著作権のあるロゴ等は使用していない）。
-const THEMES = [
-  {key:"ai",label:"AI関連",icon:"🤖",codes:["6758","4689","6501","6702","NVDA","MSFT","GOOGL","META","PLTR"]},
-  {key:"semi",label:"半導体",icon:"🔬",codes:["8035","6857","6920","3436","6526","6525","NVDA","AMD","AVGO","MU","TSM","ASML","ARM"]},
-  {key:"defense",label:"防衛",icon:"🛡️",codes:["7011","7013","7012","6701"]},
-  {key:"space",label:"宇宙ビジネス",icon:"🚀",codes:["7011","7013","6701","4307"]},
-  {key:"ev",label:"EV",icon:"🔋",codes:["7203","7267","7201","6752","6902","TSLA"]},
-  {key:"crypto",label:"暗号資産",icon:"₿",codes:["8473"]},
-  {key:"nisa",label:"NISA人気銘柄",icon:"📈",codes:["8306","9432","7203","6758","9983"]},
-  {key:"dividend",label:"高配当",icon:"💰",codes:["2914","8306","8411","8316","8766"]},
-  {key:"genai",label:"生成AI",icon:"✨",codes:["4751","4755","6098","MSFT","GOOGL","META"]},
-  {key:"yen",label:"円安関連(輸出)",icon:"💴",codes:["7203","7267","6758","6902","8035"]},
-];
 
 // ===== カラールール（セクター・銘柄共通。3章の仕様）=====
 // 上昇率(%)は0.5%刻みで6段階(0-0.5/0.5-1.0/1.0-1.5/1.5-2.0/2.0-2.5/2.5超)に区分し、1段階ずつ赤/緑を濃くする。
@@ -511,77 +493,6 @@ function Sparkline({data,color,width=140,height=36}){
     <path d={area} fill={`url(#${gid})`} stroke="none"/>
     <path d={line} fill="none" stroke={color} strokeWidth="1.6"/>
   </svg>;
-}
-
-// 10-1章：カードUI基盤（名称・現在値・前日比・ミニスパークラインの4点セット）。テーマ別グリッド(10-3章)等で再利用する。
-function StockCard({name,code,quote,onClick}){
-  const t=num(quote?.t),p=num(quote?.p);
-  const delta=t!=null&&p!=null?t-p:null;
-  const pct=t!=null&&p!=null&&p?(t-p)/p*100:null;
-  const c=changeColor(pct);
-  const sparkColor=delta==null||delta===0?"#8a8f86":(delta>0?COLOR_PALETTE[CURRENT_THEME].upBase:COLOR_PALETTE[CURRENT_THEME].downBase);
-  return <button onClick={onClick} className="card" style={{textAlign:"left",cursor:onClick?"pointer":"default",width:"100%",font:"inherit",color:"var(--ink)"}}>
-    <div style={{display:"flex",justifyContent:"space-between",gap:8}}>
-      <div><div className="card-t">{name}</div><div className="card-n mono">{code}</div></div>
-      <div style={{textAlign:"right"}}>
-        <div className="mono" style={{fontSize:16,fontWeight:700}}>{t!=null?t.toLocaleString():"—"}</div>
-        <div className="mono" style={{fontSize:12,color:c.fg}}>{pct!=null?(pct>0?"+":"")+pct.toFixed(2)+"%":"—"}</div>
-      </div>
-    </div>
-    <div style={{marginTop:8}}><Sparkline data={quote?.spark} color={sparkColor}/></div>
-  </button>;
-}
-
-// 10-3章：テーマ別銘柄グリッド（テーマ名+騰落率+アイコンのカードを2列グリッド表示）。
-// テーマをタップすると、そのテーマに属する銘柄一覧（10-1章のカードUI）に遷移する。
-function ThemeGrid({stockQuotes,onFetchCodes}){
-  const [selected,setSelected]=useState(null); // 選択中のテーマkey（null=一覧表示）
-  const [sort,setSort]=useState("popular"); // popular=人気順(定義順) / change=騰落率順
-
-  const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
-    return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
-
-  const themeStats=useMemo(()=>THEMES.map(th=>{
-    const pcts=th.codes.map(pctOf).filter(v=>v!=null);
-    const avgPct=pcts.length?pcts.reduce((a,b)=>a+b,0)/pcts.length:null;
-    return {...th,avgPct};
-  }),[stockQuotes]);
-
-  const sorted=useMemo(()=>{
-    if(sort==="change") return [...themeStats].sort((a,b)=>(b.avgPct??-Infinity)-(a.avgPct??-Infinity));
-    return themeStats; // 人気順：THEMES定義順をそのまま採用
-  },[themeStats,sort]);
-
-  const theme=selected?THEMES.find(t=>t.key===selected):null;
-
-  useEffect(()=>{if(theme)onFetchCodes(theme.codes);},[selected]);
-
-  if(theme){
-    const members=theme.codes.map(code=>MASTER_BY_CODE[code]).filter(Boolean);
-    return <div>
-      <button className="ghost" style={{marginBottom:12}} onClick={()=>setSelected(null)}>← テーマ一覧へ戻る</button>
-      <div className="sec-head">{theme.icon} {theme.label}</div>
-      <div className="sec-note">このテーマに関連する銘柄（{members.length}銘柄）。分類は名称・事業内容に基づく近似的な選定です。</div>
-      <div className="grid" style={{gridTemplateColumns:"repeat(auto-fit,minmax(240px,1fr))",marginTop:10}}>
-        {members.map(m=><StockCard key={m.code} name={m.name} code={m.code} quote={stockQuotes[m.code]}/>)}
-      </div>
-    </div>;
-  }
-
-  return <div>
-    <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:14}}>
-      <button className={"chip"+(sort==="popular"?" on":"")} onClick={()=>setSort("popular")}>人気順</button>
-      <button className={"chip"+(sort==="change"?" on":"")} onClick={()=>setSort("change")}>騰落率順</button>
-    </div>
-    <div className="grid" style={{gridTemplateColumns:"repeat(2,1fr)"}}>
-      {sorted.map(th=>{const c=changeColor(th.avgPct);
-        return <button key={th.key} className="card" style={{textAlign:"left",cursor:"pointer",font:"inherit",color:"var(--ink)"}} onClick={()=>setSelected(th.key)}>
-          <div style={{fontSize:26,marginBottom:6}}>{th.icon}</div>
-          <div className="card-t">{th.label}</div>
-          <div className="mono" style={{fontSize:13,fontWeight:700,color:c.fg,marginTop:4}}>{th.avgPct!=null?(th.avgPct>0?"+":"")+th.avgPct.toFixed(2)+"%":"—"}</div>
-        </button>;})}
-    </div>
-  </div>;
 }
 
 // 10-5章：出典名の頭文字によるサムネイル代わりのアバター（実画像はGoogleニュースRSSから取得できないため代替）
@@ -889,15 +800,6 @@ function App(){
     if(missing.length)fetchAnalysisFor(missing);
   },[s.analysisTargets]);
 
-  // 10-3章：テーマ画面で銘柄を開いた時、登録銘柄かどうかに関わらずその場で現在値・前日比・スパークラインを取得する
-  const fetchThemeQuotes=async(codes)=>{
-    const missing=codes.filter(c=>!s.stockQuotes[c]).map(c=>MASTER_BY_CODE[c]).filter(Boolean);
-    if(!missing.length)return;
-    try{
-      const tr=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(missing)});
-      if(tr.ok){const td=await tr.json();setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(td.quotes||{})}}));}
-    }catch(e){}
-  };
 
   const day=useMemo(()=>{const d=new Date(s.date+"T00:00:00");return isNaN(d)?null:d.getDay();},[s.date]);
   const isMonday=day===1;
@@ -1026,8 +928,7 @@ function App(){
       </div>
 
       {/* タブ並び順：日次モニター→ニュース→アメリカ市場(6-1)→SNS(6-2)→日本市場→分析(12章)。
-          日次モニターは6章の並びに含まれないが、要望により先頭に配置。
-          テーマ(10-3章)は6章の並びに含まれない追加画面のため末尾に配置。 */}
+          日次モニターは6章の並びに含まれないが、要望により先頭に配置。 */}
       <div className="tabs">
         <button className={"tab"+(tab==="monitor"?" on":"")} onClick={()=>setTab("monitor")}>日次モニター</button>
         <button className={"tab"+(tab==="news"?" on":"")} onClick={()=>setTab("news")}>ニュース</button>
@@ -1035,7 +936,6 @@ function App(){
         <button className={"tab"+(tab==="sns"?" on":"")} onClick={()=>setTab("sns")}>SNS</button>
         <button className={"tab"+(tab==="briefing"?" on":"")} onClick={()=>setTab("briefing")}>日本市場</button>
         <button className={"tab"+(tab==="analysis"?" on":"")} onClick={()=>setTab("analysis")}>分析</button>
-        <button className={"tab"+(tab==="theme"?" on":"")} onClick={()=>setTab("theme")}>テーマ</button>
       </div>
 
       {/* ===== 日次モニター（独立タブ） ===== */}
@@ -1203,13 +1103,6 @@ function App(){
               </div>
             </div>}
         <p className="foot" style={{marginTop:16}}>※ テクニカル指標は過去1年の日足終値から算出（25日/75日/100日移動平均・RSI14・RCI26・ボリンジャーバンド20,±2σ/±3σ・52週高値安値）。パンパカパン・ゴールデンクロス・複合底打ち等のシグナル判定を含みます。ファンダメンタルはyfinance取得可能な範囲（PER・PBR・配当利回り・予想EPS)を使用しています。</p>
-      </div>}
-
-      {/* ===== テーマ（10-3章） ===== */}
-      {tab==="theme" && <div style={{marginTop:18}}>
-        <div className="sec-head">テーマ</div>
-        <div className="sec-note">AI関連・半導体・防衛など、テーマ別に銘柄をまとめて確認できます。テーマ分類は名称・事業内容に基づく近似的な選定です。</div>
-        <ThemeGrid stockQuotes={s.stockQuotes} onFetchCodes={fetchThemeQuotes}/>
       </div>}
 
       {/* ===== NEWS（9章・9-1章・9-2章） ===== */}
