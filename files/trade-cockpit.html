@@ -384,17 +384,26 @@ const hexToRgb=(h)=>{
 const rgbToHex=(r,g,b)=>"#"+[r,g,b].map(v=>Math.max(0,Math.min(255,Math.round(v))).toString(16).padStart(2,"0")).join("");
 const mixHex=(a,b,t)=>{const[ar,ag,ab]=hexToRgb(a),[br,bg,bb]=hexToRgb(b);return rgbToHex(ar+(br-ar)*t,ag+(bg-ag)*t,ab+(bb-ab)*t);};
 
-// pct(%)を受け取り、セクター・銘柄どちらでも使う共通のカラー情報を返す。pctがnull/0はニュートラル。
+// セルの背景色に対して、白文字/濃色文字のどちらが読みやすいかをWCAGの相対輝度で判定する
+const relLuminance=(hex)=>{
+  const [r,g,b]=hexToRgb(hex).map(v=>{const c=v/255;return c<=0.03928?c/12.92:Math.pow((c+0.055)/1.055,2.4);});
+  return 0.2126*r+0.7152*g+0.0722*b;
+};
+const contrastText=(bgHex)=>relLuminance(bgHex)>0.42?"#1A1A1A":"#FFFFFF";
+
+// pct(%)を受け取り、日次モニター・セクター・登録銘柄どれでも使う共通のカラー情報を返す。
+// セルの背景そのものを段階配色にし（ヒートマップ的な塗り分け）、文字色は背景の明るさに応じて
+// 白/濃色を自動選択することで、セルの中でも数字が確実に読めるようにする。pctがnull/0はニュートラル。
 const changeColor=(pct)=>{
-  if(pct==null||pct===0) return {level:0,dir:null,fg:"var(--inkSoft)",bg:"transparent"};
+  if(pct==null||pct===0) return {level:0,dir:null,fg:"var(--inkSoft)",fgSoft:"var(--inkSoft)",bg:"var(--card)"};
   const pal=COLOR_PALETTE[CURRENT_THEME];
   const level=Math.min(CHANGE_MAX_LEVEL,Math.ceil(Math.abs(pct)/CHANGE_STEP));
   const t=(level-1)/(CHANGE_MAX_LEVEL-1);
   const up=pct>0;
-  const fg=mixHex(up?pal.upBase:pal.downBase, up?pal.upDark:pal.downDark, t);
-  // 背景は薄いトーンに留め、濃淡の主な表現は文字色(fg)側で担う（濃い背景+濃い文字は視認性が落ちるため）
-  const bg=mixHex(up?pal.upBg:pal.downBg, fg, 0.05+t*0.15);
-  return {level,dir:up?"up":"down",fg,bg};
+  const bg=mixHex(up?pal.upBase:pal.downBase, up?pal.upDark:pal.downDark, t);
+  const fg=contrastText(bg);
+  const fgSoft=fg==="#FFFFFF"?"rgba(255,255,255,.75)":"rgba(26,26,26,.65)";
+  return {level,dir:up?"up":"down",fg,fgSoft,bg};
 };
 
 // 8章：日次モニターの各項目をクリックした時に開くリアルタイムチャート用シンボル。
@@ -662,13 +671,14 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
           const avgC=changeColor(avgPct);
           return <div key={sector} style={{borderTop:i===0?"none":"1px solid var(--ruleSoft)"}}>
             <button onClick={()=>toggleSector(sector)} style={{display:"flex",alignItems:"center",width:"100%",gap:10,padding:"11px 14px",
-              background:avgC.level>0?avgC.bg:(isOpen?"var(--band)":"transparent"),border:"none",cursor:"pointer",textAlign:"left",font:"inherit",color:"var(--ink)"}}>
-              <span className="mono" style={{fontSize:11,color:"var(--inkSoft)",width:14}}>{isOpen?"▾":"▸"}</span>
+              background:avgC.level>0?avgC.bg:(isOpen?"var(--band)":"transparent"),border:"none",cursor:"pointer",textAlign:"left",font:"inherit",
+              color:avgC.level>0?avgC.fg:"var(--ink)"}}>
+              <span className="mono" style={{fontSize:11,color:avgC.level>0?avgC.fgSoft:"var(--inkSoft)",width:14}}>{isOpen?"▾":"▸"}</span>
               <span style={{flex:1,fontSize:14,fontWeight:700}}>{sector}</span>
               <span className="mono" style={{fontSize:13,fontWeight:700,color:avgC.fg,minWidth:56,textAlign:"right"}}>
                 {avgPct!=null?(avgPct>0?"+":"")+avgPct.toFixed(2)+"%":"—"}
               </span>
-              <span style={{fontSize:11.5,color:"var(--inkSoft)"}}>{items.length}銘柄</span>
+              <span style={{fontSize:11.5,color:avgC.level>0?avgC.fgSoft:"var(--inkSoft)"}}>{items.length}銘柄</span>
             </button>
             {isOpen && <div style={{overflowX:"auto"}}><table style={{minWidth:860}}>
               <thead><tr style={{background:"var(--band)"}}><th>コード</th><th>銘柄</th><th>現在値</th><th>前日比</th><th>高値</th><th>安値</th><th></th></tr></thead>
@@ -679,13 +689,13 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                 const pct=pctOf(w.code);
                 const c=changeColor(pct);
                 const inAnalysis=analysisTargets.includes(w.code);
-                return <tr key={w.id} style={{borderTop:"1px solid var(--ruleSoft)",background:c.bg}}>
+                return <tr key={w.id} style={{borderTop:"1px solid var(--ruleSoft)",background:c.bg,color:c.level>0?c.fg:"var(--ink)"}}>
                   <td className="mono" style={{fontWeight:700}}>{w.code}</td>
                   <td>{w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
                   <td className="mono" style={{fontWeight:700,color:c.fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
                   <td className="mono" style={{color:c.fg,whiteSpace:"nowrap"}}>{delta!=null?(delta>0?"+":"")+delta.toLocaleString(undefined,{maximumFractionDigits:2})+(pct!=null?` (${pct>0?"+":""}${pct.toFixed(2)}%)`:""):"—"}</td>
-                  <td className="mono" style={{color:"var(--inkSoft)",whiteSpace:"nowrap"}}>{chi!=null?chi.toLocaleString():"—"}</td>
-                  <td className="mono" style={{color:"var(--inkSoft)",whiteSpace:"nowrap"}}>{clo!=null?clo.toLocaleString():"—"}</td>
+                  <td className="mono" style={{color:c.level>0?c.fgSoft:"var(--inkSoft)",whiteSpace:"nowrap"}}>{chi!=null?chi.toLocaleString():"—"}</td>
+                  <td className="mono" style={{color:c.level>0?c.fgSoft:"var(--inkSoft)",whiteSpace:"nowrap"}}>{clo!=null?clo.toLocaleString():"—"}</td>
                   <td style={{textAlign:"center",whiteSpace:"nowrap"}}>
                     <button className="ghost" style={{padding:"4px 9px",fontSize:11.5,marginRight:5}} onClick={()=>onOpenChart(w)}>チャート</button>
                     <button className={inAnalysis?"btn primary":"ghost"} style={{padding:"4px 9px",fontSize:11.5,marginRight:5}} onClick={()=>onToggleAnalysis(w.code)}>{inAnalysis?"✓ 分析中":"分析"}</button>
@@ -986,19 +996,24 @@ function App(){
           <div className="sec-note" style={{marginTop:-4}}>項目をクリックするとリアルタイムチャートが下に開きます。</div>
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:1,background:"var(--rule)",border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden"}}>
             {METRICS.map(m=>{const v=s.metrics[m.key];const t=num(v.t),p=num(v.p);
-              const delta=t!=null&&p!=null?t-p:null;const dCol=delta==null?"var(--inkSoft)":delta>0?"var(--up)":delta<0?"var(--down)":"var(--inkSoft)";
-              const sparkColor=delta==null||delta===0?"#8a8f86":(delta>0?COLOR_PALETTE[CURRENT_THEME].upBase:COLOR_PALETTE[CURRENT_THEME].downBase);
+              const delta=t!=null&&p!=null?t-p:null;
+              const pct=t!=null&&p!=null&&p?(t-p)/p*100:null;
+              const c=changeColor(pct);
+              const sparkColor=c.level>0?c.fg:"#8a8f86"; // セル背景と同色に埋もれないよう、文字色と同じコントラスト色で描画
               const condOn=m.cond&&t!=null&&m.cond(t);
-              const cardBg=condOn?"#EAF0EC":delta>0?"var(--upBg)":delta<0?"var(--downBg)":"var(--card)";
               const isOpen=openMetrics.has(m.key);
               return <React.Fragment key={m.key}>
-                <button onClick={()=>toggleMetric(m.key)} style={{width:"100%",background:cardBg,padding:"11px 13px",border:"none",textAlign:"left",cursor:"pointer",font:"inherit",color:"var(--ink)"}}>
-                  <div style={{fontSize:11,color:"var(--inkSoft)",display:"flex",justifyContent:"space-between"}}><span>{m.label}</span>{condOn&&<span className="mono" style={{fontSize:10,color:"var(--gain)",fontWeight:700}}>条件○</span>}</div>
+                <button onClick={()=>toggleMetric(m.key)} style={{width:"100%",background:c.bg,padding:"11px 13px",
+                    border:condOn?"2px solid var(--gain)":"none",boxSizing:"border-box",textAlign:"left",cursor:"pointer",font:"inherit",
+                    color:c.level>0?c.fg:"var(--ink)"}}>
+                  <div style={{fontSize:11,color:c.level>0?c.fgSoft:"var(--inkSoft)",display:"flex",justifyContent:"space-between"}}>
+                    <span>{m.label}</span>{condOn&&<span className="mono" style={{fontSize:10,color:c.level>0?c.fg:"var(--gain)",fontWeight:700}}>条件○</span>}
+                  </div>
                   <div style={{display:"flex",alignItems:"baseline",gap:7,marginTop:3}}>
                     <span className="mono" style={{fontSize:21,fontWeight:700}}>{t!=null?t.toFixed(m.dp):"—"}</span>
-                    {delta!=null&&<span className="mono" style={{fontSize:12,color:dCol}}>{delta>0?"▲":delta<0?"▼":""}{delta>0?"+":""}{delta.toFixed(m.dp)}</span>}
+                    {delta!=null&&<span className="mono" style={{fontSize:12}}>{delta>0?"▲":delta<0?"▼":""}{delta>0?"+":""}{delta.toFixed(m.dp)}</span>}
                   </div>
-                  <div style={{marginTop:7,fontSize:12,color:"var(--inkSoft)"}}>前日 <span className="mono">{p!=null?p.toFixed(m.dp):"—"}</span></div>
+                  <div style={{marginTop:7,fontSize:12,color:c.level>0?c.fgSoft:"var(--inkSoft)"}}>前日 <span className="mono">{p!=null?p.toFixed(m.dp):"—"}</span></div>
                   <div style={{marginTop:8}}><Sparkline data={v.spark} color={sparkColor}/></div>
                 </button>
                 {isOpen && <div style={{gridColumn:"1 / -1",background:"var(--card)",padding:12}}>
