@@ -535,7 +535,13 @@ def analyze_stock(w, market_env=""):
     値はあくまで目安であり断定的な推奨ではない(12-2章の方針)。"""
     sym = _yf_symbol(w)
     tk = yf.Ticker(sym)
+    # Yahoo側の一時的なレート制限で日足が空/不足で返ってくることがあり、その場合そのまま
+    # 「データを取得できませんでした」になってしまっていたため、1回だけ間を置いて再試行する。
     h = tk.history(period="1y")
+    if len(h.get("Close", [])) < 20:
+        time.sleep(1.5)
+        tk = yf.Ticker(sym)
+        h = tk.history(period="1y")
     closes = h["Close"].dropna().tolist()
     opens = h["Open"].dropna().tolist()
     highs = h["High"].dropna().tolist()
