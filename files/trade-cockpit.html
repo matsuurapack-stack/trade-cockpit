@@ -694,12 +694,12 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
             <button onClick={()=>toggleSector(sector)} style={{display:"flex",alignItems:"center",width:"100%",gap:10,padding:"11px 14px",
               background:avgC.level>0?avgC.bg:(isOpen?"var(--band)":"transparent"),border:"none",cursor:"pointer",textAlign:"left",font:"inherit",
               color:avgC.level>0?avgC.fg:"var(--ink)"}}>
-              <span className="mono" style={{fontSize:11,color:avgC.level>0?avgC.fgSoft:"var(--inkSoft)",width:14}}>{isOpen?"▾":"▸"}</span>
-              <span style={{flex:1,fontSize:14,fontWeight:700}}>{sector}</span>
-              <span className="mono" style={{fontSize:13,fontWeight:700,color:avgC.fg,minWidth:56,textAlign:"right"}}>
+              <span className="mono" style={{fontSize:12,color:avgC.level>0?avgC.fgSoft:"var(--inkSoft)",width:14}}>{isOpen?"▾":"▸"}</span>
+              <span style={{flex:1,fontSize:18,fontWeight:700}}>{sector}</span>
+              <span className="mono" style={{fontSize:19,fontWeight:800,color:avgC.fg,minWidth:70,textAlign:"right"}}>
                 {avgPct!=null?(avgPct>0?"+":"")+avgPct.toFixed(2)+"%":"—"}
               </span>
-              <span style={{fontSize:11.5,color:avgC.level>0?avgC.fgSoft:"var(--inkSoft)"}}>{items.length}銘柄</span>
+              <span style={{fontSize:13,color:avgC.level>0?avgC.fgSoft:"var(--inkSoft)"}}>{items.length}銘柄</span>
             </button>
             {isOpen && <div style={{overflowX:"auto"}}><table style={{minWidth:860}}>
               <thead><tr style={{background:"var(--band)"}}><th>コード</th><th>銘柄</th><th>現在値</th><th>前日比</th><th>高値</th><th>安値</th><th></th></tr></thead>
@@ -711,10 +711,10 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                 const c=changeColor(pct);
                 const inAnalysis=analysisTargets.includes(w.code);
                 return <tr key={w.id} style={{borderTop:"1px solid var(--ruleSoft)",background:c.bg,color:c.level>0?c.fg:"var(--ink)"}}>
-                  <td className="mono" style={{fontWeight:700}}>{w.code}</td>
-                  <td>{w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
-                  <td className="mono" style={{fontWeight:700,color:c.fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
-                  <td className="mono" style={{color:c.fg,whiteSpace:"nowrap"}}>{delta!=null?(delta>0?"+":"")+delta.toLocaleString(undefined,{maximumFractionDigits:2})+(pct!=null?` (${pct>0?"+":""}${pct.toFixed(2)}%)`:""):"—"}</td>
+                  <td className="mono" style={{fontWeight:700,fontSize:14}}>{w.code}</td>
+                  <td style={{fontSize:16,fontWeight:600}}>{w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
+                  <td className="mono" style={{fontWeight:800,fontSize:17,color:c.fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
+                  <td className="mono" style={{fontWeight:700,fontSize:16,color:c.fg,whiteSpace:"nowrap"}}>{delta!=null?(delta>0?"+":"")+delta.toLocaleString(undefined,{maximumFractionDigits:2})+(pct!=null?` (${pct>0?"+":""}${pct.toFixed(2)}%)`:""):"—"}</td>
                   <td className="mono" style={{color:c.level>0?c.fgSoft:"var(--inkSoft)",whiteSpace:"nowrap"}}>{chi!=null?chi.toLocaleString():"—"}</td>
                   <td className="mono" style={{color:c.level>0?c.fgSoft:"var(--inkSoft)",whiteSpace:"nowrap"}}>{clo!=null?clo.toLocaleString():"—"}</td>
                   <td style={{textAlign:"center",whiteSpace:"nowrap"}}>
