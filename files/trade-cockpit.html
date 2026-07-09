@@ -796,23 +796,7 @@ function App(){
         setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sdu.quotes||{})}}));}
       setFetchMsg("登録銘柄を反映。ニュース取得中…");
     }catch(e){}
-    try{
-      // (3) ニュース（日本市場の登録銘柄＋マクロ）
-      const nr=await fetch("/api/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlist)});
-      if(nr.ok){const nd=await nr.json();
-        setS(p=>({...p,
-          stockNewsList:Array.isArray(nd.stockNews)?nd.stockNews:p.stockNewsList,
-          macroNewsList:Array.isArray(nd.macroNews)?nd.macroNews:p.macroNewsList,
-          macroNewsDomestic:Array.isArray(nd.macroNewsDomestic)?nd.macroNewsDomestic:p.macroNewsDomestic,
-          macroNewsOverseas:Array.isArray(nd.macroNewsOverseas)?nd.macroNewsOverseas:p.macroNewsOverseas,
-          stockNews:nd.stockNewsText||p.stockNews,marketNews:nd.macroNewsText||p.marketNews}));}
-    }catch(e){}
-    try{
-      // (4) ニュース（6-1章：アメリカ市場＝ダウ30の登録銘柄向け）
-      const nru=await fetch("/api/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlistUS)});
-      if(nru.ok){const ndu=await nru.json();
-        setS(p=>({...p,usStockNewsList:Array.isArray(ndu.stockNews)?ndu.stockNews:p.usStockNewsList}));}
-    }catch(e){}
+    await fetchNewsOnly();
     try{
       // (5) 分析タブ対象銘柄（12-1章：株価・指標データの更新に合わせて再計算）
       if(s.analysisTargets.length){
@@ -824,6 +808,32 @@ function App(){
     const now=new Date();
     setFetchMsg(`${now.getHours()}:${String(now.getMinutes()).padStart(2,"0")} 取得完了`);
     setFetching(false);
+  };
+
+  // ニュースタブ専用：日本市場タブに移動しなくても、ニュース（登録銘柄IR＋国内/海外市況）だけを
+  // その場で更新できるようにfetchLive()の(3)(4)を切り出したもの。
+  const fetchNewsOnly=async()=>{
+    try{
+      const nr=await fetch("/api/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlist)});
+      if(nr.ok){const nd=await nr.json();
+        setS(p=>({...p,
+          stockNewsList:Array.isArray(nd.stockNews)?nd.stockNews:p.stockNewsList,
+          macroNewsList:Array.isArray(nd.macroNews)?nd.macroNews:p.macroNewsList,
+          macroNewsDomestic:Array.isArray(nd.macroNewsDomestic)?nd.macroNewsDomestic:p.macroNewsDomestic,
+          macroNewsOverseas:Array.isArray(nd.macroNewsOverseas)?nd.macroNewsOverseas:p.macroNewsOverseas,
+          stockNews:nd.stockNewsText||p.stockNews,marketNews:nd.macroNewsText||p.marketNews}));}
+    }catch(e){}
+    try{
+      const nru=await fetch("/api/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlistUS)});
+      if(nru.ok){const ndu=await nru.json();
+        setS(p=>({...p,usStockNewsList:Array.isArray(ndu.stockNews)?ndu.stockNews:p.usStockNewsList}));}
+    }catch(e){}
+  };
+  const [newsFetching,setNewsFetching]=useState(false);
+  const refreshNews=async()=>{
+    setNewsFetching(true);
+    await fetchNewsOnly();
+    setNewsFetching(false);
   };
 
   const set=(patch)=>setS(p=>({...p,...patch}));
@@ -1166,8 +1176,11 @@ function App(){
         const showCode=newsSubTab==="summary"||newsSubTab==="disclosure";
         const hasImportant=listFor.some(it=>isImportantNews(it.title));
         return <div style={{marginTop:18}}>
-          <div className="sec-head">ニュース</div>
-          <div className="sec-note">「日本市場」タブの「リアルタイムデータを反映」を押すと、各サブタブのニュースがGoogleニュースRSSから更新されます。「適時開示」は決算・IR関連キーワードで絞り込んでいます。見出しをクリックすると元記事が開きます。</div>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+            <div className="sec-head">ニュース</div>
+            <button className="btn primary" onClick={refreshNews} disabled={newsFetching}>{newsFetching?"取得中…":"リアルタイムデータを反映"}</button>
+          </div>
+          <div className="sec-note">上のボタンで、各サブタブのニュースをGoogleニュースRSSから更新できます（登録銘柄の株価等は更新されません。それらも含めて更新する場合は「日本市場」タブのボタンを使ってください）。「適時開示」は決算・IR関連キーワードで絞り込んでいます。見出しをクリックすると元記事が開きます。</div>
           <div className="subtabs">
             {NEWS_SUBTABS.map(t=><button key={t.key} className={"chip"+(newsSubTab===t.key?" on":"")} onClick={()=>setNewsSubTab(t.key)}>{t.label}</button>)}
           </div>
