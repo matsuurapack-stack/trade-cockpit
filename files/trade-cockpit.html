@@ -794,6 +794,10 @@ function App(){
   const fetchAnalysisFor=async(items,quotesOverride)=>{
     if(!items||!items.length)return;
     setAnalyzing(true);
+    // 再取得中に前回の結果を残したままにすると、取得に失敗した場合でも古い（現在値と食い違った）
+    // 単価がそのまま表示され続けてしまう。先に対象銘柄のanalysisDataをクリアし、取得に失敗したら
+    // 「データを取得できませんでした」と正直に表示されるようにする。
+    setS(p=>{const ad={...p.analysisData};items.forEach(w=>{delete ad[w.code];});return {...p,analysisData:ad};});
     try{
       // 登録銘柄テーブルの現在値（直前の「リアルタイムデータを反映」で取得済み）をcurrentとして
       // 同封する。分析APIは内部でyfinanceに別途問い合わせるため、これを渡さないとタイミング次第で
@@ -1080,7 +1084,14 @@ function App(){
                       <button className="iconbtn" title="分析対象から外す" onClick={()=>toggleAnalysisTarget(w.code)}>×</button>
                     </div>
                     {!a
-                      ? <div style={{fontSize:12.5,color:"var(--inkSoft)"}}>{analyzing?"計算中…":"データを取得できませんでした。"}</div>
+                      ? <div style={{fontSize:12.5,color:"var(--inkSoft)"}}>
+                          {analyzing
+                            ? "計算中…"
+                            : <>データを取得できませんでした。
+                                <button className="btn" style={{marginLeft:8,fontSize:11.5,padding:"2px 10px"}}
+                                  onClick={()=>fetchAnalysisFor([w])}>再取得</button>
+                              </>}
+                        </div>
                       : <div>
                           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
                             <div className="mono" style={{fontSize:12,color:"var(--inkSoft)"}}>現在値 {a.current.toLocaleString()}</div>
