@@ -672,7 +672,7 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
               </span>
               <span style={{fontSize:13,color:avgC.level>0?avgC.fgSoft:"var(--inkSoft)"}}>{items.length}銘柄</span>
             </button>
-            {isOpen && <div style={{overflowX:"auto"}}><table style={{minWidth:860}}>
+            {isOpen && <div style={{overflowX:"auto",paddingLeft:24}}><table style={{minWidth:860}}>
               <thead><tr style={{background:"var(--band)"}}><th>コード</th><th>銘柄</th><th>現在値</th><th>前日比</th><th>高値</th><th>安値</th><th></th></tr></thead>
               <tbody>{items.map(w=>{
                 const qt=stockQuotes[w.code]||{};
