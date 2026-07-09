@@ -745,7 +745,7 @@ function App(){
     try{localStorage.setItem(THEME_KEY,theme);}catch{}
   },[theme]);
   const toggleTheme=()=>setTheme(t=>t==="dark"?"light":"dark");
-  const [tab,setTab]=useState("briefing");
+  const [tab,setTab]=useState("monitor");
   const [newsSubTab,setNewsSubTab]=useState("summary"); // 9-1章：ニュースタブのサブ切り替え
   const [chartModal,setChartModal]=useState(null); // {symbol,name} 5章：登録銘柄行の「チャート」ボタン用モーダル
   const [cBB,setCBB]=useState(true),[cRSI,setCRSI]=useState(true),[cMA,setCMA]=useState(false);
@@ -757,15 +757,22 @@ function App(){
   const fileRef=useRef();
   const modalChartRef=useRef();
   const metricRefs=useRef({});
-  const [fetching,setFetching]=useState(false);
-  const [fetchMsg,setFetchMsg]=useState("");
+  const [monitorFetching,setMonitorFetching]=useState(false);
+  const [monitorMsg,setMonitorMsg]=useState("");
+  const [jpFetching,setJpFetching]=useState(false);
+  const [jpMsg,setJpMsg]=useState("");
+  const [usFetching,setUsFetching]=useState(false);
+  const [usMsg,setUsMsg]=useState("");
 
   useEffect(()=>{try{localStorage.setItem(KEY,JSON.stringify(s));}catch{}},[s]);
 
-  const fetchLive=async()=>{
-    setFetching(true);setFetchMsg("取得中…（数値→ニュースの順）");
+  const showConnError=()=>alert("サーバーに接続できません。start.bat を実行し、開いた http://localhost:8765/trade-cockpit.html のページで使ってください。");
+  const nowHHMM=()=>{const d=new Date();return `${d.getHours()}:${String(d.getMinutes()).padStart(2,"0")}`;};
+
+  // 「日次モニター」タブ専用：指数・為替の今日値/前日値のみを取得する（他タブの登録銘柄・ニュース等は更新しない）
+  const refreshMonitor=async()=>{
+    setMonitorFetching(true);setMonitorMsg("取得中…");
     try{
-      // (1) 数値（指数・為替）を今日値/前日値ともに反映
       const qr=await fetch("/api/quotes");
       if(!qr.ok) throw new Error("quotes");
       const qd=await qr.json();
@@ -777,41 +784,55 @@ function App(){
             spark:(Array.isArray(v.spark)?v.spark:nm[k].spark)};}
         });
         return {...p,metrics:nm};});
-      setFetchMsg((qd.fetchedAt||"")+" 数値を反映。登録銘柄を取得中…");
+      setMonitorMsg((qd.fetchedAt||nowHHMM())+" 取得完了");
     }catch(e){
-      setFetching(false);setFetchMsg("");
-      alert("サーバーに接続できません。start.bat を実行し、開いた http://localhost:8765/trade-cockpit.html のページで使ってください。");
-      return;
+      setMonitorMsg("");
+      showConnError();
     }
-    try{
-      // (2) 登録銘柄の現在値・前日比・高値/安値（日本市場・アメリカ市場それぞれ取得し、同じstockQuotesに統合）
-      const sr=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlist)});
-      if(sr.ok){const sd=await sr.json();
-        setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sd.quotes||{})}}));}
-      setFetchMsg("日本株を反映。アメリカ株を取得中…");
-    }catch(e){}
-    try{
-      const sru=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlistUS)});
-      if(sru.ok){const sdu=await sru.json();
-        setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sdu.quotes||{})}}));}
-      setFetchMsg("登録銘柄を反映。ニュース取得中…");
-    }catch(e){}
-    await fetchNewsOnly();
-    try{
-      // (5) 分析タブ対象銘柄（12-1章：株価・指標データの更新に合わせて再計算）
-      if(s.analysisTargets.length){
-        setFetchMsg("分析データを再計算中…");
-        const items=s.analysisTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean);
-        await fetchAnalysisFor(items);
-      }
-    }catch(e){}
-    const now=new Date();
-    setFetchMsg(`${now.getHours()}:${String(now.getMinutes()).padStart(2,"0")} 取得完了`);
-    setFetching(false);
+    setMonitorFetching(false);
   };
 
-  // ニュースタブ専用：日本市場タブに移動しなくても、ニュース（登録銘柄IR＋国内/海外市況）だけを
-  // その場で更新できるようにfetchLive()の(3)(4)を切り出したもの。
+  // 「日本市場」タブ専用：日本の登録銘柄の現在値・前日比・高値/安値のみを取得し、
+  // 分析タブ対象のうち日本銘柄だけ再計算する（アメリカ市場・ニュース等は更新しない）
+  const refreshJP=async()=>{
+    setJpFetching(true);setJpMsg("取得中…");
+    try{
+      const sr=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlist)});
+      if(!sr.ok) throw new Error("stock-quotes");
+      const sd=await sr.json();
+      setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sd.quotes||{})}}));
+      const jpCodes=new Set(s.watchlist.map(w=>w.code));
+      const targets=s.analysisTargets.filter(c=>jpCodes.has(c)).map(code=>allWatch.find(w=>w.code===code)).filter(Boolean);
+      if(targets.length){setJpMsg("分析データを再計算中…");await fetchAnalysisFor(targets);}
+      setJpMsg(nowHHMM()+" 取得完了");
+    }catch(e){
+      setJpMsg("");
+      showConnError();
+    }
+    setJpFetching(false);
+  };
+
+  // 「アメリカ市場」タブ専用：ダウ30社の現在値・前日比・高値/安値のみを取得し、
+  // 分析タブ対象のうちアメリカ銘柄だけ再計算する（日本市場・ニュース等は更新しない）
+  const refreshUS=async()=>{
+    setUsFetching(true);setUsMsg("取得中…");
+    try{
+      const sr=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlistUS)});
+      if(!sr.ok) throw new Error("stock-quotes");
+      const sd=await sr.json();
+      setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sd.quotes||{})}}));
+      const usCodes=new Set(s.watchlistUS.map(w=>w.code));
+      const targets=s.analysisTargets.filter(c=>usCodes.has(c)).map(code=>allWatch.find(w=>w.code===code)).filter(Boolean);
+      if(targets.length){setUsMsg("分析データを再計算中…");await fetchAnalysisFor(targets);}
+      setUsMsg(nowHHMM()+" 取得完了");
+    }catch(e){
+      setUsMsg("");
+      showConnError();
+    }
+    setUsFetching(false);
+  };
+
+  // ニュースタブ専用：ニュース（登録銘柄IR＋国内/海外市況）だけをその場で更新する。
   const fetchNewsOnly=async()=>{
     try{
       const nr=await fetch("/api/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlist)});
@@ -1000,9 +1021,11 @@ function App(){
         </label>
       </div>
 
-      {/* タブ並び順（6章）：ニュース→アメリカ市場(6-1)→SNS(6-2)→日本市場→分析(12章)。
+      {/* タブ並び順：日次モニター→ニュース→アメリカ市場(6-1)→SNS(6-2)→日本市場→分析(12章)。
+          日次モニターは6章の並びに含まれないが、要望により先頭に配置。
           テーマ(10-3章)は6章の並びに含まれない追加画面のため末尾に配置。 */}
       <div className="tabs">
+        <button className={"tab"+(tab==="monitor"?" on":"")} onClick={()=>setTab("monitor")}>日次モニター</button>
         <button className={"tab"+(tab==="news"?" on":"")} onClick={()=>setTab("news")}>ニュース</button>
         <button className={"tab"+(tab==="us"?" on":"")} onClick={()=>setTab("us")}>アメリカ市場</button>
         <button className={"tab"+(tab==="sns"?" on":"")} onClick={()=>setTab("sns")}>SNS</button>
@@ -1011,61 +1034,76 @@ function App(){
         <button className={"tab"+(tab==="theme"?" on":"")} onClick={()=>setTab("theme")}>テーマ</button>
       </div>
 
+      {/* ===== 日次モニター（独立タブ） ===== */}
+      {tab==="monitor" && <div style={{marginTop:18}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+          <div className="sec-head">日次モニター</div>
+          <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+            {monitorMsg && <span style={{fontSize:11,color:"var(--inkSoft)"}}>{monitorMsg}</span>}
+            <button className="btn primary" onClick={refreshMonitor} disabled={monitorFetching}>{monitorFetching?"取得中…":"リアルタイムデータを反映"}</button>
+          </div>
+        </div>
+        <div className="sec-note">「リアルタイムデータを反映」を押すたびに、ドル円・日経平均・ダウ・ナスダック・SOX・米10年債・S&P500・KOSPI・日経225先物・NYダウ先物・WTI原油・金・銅 を今日値／前日値ともに取得します（数値は遅延あり）。</div>
+        <div className="sec-note" style={{marginTop:-4}}>項目をクリックするとリアルタイムチャートが下に開きます。</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:1,background:"var(--rule)",border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden"}}>
+          {METRICS.map(m=>{const v=s.metrics[m.key];const t=num(v.t),p=num(v.p);
+            const delta=t!=null&&p!=null?t-p:null;
+            const pct=t!=null&&p!=null&&p?(t-p)/p*100:null;
+            const c=changeColor(pct);
+            const sparkColor=c.level>0?c.fg:"#8a8f86"; // セル背景と同色に埋もれないよう、文字色と同じコントラスト色で描画
+            const condOn=m.cond&&t!=null&&m.cond(t);
+            const isOpen=openMetrics.has(m.key);
+            return <React.Fragment key={m.key}>
+              <button onClick={()=>toggleMetric(m.key)} style={{width:"100%",background:c.bg,padding:"11px 13px",
+                  border:condOn?"2px solid var(--gain)":"none",boxSizing:"border-box",textAlign:"left",cursor:"pointer",font:"inherit",
+                  color:c.level>0?c.fg:"var(--ink)"}}>
+                <div style={{fontSize:11,color:c.level>0?c.fgSoft:"var(--inkSoft)",display:"flex",justifyContent:"space-between"}}>
+                  <span>{m.label}</span>{condOn&&<span className="mono" style={{fontSize:10,color:c.level>0?c.fg:"var(--gain)",fontWeight:700}}>条件○</span>}
+                </div>
+                <div style={{display:"flex",alignItems:"baseline",gap:7,marginTop:3}}>
+                  <span className="mono" style={{fontSize:21,fontWeight:700}}>{t!=null?t.toFixed(m.dp):"—"}</span>
+                  {delta!=null&&<span className="mono" style={{fontSize:12}}>{delta>0?"▲":delta<0?"▼":""}{delta>0?"+":""}{delta.toFixed(m.dp)}</span>}
+                </div>
+                <div style={{marginTop:7,fontSize:12,color:c.level>0?c.fgSoft:"var(--inkSoft)"}}>前日 <span className="mono">{p!=null?p.toFixed(m.dp):"—"}</span></div>
+                <div style={{marginTop:8}}><Sparkline data={v.spark} color={sparkColor}/></div>
+              </button>
+              {isOpen && <div style={{gridColumn:"1 / -1",background:"var(--card)",padding:12}}>
+                {m.tvEmbed
+                  ? <div ref={el=>metricRefs.current[m.key]=el} style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",background:"var(--card)",minHeight:324}}></div>
+                  : <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10,padding:"8px 4px"}}>
+                      <span style={{fontSize:12.5,color:"var(--inkSoft)"}}>{m.label}は無料埋め込みでは表示できないシンボルです。</span>
+                      <button className="btn primary" onClick={()=>openTV(m.tv)}>↗ TradingViewで開く</button>
+                    </div>}
+              </div>}
+            </React.Fragment>;})}
+        </div>
+        <p className="foot">※ 「リアルタイムデータを反映」は、start.bat で起動したローカルサーバー経由で取得します。数値は遅延あり（前営業日終値〜数十分遅れ）でリアルタイムの板ではありません。</p>
+      </div>}
+
       {/* ===== BRIEFING（日本市場） ===== */}
       {tab==="briefing" && <div>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8,marginTop:18}}>
+          <div className="sec-head">日本市場</div>
+          <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+            {jpMsg && <span style={{fontSize:11,color:"var(--inkSoft)"}}>{jpMsg}</span>}
+            <button className="btn primary" onClick={refreshJP} disabled={jpFetching}>{jpFetching?"取得中…":"リアルタイムデータを反映"}</button>
+          </div>
+        </div>
         <SectorWatchlist market="JP" watchlist={s.watchlist} setWatchlist={setWatchlistJP} candidates={masterJP} max={MAX}
           stockQuotes={s.stockQuotes} analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
           onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name})}/>
-
-        <div style={{marginTop:22}}>
-          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
-            <div className="sec-head">日次モニター</div>
-            <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
-              {fetchMsg && <span style={{fontSize:11,color:"var(--inkSoft)"}}>{fetchMsg}</span>}
-              <button className="btn primary" onClick={fetchLive} disabled={fetching}>{fetching?"取得中…":"リアルタイムデータを反映"}</button>
-            </div>
-          </div>
-          <div className="sec-note">「リアルタイムデータを反映」を押すたびに、ドル円・日経平均・ダウ・ナスダック・SOX・米10年債・S&P500・KOSPI・日経225先物・NYダウ先物・WTI原油・金・銅 を今日値／前日値ともに取得します（数値は遅延あり）。</div>
-          <div className="sec-note" style={{marginTop:-4}}>項目をクリックするとリアルタイムチャートが下に開きます。</div>
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:1,background:"var(--rule)",border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden"}}>
-            {METRICS.map(m=>{const v=s.metrics[m.key];const t=num(v.t),p=num(v.p);
-              const delta=t!=null&&p!=null?t-p:null;
-              const pct=t!=null&&p!=null&&p?(t-p)/p*100:null;
-              const c=changeColor(pct);
-              const sparkColor=c.level>0?c.fg:"#8a8f86"; // セル背景と同色に埋もれないよう、文字色と同じコントラスト色で描画
-              const condOn=m.cond&&t!=null&&m.cond(t);
-              const isOpen=openMetrics.has(m.key);
-              return <React.Fragment key={m.key}>
-                <button onClick={()=>toggleMetric(m.key)} style={{width:"100%",background:c.bg,padding:"11px 13px",
-                    border:condOn?"2px solid var(--gain)":"none",boxSizing:"border-box",textAlign:"left",cursor:"pointer",font:"inherit",
-                    color:c.level>0?c.fg:"var(--ink)"}}>
-                  <div style={{fontSize:11,color:c.level>0?c.fgSoft:"var(--inkSoft)",display:"flex",justifyContent:"space-between"}}>
-                    <span>{m.label}</span>{condOn&&<span className="mono" style={{fontSize:10,color:c.level>0?c.fg:"var(--gain)",fontWeight:700}}>条件○</span>}
-                  </div>
-                  <div style={{display:"flex",alignItems:"baseline",gap:7,marginTop:3}}>
-                    <span className="mono" style={{fontSize:21,fontWeight:700}}>{t!=null?t.toFixed(m.dp):"—"}</span>
-                    {delta!=null&&<span className="mono" style={{fontSize:12}}>{delta>0?"▲":delta<0?"▼":""}{delta>0?"+":""}{delta.toFixed(m.dp)}</span>}
-                  </div>
-                  <div style={{marginTop:7,fontSize:12,color:c.level>0?c.fgSoft:"var(--inkSoft)"}}>前日 <span className="mono">{p!=null?p.toFixed(m.dp):"—"}</span></div>
-                  <div style={{marginTop:8}}><Sparkline data={v.spark} color={sparkColor}/></div>
-                </button>
-                {isOpen && <div style={{gridColumn:"1 / -1",background:"var(--card)",padding:12}}>
-                  {m.tvEmbed
-                    ? <div ref={el=>metricRefs.current[m.key]=el} style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",background:"var(--card)",minHeight:324}}></div>
-                    : <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10,padding:"8px 4px"}}>
-                        <span style={{fontSize:12.5,color:"var(--inkSoft)"}}>{m.label}は無料埋め込みでは表示できないシンボルです。</span>
-                        <button className="btn primary" onClick={()=>openTV(m.tv)}>↗ TradingViewで開く</button>
-                      </div>}
-                </div>}
-              </React.Fragment>;})}
-          </div>
-        </div>
-
-        <p className="foot">※ 「リアルタイムデータを反映」は、start.bat で起動したローカルサーバー経由で取得します。数値は遅延あり（前営業日終値〜数十分遅れ）でリアルタイムの板ではありません。<br/>※ ニュースはGoogleニュースRSSを利用しています。売買を推奨するものではなく、最終判断はご自身で。</p>
+        <p className="foot">※ ニュースはGoogleニュースRSSを利用しています。売買を推奨するものではなく、最終判断はご自身で。</p>
       </div>}
 
       {/* ===== US（アメリカ市場・6-1章） ===== */}
       {tab==="us" && <div>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8,marginTop:18}}>
+          <div className="sec-head">アメリカ市場</div>
+          <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+            {usMsg && <span style={{fontSize:11,color:"var(--inkSoft)"}}>{usMsg}</span>}
+            <button className="btn primary" onClick={refreshUS} disabled={usFetching}>{usFetching?"取得中…":"リアルタイムデータを反映"}</button>
+          </div>
+        </div>
         <SectorWatchlist market="US" watchlist={s.watchlistUS} setWatchlist={setWatchlistUS} candidates={masterUS} max={MAX_US}
           stockQuotes={s.stockQuotes} analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
           onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name})}/>
