@@ -887,12 +887,18 @@ function App(){
   const newsSummary=useMemo(()=>{
     const seen=new Set();
     const push=(arr,list)=>{for(const it of list){if(!it.url||seen.has(it.url))continue;seen.add(it.url);arr.push(it);}};
+    const byDateDesc=(a,b)=>(b.published||"").localeCompare(a.published||"");
+    // 4カテゴリ（登録銘柄IR・米国株IR・国内市況・海外市況）を単純に連結するだけだと、各カテゴリ内は
+    // 新しい順でも、カテゴリをまたいだ全体では古い記事が新しい記事より上に出てしまっていたため、
+    // 「重要」枠・「残り」枠それぞれの中で公開日時の降順に並べ替える（重要枠を上に固定する方針は維持）。
     const important=[];push(important,[...s.stockNewsList,...s.usStockNewsList,...s.macroNewsDomestic,...s.macroNewsOverseas].filter(it=>isImportantNews(it.title)));
+    important.sort(byDateDesc);
     const rest=[];
     push(rest,s.stockNewsList.slice(0,3));
     push(rest,s.usStockNewsList.slice(0,3));
     push(rest,s.macroNewsDomestic.slice(0,4));
     push(rest,s.macroNewsOverseas.slice(0,4));
+    rest.sort(byDateDesc);
     return [...important,...rest];
   },[s.stockNewsList,s.usStockNewsList,s.macroNewsDomestic,s.macroNewsOverseas]);
 
