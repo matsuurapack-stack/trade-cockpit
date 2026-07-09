@@ -181,21 +181,38 @@ def _clean_title(title):
     return title
 
 
+def _published_ts(entry):
+    """ソート用のUNIX時刻。取得できない場合は0（末尾扱い）にする。"""
+    pp = entry.get("published_parsed")
+    if not pp:
+        return 0
+    try:
+        return calendar.timegm(pp)
+    except Exception:
+        return 0
+
+
 def google_news(query, n=2):
+    """GoogleニュースRSSは検索クエリ単位では関連度寄りの順序で返り、必ずしも新しい順ではないため、
+    ここで公開日時の降順（新しい記事が先頭）に並べ替えてから返す。
+    複数クエリの結果を連結して使う呼び出し元（build_stock_news/build_macro_news）でも、
+    連結後に改めて全体を日時順に並べ替えている。"""
     if feedparser is None:
         return []
     url = ("https://news.google.com/rss/search?q="
            + urllib.parse.quote(query) + "&hl=ja&gl=JP&ceid=JP:ja")
     try:
         feed = feedparser.parse(url)
+        entries = sorted(feed.entries, key=_published_ts, reverse=True)
         out = []
-        for e in feed.entries[:n]:
+        for e in entries[:n]:
             raw = e.get("title", "")
             out.append({
                 "title": _clean_title(raw),
                 "url": e.get("link", ""),
                 "source": _source_of(e, raw),
                 "published": _fmt_published(e),
+                "_ts": _published_ts(e),
             })
         return out
     except Exception:
@@ -256,9 +273,17 @@ def _is_ir_news(title):
     return any(k in title for k in IR_KEYWORDS)
 
 
+def _sort_and_strip(items):
+    """複数クエリの結果を連結したリストを公開日時の降順に並べ替え、ソート用の内部フィールドを除く。"""
+    items = sorted(items, key=lambda it: it.get("_ts", 0), reverse=True)
+    return [{k: v for k, v in it.items() if k != "_ts"} for it in items]
+
+
 def build_stock_news(watchlist):
     """登録銘柄ニュースを配列で返す（各要素 code/name/title/url/source/published）。
-    9章の仕様により、決算・IR・適時開示に関連するもののみに絞り込む。"""
+    9章の仕様により、決算・IR・適時開示に関連するもののみに絞り込む。
+    銘柄ごとに検索するため単純連結だと銘柄単位で古い記事が先に来ることがあり、
+    最後に全体を公開日時の降順で並べ替えて「最新のものから」表示する。"""
     order = {"優先": 0, "通常": 1, "様子見": 2}
     wl = sorted(watchlist, key=lambda w: order.get(w.get("watch", "通常"), 1))[:12]
     items = []
@@ -271,7 +296,7 @@ def build_stock_news(watchlist):
         ir_only = [it for it in candidates if _is_ir_news(it["title"])]
         for it in ir_only[:2]:
             items.append({**it, "code": code, "name": name})
-    return items
+    return _sort_and_strip(items)
 
 
 # 9-1章：国内市況・海外市況のサブタブ用にクエリを分けて取得する
@@ -280,14 +305,15 @@ MACRO_QUERIES_OVERSEAS = ["FRB 利上げ 金利", "米国株式市場 ダウ"]
 
 
 def build_macro_news():
-    """マクロニュースを国内・海外に分けて返す（国内タプル, 海外タプル）。"""
+    """マクロニュースを国内・海外に分けて返す（国内タプル, 海外タプル）。
+    複数クエリの結果を連結後、公開日時の降順に並べ替えてから返す。"""
     domestic = []
     for q in MACRO_QUERIES_DOMESTIC:
         domestic.extend(google_news(q, 3))
     overseas = []
     for q in MACRO_QUERIES_OVERSEAS:
         overseas.extend(google_news(q, 3))
-    return domestic, overseas
+    return _sort_and_strip(domestic), _sort_and_strip(overseas)
 
 
 # 12-1章：分析タブのテクニカル指標計算。外部ライブラリ(ta-lib等)を追加せず、
