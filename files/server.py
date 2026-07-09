@@ -463,6 +463,29 @@ def _market_environment():
         return "相場環境：取得できませんでした"
 
 
+def _fetch_intraday(tk, interval):
+    """当日（直近の取引セッション）の分足を取得する。市場時間外・取得失敗時はNoneを返す。"""
+    try:
+        h = tk.history(period="1d", interval=interval)
+        closes = h["Close"].dropna().tolist()
+        highs = h["High"].dropna().tolist()
+        lows = h["Low"].dropna().tolist()
+        volumes = h["Volume"].dropna().tolist()
+        if len(closes) < 2:
+            return None
+        return {"closes": closes, "highs": highs, "lows": lows, "volumes": volumes}
+    except Exception:
+        return None
+
+
+def _vwap(closes, volumes):
+    """出来高加重平均価格（当日の分足から算出する、ザラ場でよく見る節目の一つ）。"""
+    total_vol = sum(volumes)
+    if total_vol <= 0:
+        return None
+    return sum(c * v for c, v in zip(closes, volumes)) / total_vol
+
+
 def analyze_stock(w, market_env=""):
     """12-1章・technical_analysis_rules.md：ローソク足パターン・移動平均線の並び／クロス・
     ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
@@ -490,6 +513,19 @@ def analyze_stock(w, market_env=""):
         closes[-1] = current_override
     prev = closes[-2] if n >= 2 else current
     change_pct = (current - prev) / prev * 100 if prev else 0
+
+    # ---- 当日の分足（1分足・5分足・15分足）をリアルタイムに取得し、日足だけでは分からない
+    # 「その日ここまでの実際の値動き」を購入/損切り/利確単価に反映する。市場時間外・取得失敗時は
+    # Noneのままとし、日足ベースの計算にフォールバックする。----
+    m1 = _fetch_intraday(tk, "1m")
+    m5 = _fetch_intraday(tk, "5m")
+    m15 = _fetch_intraday(tk, "15m")
+    intraday_high = max(m1["highs"]) if m1 else None
+    intraday_low = min(m1["lows"]) if m1 else None
+    intraday_range = (intraday_high - intraday_low) if (intraday_high is not None and intraday_low is not None) else None
+    vwap = _vwap(m1["closes"], m1["volumes"]) if m1 else None
+    rsi_5m = _rsi(m5["closes"], 14) if m5 and len(m5["closes"]) >= 15 else None
+    rsi_15m = _rsi(m15["closes"], 14) if m15 and len(m15["closes"]) >= 15 else None
 
     ma25_s, ma75_s, ma100_s = _sma_series(closes, 25), _sma_series(closes, 75), _sma_series(closes, 100)
     ma25, ma75, ma100 = ma25_s[-1], ma75_s[-1], ma100_s[-1]
@@ -630,9 +666,14 @@ def analyze_stock(w, market_env=""):
     # ---- 購入単価(目安)：ATR(当日の現実的な値幅)を基準に、現在値からの押し目水準を設定する。
     # 60営業日高値やMA100等の複数日単位の水準をそのまま使うと、値幅制限（ストップ高安）を
     # 超える非現実的な価格になるため、シグナルは「どの根拠で買いと判定したか」の説明にのみ使い、
-    # 実際の価格はその日のATRから逆算する。----
+    # 実際の価格はその日のATRから逆算する。当日の1分足から算出した実際の値幅（intraday_range）が
+    # 日次ATRを上回っている場合は、そちらを優先する（リアルタイムの値動きをより直接反映するため）。
     atr14 = _atr(highs, lows, closes, 14)
     atr_ref = atr14 if atr14 else current * 0.02  # ATRが計算できない場合は現在値の2%を代用
+    used_intraday_range = False
+    if intraday_range and intraday_range > atr_ref:
+        atr_ref = intraday_range
+        used_intraday_range = True
 
     priority = ["panpakapan", "compoundBottom", "goldenCross", "bb3", "volBull", "volShadow", "dojiLow", "haramiLow"]
     primary = None
@@ -641,23 +682,32 @@ def analyze_stock(w, market_env=""):
         if primary:
             break
 
+    atr_label = "当日1分足の実測値幅" if used_intraday_range else "当日のATR"
     if primary:
         entry = current - atr_ref * 0.3
-        entry_reasons = [f"{primary['label']}が点灯。当日のATR({atr_ref:.1f})から見た現実的な押し目水準として{entry:.1f}を採用"]
+        entry_reasons = [f"{primary['label']}が点灯。{atr_label}({atr_ref:.1f})から見た現実的な押し目水準として{entry:.1f}を採用"]
     else:
         entry = current - atr_ref * 0.2
-        entry_reasons = ["該当する買いシグナルなし。当日のATRから見た現在値近辺のわずかな押し目を暫定的に採用"]
+        entry_reasons = [f"該当する買いシグナルなし。{atr_label}から見た現在値近辺のわずかな押し目を暫定的に採用"]
     if rsi is not None and rsi >= 70:
         entry -= atr_ref * 0.2
         entry_reasons.append(f"RSI({rsi:.0f})が買われすぎ水準のためやや低めに調整")
+    if rsi_5m is not None and rsi_5m >= 75:
+        entry -= atr_ref * 0.1
+        entry_reasons.append(f"5分足RSI({rsi_5m:.0f})も過熱気味のため、ザラ場の短期的な買われすぎを加味してやや低めに調整")
+    if vwap is not None and current > vwap * 1.01:
+        entry_reasons.append(f"現在値はVWAP({vwap:.1f})より上（当日の平均的な出来高加重コストより高め）")
 
-    # ---- 損切り単価(目安)：当日のATRの1倍を損切り幅の目安とする（ザラ場内で許容できる下振れ）----
+    # ---- 損切り単価(目安)：ATR相当(当日実測 or 日次ATR)の1倍を損切り幅の目安とする（ザラ場内で許容できる下振れ）----
     stop = entry - atr_ref
-    stop_reasons = [f"当日のATR({atr_ref:.1f})の1倍を損切り幅の目安に設定"]
+    stop_reasons = [f"{atr_label}({atr_ref:.1f})の1倍を損切り幅の目安に設定"]
+    if intraday_low is not None and stop < intraday_low and intraday_low < current:
+        stop = max(stop, intraday_low)
+        stop_reasons.append(f"当日安値({intraday_low:.1f})を下限目安として調整")
 
-    # ---- 利確単価(目安)：当日のATRの1.5倍（リスクリワード概ね1:1.5）を利確目安とする ----
+    # ---- 利確単価(目安)：ATR相当の1.5倍（リスクリワード概ね1:1.5）を利確目安とする ----
     target = entry + atr_ref * 1.5
-    target_reasons = [f"当日のATR({atr_ref:.1f})の1.5倍（リスクリワード概ね1:1.5）を利確目安に設定"]
+    target_reasons = [f"{atr_label}({atr_ref:.1f})の1.5倍（リスクリワード概ね1:1.5）を利確目安に設定"]
 
     # ---- 東証の値幅制限（ストップ高・ストップ安）を必ず超えないようにする（日本株のみ）----
     if w.get("market", "JP") != "US":
@@ -714,6 +764,13 @@ def analyze_stock(w, market_env=""):
             "bbLower3": round(bb_lower3, 2) if bb_lower3 else None,
             "support": round(support, 2), "resistance": round(resistance, 2),
             "high52w": round(high52w, 2), "low52w": round(low52w, 2),
+            "atr14": round(atr14, 2) if atr14 is not None else None,
+            # 当日の分足（1分/5分/15分）からリアルタイムに算出した指標。市場時間外は取得できずNoneになる。
+            "intradayHigh": round(intraday_high, 2) if intraday_high is not None else None,
+            "intradayLow": round(intraday_low, 2) if intraday_low is not None else None,
+            "vwap": round(vwap, 2) if vwap is not None else None,
+            "rsi5m": round(rsi_5m, 1) if rsi_5m is not None else None,
+            "rsi15m": round(rsi_15m, 1) if rsi_15m is not None else None,
         },
         "fundamentalNote": "・".join(fund_notes) if fund_notes else "取得できるファンダメンタルデータがありません",
     }

@@ -1091,10 +1091,14 @@ function App(){
                           </div>
                           <div style={{marginTop:10,paddingTop:8,borderTop:"1px solid var(--ruleSoft)",fontSize:11,color:"var(--inkSoft)",lineHeight:1.6}}>
                             25日線 {a.indicators.ma25??"—"}　75日線 {a.indicators.ma75??"—"}　100日線 {a.indicators.ma100??"—"}<br/>
-                            RSI14 {a.indicators.rsi??"—"}　RCI26 {a.indicators.rci26??"—"}<br/>
+                            RSI14 {a.indicators.rsi??"—"}　RCI26 {a.indicators.rci26??"—"}　ATR14 {a.indicators.atr14??"—"}<br/>
                             BB-2σ {a.indicators.bbLower2??"—"}　BB-3σ {a.indicators.bbLower3??"—"}<br/>
                             直近サポート {a.indicators.support}　直近レジスタンス {a.indicators.resistance}<br/>
                             52週高値 {a.indicators.high52w}　52週安値 {a.indicators.low52w}<br/>
+                            {(a.indicators.intradayHigh!=null)
+                              ? <>当日高値 {a.indicators.intradayHigh}　当日安値 {a.indicators.intradayLow}　VWAP {a.indicators.vwap??"—"}<br/>
+                                  5分足RSI {a.indicators.rsi5m??"—"}　15分足RSI {a.indicators.rsi15m??"—"}<br/></>
+                              : <>当日の分足データなし（市場時間外の可能性）<br/></>}
                             {a.fundamentalNote}
                           </div>
                         </div>}
@@ -1102,7 +1106,7 @@ function App(){
                 })}
               </div>
             </div>}
-        <p className="foot" style={{marginTop:16}}>※ テクニカル指標は過去1年の日足終値から算出（25日/75日/100日移動平均・RSI14・RCI26・ボリンジャーバンド20,±2σ/±3σ・52週高値安値）。パンパカパン・ゴールデンクロス・複合底打ち等のシグナル判定を含みます。ファンダメンタルはyfinance取得可能な範囲（PER・PBR・配当利回り・予想EPS)を使用しています。</p>
+        <p className="foot" style={{marginTop:16}}>※ テクニカル指標は過去1年の日足終値（25日/75日/100日移動平均・RSI14・RCI26・ATR14・ボリンジャーバンド20,±2σ/±3σ・52週高値安値）に加え、当日の1分足・5分足・15分足をリアルタイムに取得し、当日高値安値・VWAP・短期RSIを購入/損切り/利確単価の算出に反映しています（市場時間外は分足データなしで日足のみの算出になります）。パンパカパン・ゴールデンクロス・複合底打ち等のシグナル判定を含みます。ファンダメンタルはyfinance取得可能な範囲（PER・PBR・配当利回り・予想EPS)を使用しています。</p>
       </div>}
 
       {/* ===== NEWS（9章・9-1章・9-2章） ===== */}
