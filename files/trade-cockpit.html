@@ -711,10 +711,11 @@ function App(){
       const sr=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlist)});
       if(!sr.ok) throw new Error("stock-quotes");
       const sd=await sr.json();
+      const mergedQuotes={...s.stockQuotes,...(sd.quotes||{})};
       setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sd.quotes||{})}}));
       const jpCodes=new Set(s.watchlist.map(w=>w.code));
       const targets=s.analysisTargets.filter(c=>jpCodes.has(c)).map(code=>allWatch.find(w=>w.code===code)).filter(Boolean);
-      if(targets.length){setJpMsg("分析データを再計算中…");await fetchAnalysisFor(targets);}
+      if(targets.length){setJpMsg("分析データを再計算中…");await fetchAnalysisFor(targets,mergedQuotes);}
       setJpMsg(nowHHMM()+" 取得完了");
     }catch(e){
       setJpMsg("");
@@ -731,10 +732,11 @@ function App(){
       const sr=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlistUS)});
       if(!sr.ok) throw new Error("stock-quotes");
       const sd=await sr.json();
+      const mergedQuotes={...s.stockQuotes,...(sd.quotes||{})};
       setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sd.quotes||{})}}));
       const usCodes=new Set(s.watchlistUS.map(w=>w.code));
       const targets=s.analysisTargets.filter(c=>usCodes.has(c)).map(code=>allWatch.find(w=>w.code===code)).filter(Boolean);
-      if(targets.length){setUsMsg("分析データを再計算中…");await fetchAnalysisFor(targets);}
+      if(targets.length){setUsMsg("分析データを再計算中…");await fetchAnalysisFor(targets,mergedQuotes);}
       setUsMsg(nowHHMM()+" 取得完了");
     }catch(e){
       setUsMsg("");
@@ -779,14 +781,18 @@ function App(){
   const allWatch=useMemo(()=>[...s.watchlist,...s.watchlistUS],[s.watchlist,s.watchlistUS]);
   const analysisItems=useMemo(()=>s.analysisTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean),[s.analysisTargets,allWatch]);
   const [analyzing,setAnalyzing]=useState(false);
-  const fetchAnalysisFor=async(items)=>{
+  const fetchAnalysisFor=async(items,quotesOverride)=>{
     if(!items||!items.length)return;
     setAnalyzing(true);
     try{
       // 登録銘柄テーブルの現在値（直前の「リアルタイムデータを反映」で取得済み）をcurrentとして
       // 同封する。分析APIは内部でyfinanceに別途問い合わせるため、これを渡さないとタイミング次第で
       // テーブルの最新値と分析結果の現在値がズレる（反映直後に分析しても最新値が反映されない不具合）。
-      const withCurrent=items.map(w=>({...w,current:s.stockQuotes[w.code]?.t}));
+      // quotesOverride: refreshJP/refreshUSがsetS直後に呼ぶ際、setSが非同期でクロージャ内のs.stockQuotes
+      // がまだ更新前の値のままになるため、取得したての最新値を明示的に渡してもらうための引数
+      // （渡さないと「表の現在値は最新だが分析の単価だけ古い現在値のまま」というズレが起きる）。
+      const quotes=quotesOverride||s.stockQuotes;
+      const withCurrent=items.map(w=>({...w,current:quotes[w.code]?.t}));
       const ar=await fetch("/api/analysis",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(withCurrent)});
       if(ar.ok){const ad=await ar.json();setS(p=>({...p,analysisData:{...p.analysisData,...(ad.analysis||{})}}));}
     }catch(e){}
