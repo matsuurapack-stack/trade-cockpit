@@ -262,9 +262,26 @@ def _nitter_tweet_url(handle, nitter_link):
     return f"https://x.com/{handle}"
 
 
+def _nitter_image_url(host, description):
+    """Nitter RSSのdescription(HTML)に埋め込まれた添付画像の<img src>を抜き出す。
+    src はホスト相対パス（例: /pic/orig/media%2Fxxx.jpg）で来ることが多いため、その場合はhostを補う。
+    プロフィールアイコン（avatar/pic/pbs.twimg.com/profile_images等）は投稿画像ではないため除外する。"""
+    if not description:
+        return None
+    for src in re.findall(r'<img[^>]+src="([^"]+)"', description):
+        if "profile_images" in src or "/avatar" in src:
+            continue
+        if src.startswith("/"):
+            return f"https://{host}{src}"
+        if src.startswith("http"):
+            return src
+    return None
+
+
 def get_sns_posts(handle, n=15):
     """指定アカウントの直近投稿をNitter RSS経由で取得する。全インスタンス失敗時は空配列を返し、
-    フロント側で「Xで開く」フォールバック表示に切り替える。"""
+    フロント側で「Xで開く」フォールバック表示に切り替える。投稿に画像が添付されていればimageも返す
+    （取得元インスタンスが不安定なため、画像URLが切れている場合はフロント側で非表示にフォールバックする）。"""
     if feedparser is None:
         return []
     for host in NITTER_INSTANCES:
@@ -275,10 +292,12 @@ def get_sns_posts(handle, n=15):
                 continue
             out = []
             for e in feed.entries[:n]:
+                description = e.get("description", "") or e.get("summary", "")
                 out.append({
                     "title": e.get("title", ""),
                     "url": _nitter_tweet_url(handle, e.get("link", "")),
                     "published": _fmt_published(e),
+                    "image": _nitter_image_url(host, description),
                 })
             if out:
                 return out
