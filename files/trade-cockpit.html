@@ -719,6 +719,7 @@ function App(){
   const [chartModal,setChartModal]=useState(null); // {symbol,name} 5章：登録銘柄行の「チャート」ボタン用モーダル
   const [cBB,setCBB]=useState(true),[cRSI,setCRSI]=useState(true),[cMA,setCMA]=useState(false);
   const [snsHandle,setSnsHandle]=useState(SNS_ACCOUNTS[0]); // 6-2章：SNSタブで選択中のXアカウント
+  const [snsFailed,setSnsFailed]=useState(false); // X埋め込みが読み込めなかった場合のフォールバック表示用
   const [openMetrics,setOpenMetrics]=useState(()=>new Set()); // 8章：日次モニターでチャートを開いている項目
   const fileRef=useRef();
   const modalChartRef=useRef();
@@ -890,10 +891,27 @@ function App(){
     sc.onload=()=>resolve(window.twttr);
     document.body.appendChild(sc);
   });
-  useEffect(()=>{if(tab!=="sns")return;const c=snsRef.current;if(!c)return;
-    c.innerHTML=`<a class="twitter-timeline" data-height="600" data-theme="light" href="https://twitter.com/${snsHandle}?ref_src=twsrc%5Etfw">Tweets by @${snsHandle}</a>`;
-    loadTwitterWidgets().then(twttr=>{if(twttr&&twttr.widgets)twttr.widgets.load(c);});
-  },[tab,snsHandle]);
+  // X側の無料埋め込み(syndication.twitter.com)は近年レート制限(429)で失敗することが多く、
+  // その場合iframe自体は生成されても中身が空のままになる。一定時間後もiframeの高さが0なら
+  // 失敗とみなし、「Xで開く」への代替リンクを表示する（日本株チャートのTradingView代替と同じ方針）。
+  useEffect(()=>{
+    if(tab!=="sns")return;
+    const c=snsRef.current;if(!c)return;
+    setSnsFailed(false);
+    c.innerHTML=`<a class="twitter-timeline" data-height="600" data-theme="${theme}" href="https://twitter.com/${snsHandle}?ref_src=twsrc%5Etfw">Tweets by @${snsHandle}</a>`;
+    let cancelled=false;
+    loadTwitterWidgets().then(twttr=>{
+      if(cancelled)return;
+      if(!twttr||!twttr.widgets){setSnsFailed(true);return;}
+      twttr.widgets.load(c);
+    });
+    const timer=setTimeout(()=>{
+      if(cancelled)return;
+      const iframe=c.querySelector("iframe");
+      if(!iframe||iframe.clientHeight===0)setSnsFailed(true);
+    },4500);
+    return ()=>{cancelled=true;clearTimeout(timer);};
+  },[tab,snsHandle,theme]);
 
   const openTV=(tv)=>{if(tv)window.open("https://jp.tradingview.com/chart/?symbol="+encodeURIComponent(tv),"_blank");};
 
@@ -1020,10 +1038,17 @@ function App(){
         <div style={{display:"flex",gap:6,flexWrap:"wrap",margin:"12px 0"}}>
           {SNS_ACCOUNTS.map(h=><button key={h} className={"chip"+(snsHandle===h?" on":"")} onClick={()=>setSnsHandle(h)}>@{h}</button>)}
         </div>
-        <div style={{border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)",minHeight:420,padding:"4px 8px"}}>
+        <div style={{position:"relative",border:"1px solid var(--rule)",borderRadius:8,background:"var(--card)",minHeight:420,padding:"4px 8px"}}>
           <div key={snsHandle} ref={snsRef}></div>
+          {snsFailed && <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",
+              justifyContent:"center",gap:14,padding:24,textAlign:"center",background:"var(--card)"}}>
+            <div style={{fontSize:12.5,color:"var(--inkSoft)",lineHeight:1.7,maxWidth:420}}>
+              X（旧Twitter）の無料埋め込みタイムラインが混雑等の理由で読み込めませんでした（配信元の一時的な制限の可能性があります）。下のボタンからXで直接確認してください。
+            </div>
+            <a className="btn primary" href={`https://x.com/${snsHandle}`} target="_blank" rel="noopener noreferrer">↗ @{snsHandle} をXで開く</a>
+          </div>}
         </div>
-        <p className="foot">※ 表示件数はXの仕様により直近20件程度に限られます。鍵アカウントの投稿は表示できません。<br/>※ 有料のX APIを契約すれば複数アカウント統合タイムラインも実装できますが、従量課金（読み取り$0.005/件、無料枠なし）のため今回は見送っています。必要であればご相談ください。</p>
+        <p className="foot">※ 表示件数はXの仕様により直近20件程度に限られます。鍵アカウントの投稿は表示できません。<br/>※ X側の無料埋め込みは制限により表示できないことがあります（その場合は上の「Xで開く」をご利用ください）。<br/>※ 有料のX APIを契約すれば複数アカウント統合タイムラインも実装できますが、従量課金（読み取り$0.005/件、無料枠なし）のため今回は見送っています。必要であればご相談ください。</p>
       </div>}
 
       {/* ===== 分析（12章） ===== */}
