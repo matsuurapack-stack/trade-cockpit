@@ -881,19 +881,32 @@ function App(){
   const day=useMemo(()=>{const d=new Date(s.date+"T00:00:00");return isNaN(d)?null:d.getDay();},[s.date]);
   const isMonday=day===1;
 
+  // 複数カテゴリのニュース配列を、重複URLを除きつつ公開日時(published:"MM/DD HH:MM")の
+  // 降順にまとめる。米国株ニュースを国内カテゴリと混ぜて表示する際に使う（年またぎは非対応）。
+  const mergeByDate=(...lists)=>{
+    const seen=new Set();const out=[];
+    for(const list of lists){for(const it of list){if(!it.url||seen.has(it.url))continue;seen.add(it.url);out.push(it);}}
+    return out.sort((a,b)=>(b.published||"").localeCompare(a.published||""));
+  };
+  // 適時開示：日本の登録銘柄＋アメリカ市場（ダウ30社）のIR・決算ニュースをまとめて表示する
+  const disclosureAll=useMemo(()=>mergeByDate(s.stockNewsList,s.usStockNewsList),[s.stockNewsList,s.usStockNewsList]);
+  // 海外市況：マクロの海外市況クエリに加え、アメリカ市場登録銘柄のニュースも含める
+  const overseasAll=useMemo(()=>mergeByDate(s.macroNewsOverseas,s.usStockNewsList),[s.macroNewsOverseas,s.usStockNewsList]);
+
   // 9-1章：「サマリー」の中身の方針。既存に該当機能がなかったため新規に決定：
   // (1) 重大ニュース（9-2章の判定に該当）を全カテゴリから最優先で集約し、(2) 残り枠を
-  // 適時開示・国内市況・海外市況からバランスよく抜粋する。重複URLは除外する。
+  // 適時開示（日本＋アメリカ）・国内市況・海外市況からバランスよく抜粋する。重複URLは除外する。
   const newsSummary=useMemo(()=>{
     const seen=new Set();
     const push=(arr,list)=>{for(const it of list){if(!it.url||seen.has(it.url))continue;seen.add(it.url);arr.push(it);}};
-    const important=[];push(important,[...s.stockNewsList,...s.macroNewsDomestic,...s.macroNewsOverseas].filter(it=>isImportantNews(it.title)));
+    const important=[];push(important,[...s.stockNewsList,...s.usStockNewsList,...s.macroNewsDomestic,...s.macroNewsOverseas].filter(it=>isImportantNews(it.title)));
     const rest=[];
-    push(rest,s.stockNewsList.slice(0,4));
+    push(rest,s.stockNewsList.slice(0,3));
+    push(rest,s.usStockNewsList.slice(0,3));
     push(rest,s.macroNewsDomestic.slice(0,4));
     push(rest,s.macroNewsOverseas.slice(0,4));
     return [...important,...rest];
-  },[s.stockNewsList,s.macroNewsDomestic,s.macroNewsOverseas]);
+  },[s.stockNewsList,s.usStockNewsList,s.macroNewsDomestic,s.macroNewsOverseas]);
 
   // 10-5章：ページ最上部の重要ニュース通知バナー用（全カテゴリを対象に件数を集計）
   const importantNewsAll=useMemo(()=>{
@@ -1056,14 +1069,7 @@ function App(){
         <SectorWatchlist market="US" watchlist={s.watchlistUS} setWatchlist={setWatchlistUS} candidates={masterUS} max={MAX_US}
           stockQuotes={s.stockQuotes} analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
           onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name})}/>
-        <div style={{marginTop:22}}>
-          <div className="sec-head">ニュース・決算・IR（ダウ平均構成30社）</div>
-          <div className="sec-note">「日本市場」タブの「リアルタイムデータを反映」を押すと、この一覧も同時に更新されます。決算関連のクエリを含めて取得しており、9章でニュースタブ全体のIR・適時開示フィルタを整備する際にあわせて精度を見直します。</div>
-          <div className="card" style={{padding:"14px 16px 6px",marginTop:10}}>
-            <NewsList items={s.usStockNewsList} showName/>
-          </div>
-        </div>
-        <p className="foot" style={{marginTop:16}}>※ 対象は現行のダウ工業株30種平均構成銘柄。業種分類は日本市場と同じ東証33業種の枠組みで統一しています（GICSセクターではありません）。</p>
+        <p className="foot" style={{marginTop:16}}>※ 対象は現行のダウ工業株30種平均構成銘柄。業種分類は日本市場と同じ東証33業種の枠組みで統一しています（GICSセクターではありません）。アメリカ市場銘柄のニュース・決算・IRは「ニュース」タブのサマリー・海外市況・適時開示に統合表示しています。</p>
       </div>}
 
       {/* ===== SNS（6-2章） ===== */}
@@ -1172,7 +1178,7 @@ function App(){
           {key:"overseas",label:"海外市況"},
           {key:"disclosure",label:"適時開示"},
         ];
-        const listFor={summary:newsSummary,domestic:s.macroNewsDomestic,overseas:s.macroNewsOverseas,disclosure:s.stockNewsList}[newsSubTab];
+        const listFor={summary:newsSummary,domestic:s.macroNewsDomestic,overseas:overseasAll,disclosure:disclosureAll}[newsSubTab];
         const showCode=newsSubTab==="summary"||newsSubTab==="disclosure";
         const hasImportant=listFor.some(it=>isImportantNews(it.title));
         return <div style={{marginTop:18}}>
@@ -1180,7 +1186,7 @@ function App(){
             <div className="sec-head">ニュース</div>
             <button className="btn primary" onClick={refreshNews} disabled={newsFetching}>{newsFetching?"取得中…":"リアルタイムデータを反映"}</button>
           </div>
-          <div className="sec-note">上のボタンで、各サブタブのニュースをGoogleニュースRSSから更新できます（登録銘柄の株価等は更新されません。それらも含めて更新する場合は「日本市場」タブのボタンを使ってください）。「適時開示」は決算・IR関連キーワードで絞り込んでいます。見出しをクリックすると元記事が開きます。</div>
+          <div className="sec-note">上のボタンで、各サブタブのニュースをGoogleニュースRSSから更新できます（登録銘柄の株価等は更新されません。それらも含めて更新する場合は「日本市場」タブのボタンを使ってください）。「サマリー」「海外市況」「適時開示」にはアメリカ市場（ダウ30社）のニュースも含みます。「適時開示」は決算・IR関連キーワードで絞り込んでいます。見出しをクリックすると元記事が開きます。</div>
           <div className="subtabs">
             {NEWS_SUBTABS.map(t=><button key={t.key} className={"chip"+(newsSubTab===t.key?" on":"")} onClick={()=>setNewsSubTab(t.key)}>{t.label}</button>)}
           </div>
