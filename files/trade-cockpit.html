@@ -32,7 +32,7 @@
 }
 *{box-sizing:border-box}
 html{background-color:var(--paper)}
-body{margin:0;background-color:var(--paper);color:var(--ink);font-size:14px;min-height:100vh;
+body{margin:0;background-color:var(--paper);color:var(--ink);font-size:15px;min-height:100vh;
   font-family:'Segoe UI','Hiragino Sans','Hiragino Kaku Gothic ProN','Yu Gothic',Meiryo,Arial,sans-serif}
 .mono{font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
 .wrap{max-width:980px;margin:0 auto;padding:22px 18px 46px}
@@ -50,44 +50,51 @@ h1{margin:3px 0 0;font-size:28px;font-weight:700;line-height:1.2;letter-spacing:
 .tabs::-webkit-scrollbar{height:6px}
 .tabs::-webkit-scrollbar-thumb{background:var(--rule);border-radius:3px}
 .tab{background:transparent;border:none;border-bottom:3px solid transparent;color:var(--inkSoft);
-  font-size:14px;padding:9px 16px;cursor:pointer;font-weight:600;flex:none;white-space:nowrap;transition:color .15s}
+  font-size:15px;padding:9px 16px;cursor:pointer;font-weight:600;flex:none;white-space:nowrap;transition:color .15s}
 .tab:hover{color:var(--ink)}
 .tab.on{color:var(--ink);border-bottom-color:var(--accent)}
 .sec-head{font-size:22px;font-weight:600;line-height:1.3;margin:0 0 4px}
-.sec-note{font-size:12px;color:var(--inkSoft);margin-bottom:10px}
+.sec-note{font-size:13px;color:var(--inkSoft);margin-bottom:10px}
 .card{border:1px solid var(--rule);background:var(--card);border-radius:8px;padding:14px 16px 16px;
   box-shadow:var(--shadow);transition:background-color .2s ease,border-color .2s ease}
 .card-t{font-size:18px;font-weight:600;line-height:1.4}
-.card-n{font-size:12px;color:var(--inkSoft);margin-top:2px}
+.card-n{font-size:13px;color:var(--inkSoft);margin-top:2px}
 .card-hd{border-bottom:1px solid var(--ruleSoft);padding-bottom:8px;margin-bottom:10px}
 .grid{display:grid;gap:16px}
-.btn{display:inline-flex;align-items:center;gap:6px;border:none;padding:10px 18px;font-size:13px;
+.btn{display:inline-flex;align-items:center;gap:6px;border:none;padding:10px 18px;font-size:14px;
   border-radius:8px;cursor:pointer;font-weight:600;transition:filter .15s,box-shadow .15s}
 .btn.primary{background:var(--accent);color:#fff}
 .btn.primary:hover{filter:brightness(1.1)}
 .ghost{display:inline-flex;align-items:center;gap:6px;background:transparent;color:var(--inkSoft);
-  border:1px solid var(--rule);padding:9px 14px;font-size:13px;border-radius:8px;cursor:pointer;transition:background-color .15s}
+  border:1px solid var(--rule);padding:9px 14px;font-size:14px;border-radius:8px;cursor:pointer;transition:background-color .15s}
 .ghost:hover{background:var(--band)}
+/* 登録銘柄行の「チャート」「分析」ボタンなど、背景が塗り分け配色（ヒートマップ風）のセル上に
+   置かれるボタン用。透明な.ghostだと濃い背景に埋もれて見えにくくなるため、常に不透明な背景を持たせる */
+.action-btn{display:inline-flex;align-items:center;gap:5px;background:var(--paperAlt);color:var(--ink);
+  border:1px solid rgba(127,127,127,.35);padding:5px 10px;font-size:12.5px;font-weight:600;border-radius:6px;
+  cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.15);transition:filter .15s}
+.action-btn:hover{filter:brightness(.94)}
+.action-btn.on{background:var(--accent);color:#fff;border-color:var(--accent)}
 .iconbtn{background:transparent;border:none;color:var(--inkSoft);cursor:pointer;padding:4px;font-size:15px}
 input,select,textarea{padding:10px 12px;border:1px solid var(--rule);background:var(--paperAlt);
-  color:var(--ink);font-size:13px;border-radius:6px;font-family:inherit;transition:border-color .15s,box-shadow .15s}
+  color:var(--ink);font-size:14px;border-radius:6px;font-family:inherit;transition:border-color .15s,box-shadow .15s}
 input::placeholder,textarea::placeholder{color:var(--inkFaint)}
 input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accentSoft)}
 textarea{resize:vertical;line-height:1.6;width:100%}
 label.fld{display:block;margin-top:8px}
-label.fld span{font-size:11px;color:var(--inkSoft);display:block;margin-bottom:4px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{padding:8px 10px;font-size:11px;font-weight:600;text-align:left;white-space:nowrap;color:var(--inkSoft)}
+label.fld span{font-size:12px;color:var(--inkSoft);display:block;margin-bottom:4px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{padding:8px 10px;font-size:12px;font-weight:600;text-align:left;white-space:nowrap;color:var(--inkSoft)}
 td{padding:7px 10px;vertical-align:middle}
-.lbl{font-size:11px;color:var(--inkSoft);margin:8px 0 4px}
-.chip{font-size:12px;padding:4px 10px;border-radius:16px;cursor:pointer;border:1px solid var(--rule);
+.lbl{font-size:12px;color:var(--inkSoft);margin:8px 0 4px}
+.chip{font-size:13px;padding:4px 10px;border-radius:16px;cursor:pointer;border:1px solid var(--rule);
   background:var(--paperAlt);color:var(--inkSoft);transition:background-color .15s,color .15s}
 .chip:hover{background:var(--band)}
 .chip.on{background:var(--accent);color:#fff;border-color:var(--accent)}
 .alarm{background:var(--alarm);color:var(--alarmText);border:2px solid var(--alarmEdge);border-radius:8px;
   padding:16px 18px;display:flex;align-items:center;gap:13px;animation:almPulse 1.2s ease-in-out infinite}
 @keyframes almPulse{0%,100%{opacity:1}50%{opacity:.82}}
-.foot{margin-top:16px;font-size:12px;color:var(--inkSoft);line-height:1.7}
+.foot{margin-top:16px;font-size:13px;color:var(--inkSoft);line-height:1.7}
 .results{position:absolute;z-index:5;left:0;right:0;margin-top:4px;background:var(--paperAlt);
   border:1px solid var(--rule);border-radius:8px;box-shadow:var(--shadowLg);overflow:hidden}
 .res-row{display:flex;width:100%;align-items:center;gap:10px;padding:9px 12px;background:transparent;
@@ -711,9 +718,9 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                   <td className="mono" style={{color:c.level>0?c.fgSoft:"var(--inkSoft)",whiteSpace:"nowrap"}}>{chi!=null?chi.toLocaleString():"—"}</td>
                   <td className="mono" style={{color:c.level>0?c.fgSoft:"var(--inkSoft)",whiteSpace:"nowrap"}}>{clo!=null?clo.toLocaleString():"—"}</td>
                   <td style={{textAlign:"center",whiteSpace:"nowrap"}}>
-                    <button className="ghost" style={{padding:"4px 9px",fontSize:11.5,marginRight:5}} onClick={()=>onOpenChart(w)}>チャート</button>
-                    <button className={inAnalysis?"btn primary":"ghost"} style={{padding:"4px 9px",fontSize:11.5,marginRight:5}} onClick={()=>onToggleAnalysis(w.code)}>{inAnalysis?"✓ 分析中":"分析"}</button>
-                    <button className="iconbtn" onClick={()=>delStock(w.id)}>×</button>
+                    <button className="action-btn" style={{marginRight:5}} onClick={()=>onOpenChart(w)}>チャート</button>
+                    <button className={"action-btn"+(inAnalysis?" on":"")} style={{marginRight:5}} onClick={()=>onToggleAnalysis(w.code)}>{inAnalysis?"✓ 分析中":"分析"}</button>
+                    <button className="iconbtn" style={{color:c.level>0?c.fg:"var(--inkSoft)"}} onClick={()=>delStock(w.id)}>×</button>
                   </td>
                 </tr>;})}</tbody>
             </table></div>}
