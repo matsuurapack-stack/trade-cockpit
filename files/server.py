@@ -528,6 +528,43 @@ def _days_to_earnings(tk):
         return None
 
 
+# trading_rules_追加分（信用倍率編）ルール②：貸借倍率(信用倍率=買残÷売残)。yfinanceは日本株の
+# 信用残高を取得できないため、kabutanの銘柄ページをスクレイピングして代用する（ユーザー承認済み方針）。
+KABUTAN_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+_MARGIN_RATIO_RE = re.compile(
+    r"<td>[\d.]+<span class=\"fs9\">倍</span></td>\s*"
+    r"<td>[\d.]+<span class=\"fs9\">倍</span></td>\s*"
+    r"<td>[\d.]+<span class=\"fs9\">％</span></td>\s*"
+    r"<td>([\d.]+)<span class=\"fs9\">倍</span></td>"
+)
+
+
+def _kabutan_margin_ratio(code):
+    """銘柄コードから信用倍率(貸借倍率)を取得する。kabutanはUser-Agent未指定のリクエストを
+    403で拒否するため、ブラウザ相当のUAを付与する。ページ構造の変化・アクセス失敗時はNoneを返し、
+    分析全体は失敗させない（ニュース/SNS取得の他の外部データ取得と同じ、失敗を許容する方針）。"""
+    try:
+        req = urllib.request.Request(f"https://kabutan.jp/stock/?code={code}", headers={"User-Agent": KABUTAN_UA})
+        with urllib.request.urlopen(req, timeout=5) as res:
+            html = res.read().decode("utf-8", errors="replace")
+        m = _MARGIN_RATIO_RE.search(html)
+        return float(m.group(1)) if m else None
+    except Exception as e:
+        print("  信用倍率取得失敗", code, e)
+        return None
+
+
+def _margin_badge(ratio):
+    """trading_rules_追加分ルール②の3段階判定：10倍未満=通常／10倍以上30倍以下=慎重／30倍超=厳重注意。"""
+    if ratio is None:
+        return None, None
+    if ratio > 30:
+        return "danger", f"貸借倍率{ratio:.2f}倍のため戻り売り警戒（上値に含み損玉が多い可能性、厳重注意）"
+    if ratio >= 10:
+        return "caution", f"貸借倍率{ratio:.2f}倍のため戻り売りに慎重"
+    return "normal", f"貸借倍率{ratio:.2f}倍（通常水準）"
+
+
 def analyze_stock(w, market_env=""):
     """12-1章・technical_analysis_rules.md：ローソク足パターン・移動平均線の並び／クロス・
     ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
@@ -575,6 +612,16 @@ def analyze_stock(w, market_env=""):
     rsi_5m = _rsi(m5["closes"], 14) if m5 and len(m5["closes"]) >= 15 else None
     rsi_15m = _rsi(m15["closes"], 14) if m15 and len(m15["closes"]) >= 15 else None
 
+    # ---- trading_rules_追加分ルール①③：GU（ギャップアップ）率と、寄り付き高値からの押し目形成有無。
+    # 「様子見(初押し待ち)」判定と「寄り付き高値を追わない」警告の両方でこの2つを使う。----
+    today_open = opens[-1] if opens else None
+    gu_pct = (today_open - prev) / prev * 100 if (today_open is not None and prev) else None
+    elapsed_minutes = len(m1["closes"]) if m1 else None  # 1分足の本数を経過分数の目安として使う
+    pullback_formed = False
+    if m1 and len(m1["closes"]) >= 2:
+        peak = max(m1["closes"])
+        pullback_formed = m1["closes"][-1] <= peak * 0.997  # 高値から0.3%以上の押し目
+
     ma25_s, ma75_s, ma100_s = _sma_series(closes, 25), _sma_series(closes, 75), _sma_series(closes, 100)
     ma25, ma75, ma100 = ma25_s[-1], ma75_s[-1], ma100_s[-1]
     rsi = _rsi(closes, 14)
@@ -590,6 +637,13 @@ def analyze_stock(w, market_env=""):
     vol_surge = vol_avg5 is not None and volumes[-1] > vol_avg5 * 1.5
     vol_thin = vol_avg5 is not None and volumes[-1] < vol_avg5 * 0.7
     change_1w = (current - closes[-6]) / closes[-6] * 100 if n >= 6 and closes[-6] else None
+
+    # ---- trading_rules_追加分ルール①：好決算日等の様子見ルール。5%以上のGU or 出来高急増で、
+    # 寄り付きから60分未満・かつ押し目がまだ形成されていなければ「様子見中」とする。----
+    watch_status = None
+    if m1 and elapsed_minutes is not None and elapsed_minutes < 60 and not pullback_formed:
+        if (gu_pct is not None and gu_pct >= 5) or vol_surge:
+            watch_status = "様子見中(初押し待ち)"
 
     low_zone = current <= high52w * 0.8   # 条件C等：52週高値の-20%以下＝安値圏
     high_zone = current >= high52w * 0.95  # 条件B等：52週高値の-5%以内＝高値圏
@@ -832,6 +886,29 @@ def analyze_stock(w, market_env=""):
         {"key": "weakSector", "label": "セクターが弱い（日次モニターのセクター順で要確認）", "hit": None},
     ]
 
+    # ---- trading_rules_追加分ルール③：GU日に寄り付き高値を追いかけていないか ----
+    chasing_gu_high = bool(gu_pct is not None and gu_pct >= 5 and intraday_high is not None
+                            and current >= intraday_high * 0.995 and not pullback_formed)
+    if chasing_gu_high:
+        avoid_checklist.append({"key": "chasingGuHigh", "label": "GU日の寄り付き高値を追いかけている（押し目待ち推奨）", "hit": True})
+
+    # ---- trading_rules_追加分ルール④：エントリー位置がVWAP・移動平均線から離れすぎていないか ----
+    entry_ref = vwap if vwap is not None else ma25
+    entry_dev_pct = (current - entry_ref) / entry_ref * 100 if entry_ref else None
+    if entry_dev_pct is not None and entry_dev_pct > 2:
+        avoid_checklist.append({"key": "awayFromMaVwap",
+                                 "label": f"現在値がVWAP/移動平均線から+{entry_dev_pct:.1f}%乖離（高値掴みリスク、待てないなら見送り）",
+                                 "hit": True})
+
+    # ---- trading_rules_追加分ルール②：貸借倍率（kabutanスクレイピング、日本株のみ）----
+    margin_ratio = _kabutan_margin_ratio(w.get("code", "")) if w.get("market", "JP") == "JP" else None
+    margin_badge, margin_note = _margin_badge(margin_ratio)
+    if margin_badge in ("caution", "danger"):
+        avoid_checklist.append({"key": "marginRatio", "label": margin_note, "hit": True})
+    if margin_badge == "danger":
+        strength = max(1, strength - 1)
+        entry_reasons.append(f"{margin_note}のためエントリー推奨を格下げ")
+
     # ---- 決算またぎルール：決算発表が近い場合、直近1週間の値動きから「またぐ／またがない」の目安を出す ----
     days_to_earnings = _days_to_earnings(tk)
     earnings_note = None
@@ -900,6 +977,9 @@ def analyze_stock(w, market_env=""):
             "entryChecklist": entry_checklist,
             "avoidChecklist": avoid_checklist,
             "earningsNote": earnings_note,
+            "watchStatus": watch_status,
+            "marginRatio": round(margin_ratio, 2) if margin_ratio is not None else None,
+            "marginBadge": margin_badge,
         },
     }
 

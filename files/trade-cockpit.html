@@ -1154,6 +1154,8 @@ function App(){
           <div style={{fontWeight:700,color:"var(--ink)",marginBottom:4}}>自分のトレードルール（要点）</div>
           最優先は負けないこと・利確は欲張らず+3〜5%が目安・<b style={{color:"var(--ink)"}}>逆指値は絶対に下げない</b>・基本は持ち越さない（自信ある銘柄のみ例外）・地合いが悪い/弱いセクターでは無理をしない・ノートレードも立派な判断。
           <div style={{marginTop:6}}>銘柄選びの優先順位：①半導体 → ②AI関連 → ③当日最強セクター（日次モニターのセクター売買代金順を参照） → ④材料株。</div>
+          <div style={{marginTop:6}}>好決算翌営業日は<b style={{color:"var(--ink)"}}>100株スタート</b>、上昇を確認してから追加を検討。GU（ギャップアップ）日は寄り付き高値を追わず、押し目形成・陽線・出来高を確認してからエントリー。エントリーは移動平均線/VWAP付近まで待つ（待てないなら見送る）。</div>
+          <div style={{marginTop:6,fontWeight:700,color:"var(--ink)"}}>黄金ルール：「勝てそう」では買わない。「買いが勝っていることを確認してから買う」。期待ではなく、チャートと出来高が期待を現実に変えたことを確認してから入る。</div>
         </div>
         {analysisItems.length===0
           ? <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13,border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)"}}>
@@ -1184,6 +1186,7 @@ function App(){
                             <div title="シグナル強度" style={{color:"var(--star)",fontSize:13,letterSpacing:1}}>{"★".repeat(a.strength||0)}{"☆".repeat(5-(a.strength||0))}</div>
                           </div>
                           {a.marketEnv && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>{a.marketEnv}</div>}
+                          {a.tradeRules?.watchStatus && <div style={{fontSize:11.5,fontWeight:700,color:"var(--accent)",background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>⏳ {a.tradeRules.watchStatus}</div>}
                           {/* 決算またぎ期待値：発表10日前からカウントダウンを目立つ色で表示。星評価はいつでも編集可能で、
                               決算通過後もこのまま表示され続ける（事前予想→決算後の答え合わせ、という運用のため）。 */}
                           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6,
@@ -1231,6 +1234,10 @@ function App(){
                             RSI14 {a.indicators.rsi??"—"}　RCI26 {a.indicators.rci26??"—"}　ATR14 {a.indicators.atr14??"—"}<br/>
                             BB-2σ {a.indicators.bbLower2??"—"}　BB-3σ {a.indicators.bbLower3??"—"}<br/>
                             直近サポート {a.indicators.support}　直近レジスタンス {a.indicators.resistance}<br/>
+                            {a.tradeRules?.marginRatio!=null && <>信用倍率(貸借倍率) {a.tradeRules.marginRatio}倍
+                              {a.tradeRules.marginBadge==="danger" && <span style={{color:"var(--down)",fontWeight:700}}>（厳重注意）</span>}
+                              {a.tradeRules.marginBadge==="caution" && <span style={{color:"var(--down)"}}>（慎重）</span>}
+                              <br/></>}
                             52週高値 {a.indicators.high52w}　52週安値 {a.indicators.low52w}<br/>
                             {(a.indicators.intradayHigh!=null)
                               ? <>当日高値 {a.indicators.intradayHigh}　当日安値 {a.indicators.intradayLow}　VWAP {a.indicators.vwap??"—"}<br/>
