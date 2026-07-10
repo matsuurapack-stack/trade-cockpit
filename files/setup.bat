@@ -7,7 +7,7 @@ echo.
 echo Installing required libraries. Please wait...
 echo.
 python -m pip install --upgrade pip
-python -m pip install yfinance feedparser
+python -m pip install yfinance feedparser pypdf
 echo.
 echo ============================================
 echo   Setup complete.

@@ -5,6 +5,7 @@
 - 取得: 指数/為替(yfinance)、ニュース(Googleニュース RSS)
 - 使い方: start.bat をダブルクリック。ブラウザが自動で開きます。
 """
+import io
 import os
 import re
 import json
@@ -17,6 +18,11 @@ import urllib.parse
 import urllib.request
 from http.server import SimpleHTTPRequestHandler
 from socketserver import ThreadingTCPServer
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
@@ -314,14 +320,229 @@ def _sort_and_strip(items):
     return [{k: v for k, v in it.items() if k != "_ts"} for it in items]
 
 
+# 適時開示は本来Googleニュースの近似ではなく、TDnet（適時開示情報閲覧サービス）の公開一覧ページ
+# （https://www.release.tdnet.info/inbs/I_list_XXX_YYYYMMDD.html）を直接スクレイピングして「本日
+# 発表された決算・業績関連の適時開示」を取得する。1回のページ取得（複数ページに分割されている
+# 場合は全ページ）でその日の全上場企業分がまとまっているため、登録銘柄が何社あっても銘柄ごとに
+# 検索する必要がなく、上位12社だけに絞る必要もない（kabutan同様、公式APIはないため公開HTMLの
+# スクレイピング。ユーザー承認済み方針）。アメリカ株はTDnet対象外のため、従来通りGoogleニュース
+# RSSを優先度順の上位12社まで検索する方式を維持する。
+TDNET_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+_TDNET_ROW_RE = re.compile(
+    r'<td class="\w+new-L kjTime" noWrap>([\d:]+)</td>\s*'
+    r'<td class="\w+new-M kjCode" noWrap>([0-9A-Z]+)</td>\s*'
+    r'<td class="\w+new-M kjName" noWrap>[^<]*</td>\s*'
+    r'<td class="\w+new-M kjTitle" align="left"><a href="([^"]+)"[^>]*>([^<]*)</a>'
+)
+_TDNET_TOTAL_RE = re.compile(r"全(\d+)件")
+EARNINGS_TITLE_KEYWORDS = ["決算", "業績予想", "業績の修正", "業績修正", "上方修正", "下方修正"]
+
+
+def _is_earnings_title(title):
+    return any(k in title for k in EARNINGS_TITLE_KEYWORDS)
+
+
+def _tdnet_fetch_page(date_str, page):
+    url = f"https://www.release.tdnet.info/inbs/I_list_{page:03d}_{date_str}.html"
+    req = urllib.request.Request(url, headers={"User-Agent": TDNET_UA})
+    with urllib.request.urlopen(req, timeout=8) as res:
+        return res.read().decode("utf-8", errors="replace")
+
+
+def _tdnet_sort_key(time_str):
+    """開示時刻(HH:MM、本日分)をソート用のUNIX時刻に変換する。"""
+    try:
+        jst = datetime.timezone(datetime.timedelta(hours=9))
+        hh, mm = time_str.split(":")
+        return datetime.datetime.now(jst).replace(hour=int(hh), minute=int(mm), second=0, microsecond=0).timestamp()
+    except Exception:
+        return 0
+
+
+def _tdnet_today_disclosures():
+    """本日TDnetに開示された情報を、証券コード(4桁)をキーにした辞書（値はリスト、1コードに
+    複数開示があることもある）で返す。取得失敗時は空辞書（分析全体は失敗させない方針）。"""
+    date_str = datetime.date.today().strftime("%Y%m%d")
+    by_code = {}
+    try:
+        html = _tdnet_fetch_page(date_str, 1)
+    except Exception as e:
+        print("  TDnet取得失敗", e)
+        return by_code
+    m = _TDNET_TOTAL_RE.search(html)
+    total = int(m.group(1)) if m else 0
+    pages = min(max((total + 99) // 100, 1), 10)  # 安全のため最大10ページ(1000件)まで
+    htmls = [html]
+    for p in range(2, pages + 1):
+        try:
+            htmls.append(_tdnet_fetch_page(date_str, p))
+        except Exception as e:
+            print("  TDnet取得失敗", p, e)
+            break
+    for page_html in htmls:
+        for time_s, code5, href, title in _TDNET_ROW_RE.findall(page_html):
+            code = code5[:-1] if len(code5) == 5 else code5
+            by_code.setdefault(code, []).append({
+                "time": time_s,
+                "title": title.strip(),
+                "url": "https://www.release.tdnet.info/inbs/" + href,
+            })
+    return by_code
+
+
+# 決算短信の1〜2ページ目は東証が指定する統一フォーマット（サマリー情報）のため、会社が変わっても
+# 「経営成績（実績）」「通期の連結業績予想」の表はほぼ同じ並びで出てくる。ここではLLMを使わず、
+# その表を正規表現で抜き出して「前年同期比」「会社計画に対する進捗率」「予想修正の有無」を
+# 機械的に要約する（自由記述の定性コメントの要約にはLLMが必要なため対象外）。
+_EARNINGS_ROW_RE = re.compile(
+    r"(\S+?年\S+?月期\S*)\s+([\d,]+)\s+(△?[\d.]+)\s+([\d,]+)\s+(△?[\d.]+)\s+"
+    r"([\d,]+)\s+(△?[\d.]+)\s+([\d,]+)\s+(△?[\d.]+)"
+)
+_EARNINGS_FORECAST_RE = re.compile(
+    r"通期\s+([\d,]+)\s+(△?[\d.]+)\s+([\d,]+)\s+(△?[\d.]+)\s+"
+    r"([\d,]+)\s+(△?[\d.]+)\s+([\d,]+)\s+(△?[\d.]+)"
+)
+_GUIDANCE_REVISED_RE = re.compile(r"業績予想からの修正の有無[：:]\s*([無有])")
+
+
+def _num(s):
+    return float(s.replace(",", ""))
+
+
+def _pct(s):
+    return -_num(s[1:]) if s.startswith("△") else _num(s)
+
+
+def _fetch_pdf_text(url, max_pages=2):
+    """決算短信PDFの先頭ページ群のテキストを返す。取得・解析失敗時は空文字（呼び出し元で
+    要約をスキップする＝ニュース自体は表示され、要約だけが付かない形に落とす）。"""
+    if PdfReader is None:
+        return ""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": TDNET_UA})
+        with urllib.request.urlopen(req, timeout=10) as res:
+            data = res.read()
+        reader = PdfReader(io.BytesIO(data))
+        return "\n".join((reader.pages[i].extract_text() or "") for i in range(min(max_pages, len(reader.pages))))
+    except Exception as e:
+        print("  決算短信PDF取得失敗", url, e)
+        return ""
+
+
+def summarize_earnings_pdf(url):
+    """決算短信PDFのサマリー表から「前年同期比」「通期会社計画比の進捗率」「予想修正の有無」を
+    抜き出したテンプレート文を返す。表のレイアウトが想定と異なる銘柄では抽出できずNoneになる
+    （数値ベースの決定的な処理のみで、定性コメントの要約は行わない＝1段階目の実装）。"""
+    text = _fetch_pdf_text(url)
+    m = _EARNINGS_ROW_RE.search(text)
+    if not m:
+        return None
+    period = m.group(1)
+    revenue, revenue_yoy = _num(m.group(2)), _pct(m.group(3))
+    op, op_yoy = _num(m.group(4)), _pct(m.group(5))
+    net, net_yoy = _num(m.group(8)), _pct(m.group(9))
+
+    parts = [
+        f"{period}実績：売上高{revenue:,.0f}百万円({revenue_yoy:+.1f}%)・"
+        f"営業利益{op:,.0f}百万円({op_yoy:+.1f}%)・純利益{net:,.0f}百万円({net_yoy:+.1f}%)"
+    ]
+
+    fm = _EARNINGS_FORECAST_RE.search(text)
+    if fm:
+        f_rev, f_rev_yoy = _num(fm.group(1)), _pct(fm.group(2))
+        f_op, f_op_yoy = _num(fm.group(3)), _pct(fm.group(4))
+        progress = f"（今回までの進捗率{revenue / f_rev * 100:.1f}%）" if f_rev else ""
+        parts.append(
+            f"通期会社計画：売上高{f_rev:,.0f}百万円({f_rev_yoy:+.1f}%)・"
+            f"営業利益{f_op:,.0f}百万円({f_op_yoy:+.1f}%){progress}"
+        )
+
+    gm = _GUIDANCE_REVISED_RE.search(text)
+    if gm:
+        parts.append("業績予想は今回修正あり（要確認）" if gm.group(1) == "有" else "業績予想は据え置き")
+
+    return "。".join(parts) + "。"
+
+
+# 決算分析タブ（「決算」ボタン）用：TDnetの日付一覧ページは銘柄横断検索ができないため、
+# yanoshin氏が公開している非公式のTDnetミラーAPI（銘柄コード単位で開示履歴を返す）を使い、
+# 「本日」に限らず直近の決算短信を探す。公式APIではないため取得失敗時は空リストで諦める。
+TDNET_HISTORY_API = "https://webapi.yanoshin.jp/webapi/tdnet/list/{code}.json?limit=30"
+
+
+def _tdnet_company_history(code):
+    url = TDNET_HISTORY_API.format(code=code)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": TDNET_UA})
+        with urllib.request.urlopen(req, timeout=8) as res:
+            data = json.loads(res.read().decode("utf-8", errors="replace"))
+    except Exception as e:
+        print("  TDnet銘柄別履歴取得失敗", code, e)
+        return []
+    out = []
+    for item in data.get("items", []):
+        t = item.get("Tdnet", {})
+        title = t.get("title", "")
+        raw_url = t.get("document_url", "") or ""
+        # yanoshinのdocument_urlは "https://webapi.yanoshin.jp/rd.php?<実URL>" のリダイレクト形式。
+        pdf_url = raw_url.split("rd.php?", 1)[-1] if "rd.php?" in raw_url else raw_url
+        out.append({"title": title, "pubdate": t.get("pubdate", ""), "url": pdf_url})
+    return out
+
+
+def latest_earnings_detail(code, name):
+    """指定銘柄の直近の決算短信を探し、summarize_earnings_pdf()の数値要約を添えて返す。
+    見つからない・要約できない場合はtitle/summaryがNoneのまま返す（フロント側で
+    「見つかりません」「要約できません」の文言に分岐させる）。"""
+    result = {"code": code, "name": name, "title": None, "url": None, "published": None, "summary": None}
+    latest = next((h for h in _tdnet_company_history(code) if "決算短信" in h["title"]), None)
+    if not latest:
+        return result
+    result["title"] = latest["title"]
+    result["url"] = latest["url"]
+    result["published"] = latest["pubdate"]
+    if latest["url"]:
+        result["summary"] = summarize_earnings_pdf(latest["url"])
+    return result
+
+
 def build_stock_news(watchlist):
     """登録銘柄ニュースを配列で返す（各要素 code/name/title/url/source/published）。
     9章の仕様により、決算・IR・適時開示に関連するもののみに絞り込む。
-    銘柄ごとに検索するため単純連結だと銘柄単位で古い記事が先に来ることがあり、
-    最後に全体を公開日時の降順で並べ替えて「最新のものから」表示する。"""
-    order = {"優先": 0, "通常": 1, "様子見": 2}
-    wl = sorted(watchlist, key=lambda w: order.get(w.get("watch", "通常"), 1))[:12]
+    日本株はTDnetの本日開示一覧（登録銘柄数によらず1回のページ取得でカバー）から本日発表済みの
+    決算・業績関連開示のみを抽出する。アメリカ株はTDnet対象外のため、Googleニュースを優先度順の
+    上位12社まで検索する（銘柄ごとに検索する方式のため件数を絞っている）。"""
     items = []
+
+    jp_items = [w for w in watchlist if w.get("market", "JP") != "US"]
+    us_items = [w for w in watchlist if w.get("market", "JP") == "US"]
+
+    if jp_items:
+        jst = datetime.timezone(datetime.timedelta(hours=9))
+        today_str = datetime.datetime.now(jst).strftime("%m/%d")
+        tdnet = _tdnet_today_disclosures()
+        for w in jp_items:
+            code, name = w.get("code", ""), w.get("name", "")
+            if not code or not name:
+                continue
+            for e in tdnet.get(code, []):
+                if not _is_earnings_title(e["title"]):
+                    continue
+                entry = {
+                    "code": code, "name": name, "title": e["title"], "url": e["url"],
+                    "source": "TDnet", "published": f"{today_str} {e['time']}",
+                    "_ts": _tdnet_sort_key(e["time"]),
+                }
+                # 決算短信（東証統一フォーマットのサマリー表を含む）のみ数値要約を試みる。
+                # 決算説明資料など別フォーマットのPDFは対象外（無理に解析すると誤読のリスクがあるため）。
+                if "決算短信" in e["title"]:
+                    summary = summarize_earnings_pdf(e["url"])
+                    if summary:
+                        entry["summary"] = summary
+                items.append(entry)
+
+    order = {"優先": 0, "通常": 1, "様子見": 2}
+    wl = sorted(us_items, key=lambda w: order.get(w.get("watch", "通常"), 1))[:12]
     for w in wl:
         name = w.get("name", "")
         code = w.get("code", "")
@@ -331,6 +552,7 @@ def build_stock_news(watchlist):
         ir_only = [it for it in candidates if _is_ir_news(it["title"]) and _title_mentions_name(name, it["title"])]
         for it in ir_only[:2]:
             items.append({**it, "code": code, "name": name})
+
     return _sort_and_strip(items)
 
 
@@ -1096,6 +1318,17 @@ class Handler(SimpleHTTPRequestHandler):
             print(f"[取得] 分析（対象 {len(targets)} 銘柄）…")
             analysis = build_analysis(targets)
             self._send_json({"analysis": analysis})
+        elif self.path.startswith("/api/earnings-detail"):
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b"[]"
+            try:
+                targets = json.loads(raw.decode("utf-8") or "[]")
+            except Exception:
+                targets = []
+            print(f"[取得] 決算分析（対象 {len(targets)} 銘柄）…")
+            results = [latest_earnings_detail(t.get("code", ""), t.get("name", ""))
+                       for t in targets if t.get("code")]
+            self._send_json({"results": results})
         elif self.path.startswith("/api/earnings-rating"):
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length) if length else b"{}"

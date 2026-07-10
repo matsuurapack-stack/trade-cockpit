@@ -111,6 +111,7 @@ td{padding:7px 10px;vertical-align:middle}
   border:1px solid var(--rule);border-radius:3px;padding:1px 6px;white-space:nowrap}
 .news-body{flex:1;min-width:0}
 .news-title{font-size:14px;line-height:1.5}
+.news-summary{display:block;font-size:12px;line-height:1.5;color:var(--inkSoft);margin-top:4px}
 .news-meta{display:block;font-size:11px;color:var(--inkFaint);margin-top:3px}
 .news-empty{font-size:12px;color:var(--inkSoft);padding:16px 4px}
 /* 9-2章：重大ニュースの強調表示（4-6章：アラート仕様に統一） */
@@ -456,6 +457,8 @@ const emptyState=()=>({
   stockNewsList:[], macroNewsList:[], macroNewsDomestic:[], macroNewsOverseas:[], usStockNewsList:[], stockQuotes:{},
   analysisTargets:[], // analysisTargets: 5章「分析」ボタンで追加した銘柄コード一覧（12章の分析タブで使用）
   analysisData:{}, // analysisData: 12-1章の分析結果（購入/損切り/利確の目安・算出根拠）をコードごとに保持
+  earningsTargets:[], // earningsTargets: 登録銘柄テーブルの「決算」ボタンで追加した銘柄コード一覧（決算分析タブで使用）
+  earningsDetail:{}, // earningsDetail: 直近の決算短信（TDnet）のタイトル・URL・数値要約をコードごとに保持
   notifyEnabled:true, // 10-5章：重要ニュース通知バナーのオン/オフ
 });
 // 1章：255社デフォルトを後から追加したため、既にlocalStorageに保存済みだったユーザーは
@@ -555,6 +558,7 @@ function NewsList({items,showName,announcements,announceInterval=5}){
           {showName&&it.code&&<span className="news-tag">{it.code}</span>}
           <span className="news-body">
             <span className="news-title">{it.title}</span>
+            {it.summary&&<span className="news-summary">{it.summary}</span>}
             {meta&&<span className="news-meta">{meta}</span>}
           </span>
           <SourceThumb source={it.source}/>
@@ -586,7 +590,7 @@ function EarningsStars({value,onChange}){
 
 // 6-1章：銘柄検索・登録＋セクター別アコーディオン表示（2〜5章の仕様）を市場ごとに再利用するための共通コンポーネント。
 // 日本市場・アメリカ市場タブの両方で、このコンポーネントをそのまま使い回すことで「全く同じ仕様・UI」を担保する。
-function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuotes,analysisTargets,onToggleAnalysis,onOpenChart}){
+function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,onOpenChart}){
   const [q,setQ]=useState("");
   const [manualSector,setManualSector]=useState(SECTOR_CHOICES[0]);
   const [openSectors,setOpenSectors]=useState(()=>new Set());
@@ -681,6 +685,7 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                 const pct=pctOf(w.code);
                 const c=changeColor(pct);
                 const inAnalysis=analysisTargets.includes(w.code);
+                const inEarnings=earningsTargets.includes(w.code);
                 return <tr key={w.id} style={{borderTop:"1px solid var(--ruleSoft)",background:c.bg,color:c.level>0?c.fg:"var(--ink)"}}>
                   <td className="mono" style={{fontWeight:700,fontSize:14}}>{w.code}</td>
                   <td style={{fontSize:16,fontWeight:600}}>{w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
@@ -691,6 +696,7 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                   <td style={{textAlign:"center",whiteSpace:"nowrap"}}>
                     <button className="action-btn" style={{marginRight:5}} onClick={()=>onOpenChart(w)}>チャート</button>
                     <button className={"action-btn"+(inAnalysis?" on":"")} style={{marginRight:5}} onClick={()=>onToggleAnalysis(w.code)}>{inAnalysis?"✓ 分析中":"分析"}</button>
+                    {market==="JP" && <button className={"action-btn"+(inEarnings?" on":"")} style={{marginRight:5}} onClick={()=>onToggleEarnings(w.code)}>{inEarnings?"✓ 決算":"決算"}</button>}
                     <button className="iconbtn" style={{color:c.level>0?c.fg:"var(--inkSoft)"}} onClick={()=>delStock(w.id)}>×</button>
                   </td>
                 </tr>;})}</tbody>
@@ -864,6 +870,28 @@ function App(){
     if(missing.length)fetchAnalysisFor(missing);
   },[s.analysisTargets]);
 
+  // 決算分析タブの対象銘柄。「決算」ボタンで追加され、直近の決算短信（TDnet）のタイトル・
+  // 数値要約を取得して表示する（要約の作り方は適時開示タブと同じ、9章のsummarize_earnings_pdf）。
+  const earningsItems=useMemo(()=>s.earningsTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean),[s.earningsTargets,allWatch]);
+  const [earningsFetching,setEarningsFetching]=useState(false);
+  const fetchEarningsDetailFor=async(items)=>{
+    if(!items||!items.length)return;
+    setEarningsFetching(true);
+    try{
+      const er=await fetch("/api/earnings-detail",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify(items.map(w=>({code:w.code,name:w.name})))});
+      if(er.ok){const ed=await er.json();
+        const byCode=Object.fromEntries((ed.results||[]).map(r=>[r.code,r]));
+        setS(p=>({...p,earningsDetail:{...p.earningsDetail,...byCode}}));}
+    }catch(e){}
+    setEarningsFetching(false);
+  };
+  // 銘柄追加時：earningsDetailにまだ結果がない対象銘柄だけを取得する
+  useEffect(()=>{
+    const missing=earningsItems.filter(w=>!s.earningsDetail[w.code]);
+    if(missing.length)fetchEarningsDetailFor(missing);
+  },[s.earningsTargets]);
+
   // 決算またぎ期待値：星評価(0.5刻み・0〜5)。銘柄コードに紐づけてサーバー側のJSONファイルに保存し、
   // OneDrive共有フォルダ経由でも家族と共有・反映されるようにする（ローカルストレージだと共有されないため）。
   const [earningsRatings,setEarningsRatings]=useState({}); // {code:{stars,updatedAt}}
@@ -929,6 +957,14 @@ function App(){
     setS(p=>({...p,analysisTargets:p.analysisTargets.includes(code)
       ?p.analysisTargets.filter(c=>c!==code):[...p.analysisTargets,code]}));
     setTab("analysis");
+  };
+
+  // 登録銘柄テーブルの「決算」ボタン。押すたびに決算分析タブの対象銘柄リストに追加/削除をトグルし、
+  // 追加・削除いずれの場合も結果をすぐ確認できるよう「決算分析」タブに遷移する（分析ボタンと同様の設計）。
+  const toggleEarningsTarget=(code)=>{
+    setS(p=>({...p,earningsTargets:p.earningsTargets.includes(code)
+      ?p.earningsTargets.filter(c=>c!==code):[...p.earningsTargets,code]}));
+    setTab("earnings");
   };
 
   const rollToNextDay=()=>{if(!confirm("今日の値を前日値へ繰り越し、新しい一日にします（登録銘柄・分析対象銘柄は保持）。よろしいですか？"))return;
@@ -1016,15 +1052,19 @@ function App(){
         </label>
       </div>
 
-      {/* タブ並び順：日次モニター→ニュース→アメリカ市場(6-1)→SNS(6-2)→日本市場→分析(12章)。
-          日次モニターは6章の並びに含まれないが、要望により先頭に配置。 */}
+      {/* タブ並び順：日次モニター→ニュース→アメリカ市場(6-1)→SNS(6-2)→日本市場→決算分析→銘柄分析(12章)。
+          日次モニターは6章の並びに含まれないが、要望により先頭に配置。
+          決算分析：登録銘柄テーブルの「決算」ボタンで追加した銘柄の直近決算短信を表示するタブ
+          （tabキーはearnings、内部状態はearningsTargets/earningsDetail）。「銘柄分析」は元「分析」タブ
+          （tabキーはanalysisのまま、ラベルのみ変更）で、混同を避けるため隣に並べている。 */}
       <div className="tabs">
         <button className={"tab"+(tab==="monitor"?" on":"")} onClick={()=>setTab("monitor")}>日次モニター</button>
         <button className={"tab"+(tab==="news"?" on":"")} onClick={()=>setTab("news")}>ニュース</button>
         <button className={"tab"+(tab==="us"?" on":"")} onClick={()=>setTab("us")}>アメリカ市場</button>
         <button className={"tab"+(tab==="sns"?" on":"")} onClick={()=>setTab("sns")}>SNS</button>
         <button className={"tab"+(tab==="briefing"?" on":"")} onClick={()=>setTab("briefing")}>日本市場</button>
-        <button className={"tab"+(tab==="analysis"?" on":"")} onClick={()=>setTab("analysis")}>分析</button>
+        <button className={"tab"+(tab==="earnings"?" on":"")} onClick={()=>setTab("earnings")}>決算分析</button>
+        <button className={"tab"+(tab==="analysis"?" on":"")} onClick={()=>setTab("analysis")}>銘柄分析</button>
       </div>
 
       {/* ===== 日次モニター（独立タブ） ===== */}
@@ -1084,6 +1124,7 @@ function App(){
         </div>
         <SectorWatchlist market="JP" watchlist={s.watchlist} setWatchlist={setWatchlistJP} candidates={masterJP} max={MAX}
           stockQuotes={s.stockQuotes} analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
+          earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
           onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name})}/>
         <p className="foot">※ ニュースはGoogleニュースRSSを利用しています。売買を推奨するものではなく、最終判断はご自身で。</p>
       </div>}
@@ -1099,6 +1140,7 @@ function App(){
         </div>
         <SectorWatchlist market="US" watchlist={s.watchlistUS} setWatchlist={setWatchlistUS} candidates={masterUS} max={MAX_US}
           stockQuotes={s.stockQuotes} analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
+          earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
           onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name})}/>
         <p className="foot" style={{marginTop:16}}>※ 対象は現行のダウ工業株30種平均構成銘柄。業種分類は日本市場と同じ東証33業種の枠組みで統一しています（GICSセクターではありません）。アメリカ市場銘柄のニュース・決算・IRは「ニュース」タブのサマリー・海外市況・適時開示に統合表示しています。</p>
       </div>}
@@ -1138,10 +1180,56 @@ function App(){
         <p className="foot">※ 投稿の取得元はNitter（Xの代替フロントエンド）のRSSフィードのため、表示が遅れる・欠落することがあります。鍵アカウントの投稿は表示できません。<br/>※ 有料のX APIを契約すれば複数アカウント統合タイムラインも実装できますが、従量課金（読み取り$0.005/件、無料枠なし）のため今回は見送っています。必要であればご相談ください。</p>
       </div>}
 
-      {/* ===== 分析（12章） ===== */}
+      {/* ===== 決算分析（日本市場・アメリカ市場の登録銘柄テーブルの「決算」ボタンで追加） ===== */}
+      {tab==="earnings" && <div style={{marginTop:18}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+          <div className="sec-head">決算分析</div>
+          <button className="btn primary" onClick={()=>fetchEarningsDetailFor(earningsItems)} disabled={earningsFetching||!earningsItems.length}>{earningsFetching?"取得中…":"最新の情報に更新"}</button>
+        </div>
+        <div className="sec-note">TDnetから取得した直近の決算短信（決算・業績関連のみ）を、前年同期比・通期会社計画・予想修正の有無で機械的に要約して表示します（数値ベースの決定的な処理のみで、AIによる要約ではありません）。アメリカ株はTDnet対象外のため取得できません。</div>
+        {earningsItems.length===0
+          ? <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13,border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)"}}>
+              決算分析の対象銘柄がありません。「日本市場」タブの登録銘柄一覧で「決算」ボタンを押すと、ここに追加されます。
+            </div>
+          : <div className="grid" style={{gridTemplateColumns:"repeat(auto-fit,minmax(320px,1fr))"}}>
+              {earningsItems.map(w=>{
+                const d=s.earningsDetail[w.code];
+                return <div key={w.code} className="card">
+                  <div className="card-hd" style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                    <div><div className="card-t">{w.name}</div><div className="card-n mono">{w.code}</div></div>
+                    <button className="iconbtn" title="決算分析対象から外す" onClick={()=>toggleEarningsTarget(w.code)}>×</button>
+                  </div>
+                  {!d
+                    ? <div style={{fontSize:12.5,color:"var(--inkSoft)"}}>
+                        {earningsFetching
+                          ? "取得中…"
+                          : <>まだ取得していません。
+                              <button className="btn" style={{marginLeft:8,fontSize:11.5,padding:"2px 10px"}}
+                                onClick={()=>fetchEarningsDetailFor([w])}>取得</button>
+                            </>}
+                      </div>
+                    : !d.title
+                      ? <div style={{fontSize:12.5,color:"var(--inkSoft)"}}>
+                          直近の決算短信が見つかりませんでした（TDnetの取得範囲内に決算短信の開示がないか、取得に失敗した可能性があります）。
+                          <button className="btn" style={{marginLeft:8,fontSize:11.5,padding:"2px 10px"}}
+                            onClick={()=>fetchEarningsDetailFor([w])}>再取得</button>
+                        </div>
+                      : <div>
+                          <a href={d.url} target="_blank" rel="noopener noreferrer" style={{fontSize:13,fontWeight:600,color:"var(--ink)",textDecoration:"none"}}>{d.title}</a>
+                          {d.published && <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:2}}>{d.published}</div>}
+                          {d.summary
+                            ? <div style={{fontSize:12.5,lineHeight:1.7,color:"var(--inkSoft)",marginTop:8,paddingTop:8,borderTop:"1px solid var(--ruleSoft)"}}>{d.summary}</div>
+                            : <div style={{fontSize:12,color:"var(--inkSoft)",marginTop:8}}>数値の自動要約はできませんでした（表のレイアウトが想定と異なる可能性があります）。リンク先のPDFで直接ご確認ください。</div>}
+                        </div>}
+                </div>;
+              })}
+            </div>}
+      </div>}
+
+      {/* ===== 銘柄分析（12章、旧「分析」） ===== */}
       {tab==="analysis" && <div style={{marginTop:18}}>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
-          <div className="sec-head">分析</div>
+          <div className="sec-head">銘柄分析</div>
           <button className="btn primary" onClick={refreshAll} disabled={anyFetching}>{analyzing?"取得中…":"リアルタイムデータを反映"}</button>
         </div>
         {/* 12-2章：免責表示（必須・常時表示・断定的表現を避ける） */}
