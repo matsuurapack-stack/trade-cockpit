@@ -1221,6 +1221,31 @@ function App(){
                             ? <div style={{fontSize:12.5,lineHeight:1.7,color:"var(--inkSoft)",marginTop:8,paddingTop:8,borderTop:"1px solid var(--ruleSoft)"}}>{d.summary}</div>
                             : <div style={{fontSize:12,color:"var(--inkSoft)",marginTop:8}}>数値の自動要約はできませんでした（表のレイアウトが想定と異なる可能性があります）。リンク先のPDFで直接ご確認ください。</div>}
                         </div>}
+                  {d && d.trend && d.trend.length>0 && <div style={{marginTop:10,paddingTop:8,borderTop:"1px solid var(--ruleSoft)"}}>
+                    <div style={{fontSize:11,color:"var(--inkFaint)",marginBottom:4}}>業績推移（jQuants・四半期累計/通期、直近1件は遅延反映のため未掲載のことあり）</div>
+                    <table style={{width:"100%",fontSize:11.5,borderCollapse:"collapse"}}>
+                      <thead><tr style={{color:"var(--inkFaint)"}}>
+                        <td>期</td><td style={{textAlign:"right"}}>売上高</td><td style={{textAlign:"right"}}>営業利益</td><td style={{textAlign:"right"}}>純利益</td>
+                      </tr></thead>
+                      <tbody>
+                        {d.trend.map((t,i)=>{
+                          const yen=v=>v==null?"—":(v/1e8).toLocaleString(undefined,{maximumFractionDigits:0})+"億";
+                          const yoy=v=>v==null?"":<span style={{color:v>=0?"var(--up)":"var(--down)"}}> ({v>=0?"+":""}{v.toFixed(1)}%)</span>;
+                          return <tr key={i} style={{borderTop:"1px solid var(--ruleSoft)"}}>
+                            <td>{t.periodEnd} {t.periodType}</td>
+                            <td style={{textAlign:"right"}}>{yen(t.sales)}{yoy(t.salesYoy)}</td>
+                            <td style={{textAlign:"right"}}>{yen(t.op)}{yoy(t.opYoy)}</td>
+                            <td style={{textAlign:"right"}}>{yen(t.net)}{yoy(t.netYoy)}</td>
+                          </tr>;
+                        })}
+                      </tbody>
+                    </table>
+                  </div>}
+                  {d && d.edinetReport && <div style={{marginTop:10,paddingTop:8,borderTop:"1px solid var(--ruleSoft)"}}>
+                    <div style={{fontSize:11,color:"var(--inkFaint)",marginBottom:4}}>有価証券報告書（EDINET・決算短信より詳細、提出は数週間〜1ヶ月ほど遅れます）</div>
+                    <a href={"/api/edinet-doc?docID="+encodeURIComponent(d.edinetReport.docID)} target="_blank" rel="noopener noreferrer" style={{fontSize:12.5,fontWeight:600,color:"var(--ink)",textDecoration:"none"}}>{d.edinetReport.title}</a>
+                    {d.edinetReport.published && <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:2}}>{d.edinetReport.published}</div>}
+                  </div>}
                 </div>;
               })}
             </div>}

@@ -30,6 +30,21 @@ IS_CLOUD = bool(os.environ.get("RENDER") or os.environ.get("PORT"))
 PORT = int(os.environ.get("PORT", 8765))
 HOST = "0.0.0.0" if IS_CLOUD else "127.0.0.1"
 
+
+# APIキー類はfiles/secrets.json（gitignore済み・未コミット）に置く。ファイルが無い/キー未設定
+# でも動くようにし、その場合は該当機能だけ空データで諦める。
+def _load_secrets():
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "secrets.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+_SECRETS = _load_secrets()
+JQUANTS_API_KEY = _SECRETS.get("jquants_refresh_token", "")  # V2はAPIキー方式（x-api-keyヘッダー）
+EDINET_API_KEY = _SECRETS.get("edinet_api_key", "")
+
 try:
     import yfinance as yf
 except ImportError:
@@ -497,13 +512,143 @@ def latest_earnings_detail(code, name):
     result = {"code": code, "name": name, "title": None, "url": None, "published": None, "summary": None}
     latest = next((h for h in _tdnet_company_history(code) if "決算短信" in h["title"]), None)
     if not latest:
+        result["trend"] = build_earnings_trend(code)
+        result["edinetReport"] = find_edinet_annual_report(code)
         return result
     result["title"] = latest["title"]
     result["url"] = latest["url"]
     result["published"] = latest["pubdate"]
     if latest["url"]:
         result["summary"] = summarize_earnings_pdf(latest["url"])
+    result["trend"] = build_earnings_trend(code)
+    result["edinetReport"] = find_edinet_annual_report(code)
     return result
+
+
+# jQuants（無料プラン）の財務データサマリーで、TDnet決算短信PDFの正規表現抽出に頼らず
+# 過去の開示（四半期累計・通期）の売上高/営業利益/純利益/EPSを構造化データで取得する。
+# ただし無料プランは直近約12週間分が遅延で欠けるため、「直近の決算」はTDnet側が担当し、
+# ここでは「その手前までの推移」の補助表示に限定する。
+JQUANTS_API_BASE = "https://api.jquants.com/v2"
+
+
+def fetch_jquants_summary(code):
+    if not JQUANTS_API_KEY:
+        return []
+    try:
+        req = urllib.request.Request(
+            f"{JQUANTS_API_BASE}/fins/summary?code={code}",
+            headers={"x-api-key": JQUANTS_API_KEY},
+        )
+        with urllib.request.urlopen(req, timeout=10) as res:
+            data = json.loads(res.read().decode("utf-8"))
+        return data.get("data", [])
+    except Exception as e:
+        print("  jQuants取得失敗", code, e)
+        return []
+
+
+def _jq_num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _yoy_pct(cur, prev):
+    if cur is None or not prev:
+        return None
+    return (cur / prev - 1) * 100
+
+
+def build_earnings_trend(code):
+    """直近8件分の開示（四半期累計・通期）から、売上高・営業利益・純利益・EPSと
+    前年同期比（同じ決算期区分の1年前データとの比較）を計算して返す。
+    キー未設定・取得失敗時は空リスト（フロント側は「非表示」扱いにする）。"""
+    rows = fetch_jquants_summary(code)
+    if not rows:
+        return []
+    rows.sort(key=lambda r: r.get("DiscDate", ""))
+    by_period = {}
+    trend = []
+    for r in rows:
+        per_type = r.get("CurPerType", "")
+        fy_end = r.get("CurFYEn", "")
+        key = (per_type, fy_end)
+        sales, op, net, eps = (_jq_num(r.get(k)) for k in ("Sales", "OP", "NP", "EPS"))
+        prev = None
+        if len(fy_end) >= 4 and fy_end[:4].isdigit():
+            prev = by_period.get((per_type, str(int(fy_end[:4]) - 1) + fy_end[4:]))
+        entry = {
+            "periodType": per_type,
+            "periodEnd": r.get("CurPerEn"),
+            "discDate": r.get("DiscDate"),
+            "sales": sales, "op": op, "net": net, "eps": eps,
+            "salesYoy": _yoy_pct(sales, prev and prev["sales"]),
+            "opYoy": _yoy_pct(op, prev and prev["op"]),
+            "netYoy": _yoy_pct(net, prev and prev["net"]),
+        }
+        by_period[key] = entry
+        trend.append(entry)
+    return trend[-8:]
+
+
+# EDINET（無料・プラン制限なし）から有価証券報告書（決算短信より詳しいが提出は数週間〜1ヶ月ほど
+# 遅い）を探す。EDINETには銘柄コード横断の履歴検索APIが無く、日付ごとの全件一覧を返す
+# documents.json を1日ずつ叩いてsecCodeで絞り込むしかないため、直近120日分（多くの企業の
+# 3月期決算→6月提出に対応できる範囲）を一度だけスキャンしてsecCode→最新の有価証券報告書の
+# 対応表をメモリ上にキャッシュする（半日ごとに再構築。サーバー再起動でも再構築）。
+EDINET_API_BASE = "https://api.edinet-fsa.go.jp/api/v2"
+EDINET_INDEX_SCAN_DAYS = 120
+EDINET_INDEX_TTL_SEC = 12 * 3600
+_edinet_index_cache = {"built_at": 0, "by_sec_code": {}}
+
+
+def _edinet_day_documents(date_str):
+    if not EDINET_API_KEY:
+        return []
+    try:
+        req = urllib.request.Request(
+            f"{EDINET_API_BASE}/documents.json?date={date_str}&type=2&Subscription-Key={EDINET_API_KEY}"
+        )
+        with urllib.request.urlopen(req, timeout=10) as res:
+            data = json.loads(res.read().decode("utf-8"))
+        return data.get("results", []) or []
+    except Exception as e:
+        print("  EDINET取得失敗", date_str, e)
+        return []
+
+
+def _build_edinet_index():
+    by_sec_code = {}
+    today = datetime.date.today()
+    for i in range(EDINET_INDEX_SCAN_DAYS):
+        d = today - datetime.timedelta(days=i)
+        for r in _edinet_day_documents(d.isoformat()):
+            sec_code = r.get("secCode")
+            # 今日から過去へ向かって走査するため、同じsecCodeで最初に見つかったものが最新。
+            if r.get("docTypeCode") == "120" and sec_code and sec_code not in by_sec_code:
+                by_sec_code[sec_code] = {
+                    "docID": r.get("docID"),
+                    "title": r.get("docDescription"),
+                    "published": r.get("submitDateTime"),
+                }
+    return by_sec_code
+
+
+def _get_edinet_index():
+    if time.time() - _edinet_index_cache["built_at"] > EDINET_INDEX_TTL_SEC:
+        print(f"[取得] EDINET有価証券報告書インデックス構築中（過去{EDINET_INDEX_SCAN_DAYS}日分）…")
+        _edinet_index_cache["by_sec_code"] = _build_edinet_index()
+        _edinet_index_cache["built_at"] = time.time()
+    return _edinet_index_cache["by_sec_code"]
+
+
+def find_edinet_annual_report(code):
+    """指定銘柄（4桁コード）の直近の有価証券報告書を探す。見つからない場合はNone。"""
+    if not EDINET_API_KEY:
+        return None
+    return _get_edinet_index().get(code + "0")
 
 
 def build_stock_news(watchlist):
@@ -1273,8 +1418,38 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json({"posts": posts})
         elif self.path.startswith("/api/earnings-rating"):
             self._send_json({"ratings": _load_earnings_ratings()})
+        elif self.path.startswith("/api/edinet-doc"):
+            self._proxy_edinet_doc()
         else:
             super().do_GET()  # HTMLなどの静的配信
+
+    _DOC_ID_RE = re.compile(r"^[A-Za-z0-9]+$")
+
+    def _proxy_edinet_doc(self):
+        # EDINETのPDF取得APIはAPIキーが必須のため、キーをブラウザに渡さずサーバー側で
+        # 中継する（フロントはこのエンドポイントへのリンクを開くだけでよい）。
+        qs = urllib.parse.urlparse(self.path).query
+        doc_id = urllib.parse.parse_qs(qs).get("docID", [""])[0]
+        if not doc_id or not self._DOC_ID_RE.match(doc_id) or not EDINET_API_KEY:
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            req = urllib.request.Request(
+                f"{EDINET_API_BASE}/documents/{doc_id}?type=2&Subscription-Key={EDINET_API_KEY}"
+            )
+            with urllib.request.urlopen(req, timeout=15) as res:
+                pdf = res.read()
+        except Exception as e:
+            print("  EDINET PDF取得失敗", doc_id, e)
+            self.send_response(502)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/pdf")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(pdf)
 
     def do_POST(self):
         if self.path.startswith("/api/news"):
