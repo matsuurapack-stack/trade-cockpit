@@ -672,8 +672,8 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
               </span>
               <span style={{fontSize:13,color:avgC.level>0?avgC.fgSoft:"var(--inkSoft)"}}>{items.length}銘柄</span>
             </button>
-            {isOpen && <div style={{overflowX:"auto",paddingLeft:24}}><table style={{minWidth:860}}>
-              <thead><tr style={{background:"var(--band)"}}><th>コード</th><th>銘柄</th><th>現在値</th><th>前日比</th><th>高値</th><th>安値</th><th></th></tr></thead>
+            {isOpen && <div style={{overflowX:"auto"}}><table style={{minWidth:860}}>
+              <thead><tr style={{background:"var(--band)"}}><th style={{paddingLeft:24}}>コード</th><th>銘柄</th><th>現在値</th><th>前日比</th><th>高値</th><th>安値</th><th></th></tr></thead>
               <tbody>{items.map(w=>{
                 const qt=stockQuotes[w.code]||{};
                 const ct=num(qt.t),cp=num(qt.p),chi=num(qt.high),clo=num(qt.low);
@@ -682,7 +682,7 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                 const c=changeColor(pct);
                 const inAnalysis=analysisTargets.includes(w.code);
                 return <tr key={w.id} style={{borderTop:"1px solid var(--ruleSoft)",background:c.bg,color:c.level>0?c.fg:"var(--ink)"}}>
-                  <td className="mono" style={{fontWeight:700,fontSize:14}}>{w.code}</td>
+                  <td className="mono" style={{fontWeight:700,fontSize:14,paddingLeft:24}}>{w.code}</td>
                   <td style={{fontSize:16,fontWeight:600}}>{w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
                   <td className="mono" style={{fontWeight:800,fontSize:17,color:c.fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
                   <td className="mono" style={{fontWeight:700,fontSize:16,color:c.fg,whiteSpace:"nowrap"}}>{delta!=null?(delta>0?"+":"")+delta.toLocaleString(undefined,{maximumFractionDigits:2})+(pct!=null?` (${pct>0?"+":""}${pct.toFixed(2)}%)`:""):"—"}</td>
