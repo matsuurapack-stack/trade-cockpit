@@ -951,6 +951,12 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
+    def end_headers(self):
+        # trade-cockpit.html等の静的配信はブラウザ側のキャッシュにより、コード修正後に
+        # リロードしても古い見た目のままになることがあったため、常にキャッシュさせない。
+        self.send_header("Cache-Control", "no-store, must-revalidate")
+        super().end_headers()
+
     def do_GET(self):
         if self.path.startswith("/api/quotes"):
             print("[取得] 指数・為替 …")
