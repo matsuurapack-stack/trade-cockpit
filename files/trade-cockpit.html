@@ -124,11 +124,6 @@ td{padding:7px 10px;vertical-align:middle}
 .news-thumb{flex:none;width:42px;height:42px;border-radius:6px;background:var(--band);color:var(--inkSoft);
   display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;align-self:center;
   box-shadow:var(--shadow)}
-/* 10-5章：運営からの「新着情報」お知らせをニュース一覧に自然に挟み込むための行 */
-.news-announce{display:flex;gap:9px;align-items:center;padding:9px 4px;border-bottom:1px solid var(--ruleSoft);
-  background:var(--paperAlt);border-left:3px solid var(--accent);padding-left:8px;margin-left:-1px}
-.news-announce-badge{flex:none;font-size:10.5px;font-weight:700;color:#fff;background:var(--accent);
-  border-radius:3px;padding:2px 6px;white-space:nowrap}
 /* 10-5章：重要ニュース通知バナー（ページ最上部に常設、オン/オフ切り替え可。4-6章：warning系に統一） */
 .notify-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;
   background:var(--alarm);color:var(--alarmText);border:2px solid var(--alarmEdge);border-radius:8px;padding:10px 14px;margin-bottom:12px}
@@ -507,12 +502,6 @@ const IMPORTANT_KEYWORDS = [
 ];
 const isImportantNews=(title)=>IMPORTANT_KEYWORDS.some(k=>(title||"").includes(k));
 
-// 10-5章：運営からの「新着情報」お知らせ。ニュース一覧に自然に挟み込む（機能追加時にここへ追記していく）。
-const ANNOUNCEMENTS = [
-  {title:"「分析」タブを追加しました。テクニカル・ファンダメンタル指標をもとに購入/損切り/利確の目安を表示します。", date:"2026-07"},
-  {title:"ニュースタブに「サマリー」「国内市況」「海外市況」「適時開示」のサブタブを追加しました。", date:"2026-07"},
-];
-
 // 10-1章：カードUI基盤。ミニスパークライン（値上がり/値下がりでグラデーション色を変える）
 function Sparkline({data,color,width=140,height=36}){
   const gid=(React.useId?React.useId():"spark")+"-g";
@@ -541,48 +530,35 @@ function SourceThumb({source,style}){
 
 // 10-5章：announcements(運営からの新着情報)を渡すと、ニュース一覧の間に自然に挟み込んで表示する。
 // interval件ごとに1件挟む（末尾到達で先頭に戻る簡易ローテーション）。
-function NewsList({items,showName,announcements,announceInterval=5}){
+function NewsList({items,showName}){
   if(!items||!items.length) return <div className="news-empty">まだ取得していません。ブリーフィングの「リアルタイムデータを反映」を押してください。</div>;
-  let annIdx=0;
   return <div className="news-list">
     {items.map((it,i)=>{
       const meta=[showName?it.name:null,it.source,it.published].filter(Boolean).join(" ・ ");
       const important=isImportantNews(it.title);
-      const showAnnounce=announcements&&announcements.length&&i>0&&i%announceInterval===0;
-      const ann=showAnnounce?announcements[annIdx++%announcements.length]:null;
-      return <React.Fragment key={i}>
-        {ann&&<div className="news-announce">
-          <span className="news-announce-badge">お知らせ</span>
-          <span className="news-body"><span className="news-title">{ann.title}</span><span className="news-meta">{ann.date}</span></span>
-        </div>}
-        <a className={"news-item"+(important?" important":"")} href={it.url} target="_blank" rel="noopener noreferrer">
-          {important&&<span className="news-alert-badge">⚠ 重要</span>}
-          {showName&&it.code&&<span className="news-tag">{it.code}</span>}
-          <span className="news-body">
-            <span className="news-title">{it.title}</span>
-            {it.summary&&<span className="news-summary">{it.summary}</span>}
-            {meta&&<span className="news-meta">{meta}</span>}
-          </span>
-          <SourceThumb source={it.source}/>
-        </a>
-      </React.Fragment>;
+      return <a key={i} className={"news-item"+(important?" important":"")} href={it.url} target="_blank" rel="noopener noreferrer">
+        {important&&<span className="news-alert-badge">⚠ 重要</span>}
+        {showName&&it.code&&<span className="news-tag">{it.code}</span>}
+        <span className="news-body">
+          <span className="news-title">{it.title}</span>
+          {it.summary&&<span className="news-summary">{it.summary}</span>}
+          {meta&&<span className="news-meta">{meta}</span>}
+        </span>
+        <SourceThumb source={it.source}/>
+      </a>;
     })}
   </div>;
 }
 
-// 決算またぎ期待値：0.5刻み5段階の星評価。星の左半分クリックで0.5刻み、右半分クリックで整数刻みにする。
-// いつでも編集可能（決算前の事前予想→決算後の答え合わせ、という運用を想定）。
-function EarningsStars({value,onChange}){
+// 決算期待値：0.5刻み5段階の星評価。過去の上方/下方修正比率・直近決算の良し悪し・現在の株価の
+// 過熱度（RSI・52週高値/安値からの位置）からサーバー側で自動算出した値をそのまま表示する
+// （旧・手動クリック評価は廃止）。
+function EarningsStars({value}){
   const v=value||0;
-  const pick=(i,e)=>{
-    const rect=e.currentTarget.getBoundingClientRect();
-    const half=(e.clientX-rect.left)<rect.width/2;
-    onChange(half?i+0.5:i+1);
-  };
-  return <span style={{display:"inline-flex",gap:1,cursor:"pointer"}} title={`期待値評価：${v}/5（クリックで編集）`}>
+  return <span style={{display:"inline-flex",gap:1}} title={`決算期待値（自動算出）：${v}/5`}>
     {[0,1,2,3,4].map(i=>{
       const pct=Math.max(0,Math.min(1,v-i))*100;
-      return <span key={i} onClick={e=>pick(i,e)} style={{position:"relative",display:"inline-block",fontSize:15,lineHeight:1}}>
+      return <span key={i} style={{position:"relative",display:"inline-block",fontSize:15,lineHeight:1}}>
         <span style={{color:"var(--rule)"}}>★</span>
         <span style={{position:"absolute",left:0,top:0,overflow:"hidden",width:pct+"%",color:"var(--star)"}}>★</span>
       </span>;
@@ -871,9 +847,9 @@ function App(){
   };
   // 銘柄追加時：analysisDataにまだ結果がない対象銘柄だけを取得する
   useEffect(()=>{
-    // technical_analysis_rules.md反映でスキーマ変更（strengthフィールド追加）したため、
-    // 旧スキーマのキャッシュ済みデータ（strength未定義）も再取得対象に含める
-    const missing=analysisItems.filter(w=>!s.analysisData[w.code]||s.analysisData[w.code].strength===undefined);
+    // technical_analysis_rules.md反映でスキーマ変更（strength/autoEarningsStarsフィールド追加）したため、
+    // 旧スキーマのキャッシュ済みデータ（いずれか未定義）も再取得対象に含める
+    const missing=analysisItems.filter(w=>!s.analysisData[w.code]||s.analysisData[w.code].strength===undefined||s.analysisData[w.code].autoEarningsStars===undefined);
     if(missing.length)fetchAnalysisFor(missing);
   },[s.analysisTargets]);
 
@@ -898,20 +874,6 @@ function App(){
     const missing=earningsItems.filter(w=>!s.earningsDetail[w.code]);
     if(missing.length)fetchEarningsDetailFor(missing);
   },[s.earningsTargets]);
-
-  // 決算またぎ期待値：星評価(0.5刻み・0〜5)。銘柄コードに紐づけてサーバー側のJSONファイルに保存し、
-  // OneDrive共有フォルダ経由でも家族と共有・反映されるようにする（ローカルストレージだと共有されないため）。
-  const [earningsRatings,setEarningsRatings]=useState({}); // {code:{stars,updatedAt}}
-  useEffect(()=>{
-    if(tab!=="analysis")return;
-    fetch("/api/earnings-rating").then(r=>r.json()).then(d=>setEarningsRatings(d.ratings||{})).catch(()=>{});
-  },[tab]);
-  const setEarningsStar=(code,stars)=>{
-    setEarningsRatings(prev=>({...prev,[code]:{stars,updatedAt:prev[code]?.updatedAt}}));
-    fetch("/api/earnings-rating",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({code,stars})})
-      .then(r=>r.json()).then(d=>{if(d.ratings)setEarningsRatings(d.ratings);}).catch(()=>{});
-  };
-
 
   const day=useMemo(()=>{const d=new Date(s.date+"T00:00:00");return isNaN(d)?null:d.getDay();},[s.date]);
   const isMonday=day===1;
@@ -1341,16 +1303,17 @@ function App(){
                           </div>
                           {a.marketEnv && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>{a.marketEnv}</div>}
                           {a.tradeRules?.watchStatus && <div style={{fontSize:11.5,fontWeight:700,color:"var(--accent)",background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>⏳ {a.tradeRules.watchStatus}</div>}
-                          {/* 決算またぎ期待値：発表10日前からカウントダウンを目立つ色で表示。星評価はいつでも編集可能で、
-                              決算通過後もこのまま表示され続ける（事前予想→決算後の答え合わせ、という運用のため）。 */}
+                          {/* 決算期待値：発表10日前からカウントダウンを目立つ色で表示。星は過去の上方/下方修正比率・
+                              直近決算の良し悪し・現在の株価の過熱度からサーバー側で自動算出（旧・手動評価は廃止）。 */}
                           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6,
                             background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"6px 8px",marginBottom:8}}>
                             {(a.daysToEarnings!=null && a.daysToEarnings>=0 && a.daysToEarnings<=10)
                               ? <span style={{fontSize:12.5,fontWeight:700,color:"var(--accent)"}}>📅 決算発表まで あと{a.daysToEarnings}日</span>
-                              : <span style={{fontSize:11,color:"var(--inkSoft)"}}>決算期待値（事前予想・答え合わせ）</span>}
-                            <EarningsStars value={earningsRatings[w.code]?.stars||0} onChange={stars=>setEarningsStar(w.code,stars)}/>
+                              : <span style={{fontSize:11,color:"var(--inkSoft)"}}>決算期待値（自動算出）</span>}
+                            <EarningsStars value={a.autoEarningsStars||0}/>
                           </div>
                           {a.tradeRules?.earningsNote && <div style={{fontSize:11.5,color:"var(--ink)",background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"6px 8px",marginBottom:8,lineHeight:1.6}}>📅 {a.tradeRules.earningsNote}</div>}
+                          {a.tradeRules?.ptsNote && <div style={{fontSize:11,color:"var(--inkFaint)",marginBottom:8,lineHeight:1.5}}>ℹ️ {a.tradeRules.ptsNote}</div>}
                           {a.tradeRules && <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:8}}>
                             {a.tradeRules.entryChecklist.filter(c=>c.pass!=null).map(c=>
                               <span key={c.key} className="chip" style={{fontSize:10.5,display:"inline-block",
@@ -1433,7 +1396,7 @@ function App(){
             <span style={{fontSize:12,color:"var(--inkSoft)"}}>サプライズ決算・戦争紛争・パンデミック・大規模災害・株価暴落に関連する見出しに印を付けています。</span>
           </div>}
           <div className="card" style={{padding:"14px 16px 6px"}}>
-            <NewsList items={listFor} showName={showCode} announcements={ANNOUNCEMENTS}/>
+            <NewsList items={listFor} showName={showCode}/>
           </div>
         </div>;
       })()}

@@ -593,6 +593,91 @@ def _tdnet_company_history(code):
     return out
 
 
+# 12章・銘柄分析タブ用：決算内容の悪化・増資（希薄化）の適時開示を購入判断の格下げ材料に反映する
+# （ユーザー要望）。PTS（夜間取引）は無料で安定したAPIがないため自動取得はせず、注記のみ行う。
+BAD_EARNINGS_LOOKBACK_DAYS = 30
+DILUTION_KEYWORDS = ["第三者割当", "公募増資", "新株式発行", "株式の発行", "新株予約権付社債", "行使価額修正条項付新株予約権"]
+DILUTION_DISCOUNT_PCT = 1.5  # 希薄化リスクの適時開示があった場合の単価割引の目安(%)
+
+
+def _within_lookback(pubdate, days=BAD_EARNINGS_LOOKBACK_DAYS):
+    try:
+        pub_date = datetime.datetime.strptime(pubdate[:10], "%Y-%m-%d").date()
+    except Exception:
+        return False
+    return (datetime.date.today() - pub_date).days <= days
+
+
+EARNINGS_DISCOUNT_PER_POINT = 1.5  # 悪材料1件あたりの単価割引幅(%)の目安
+EARNINGS_DISCOUNT_MAX = 4.0
+
+
+def _earnings_risk(code):
+    """直近BAD_EARNINGS_LOOKBACK_DAYS日以内に決算短信があれば、analyze_earnings_pdf()（決算分析
+    タブと同じPDF解析）の実績・通期予想の前年比、および「下方修正」の明示的な適時開示の有無から
+    「悪かった」と言えるかを判定し、(注記文, 単価割引の目安%) を返す。決算短信が無い・期間外・
+    良好な内容だった場合は (None, 0)。
+    （PDFの「修正の有無」フラグは上方/下方を区別しないため誤検知を避けるためあえて使わない。
+    方向は見出しに「下方修正」と明示された開示があるかどうかで確認する）"""
+    history = _tdnet_company_history(code)
+    latest = next((h for h in history if "決算短信" in h["title"]), None)
+    if not latest or not latest.get("url") or not _within_lookback(latest.get("pubdate", "")):
+        return None, 0
+    detail = analyze_earnings_pdf(latest["url"])
+    if not detail:
+        return None, 0
+    bad_points = []
+    if detail.get("opYoy") is not None and detail["opYoy"] < 0:
+        bad_points.append(f"営業利益{detail['opYoy']:+.1f}%")
+    if detail.get("netYoy") is not None and detail["netYoy"] < 0:
+        bad_points.append(f"純利益{detail['netYoy']:+.1f}%")
+    if detail.get("forecastOpYoy") is not None and detail["forecastOpYoy"] < 0:
+        bad_points.append(f"通期営業利益予想{detail['forecastOpYoy']:+.1f}%")
+    if any("下方修正" in h["title"] and _within_lookback(h.get("pubdate", "")) for h in history):
+        bad_points.append("業績予想を下方修正")
+    if not bad_points:
+        return None, 0
+    note = f"直近決算（{detail.get('period', '')}）が軟調：" + "・".join(bad_points)
+    discount = min(EARNINGS_DISCOUNT_PER_POINT * len(bad_points), EARNINGS_DISCOUNT_MAX)
+    return note, discount
+
+
+def _dilution_flag(code):
+    """直近BAD_EARNINGS_LOOKBACK_DAYS日以内に、増資・新株予約権付社債等の希薄化につながりうる
+    適時開示があれば、その見出しを注記文として返す。無ければNone。"""
+    for h in _tdnet_company_history(code):
+        if any(k in h["title"] for k in DILUTION_KEYWORDS) and _within_lookback(h.get("pubdate", "")):
+            return f"希薄化リスクのある適時開示あり：{h['title']}"
+    return None
+
+
+def _auto_earnings_stars(code, rsi, high_zone, low_zone, bad_earnings_note, dilution_note):
+    """「決算期待値」の星（0〜5・0.5刻み）を自動算出する（旧・手動クリック評価を置き換え）。
+    ①過去の上方修正/下方修正の開示回数比率（会社が自社予想をどれだけ上振れさせてきたか＝
+    予想達成率の代理指標。TDnet銘柄別履歴の直近30件分が対象）②直近決算が軟調でないか
+    （このモジュール内の_earnings_risk/_dilution_flagの結果を流用）③現在の株価の過熱度
+    （RSI・52週高値/安値からの位置）の3点を合成する。"""
+    history = _tdnet_company_history(code)
+    up = sum(1 for h in history if "上方修正" in h["title"])
+    down = sum(1 for h in history if "下方修正" in h["title"])
+    score = (up / (up + down) * 5) if (up + down) > 0 else 2.5
+    if rsi is not None:
+        if rsi >= 70:
+            score -= 1  # 過熱＝短期的な期待の織り込み過ぎに注意
+        elif rsi <= 30:
+            score += 0.5  # 売られ過ぎ＝出直りの余地
+    if high_zone:
+        score -= 0.5
+    if low_zone:
+        score += 0.5
+    if bad_earnings_note:
+        score -= 1
+    if dilution_note:
+        score -= 0.5
+    score = max(0, min(5, score))
+    return round(score * 2) / 2
+
+
 def latest_earnings_detail(code, name):
     """指定銘柄の直近の決算短信を探し、analyze_earnings_pdf()の構造化詳細（実績・通期会社計画・
     進捗率・予想修正の有無）を添えて返す。見つからない・抽出できない場合はtitle/latestDetailが
@@ -1046,24 +1131,6 @@ def _vwap(closes, volumes):
     return sum(c * v for c, v in zip(closes, volumes)) / total_vol
 
 
-EARNINGS_RATINGS_FILE = "earnings_ratings.json"
-
-
-def _load_earnings_ratings():
-    """決算またぎ期待値の星評価（銘柄コード→{stars, updatedAt}）。JSONファイルはfiles/直下に置き、
-    OneDrive共有フォルダ経由でアプリ自体と一緒に共有されるようにする（1章の仕様）。"""
-    try:
-        with open(EARNINGS_RATINGS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _save_earnings_ratings(data):
-    with open(EARNINGS_RATINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
 def _days_to_earnings(tk):
     """trading_rules.mdの決算またぎルール判定に使う、次回決算発表までの日数。
     取得できない場合はNoneを返す（銘柄によっては非開示・データなしのことがある）。"""
@@ -1121,6 +1188,7 @@ def analyze_stock(w, market_env=""):
     ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
     最有力のシグナルに基づいて購入・損切り・利確の目安単価と算出根拠を返す。
     値はあくまで目安であり断定的な推奨ではない(12-2章の方針)。"""
+    code = w.get("code", "")
     sym = _yf_symbol(w)
     tk = yf.Ticker(sym)
     # Yahoo側の一時的なレート制限で日足が空/不足で返ってくることがあり、その場合そのまま
@@ -1369,6 +1437,30 @@ def analyze_stock(w, market_env=""):
         entry = intraday_high
         entry_reasons.append(f"当日高値({intraday_high:.1f})を上限として調整")
 
+    # ---- 決算内容の悪化・増資（希薄化）を単価にも反映する（ユーザー要望）。ここで下げたentryを
+    # 元にstop/targetも算出されるため、以降の計算すべてに反映される。市場が開いている間（当日の
+    # 分足m1が取得できている間）はチャート・出来高で悪材料がどれだけ株価に織り込まれたかを見て
+    # 割引幅を調整し（既に大きく下げていれば二重に織り込まない）、開いていない間は直近終値・
+    # 決算内容だけに基づいて機械的に割引く。PTS（夜間取引）は自動取得非対応のため対象外。----
+    bad_earnings_note, earnings_discount = (None, 0)
+    dilution_note = None
+    if w.get("market", "JP") != "US" and code:
+        bad_earnings_note, earnings_discount = _earnings_risk(code)
+        dilution_note = _dilution_flag(code)
+    dilution_discount = DILUTION_DISCOUNT_PCT if dilution_note else 0
+    total_discount = min(earnings_discount + dilution_discount, 6.0)
+    if total_discount > 0:
+        market_open = bool(m1)
+        if market_open:
+            already_priced_in = change_pct is not None and change_pct <= -3
+            effective_discount = total_discount * (0.4 if already_priced_in else 1.0)
+            basis_note = "当日の下落で概ね織り込み済みのため圧縮" if already_priced_in else "当日の値動きにまだ十分反映されていない可能性を考慮"
+        else:
+            effective_discount = total_discount
+            basis_note = "市場時間外のため直近終値・決算内容に基づき算出"
+        entry = entry * (1 - effective_discount / 100)
+        entry_reasons.append(f"決算・増資の材料を反映し目安を-{effective_discount:.1f}%引き下げ（{basis_note}）")
+
     # ---- 損切り単価(目安)：ATR相当(当日実測 or 日次ATR)の1倍を損切り幅の目安とする（ザラ場内で許容できる下振れ）。
     # entry確定後に算出するため、当日安値による下限調整をentryにも先に反映済み（旧実装は
     # entry未調整のままstopだけ当日安値でかさ上げしていたため、entryより高いstopが出る不具合があった）。----
@@ -1460,6 +1552,27 @@ def analyze_stock(w, market_env=""):
         strength = max(1, strength - 1)
         entry_reasons.append(f"{margin_note}のためエントリー推奨を格下げ")
 
+    # ---- 決算内容の悪化・増資（希薄化）をチェックリスト・推奨度（星）にも反映する（ユーザー要望）。
+    # 単価への反映は上のentry算出時点で済んでいるため、ここではbad_earnings_note/dilution_note
+    # （entry算出時に計算済み）を使い回し、PDF・TDnetの再取得はしない。----
+    if bad_earnings_note:
+        avoid_checklist.append({"key": "badEarnings", "label": bad_earnings_note, "hit": True})
+        # 決算悪化はテクニカルの強気シグナルより重い材料のため、他の警告(-1)より大きく
+        # 「星2つ以下」まで一気に格下げする（テクニカルが強気でも鵜呑みにしない）。
+        strength = min(strength, 2)
+        entry_reasons.append("直近決算が軟調のため推奨度（星）を大きく格下げ")
+    if dilution_note:
+        avoid_checklist.append({"key": "dilution", "label": dilution_note, "hit": True})
+        strength = max(1, strength - 1)
+        entry_reasons.append("増資関連の適時開示があるためエントリー推奨度（星）を格下げ")
+    # PTS（夜間取引）は無料で安定したAPIが無く自動取得できないため、警告扱いにはせず中立的な
+    # 注記（ptsNote）としてのみ返す（avoidChecklistに混ぜると「検出された危険」に見えてしまうため）。
+    pts_note = "PTS（夜間取引）の値動きは自動取得非対応です。気配は証券会社アプリ等でご自身でご確認ください。"
+
+    # ---- 決算期待値の星（旧・手動クリック評価を自動計算に置き換え）----
+    auto_earnings_stars = (_auto_earnings_stars(code, rsi, high_zone, low_zone, bad_earnings_note, dilution_note)
+                            if w.get("market", "JP") != "US" and code else None)
+
     # ---- 決算またぎルール：決算発表が近い場合、直近1週間の値動きから「またぐ／またがない」の目安を出す ----
     days_to_earnings = _days_to_earnings(tk)
     earnings_note = None
@@ -1524,10 +1637,12 @@ def analyze_stock(w, market_env=""):
         },
         "fundamentalNote": "・".join(fund_notes) if fund_notes else "取得できるファンダメンタルデータがありません",
         "daysToEarnings": days_to_earnings,  # 決算またぎ期待値機能：10日前からのカウントダウン表示に使う
+        "autoEarningsStars": auto_earnings_stars,  # 決算期待値の星（過去の上方/下方修正比率・直近決算・過熱度から自動算出）
         "tradeRules": {
             "entryChecklist": entry_checklist,
             "avoidChecklist": avoid_checklist,
             "earningsNote": earnings_note,
+            "ptsNote": pts_note,
             "watchStatus": watch_status,
             "marginRatio": round(margin_ratio, 2) if margin_ratio is not None else None,
             "marginBadge": margin_badge,
@@ -1600,8 +1715,6 @@ class Handler(SimpleHTTPRequestHandler):
             print(f"[取得] SNS（@{handle}）…")
             posts = get_sns_posts(handle) if handle else []
             self._send_json({"posts": posts})
-        elif self.path.startswith("/api/earnings-rating"):
-            self._send_json({"ratings": _load_earnings_ratings()})
         elif self.path.startswith("/api/edinet-doc"):
             self._proxy_edinet_doc()
         else:
@@ -1692,22 +1805,6 @@ class Handler(SimpleHTTPRequestHandler):
             results = [latest_earnings_detail(t.get("code", ""), t.get("name", ""))
                        for t in targets if t.get("code")]
             self._send_json({"results": results})
-        elif self.path.startswith("/api/earnings-rating"):
-            length = int(self.headers.get("Content-Length", 0))
-            raw = self.rfile.read(length) if length else b"{}"
-            try:
-                body = json.loads(raw.decode("utf-8") or "{}")
-            except Exception:
-                body = {}
-            code = str(body.get("code", "")).strip()
-            stars = body.get("stars")
-            if code and isinstance(stars, (int, float)) and 0 <= stars <= 5:
-                ratings = _load_earnings_ratings()
-                ratings[code] = {"stars": stars, "updatedAt": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")}
-                _save_earnings_ratings(ratings)
-                self._send_json({"ok": True, "ratings": ratings})
-            else:
-                self._send_json({"ok": False})
         else:
             self.send_response(404)
             self.end_headers()
