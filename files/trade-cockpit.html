@@ -455,6 +455,8 @@ const emptyState=()=>({
   date:todayISO(), watchlist:DEFAULT_WATCHLIST, watchlistUS:DEFAULT_WATCHLIST_US, metrics:emptyMetrics(),
   stockNews:"",marketNews:"", // 旧フロント・バックアップ互換のためのテキスト版ニュース（7章で市況メモ等のUIは削除済み、フィールドのみ残置）
   stockNewsList:[], macroNewsList:[], macroNewsDomestic:[], macroNewsOverseas:[], usStockNewsList:[], stockQuotes:{},
+  stockNameNewsList:[], usStockNameNewsList:[], // ニュースタブ「登録銘柄」サブタブ：IR以外も含む社名一致ニュース
+  disclosureNewsList:[], usDisclosureNewsList:[], // ニュースタブ「適時開示」サブタブ：当日含む直近10日分・種類問わず全件
   analysisTargets:[], // analysisTargets: 5章「分析」ボタンで追加した銘柄コード一覧（12章の分析タブで使用）
   analysisData:{}, // analysisData: 12-1章の分析結果（購入/損切り/利確の目安・算出根拠）をコードごとに保持
   earningsTargets:[], // earningsTargets: 登録銘柄テーブルの「決算」ボタンで追加した銘柄コード一覧（決算分析タブで使用）
@@ -753,6 +755,8 @@ function App(){
       if(nr.ok){const nd=await nr.json();
         setS(p=>({...p,
           stockNewsList:Array.isArray(nd.stockNews)?nd.stockNews:p.stockNewsList,
+          stockNameNewsList:Array.isArray(nd.stockNameNews)?nd.stockNameNews:p.stockNameNewsList,
+          disclosureNewsList:Array.isArray(nd.disclosureNews)?nd.disclosureNews:p.disclosureNewsList,
           macroNewsList:Array.isArray(nd.macroNews)?nd.macroNews:p.macroNewsList,
           macroNewsDomestic:Array.isArray(nd.macroNewsDomestic)?nd.macroNewsDomestic:p.macroNewsDomestic,
           macroNewsOverseas:Array.isArray(nd.macroNewsOverseas)?nd.macroNewsOverseas:p.macroNewsOverseas,
@@ -761,7 +765,10 @@ function App(){
     try{
       const nru=await fetch("/api/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlistUS)});
       if(nru.ok){const ndu=await nru.json();
-        setS(p=>({...p,usStockNewsList:Array.isArray(ndu.stockNews)?ndu.stockNews:p.usStockNewsList}));}
+        setS(p=>({...p,
+          usStockNewsList:Array.isArray(ndu.stockNews)?ndu.stockNews:p.usStockNewsList,
+          usStockNameNewsList:Array.isArray(ndu.stockNameNews)?ndu.stockNameNews:p.usStockNameNewsList,
+          usDisclosureNewsList:Array.isArray(ndu.disclosureNews)?ndu.disclosureNews:p.usDisclosureNewsList}));}
     }catch(e){}
   };
   const [newsFetching,setNewsFetching]=useState(false);
@@ -916,8 +923,11 @@ function App(){
     for(const list of lists){for(const it of list){if(!it.url||seen.has(it.url))continue;seen.add(it.url);out.push(it);}}
     return out.sort((a,b)=>(b.published||"").localeCompare(a.published||""));
   };
-  // 適時開示：日本の登録銘柄＋アメリカ市場（ダウ30社）のIR・決算ニュースをまとめて表示する
-  const disclosureAll=useMemo(()=>mergeByDate(s.stockNewsList,s.usStockNewsList),[s.stockNewsList,s.usStockNewsList]);
+  // 適時開示：日本の登録銘柄＋アメリカ市場（ダウ30社）の開示・IR・決算ニュースを、当日含む
+  // 直近10日分・種類を問わず全件まとめて表示する
+  const disclosureAll=useMemo(()=>mergeByDate(s.disclosureNewsList,s.usDisclosureNewsList),[s.disclosureNewsList,s.usDisclosureNewsList]);
+  // 登録銘柄：IR以外も含む社名一致ニュース（日本＋アメリカ）
+  const stockNameNewsAll=useMemo(()=>mergeByDate(s.stockNameNewsList,s.usStockNameNewsList),[s.stockNameNewsList,s.usStockNameNewsList]);
   // 海外市況：マクロの海外市況クエリに加え、アメリカ市場登録銘柄のニュースも含める
   const overseasAll=useMemo(()=>mergeByDate(s.macroNewsOverseas,s.usStockNewsList),[s.macroNewsOverseas,s.usStockNewsList]);
 
@@ -1186,65 +1196,96 @@ function App(){
           <div className="sec-head">決算分析</div>
           <button className="btn primary" onClick={()=>fetchEarningsDetailFor(earningsItems)} disabled={earningsFetching||!earningsItems.length}>{earningsFetching?"取得中…":"最新の情報に更新"}</button>
         </div>
-        <div className="sec-note">TDnetから取得した直近の決算短信（決算・業績関連のみ）を、前年同期比・通期会社計画・予想修正の有無で機械的に要約して表示します（数値ベースの決定的な処理のみで、AIによる要約ではありません）。アメリカ株はTDnet対象外のため取得できません。</div>
+        <div className="sec-note" style={{fontSize:13}}>TDnetから取得した直近の決算短信（決算・業績関連のみ）の実績・通期会社計画・進捗率・予想修正の有無を、数値ベースの決定的な処理で抜き出して表示します（AIによる要約ではありません）。アメリカ株はTDnet対象外のため取得できません。</div>
         {earningsItems.length===0
-          ? <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13,border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)"}}>
+          ? <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:14,border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)"}}>
               決算分析の対象銘柄がありません。「日本市場」タブの登録銘柄一覧で「決算」ボタンを押すと、ここに追加されます。
             </div>
-          : <div className="grid" style={{gridTemplateColumns:"repeat(auto-fit,minmax(320px,1fr))"}}>
+          : <div className="grid" style={{gridTemplateColumns:"repeat(auto-fit,minmax(380px,1fr))"}}>
               {earningsItems.map(w=>{
                 const d=s.earningsDetail[w.code];
+                const yen=v=>v==null?"—":(v/1e8).toLocaleString(undefined,{maximumFractionDigits:0})+"億";
+                const yoy=v=>v==null?"":<span style={{color:v>=0?"var(--up)":"var(--down)"}}> ({v>=0?"+":""}{v.toFixed(1)}%)</span>;
                 return <div key={w.code} className="card">
                   <div className="card-hd" style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-                    <div><div className="card-t">{w.name}</div><div className="card-n mono">{w.code}</div></div>
+                    <div><div className="card-t" style={{fontSize:18}}>{w.name}</div><div className="card-n mono" style={{fontSize:13}}>{w.code}</div></div>
                     <button className="iconbtn" title="決算分析対象から外す" onClick={()=>toggleEarningsTarget(w.code)}>×</button>
                   </div>
                   {!d
-                    ? <div style={{fontSize:12.5,color:"var(--inkSoft)"}}>
+                    ? <div style={{fontSize:14,color:"var(--inkSoft)"}}>
                         {earningsFetching
                           ? "取得中…"
                           : <>まだ取得していません。
-                              <button className="btn" style={{marginLeft:8,fontSize:11.5,padding:"2px 10px"}}
+                              <button className="btn" style={{marginLeft:8,fontSize:13,padding:"3px 12px"}}
                                 onClick={()=>fetchEarningsDetailFor([w])}>取得</button>
                             </>}
                       </div>
                     : !d.title
-                      ? <div style={{fontSize:12.5,color:"var(--inkSoft)"}}>
+                      ? <div style={{fontSize:14,color:"var(--inkSoft)"}}>
                           直近の決算短信が見つかりませんでした（TDnetの取得範囲内に決算短信の開示がないか、取得に失敗した可能性があります）。
-                          <button className="btn" style={{marginLeft:8,fontSize:11.5,padding:"2px 10px"}}
+                          <button className="btn" style={{marginLeft:8,fontSize:13,padding:"3px 12px"}}
                             onClick={()=>fetchEarningsDetailFor([w])}>再取得</button>
                         </div>
                       : <div>
-                          <a href={d.url} target="_blank" rel="noopener noreferrer" style={{fontSize:13,fontWeight:600,color:"var(--ink)",textDecoration:"none"}}>{d.title}</a>
-                          {d.published && <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:2}}>{d.published}</div>}
-                          {d.summary
-                            ? <div style={{fontSize:12.5,lineHeight:1.7,color:"var(--inkSoft)",marginTop:8,paddingTop:8,borderTop:"1px solid var(--ruleSoft)"}}>{d.summary}</div>
-                            : <div style={{fontSize:12,color:"var(--inkSoft)",marginTop:8}}>数値の自動要約はできませんでした（表のレイアウトが想定と異なる可能性があります）。リンク先のPDFで直接ご確認ください。</div>}
+                          <a href={d.url} target="_blank" rel="noopener noreferrer" style={{fontSize:15,fontWeight:600,color:"var(--ink)",textDecoration:"none"}}>{d.title}</a>
+                          {d.published && <div style={{fontSize:12.5,color:"var(--inkFaint)",marginTop:2}}>{d.published}</div>}
+                          {!d.latestDetail && <div style={{fontSize:13,color:"var(--inkSoft)",marginTop:8}}>数値の自動抽出はできませんでした（表のレイアウトが想定と異なる可能性があります）。リンク先のPDFで直接ご確認ください。</div>}
                         </div>}
-                  {d && d.trend && d.trend.length>0 && <div style={{marginTop:10,paddingTop:8,borderTop:"1px solid var(--ruleSoft)"}}>
-                    <div style={{fontSize:11,color:"var(--inkFaint)",marginBottom:4}}>業績推移（jQuants・四半期累計/通期、直近1件は遅延反映のため未掲載のことあり）</div>
-                    <table style={{width:"100%",fontSize:11.5,borderCollapse:"collapse"}}>
+                  {d && d.latestDetail && <div style={{marginTop:10,paddingTop:9,borderTop:"1px solid var(--ruleSoft)"}}>
+                    <div style={{fontSize:12.5,color:"var(--inkFaint)",marginBottom:6}}>{d.latestDetail.period}・通期会社計画</div>
+                    <table style={{width:"100%",fontSize:14,borderCollapse:"collapse"}}>
+                      <tbody>
+                        <tr>
+                          <td style={{color:"var(--inkSoft)",padding:"3px 0"}}>通期売上高予想</td>
+                          <td style={{textAlign:"right",padding:"3px 0"}}>{yen(d.latestDetail.forecastRevenue&&d.latestDetail.forecastRevenue*1e6)}{yoy(d.latestDetail.forecastRevenueYoy)}</td>
+                        </tr>
+                        <tr>
+                          <td style={{color:"var(--inkSoft)",padding:"3px 0"}}>通期営業利益予想</td>
+                          <td style={{textAlign:"right",padding:"3px 0"}}>{yen(d.latestDetail.forecastOp&&d.latestDetail.forecastOp*1e6)}{yoy(d.latestDetail.forecastOpYoy)}</td>
+                        </tr>
+                        <tr>
+                          <td style={{color:"var(--inkSoft)",padding:"3px 0"}}>通期純利益予想</td>
+                          <td style={{textAlign:"right",padding:"3px 0"}}>{yen(d.latestDetail.forecastNet&&d.latestDetail.forecastNet*1e6)}{yoy(d.latestDetail.forecastNetYoy)}</td>
+                        </tr>
+                        <tr>
+                          <td style={{color:"var(--inkSoft)",padding:"3px 0"}}>進捗率（今回までの累計÷通期予想）</td>
+                          <td style={{textAlign:"right",padding:"3px 0",fontWeight:600}}>{d.latestDetail.progressPct==null?"—":d.latestDetail.progressPct.toFixed(1)+"%"}</td>
+                        </tr>
+                        <tr>
+                          <td style={{color:"var(--inkSoft)",padding:"3px 0"}}>業績予想の修正</td>
+                          <td style={{textAlign:"right",padding:"3px 0"}}>
+                            {d.latestDetail.guidanceRevised==null
+                              ? <span style={{color:"var(--inkFaint)"}}>不明</span>
+                              : d.latestDetail.guidanceRevised
+                                ? <span style={{color:"var(--up)",fontWeight:600}}>修正あり（要確認）</span>
+                                : <span style={{color:"var(--inkSoft)"}}>据え置き</span>}
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>}
+                  {d && d.trend && d.trend.length>0 && <div style={{marginTop:10,paddingTop:9,borderTop:"1px solid var(--ruleSoft)"}}>
+                    <div style={{fontSize:12.5,color:"var(--inkFaint)",marginBottom:6}}>業績推移（過去分はjQuants、直近1件は決算短信の実績値を速報として反映）</div>
+                    <table style={{width:"100%",fontSize:13.5,borderCollapse:"collapse"}}>
                       <thead><tr style={{color:"var(--inkFaint)"}}>
                         <td>期</td><td style={{textAlign:"right"}}>売上高</td><td style={{textAlign:"right"}}>営業利益</td><td style={{textAlign:"right"}}>純利益</td>
                       </tr></thead>
                       <tbody>
-                        {d.trend.map((t,i)=>{
-                          const yen=v=>v==null?"—":(v/1e8).toLocaleString(undefined,{maximumFractionDigits:0})+"億";
-                          const yoy=v=>v==null?"":<span style={{color:v>=0?"var(--up)":"var(--down)"}}> ({v>=0?"+":""}{v.toFixed(1)}%)</span>;
-                          return <tr key={i} style={{borderTop:"1px solid var(--ruleSoft)"}}>
-                            <td>{t.periodEnd} {t.periodType}</td>
+                        {d.trend.map((t,i)=>(
+                          <tr key={i} style={{borderTop:"1px solid var(--ruleSoft)",fontWeight:t.isLatest?700:400}}>
+                            <td>{t.periodEnd?`${t.periodEnd} ${t.periodType}`:t.periodLabel}{t.isLatest&&<span style={{marginLeft:4,fontSize:11,fontWeight:400,color:"var(--inkFaint)"}}>速報</span>}</td>
                             <td style={{textAlign:"right"}}>{yen(t.sales)}{yoy(t.salesYoy)}</td>
                             <td style={{textAlign:"right"}}>{yen(t.op)}{yoy(t.opYoy)}</td>
                             <td style={{textAlign:"right"}}>{yen(t.net)}{yoy(t.netYoy)}</td>
-                          </tr>;
-                        })}
+                          </tr>
+                        ))}
                       </tbody>
                     </table>
                   </div>}
-                  {d && d.edinetReport && <div style={{marginTop:10,paddingTop:8,borderTop:"1px solid var(--ruleSoft)"}}>
-                    <div style={{fontSize:11,color:"var(--inkFaint)",marginBottom:4}}>有価証券報告書（EDINET・決算短信より詳細、提出は数週間〜1ヶ月ほど遅れます）</div>
-                    <a href={"/api/edinet-doc?docID="+encodeURIComponent(d.edinetReport.docID)} target="_blank" rel="noopener noreferrer" style={{fontSize:12.5,fontWeight:600,color:"var(--ink)",textDecoration:"none"}}>{d.edinetReport.title}</a>
-                    {d.edinetReport.published && <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:2}}>{d.edinetReport.published}</div>}
+                  {d && d.edinetReport && <div style={{marginTop:10,paddingTop:9,borderTop:"1px solid var(--ruleSoft)"}}>
+                    <div style={{fontSize:12.5,color:"var(--inkFaint)",marginBottom:6}}>有価証券報告書（EDINET・決算短信より詳細、提出は数週間〜1ヶ月ほど遅れます）</div>
+                    <a href={"/api/edinet-doc?docID="+encodeURIComponent(d.edinetReport.docID)} target="_blank" rel="noopener noreferrer" style={{fontSize:14,fontWeight:600,color:"var(--ink)",textDecoration:"none"}}>{d.edinetReport.title}</a>
+                    {d.edinetReport.published && <div style={{fontSize:12.5,color:"var(--inkFaint)",marginTop:2}}>{d.edinetReport.published}</div>}
                   </div>}
                 </div>;
               })}
@@ -1372,17 +1413,18 @@ function App(){
           {key:"summary",label:"サマリー"},
           {key:"domestic",label:"国内市況"},
           {key:"overseas",label:"海外市況"},
+          {key:"registered",label:"登録銘柄"},
           {key:"disclosure",label:"適時開示"},
         ];
-        const listFor={summary:newsSummary,domestic:s.macroNewsDomestic,overseas:overseasAll,disclosure:disclosureAll}[newsSubTab];
-        const showCode=newsSubTab==="summary"||newsSubTab==="disclosure";
+        const listFor={summary:newsSummary,domestic:s.macroNewsDomestic,overseas:overseasAll,registered:stockNameNewsAll,disclosure:disclosureAll}[newsSubTab];
+        const showCode=newsSubTab==="summary"||newsSubTab==="disclosure"||newsSubTab==="registered";
         const hasImportant=listFor.some(it=>isImportantNews(it.title));
         return <div style={{marginTop:18}}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
             <div className="sec-head">ニュース</div>
             <button className="btn primary" onClick={refreshAll} disabled={anyFetching}>{newsFetching?"取得中…":"リアルタイムデータを反映"}</button>
           </div>
-          <div className="sec-note">上のボタンで、各サブタブのニュースをGoogleニュースRSSから更新できます（登録銘柄の株価等は更新されません。それらも含めて更新する場合は「日本市場」タブのボタンを使ってください）。「サマリー」「海外市況」「適時開示」にはアメリカ市場（ダウ30社）のニュースも含みます。「適時開示」は決算・IR関連キーワードで絞り込んでいます。見出しをクリックすると元記事が開きます。</div>
+          <div className="sec-note">上のボタンで、各サブタブのニュースをGoogleニュースRSSから更新できます（登録銘柄の株価等は更新されません。それらも含めて更新する場合は「日本市場」タブのボタンを使ってください）。「サマリー」「海外市況」「登録銘柄」「適時開示」にはアメリカ市場（ダウ30社）のニュースも含みます。「適時開示」は日本の登録銘柄について当日を含む直近10日分のTDnet開示を種類を問わず（決算・上方修正・下方修正・新株予約権発行など）全件表示します（アメリカ株はTDnet対象外のためGoogleニュースのIR関連キーワードで近似）。「登録銘柄」は社名が見出しに出てくるニュース全般（優先度上位の銘柄まで）です。見出しをクリックすると元記事が開きます。</div>
           <div className="subtabs">
             {NEWS_SUBTABS.map(t=><button key={t.key} className={"chip"+(newsSubTab===t.key?" on":"")} onClick={()=>setNewsSubTab(t.key)}>{t.label}</button>)}
           </div>

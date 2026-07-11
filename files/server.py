@@ -374,15 +374,14 @@ def _tdnet_sort_key(time_str):
         return 0
 
 
-def _tdnet_today_disclosures():
-    """本日TDnetに開示された情報を、証券コード(4桁)をキーにした辞書（値はリスト、1コードに
-    複数開示があることもある）で返す。取得失敗時は空辞書（分析全体は失敗させない方針）。"""
-    date_str = datetime.date.today().strftime("%Y%m%d")
+def _tdnet_disclosures_for_date(date_str):
+    """指定日(YYYYMMDD)にTDnetに開示された情報を、証券コード(4桁)をキーにした辞書（値はリスト、
+    1コードに複数開示があることもある）で返す。取得失敗時は空辞書（分析全体は失敗させない方針）。"""
     by_code = {}
     try:
         html = _tdnet_fetch_page(date_str, 1)
     except Exception as e:
-        print("  TDnet取得失敗", e)
+        print("  TDnet取得失敗", date_str, e)
         return by_code
     m = _TDNET_TOTAL_RE.search(html)
     total = int(m.group(1)) if m else 0
@@ -392,17 +391,50 @@ def _tdnet_today_disclosures():
         try:
             htmls.append(_tdnet_fetch_page(date_str, p))
         except Exception as e:
-            print("  TDnet取得失敗", p, e)
+            print("  TDnet取得失敗", date_str, p, e)
             break
     for page_html in htmls:
         for time_s, code5, href, title in _TDNET_ROW_RE.findall(page_html):
             code = code5[:-1] if len(code5) == 5 else code5
             by_code.setdefault(code, []).append({
-                "time": time_s,
+                "time": time_s, "date": date_str,
                 "title": title.strip(),
                 "url": "https://www.release.tdnet.info/inbs/" + href,
             })
     return by_code
+
+
+def _tdnet_today_disclosures():
+    return _tdnet_disclosures_for_date(datetime.date.today().strftime("%Y%m%d"))
+
+
+# 「適時開示」サブタブ用：決算・上方修正・下方修正・新株予約権発行など種類を問わず、当日を含む
+# 直近10日分のTDnet開示を対象にする（本日分だけの_tdnet_today_disclosuresより広い期間）。
+TDNET_DISCLOSURE_RANGE_DAYS = 10
+
+
+def _tdnet_recent_disclosures(days=TDNET_DISCLOSURE_RANGE_DAYS):
+    """当日を含む直近days日分のTDnet開示を証券コードごとにまとめて返す（日付混在、新しい順ではない
+    ため呼び出し元でソートする）。"""
+    by_code = {}
+    today = datetime.date.today()
+    for i in range(days):
+        d = today - datetime.timedelta(days=i)
+        for code, day_items in _tdnet_disclosures_for_date(d.strftime("%Y%m%d")).items():
+            by_code.setdefault(code, []).extend(day_items)
+    return by_code
+
+
+def _tdnet_date_sort_key(date_str, time_str):
+    """複数日にまたがる開示のソート用に、日付(YYYYMMDD)＋時刻(HH:MM)をUNIX時刻に変換する。"""
+    try:
+        jst = datetime.timezone(datetime.timedelta(hours=9))
+        hh, mm = time_str.split(":")
+        dt = datetime.datetime.strptime(date_str, "%Y%m%d").replace(
+            hour=int(hh), minute=int(mm), tzinfo=jst)
+        return dt.timestamp()
+    except Exception:
+        return 0
 
 
 # 決算短信の1〜2ページ目は東証が指定する統一フォーマット（サマリー情報）のため、会社が変わっても
@@ -444,29 +476,31 @@ def _fetch_pdf_text(url, max_pages=2):
         return ""
 
 
-def summarize_earnings_pdf(url):
-    """決算短信PDFのサマリー表から「前年同期比」「通期会社計画比の進捗率」「予想修正の有無」を
-    抜き出したテンプレート文を返す。表のレイアウトが想定と異なる銘柄では抽出できずNoneになる
-    （数値ベースの決定的な処理のみで、定性コメントの要約は行わない＝1段階目の実装）。"""
-    text = _fetch_pdf_text(url)
+def _parse_earnings_numbers(text):
+    """サマリー表から売上高・営業利益・純利益とその前年同期比を抜き出す（百万円ベース）。
+    表のレイアウトが想定と異なる銘柄では抽出できずNoneになる。"""
     m = _EARNINGS_ROW_RE.search(text)
     if not m:
         return None
-    period = m.group(1)
-    revenue, revenue_yoy = _num(m.group(2)), _pct(m.group(3))
-    op, op_yoy = _num(m.group(4)), _pct(m.group(5))
-    net, net_yoy = _num(m.group(8)), _pct(m.group(9))
+    return {
+        "period": m.group(1),
+        "revenue": _num(m.group(2)), "revenue_yoy": _pct(m.group(3)),
+        "op": _num(m.group(4)), "op_yoy": _pct(m.group(5)),
+        "net": _num(m.group(8)), "net_yoy": _pct(m.group(9)),
+    }
 
+
+def _summarize_earnings_text(text, nums):
     parts = [
-        f"{period}実績：売上高{revenue:,.0f}百万円({revenue_yoy:+.1f}%)・"
-        f"営業利益{op:,.0f}百万円({op_yoy:+.1f}%)・純利益{net:,.0f}百万円({net_yoy:+.1f}%)"
+        f"{nums['period']}実績：売上高{nums['revenue']:,.0f}百万円({nums['revenue_yoy']:+.1f}%)・"
+        f"営業利益{nums['op']:,.0f}百万円({nums['op_yoy']:+.1f}%)・純利益{nums['net']:,.0f}百万円({nums['net_yoy']:+.1f}%)"
     ]
 
     fm = _EARNINGS_FORECAST_RE.search(text)
     if fm:
         f_rev, f_rev_yoy = _num(fm.group(1)), _pct(fm.group(2))
         f_op, f_op_yoy = _num(fm.group(3)), _pct(fm.group(4))
-        progress = f"（今回までの進捗率{revenue / f_rev * 100:.1f}%）" if f_rev else ""
+        progress = f"（今回までの進捗率{nums['revenue'] / f_rev * 100:.1f}%）" if f_rev else ""
         parts.append(
             f"通期会社計画：売上高{f_rev:,.0f}百万円({f_rev_yoy:+.1f}%)・"
             f"営業利益{f_op:,.0f}百万円({f_op_yoy:+.1f}%){progress}"
@@ -477,6 +511,60 @@ def summarize_earnings_pdf(url):
         parts.append("業績予想は今回修正あり（要確認）" if gm.group(1) == "有" else "業績予想は据え置き")
 
     return "。".join(parts) + "。"
+
+
+def summarize_earnings_pdf(url):
+    """決算短信PDFのサマリー表から「前年同期比」「通期会社計画比の進捗率」「予想修正の有無」を
+    抜き出したテンプレート文を返す。表のレイアウトが想定と異なる銘柄では抽出できずNoneになる
+    （数値ベースの決定的な処理のみで、定性コメントの要約は行わない＝1段階目の実装）。"""
+    text = _fetch_pdf_text(url)
+    nums = _parse_earnings_numbers(text)
+    return _summarize_earnings_text(text, nums) if nums else None
+
+
+def _parse_earnings_detail(text, nums):
+    """実績(nums)に加え、通期会社計画・進捗率・予想修正の有無を構造化して返す（百万円ベース）。
+    フロント側で「通期会社計画」パネルを表として表示するための構造化データ
+    （文章要約はここでは作らない＝latest_earnings_detailの画面はテーブル表示に一本化）。"""
+    detail = {
+        "period": nums["period"],
+        "revenue": nums["revenue"], "revenueYoy": nums["revenue_yoy"],
+        "op": nums["op"], "opYoy": nums["op_yoy"],
+        "net": nums["net"], "netYoy": nums["net_yoy"],
+        "forecastRevenue": None, "forecastRevenueYoy": None,
+        "forecastOp": None, "forecastOpYoy": None,
+        "forecastNet": None, "forecastNetYoy": None,
+        "progressPct": None,
+        "guidanceRevised": None,  # True=修正あり／False=据え置き／None=PDFから判定できず
+    }
+    fm = _EARNINGS_FORECAST_RE.search(text)
+    if fm:
+        f_rev, f_rev_yoy = _num(fm.group(1)), _pct(fm.group(2))
+        f_op, f_op_yoy = _num(fm.group(3)), _pct(fm.group(4))
+        # 通期予想の4項目は実績表(_EARNINGS_ROW_RE)と同じ並び（売上高・営業利益・経常利益・純利益）
+        # のため、純利益はグループ7・8（経常利益の次）。
+        f_net, f_net_yoy = _num(fm.group(7)), _pct(fm.group(8))
+        detail["forecastRevenue"] = f_rev
+        detail["forecastRevenueYoy"] = f_rev_yoy
+        detail["forecastOp"] = f_op
+        detail["forecastOpYoy"] = f_op_yoy
+        detail["forecastNet"] = f_net
+        detail["forecastNetYoy"] = f_net_yoy
+        detail["progressPct"] = (nums["revenue"] / f_rev * 100) if f_rev else None
+    gm = _GUIDANCE_REVISED_RE.search(text)
+    if gm:
+        detail["guidanceRevised"] = (gm.group(1) == "有")
+    return detail
+
+
+def analyze_earnings_pdf(url):
+    """latest_earnings_detail用：PDFを1回だけ取得し、構造化された実績・通期会社計画・進捗率・
+    予想修正の有無を返す（Noneはサマリー表のレイアウトが想定と異なり抽出できなかった場合）。"""
+    text = _fetch_pdf_text(url)
+    nums = _parse_earnings_numbers(text)
+    if not nums:
+        return None
+    return _parse_earnings_detail(text, nums)
 
 
 # 決算分析タブ（「決算」ボタン）用：TDnetの日付一覧ページは銘柄横断検索ができないため、
@@ -506,10 +594,10 @@ def _tdnet_company_history(code):
 
 
 def latest_earnings_detail(code, name):
-    """指定銘柄の直近の決算短信を探し、summarize_earnings_pdf()の数値要約を添えて返す。
-    見つからない・要約できない場合はtitle/summaryがNoneのまま返す（フロント側で
-    「見つかりません」「要約できません」の文言に分岐させる）。"""
-    result = {"code": code, "name": name, "title": None, "url": None, "published": None, "summary": None}
+    """指定銘柄の直近の決算短信を探し、analyze_earnings_pdf()の構造化詳細（実績・通期会社計画・
+    進捗率・予想修正の有無）を添えて返す。見つからない・抽出できない場合はtitle/latestDetailが
+    Noneのまま返す（フロント側で「見つかりません」「抽出できません」の文言に分岐させる）。"""
+    result = {"code": code, "name": name, "title": None, "url": None, "published": None, "latestDetail": None}
     latest = next((h for h in _tdnet_company_history(code) if "決算短信" in h["title"]), None)
     if not latest:
         result["trend"] = build_earnings_trend(code)
@@ -518,9 +606,23 @@ def latest_earnings_detail(code, name):
     result["title"] = latest["title"]
     result["url"] = latest["url"]
     result["published"] = latest["pubdate"]
+    trend = build_earnings_trend(code)
     if latest["url"]:
-        result["summary"] = summarize_earnings_pdf(latest["url"])
-    result["trend"] = build_earnings_trend(code)
+        detail = analyze_earnings_pdf(latest["url"])
+        result["latestDetail"] = detail
+        # jQuantsは無料プランの遅延で直近1件が欠けやすいため、TDnetから取れた最新の実績値を
+        # 「速報」として推移テーブルの末尾に合流させる（jQuants側が既にこの期を含んでいれば
+        # 発表日の新しい方＝TDnet側だけ残るよう、重複時は追加しない）。
+        if detail and (not trend or trend[-1].get("discDate", "") < (latest["pubdate"] or "")):
+            trend.append({
+                "periodType": None, "periodEnd": None, "periodLabel": detail["period"],
+                "discDate": latest["pubdate"], "isLatest": True,
+                "sales": detail["revenue"] * 1_000_000, "op": detail["op"] * 1_000_000, "net": detail["net"] * 1_000_000,
+                "eps": None,
+                "salesYoy": detail["revenueYoy"], "opYoy": detail["opYoy"], "netYoy": detail["netYoy"],
+            })
+            trend = trend[-8:]
+    result["trend"] = trend
     result["edinetReport"] = find_edinet_annual_report(code)
     return result
 
@@ -698,6 +800,88 @@ def build_stock_news(watchlist):
         for it in ir_only[:2]:
             items.append({**it, "code": code, "name": name})
 
+    return _sort_and_strip(items)
+
+
+def build_disclosure_news(watchlist):
+    """ニュースタブ「適時開示」サブタブ用：決算・上方修正・下方修正・新株予約権発行など種類を
+    問わず、登録銘柄（日本株）の当日を含む直近TDNET_DISCLOSURE_RANGE_DAYS日分の開示を全件返す
+    （build_stock_newsは当日分・決算関連キーワードのみに絞っているため別関数にしている）。
+    決算短信のみ東証統一フォーマットのサマリー表からの数値要約を試みる。アメリカ株はTDnet対象外
+    のため、build_stock_newsと同じGoogleニュースのIRキーワード絞り込みを流用する。"""
+    items = []
+
+    jp_items = [w for w in watchlist if w.get("market", "JP") != "US"]
+    us_items = [w for w in watchlist if w.get("market", "JP") == "US"]
+
+    if jp_items:
+        tdnet = _tdnet_recent_disclosures()
+        for w in jp_items:
+            code, name = w.get("code", ""), w.get("name", "")
+            if not code or not name:
+                continue
+            for e in tdnet.get(code, []):
+                date_str = e.get("date", "")
+                published = f"{date_str[4:6]}/{date_str[6:8]} {e['time']}" if len(date_str) == 8 else e["time"]
+                entry = {
+                    "code": code, "name": name, "title": e["title"], "url": e["url"],
+                    "source": "TDnet", "published": published,
+                    "_ts": _tdnet_date_sort_key(date_str, e["time"]),
+                }
+                if "決算短信" in e["title"]:
+                    summary = summarize_earnings_pdf(e["url"])
+                    if summary:
+                        entry["summary"] = summary
+                items.append(entry)
+
+    order = {"優先": 0, "通常": 1, "様子見": 2}
+    wl = sorted(us_items, key=lambda w: order.get(w.get("watch", "通常"), 1))[:12]
+    for w in wl:
+        name = w.get("name", "")
+        code = w.get("code", "")
+        if not name:
+            continue
+        candidates = google_news(name + " 決算 適時開示 業績", 4, max_age_days=STOCK_NEWS_MAX_AGE_DAYS)
+        ir_only = [it for it in candidates if _is_ir_news(it["title"]) and _title_mentions_name(name, it["title"])]
+        for it in ir_only[:2]:
+            items.append({**it, "code": code, "name": name})
+
+    return _sort_and_strip(items)
+
+
+# ニュースタブ「登録銘柄」サブタブ用：適時開示（決算・IR関連キーワードのみ）とは別に、社名が
+# そのままニュース見出しに出てくる一般ニュースを拾う（決算・IR以外の材料も見たいというニーズに
+# 対応）。登録銘柄数が多い場合に検索回数が膨らむため、優先度順の上位に限定する。
+STOCK_NAME_NEWS_LIMIT = 15
+
+# 社名一致は広く拾う分、Amazon「プライムデー」等のセール告知・PR記事が紛れ込みやすい
+# （判断材料としての価値が薄いため除外する）。
+STOCK_NAME_NEWS_EXCLUDE_KEYWORDS = [
+    "セール", "プライムデー", "タイムセール", "クーポン", "割引", "％オフ", "%オフ", "ポイント還元",
+    "PR", "広告",
+]
+
+
+def _is_promo_news(title):
+    return any(k in title for k in STOCK_NAME_NEWS_EXCLUDE_KEYWORDS)
+
+
+def build_stock_name_news(watchlist):
+    """優先度順（優先→通常→様子見）に上位STOCK_NAME_NEWS_LIMIT銘柄まで、社名そのもので
+    Googleニュースを検索し、見出しに社名を含むものだけを返す（IRキーワードでの絞り込みはしない）。
+    セール告知等のPR記事はSTOCK_NAME_NEWS_EXCLUDE_KEYWORDSで除外する。"""
+    order = {"優先": 0, "通常": 1, "様子見": 2}
+    wl = sorted(watchlist, key=lambda w: order.get(w.get("watch", "通常"), 1))[:STOCK_NAME_NEWS_LIMIT]
+    items = []
+    for w in wl:
+        name, code = w.get("name", ""), w.get("code", "")
+        if not name:
+            continue
+        candidates = google_news(name, 4, max_age_days=STOCK_NEWS_MAX_AGE_DAYS)
+        matched = [it for it in candidates
+                   if _title_mentions_name(name, it["title"]) and not _is_promo_news(it["title"])]
+        for it in matched[:2]:
+            items.append({**it, "code": code, "name": name})
     return _sort_and_strip(items)
 
 
@@ -1461,10 +1645,14 @@ class Handler(SimpleHTTPRequestHandler):
                 watchlist = []
             print(f"[取得] ニュース（登録銘柄 {len(watchlist)} 件 ＋ マクロ）…")
             stock = build_stock_news(watchlist)
+            stock_name_news = build_stock_name_news(watchlist)
+            disclosure_news = build_disclosure_news(watchlist)
             macro_domestic, macro_overseas = build_macro_news()
             macro_all = macro_domestic + macro_overseas
             self._send_json({
                 "stockNews": stock,  # 9章：決算・IR・適時開示のみに絞り込み済み
+                "stockNameNews": stock_name_news,  # 「登録銘柄」サブタブ：IR以外も含む社名一致ニュース
+                "disclosureNews": disclosure_news,  # 「適時開示」サブタブ：当日含む直近10日分・種類問わず全件
                 "macroNews": macro_all,
                 "macroNewsDomestic": macro_domestic,  # 9-1章：国内市況サブタブ
                 "macroNewsOverseas": macro_overseas,  # 9-1章：海外市況サブタブ
