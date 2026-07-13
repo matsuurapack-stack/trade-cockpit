@@ -1409,23 +1409,38 @@ def analyze_stock(w, market_env=""):
             break
 
     atr_label = "当日1分足の実測値幅" if used_intraday_range else "当日のATR"
+    # 現在値が既に当日VWAPより下＝ザラ場内で一定の押し目が入っている状態。この状態からさらに
+    # 当日値幅ベースの押し目を満額差し引くと、ボラティリティの大きい銘柄ほど二重に保守的な
+    # （現在値からかけ離れた）水準になってしまうため、その場合は割引係数を半分に弱める。
+    already_pulled_back = vwap is not None and current < vwap
+    pullback_factor = 0.5 if already_pulled_back else 1.0
     if primary:
-        entry = current - atr_ref * 0.3
+        entry = current - atr_ref * 0.3 * pullback_factor
         entry_reasons = [f"{primary['label']}が点灯。{atr_label}({atr_ref:.1f})から見た現実的な押し目水準として{entry:.1f}を採用"]
     else:
-        entry = current - atr_ref * 0.2
+        entry = current - atr_ref * 0.2 * pullback_factor
         entry_reasons = [f"該当する買いシグナルなし。{atr_label}から見た現在値近辺のわずかな押し目を暫定的に採用"]
+    if already_pulled_back:
+        entry_reasons.append(f"現在値が当日VWAP({vwap:.1f})より下＝ザラ場内で既に押し目が入っているため、追加の押し目調整を弱めて算出")
     if rsi is not None and rsi >= 70:
-        entry -= atr_ref * 0.2
+        entry -= atr_ref * 0.2 * pullback_factor
         entry_reasons.append(f"RSI({rsi:.0f})が買われすぎ水準のためやや低めに調整")
     if rsi_5m is not None and rsi_5m >= 75:
-        entry -= atr_ref * 0.1
+        entry -= atr_ref * 0.1 * pullback_factor
         entry_reasons.append(f"5分足RSI({rsi_5m:.0f})も過熱気味のため、ザラ場の短期的な買われすぎを加味してやや低めに調整")
     if rsi_15m is not None and rsi_15m >= 75:
-        entry -= atr_ref * 0.1
+        entry -= atr_ref * 0.1 * pullback_factor
         entry_reasons.append(f"15分足RSI({rsi_15m:.0f})も過熱気味のため、やや低めに調整")
     if vwap is not None and current > vwap * 1.01:
         entry_reasons.append(f"現在値はVWAP({vwap:.1f})より上（当日の平均的な出来高加重コストより高め）")
+
+    # ---- ボラティリティの大きい銘柄では当日値幅ベースの押し目が現在値から離れすぎることがあるため、
+    # 現在値の-3%を下限として、押し目調整が行き過ぎないようキャップする（決算・増資による追加の
+    # 割引は、これとは別の理由に基づく調整のためこのキャップの対象外＝後段で別途適用）。----
+    entry_floor = current * 0.97
+    if entry < entry_floor:
+        entry = entry_floor
+        entry_reasons.append("現在値からの押し目幅が大きくなりすぎないよう、現在値の-3%を下限として調整")
 
     # ---- entryは「今日、実際にその価格で約定し得たか」を保証するため、当日の実測値幅
     # （intraday_low〜intraday_high）の中に必ず収める。ATRから逆算した押し目が当日の実際の安値

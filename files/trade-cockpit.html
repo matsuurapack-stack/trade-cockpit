@@ -316,6 +316,7 @@ const MASTER = [
   M("4368","扶桑化学工業","化学","JP"),M("5384","フジミインコーポレーテッド","ガラス・土石製品","JP"),
   M("1961","三機工業","建設業","JP"),M("5805","SWCC","非鉄金属","JP"),
   M("3891","ニッポン高度紙工業","パルプ・紙","JP"),
+  M("6136","オーエスジー","機械","JP"),
 
   // ===== NYダウ工業株30種平均 構成銘柄 (30)。6-1章：東証33業種と同じ枠組みで分類（GICSではなく統一） =====
   // 基準日2026-07-08時点。2026-06-29にAlphabetがVerizonと入れ替わり採用（直近の入替）。
@@ -540,7 +541,7 @@ function NewsList({items,showName}){
         {important&&<span className="news-alert-badge">⚠ 重要</span>}
         {showName&&it.code&&<span className="news-tag">{it.code}</span>}
         <span className="news-body">
-          <span className="news-title">{it.title}</span>
+          <span className="news-title" style={important?{color:"var(--accent)",fontWeight:700}:undefined}>{it.title}</span>
           {it.summary&&<span className="news-summary">{it.summary}</span>}
           {meta&&<span className="news-meta">{meta}</span>}
         </span>
@@ -564,6 +565,62 @@ function EarningsStars({value}){
       </span>;
     })}
   </span>;
+}
+
+// 決算分析タブ：業績進捗率を「棒グラフ（推移＋通期予想との比較）」と「円グラフ（進捗率が一目でわかる）」で表示。
+// moomoo証券アプリの配色に合わせ、進捗を示す環はaccent（オレンジ）、実績棒は前期比の増減でup/down色を使う。
+function EarningsProgressChart({trend,latestDetail}){
+  if(!trend||!trend.length||!latestDetail||latestDetail.forecastRevenue==null)return null;
+  const bars=trend.filter(t=>t.sales!=null).slice(-6);
+  if(!bars.length)return null;
+  const forecastYen=latestDetail.forecastRevenue*1e6;
+  const maxV=Math.max(forecastYen,...bars.map(b=>b.sales));
+  const oku=v=>(v/1e8).toLocaleString(undefined,{maximumFractionDigits:0});
+  const W=320,H=150,padL=4,padR=4,padB=20,padT=10;
+  const plotW=W-padL-padR,plotH=H-padT-padB;
+  const bw=plotW/bars.length*0.56;
+  const gap=plotW/bars.length;
+  const yOf=v=>padT+plotH-(v/maxV)*plotH;
+  const forecastY=yOf(forecastYen);
+  const pct=latestDetail.progressPct;
+  const pctClamped=pct==null?0:Math.max(0,Math.min(100,pct));
+  const R=42,CX=60,CY=60,STROKE=11;
+  const circumference=2*Math.PI*R;
+  const dash=circumference*(pctClamped/100);
+  return <div style={{display:"flex",flexWrap:"wrap",gap:18,alignItems:"center",marginTop:10,paddingTop:9,borderTop:"1px solid var(--ruleSoft)"}}>
+    <div style={{flex:"0 0 auto"}}>
+      <div style={{fontSize:12.5,color:"var(--inkFaint)",marginBottom:4,textAlign:"center"}}>通期進捗率</div>
+      <svg viewBox="0 0 120 120" width={120} height={120}>
+        <circle cx={CX} cy={CY} r={R} fill="none" stroke="var(--rule)" strokeWidth={STROKE}/>
+        <circle cx={CX} cy={CY} r={R} fill="none" stroke="var(--accent)" strokeWidth={STROKE}
+          strokeDasharray={`${dash} ${circumference-dash}`} strokeLinecap="round"
+          transform={`rotate(-90 ${CX} ${CY})`}/>
+        <text x={CX} y={CY-2} textAnchor="middle" fontSize={20} fontWeight={800} fill="var(--ink)">
+          {pct==null?"—":pct.toFixed(1)}
+        </text>
+        <text x={CX} y={CY+16} textAnchor="middle" fontSize={11} fill="var(--inkSoft)">{pct==null?"":"%"}</text>
+      </svg>
+    </div>
+    <div style={{flex:"1 1 220px",minWidth:220}}>
+      <div style={{fontSize:12.5,color:"var(--inkFaint)",marginBottom:4}}>売上高推移（実績）と通期会社予想（億円）</div>
+      <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H}>
+        <line x1={padL} y1={forecastY} x2={W-padR} y2={forecastY} stroke="var(--accent)" strokeWidth={1.5} strokeDasharray="4 3"/>
+        <text x={W-padR} y={forecastY-3} textAnchor="end" fontSize={10} fill="var(--accent)">通期予想 {oku(forecastYen)}億</text>
+        {bars.map((b,i)=>{
+          const x=padL+gap*i+(gap-bw)/2;
+          const y=yOf(b.sales);
+          const h=padT+plotH-y;
+          const up=b.salesYoy==null?null:b.salesYoy>=0;
+          const color=b.isLatest?"var(--accent)":(up==null?"var(--inkFaint)":(up?"var(--up)":"var(--down)"));
+          const label=b.periodEnd?b.periodEnd.slice(5):(b.periodLabel||"");
+          return <g key={i}>
+            <rect x={x} y={y} width={bw} height={Math.max(1,h)} fill={color} rx={2}/>
+            <text x={x+bw/2} y={H-6} textAnchor="middle" fontSize={9.5} fill="var(--inkFaint)">{label}</text>
+          </g>;
+        })}
+      </svg>
+    </div>
+  </div>;
 }
 
 // 6-1章：銘柄検索・登録＋セクター別アコーディオン表示（2〜5章の仕様）を市場ごとに再利用するための共通コンポーネント。
@@ -1226,6 +1283,8 @@ function App(){
                       </tbody>
                     </table>
                   </div>}
+                  {d && d.trend && d.trend.length>0 && d.latestDetail &&
+                    <EarningsProgressChart trend={d.trend} latestDetail={d.latestDetail}/>}
                   {d && d.trend && d.trend.length>0 && <div style={{marginTop:10,paddingTop:9,borderTop:"1px solid var(--ruleSoft)"}}>
                     <div style={{fontSize:12.5,color:"var(--inkFaint)",marginBottom:6}}>業績推移（過去分はjQuants、直近1件は決算短信の実績値を速報として反映）</div>
                     <table style={{width:"100%",fontSize:13.5,borderCollapse:"collapse"}}>
