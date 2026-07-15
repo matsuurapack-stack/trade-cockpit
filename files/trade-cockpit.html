@@ -443,10 +443,10 @@ const SNS_ACCOUNTS = [
 const emptyMetrics=()=>Object.fromEntries(METRICS.map(m=>[m.key,{t:"",p:"",spark:[]}]));
 // 初期登録銘柄（日本市場）：MASTERの日経225+時価総額上位30社(255社)を、重複コードなしでそのまま初期値にする（1章のマスタと1:1）。
 const DEFAULT_WATCHLIST=(()=>{const seen=new Set();return MASTER.filter(m=>m.market==="JP"&&!m.extra&&m.code&&!seen.has(m.code)&&seen.add(m.code))
-  .map(m=>({id:m.code,...m,watch:"通常",note:""}));})();
+  .map(m=>({id:m.code,...m,watch:"通常",note:"",theme:""}));})();
 // 初期登録銘柄（アメリカ市場）：MASTERのダウ平均構成30社をそのまま初期値にする（6-1章）。
 const DEFAULT_WATCHLIST_US=(()=>{const seen=new Set();return MASTER.filter(m=>m.market==="US"&&!m.extra&&m.code&&!seen.has(m.code)&&seen.add(m.code))
-  .map(m=>({id:m.code,...m,watch:"通常",note:""}));})();
+  .map(m=>({id:m.code,...m,watch:"通常",note:"",theme:""}));})();
 const emptyState=()=>({
   date:todayISO(), watchlist:DEFAULT_WATCHLIST, watchlistUS:DEFAULT_WATCHLIST_US, metrics:emptyMetrics(),
   stockNews:"",marketNews:"", // 旧フロント・バックアップ互換のためのテキスト版ニュース（7章で市況メモ等のUIは削除済み、フィールドのみ残置）
@@ -458,6 +458,8 @@ const emptyState=()=>({
   earningsTargets:[], // earningsTargets: 登録銘柄テーブルの「決算」ボタンで追加した銘柄コード一覧（決算分析タブで使用）
   earningsDetail:{}, // earningsDetail: 直近の決算短信（TDnet）のタイトル・URL・数値要約をコードごとに保持
   notifyEnabled:true, // 10-5章：重要ニュース通知バナーのオン/オフ
+  settings:{totalCapital:"",riskPct:1}, // 資金管理：総資金・1トレードの許容損失%（銘柄分析タブの株数計算に使用）
+  journal:[], // 売買記録（トレードジャーナル）。1件＝{id,createdAt,code,name,action,price,shares,entryPlan,marketEnvAtEntry,reason,result,lessonNote}
 });
 // 1章：255社デフォルトを後から追加したため、既にlocalStorageに保存済みだったユーザーは
 // 保存データの登録銘柄がそのまま優先され、新しいデフォルト銘柄が反映されないケースがある。
@@ -465,7 +467,7 @@ const emptyState=()=>({
 const mergeDefaults=(saved,defaults,max)=>{
   if(!Array.isArray(saved))return saved;
   const seen=new Set(saved.map(w=>w.code));
-  const toAdd=defaults.filter(m=>!seen.has(m.code)).map(m=>({id:m.code,...m,watch:"通常",note:""}));
+  const toAdd=defaults.filter(m=>!seen.has(m.code)).map(m=>({id:m.code,...m,watch:"通常",note:"",theme:""}));
   return [...saved,...toAdd].slice(0,max);
 };
 // 「その他」セクター撤去（3章）より前に登録された銘柄は、保存データに古い sector:"その他" が
@@ -634,7 +636,7 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
   const results=useMemo(()=>{const t=q.trim().toLowerCase();if(!t)return[];
     return candidates.filter(m=>!regCodes.has(m.code)&&(m.code.toLowerCase().includes(t)||m.name.toLowerCase().includes(t)||m.sector.toLowerCase().includes(t))).slice(0,8);},[q,regCodes,candidates]);
   const addStock=(m)=>{if(watchlist.length>=max){alert("登録は最大"+max+"社までです。");return;}
-    if(regCodes.has(m.code))return; setWatchlist([...watchlist,{id:m.code,...m,watch:"通常",note:""}]);setQ("");};
+    if(regCodes.has(m.code))return; setWatchlist([...watchlist,{id:m.code,...m,watch:"通常",note:"",theme:""}]);setQ("");};
   const addManual=()=>{
     const raw=q.trim();if(!raw)return;if(watchlist.length>=max){alert("最大"+max+"社");return;}
     let code=raw,name=raw;
@@ -643,8 +645,13 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
       if(!input||!input.trim())return;
       code=input.trim();
     }
-    setWatchlist([...watchlist,{id:Date.now()+Math.random(),code,name,sector:manualSector,market,tvSymbol:(market==="JP"?"TSE:"+code:code),watch:"通常",note:""}]);setQ("");};
+    setWatchlist([...watchlist,{id:Date.now()+Math.random(),code,name,sector:manualSector,market,tvSymbol:(market==="JP"?"TSE:"+code:code),watch:"通常",note:"",theme:""}]);setQ("");};
   const delStock=(id)=>setWatchlist(watchlist.filter(w=>w.id!==id));
+  const editTheme=(w)=>{
+    const input=prompt(`「${w.name}」のテーマ（例：AI関連、インバウンド、半導体）`,w.theme||"");
+    if(input==null)return; // キャンセル
+    setWatchlist(watchlist.map(x=>x.id===w.id?{...x,theme:input.trim()}:x));
+  };
 
   // 銘柄コードの前日比(%)・売買代金（3章カラールール・セクター並び替えで共通利用）
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
@@ -712,7 +719,7 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
               <span style={{fontSize:13,color:avgC.level>0?avgC.fgSoft:"var(--inkSoft)"}}>{items.length}銘柄</span>
             </button>
             {isOpen && <div style={{overflowX:"auto",padding:"0 0 0 28px",background:"var(--card)"}}><table style={{minWidth:860}}>
-              <thead><tr style={{background:"var(--band)"}}><th>コード</th><th>銘柄</th><th>現在値</th><th>前日比</th><th>高値</th><th>安値</th><th></th></tr></thead>
+              <thead><tr style={{background:"var(--band)"}}><th>コード</th><th>銘柄</th><th>テーマ</th><th>現在値</th><th>前日比</th><th>高値</th><th>安値</th><th></th></tr></thead>
               <tbody>{items.map(w=>{
                 const qt=stockQuotes[w.code]||{};
                 const ct=num(qt.t),cp=num(qt.p),chi=num(qt.high),clo=num(qt.low);
@@ -724,6 +731,10 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                 return <tr key={w.id} style={{borderTop:"1px solid var(--ruleSoft)",background:c.bg,color:c.level>0?c.fg:"var(--ink)"}}>
                   <td className="mono" style={{fontWeight:700,fontSize:14}}>{w.code}</td>
                   <td style={{fontSize:16,fontWeight:600}}>{w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
+                  <td>
+                    <button className="iconbtn" style={{fontSize:11.5,color:w.theme?"var(--accent)":"var(--inkFaint)",whiteSpace:"nowrap"}}
+                      onClick={()=>editTheme(w)} title="クリックしてテーマを編集">{w.theme||"＋テーマ"}</button>
+                  </td>
                   <td className="mono" style={{fontWeight:800,fontSize:17,color:c.fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
                   <td className="mono" style={{fontWeight:700,fontSize:16,color:c.fg,whiteSpace:"nowrap"}}>{delta!=null?(delta>0?"+":"")+delta.toLocaleString(undefined,{maximumFractionDigits:2})+(pct!=null?` (${pct>0?"+":""}${pct.toFixed(2)}%)`:""):"—"}</td>
                   <td className="mono" style={{color:c.level>0?c.fgSoft:"var(--inkSoft)",whiteSpace:"nowrap"}}>{chi!=null?chi.toLocaleString():"—"}</td>
@@ -742,10 +753,89 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
   </div>;
 }
 
+// 資金管理・分割買いツール：総資金とリスク許容%、エントリー/損切り単価から株数目安を計算する（14-15章）。
+// 日本株は100株単位、米国株は1株単位に丸める。分割買いは1回目40%（打診買い）・2回目30%（反転確認後）・
+// 3回目残り30%（節目上抜け後）の目安に分ける（3回とも単元株数に丸めるため合計が端数分減ることがある）。
+const computePositionSize=(totalCapital,riskPct,entry,stop,market)=>{
+  const capital=num(totalCapital),risk=num(riskPct);
+  if(capital==null||capital<=0||risk==null||risk<=0||entry==null||stop==null)return null;
+  const perShareRisk=entry-stop;
+  if(perShareRisk<=0)return null;
+  const lotSize=market==="JP"?100:1;
+  const riskAmount=capital*(risk/100);
+  const rawShares=riskAmount/perShareRisk;
+  const suggestedShares=Math.floor(rawShares/lotSize)*lotSize;
+  if(suggestedShares<lotSize)return {suggestedShares:0,investAmount:0,tranches:[0,0,0]};
+  const t1=Math.floor(suggestedShares*0.4/lotSize)*lotSize;
+  const t2=Math.floor(suggestedShares*0.3/lotSize)*lotSize;
+  const t3=suggestedShares-t1-t2;
+  return {suggestedShares,investAmount:suggestedShares*entry,tranches:[t1,t2,t3]};
+};
+
+// テーマ・セクター強弱の可視化：SectorWatchlist内のsectorGroups集計（平均騰落率・合計売買代金）と
+// 同じ考え方を、JP+US統合した銘柄リストに対して汎用的に適用する。keyFnがnull/""を返す銘柄は
+// 対象外にする（テーマ未設定銘柄をテーマ別ランキングから除外するため）。
+const groupStocks=(items,stockQuotes,keyFn)=>{
+  const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
+    return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
+  const turnoverOf=(code)=>{const v=num(stockQuotes[code]?.turnover);return v!=null&&v>0?v:null;};
+  const map={};
+  items.forEach(w=>{const key=keyFn(w);if(!key)return;(map[key]=map[key]||[]).push(w);});
+  return Object.entries(map).map(([key,members])=>{
+    const pcts=members.map(w=>pctOf(w.code)).filter(v=>v!=null);
+    const avgPct=pcts.length?pcts.reduce((a,b)=>a+b,0)/pcts.length:null;
+    const totalTurnover=members.reduce((sum,w)=>sum+(turnoverOf(w.code)||0),0);
+    // 代表銘柄：グループ内で騰落率の絶対値が最大の銘柄（値動きが最も大きい＝今日そのグループを牽引している銘柄）
+    let leader=null,leaderAbsPct=-1;
+    members.forEach(w=>{const p=pctOf(w.code);if(p!=null&&Math.abs(p)>leaderAbsPct){leaderAbsPct=Math.abs(p);leader={name:w.name,pct:p};}});
+    return {key,avgPct,totalTurnover,count:members.length,leader};
+  }).sort((a,b)=>(b.totalTurnover-a.totalTurnover));
+};
+
+// 日次モニター先頭に表示するランキングパネル。「市場→テーマ→セクター→銘柄」の確認順序を
+// タブを跨がずに把握できるようにする（4〜6章対応）。テーマは登録銘柄にユーザーが手動で
+// 付けたタグのみを対象にするため、1件も設定されていなければテーマ欄は非表示にする。
+function ThemeSectorRanking({watchlistAll,stockQuotes}){
+  const sectorRanking=useMemo(()=>groupStocks(watchlistAll,stockQuotes,w=>w.sector).slice(0,5),[watchlistAll,stockQuotes]);
+  const themeRanking=useMemo(()=>groupStocks(watchlistAll,stockQuotes,w=>(w.theme||"").trim()).slice(0,5),[watchlistAll,stockQuotes]);
+
+  const RankList=({title,rows,emptyNote})=>
+    <div style={{flex:"1 1 320px",minWidth:280}}>
+      <div style={{fontSize:13,fontWeight:700,marginBottom:6}}>{title}</div>
+      {rows.length===0
+        ? <div style={{fontSize:12,color:"var(--inkSoft)"}}>{emptyNote}</div>
+        : <div style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden"}}>
+            {rows.map((r,i)=>{const c=changeColor(r.avgPct);
+              return <div key={r.key} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 10px",
+                borderTop:i===0?"none":"1px solid var(--ruleSoft)",background:c.level>0?c.bg:"transparent"}}>
+                <span className="mono" style={{fontSize:11,color:"var(--inkSoft)",width:14}}>{i+1}</span>
+                <span style={{flex:1,fontSize:13,fontWeight:600,color:c.level>0?c.fg:"var(--ink)"}}>{r.key}</span>
+                <span style={{fontSize:11,color:"var(--inkSoft)"}}>{r.count}銘柄</span>
+                <span className="mono" style={{fontSize:13,fontWeight:800,color:c.fg,minWidth:56,textAlign:"right"}}>
+                  {r.avgPct!=null?(r.avgPct>0?"+":"")+r.avgPct.toFixed(2)+"%":"—"}
+                </span>
+                {r.leader&&<span style={{fontSize:11,color:"var(--inkSoft)",whiteSpace:"nowrap"}}>代表：{r.leader.name}
+                  <span className="mono" style={{color:changeColor(r.leader.pct).fg,fontWeight:700}}> {r.leader.pct>0?"+":""}{r.leader.pct.toFixed(1)}%</span>
+                </span>}
+              </div>;})}
+          </div>}
+    </div>;
+
+  return <div style={{marginBottom:18}}>
+    <div className="sec-head">本日の注目セクター・テーマ</div>
+    <div className="sec-note">登録銘柄（日本・アメリカ市場）の平均騰落率・合計売買代金から自動算出。「代表銘柄」はそのグループ内で最も値動きが大きい銘柄です。</div>
+    <div style={{display:"flex",flexWrap:"wrap",gap:16,marginTop:8}}>
+      <RankList title="セクター別（上位5・合計売買代金順）" rows={sectorRanking} emptyNote="登録銘柄がありません。「日本市場」「アメリカ市場」タブで銘柄を登録してください。"/>
+      <RankList title="テーマ別（上位5・合計売買代金順）" rows={themeRanking} emptyNote="テーマが設定された銘柄がありません。「日本市場」「アメリカ市場」タブの登録銘柄一覧で、銘柄名の右の「＋テーマ」から設定できます。"/>
+    </div>
+  </div>;
+}
+
 const MAX_US=50; // 6-1章：アメリカ市場タブの登録上限（ダウ30 + 手動追加の余地）
 
 function App(){
   const [s,setS]=useState(()=>loadState()||emptyState());
+  const watchlistAll=useMemo(()=>[...s.watchlist,...s.watchlistUS],[s.watchlist,s.watchlistUS]); // テーマ/セクター強弱ランキング（日次モニター）用のJP+US統合リスト
   // 3章：ダーク/ライトモード切り替え。CSS変数(:root[data-theme])とJS側の色計算(changeColor等)の両方に反映する
   const [theme,setTheme]=useState(getInitialTheme);
   // useEffectはレンダー後に発火するため、そこでCURRENT_THEMEを更新すると今回のレンダーで
@@ -759,6 +849,8 @@ function App(){
   const toggleTheme=()=>setTheme(t=>t==="dark"?"light":"dark");
   const [tab,setTab]=useState("monitor");
   const [newsSubTab,setNewsSubTab]=useState("summary"); // 9-1章：ニュースタブのサブ切り替え
+  const NEWS_PAGE_SIZE=15; // 「もっと見る」：初期表示件数・1クリックあたりの追加表示件数
+  const [newsShowCount,setNewsShowCount]=useState(NEWS_PAGE_SIZE); // サブタブごとにリセットする表示件数
   const [chartModal,setChartModal]=useState(null); // {symbol,name} 5章：登録銘柄行の「チャート」ボタン用モーダル
   const [cBB,setCBB]=useState(true),[cRSI,setCRSI]=useState(true),[cMA,setCMA]=useState(false);
   const [snsHandle,setSnsHandle]=useState(SNS_ACCOUNTS[0]); // 6-2章：SNSタブで選択中のXアカウント
@@ -960,25 +1052,26 @@ function App(){
     // 4カテゴリ（登録銘柄IR・米国株IR・国内市況・海外市況）を単純に連結するだけだと、各カテゴリ内は
     // 新しい順でも、カテゴリをまたいだ全体では古い記事が新しい記事より上に出てしまっていたため、
     // 「重要」枠・「残り」枠それぞれの中で公開日時の降順に並べ替える（重要枠を上に固定する方針は維持）。
-    const important=[];push(important,[...s.stockNewsList,...s.usStockNewsList,...s.macroNewsDomestic,...s.macroNewsOverseas].filter(it=>isImportantNews(it.title)));
+    const important=[];push(important,[...s.stockNewsList,...s.usStockNewsList,...s.macroNewsDomestic,...s.macroNewsOverseas,...s.stockNameNewsList].filter(it=>isImportantNews(it.title)));
     important.sort(byDateDesc);
     const rest=[];
-    push(rest,s.stockNewsList.slice(0,3));
-    push(rest,s.usStockNewsList.slice(0,3));
-    push(rest,s.macroNewsDomestic.slice(0,4));
-    push(rest,s.macroNewsOverseas.slice(0,4));
+    push(rest,s.stockNewsList.slice(0,6));
+    push(rest,s.usStockNewsList.slice(0,6));
+    push(rest,s.macroNewsDomestic.slice(0,8));
+    push(rest,s.macroNewsOverseas.slice(0,8));
+    push(rest,s.stockNameNewsList.slice(0,10));
     rest.sort(byDateDesc);
     return [...important,...rest];
-  },[s.stockNewsList,s.usStockNewsList,s.macroNewsDomestic,s.macroNewsOverseas]);
+  },[s.stockNewsList,s.usStockNewsList,s.macroNewsDomestic,s.macroNewsOverseas,s.stockNameNewsList]);
 
   // 10-5章：ページ最上部の重要ニュース通知バナー用（全カテゴリを対象に件数を集計）
   const importantNewsAll=useMemo(()=>{
     const seen=new Set();const out=[];
-    [...s.stockNewsList,...s.usStockNewsList,...s.macroNewsDomestic,...s.macroNewsOverseas].forEach(it=>{
+    [...s.stockNewsList,...s.usStockNewsList,...s.macroNewsDomestic,...s.macroNewsOverseas,...s.stockNameNewsList].forEach(it=>{
       if(isImportantNews(it.title)&&it.url&&!seen.has(it.url)){seen.add(it.url);out.push(it);}
     });
     return out;
-  },[s.stockNewsList,s.usStockNewsList,s.macroNewsDomestic,s.macroNewsOverseas]);
+  },[s.stockNewsList,s.usStockNewsList,s.macroNewsDomestic,s.macroNewsOverseas,s.stockNameNewsList]);
 
   // 5章：「分析」ボタン。押すたびに分析タブ（12章）の対象銘柄リストに追加/削除をトグルし、
   // 追加・削除いずれの場合も結果をすぐ確認できるよう「分析」タブに遷移する。
@@ -995,6 +1088,28 @@ function App(){
       ?p.earningsTargets.filter(c=>c!==code):[...p.earningsTargets,code]}));
     setTab("earnings");
   };
+
+  // 売買記録（トレードジャーナル）：銘柄分析カードの「記録に追加」ボタンから、そのカードの
+  // entry/stop/target/marketEnv/entryReasonを初期値にしたドラフトを開き、「記録」タブへ遷移する。
+  // 保存するまでs.journalには追加しない（下書き段階ではjournalDraft stateのみで保持）。
+  const [journalDraft,setJournalDraft]=useState(null);
+  const openJournalDraft=(w,a)=>{
+    setJournalDraft({
+      code:w.code,name:w.name,action:"新規買い",
+      price:a.entry??"",shares:"",
+      entryPlan:{entry:a.entry,stop:a.stop,target:a.target},
+      marketEnvAtEntry:a.marketEnv||"",reason:a.entryReason||"",
+    });
+    setTab("journal");
+  };
+  const saveJournalEntry=()=>{
+    if(!journalDraft)return;
+    const entry={...journalDraft,id:Date.now()+Math.random(),createdAt:new Date().toISOString(),result:"未定",lessonNote:""};
+    setS(p=>({...p,journal:[entry,...p.journal]}));
+    setJournalDraft(null);
+  };
+  const updateJournalEntry=(id,patch)=>setS(p=>({...p,journal:p.journal.map(j=>j.id===id?{...j,...patch}:j)}));
+  const deleteJournalEntry=(id)=>{if(!confirm("この記録を削除しますか？"))return;setS(p=>({...p,journal:p.journal.filter(j=>j.id!==id)}));};
 
   const rollToNextDay=()=>{if(!confirm("今日の値を前日値へ繰り越し、新しい一日にします（登録銘柄・分析対象銘柄は保持）。よろしいですか？"))return;
     setS(p=>({...emptyState(),date:todayISO(),watchlist:p.watchlist,watchlistUS:p.watchlistUS,analysisTargets:p.analysisTargets,
@@ -1094,6 +1209,7 @@ function App(){
         <button className={"tab"+(tab==="briefing"?" on":"")} onClick={()=>setTab("briefing")}>日本市場</button>
         <button className={"tab"+(tab==="earnings"?" on":"")} onClick={()=>setTab("earnings")}>決算分析</button>
         <button className={"tab"+(tab==="analysis"?" on":"")} onClick={()=>setTab("analysis")}>銘柄分析</button>
+        <button className={"tab"+(tab==="journal"?" on":"")} onClick={()=>setTab("journal")}>記録</button>
       </div>
 
       {/* ===== 日次モニター（独立タブ） ===== */}
@@ -1106,7 +1222,8 @@ function App(){
           </div>
         </div>
         <div className="sec-note">「リアルタイムデータを反映」を押すたびに、ドル円・日経平均・ダウ・ナスダック・SOX・米10年債・S&P500・KOSPI・日経225先物・NYダウ先物・WTI原油・金・銅 を今日値／前日値ともに取得します（数値は遅延あり）。</div>
-        <div className="sec-note" style={{marginTop:-4}}>項目をクリックするとリアルタイムチャートが下に開きます。</div>
+        <div className="sec-note" style={{marginTop:-4,marginBottom:14}}>項目をクリックするとリアルタイムチャートが下に開きます。</div>
+        <ThemeSectorRanking watchlistAll={watchlistAll} stockQuotes={s.stockQuotes}/>
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:1,background:"var(--rule)",border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden"}}>
           {METRICS.map(m=>{const v=s.metrics[m.key];const t=num(v.t),p=num(v.p);
             const delta=t!=null&&p!=null?t-p:null;
@@ -1327,10 +1444,24 @@ function App(){
         {/* 自身のトレードルール（trading_rules.md）：常に忘れないための固定リマインド */}
         <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14,fontSize:12,lineHeight:1.8,color:"var(--inkSoft)"}}>
           <div style={{fontWeight:700,color:"var(--ink)",marginBottom:4}}>自分のトレードルール（要点）</div>
-          最優先は負けないこと・利確は欲張らず+3〜5%が目安・<b style={{color:"var(--ink)"}}>逆指値は絶対に下げない</b>・基本は持ち越さない（自信ある銘柄のみ例外）・地合いが悪い/弱いセクターでは無理をしない・ノートレードも立派な判断。
-          <div style={{marginTop:6}}>銘柄選びの優先順位：①半導体 → ②AI関連 → ③当日最強セクター（日次モニターのセクター売買代金順を参照） → ④材料株。</div>
-          <div style={{marginTop:6}}>好決算翌営業日は<b style={{color:"var(--ink)"}}>100株スタート</b>、上昇を確認してから追加を検討。GU（ギャップアップ）日は寄り付き高値を追わず、押し目形成・陽線・出来高を確認してからエントリー。エントリーは移動平均線/VWAP付近まで待つ（待てないなら見送る）。</div>
-          <div style={{marginTop:6,fontWeight:700,color:"var(--ink)"}}>黄金ルール：「勝てそう」では買わない。「買いが勝っていることを確認してから買う」。期待ではなく、チャートと出来高が期待を現実に変えたことを確認してから入る。</div>
+          最優先は負けないこと・<b style={{color:"var(--ink)"}}>逆指値は絶対に下げない</b>・基本は持ち越さない（自信ある銘柄のみ例外）・ノートレードも立派な判断。
+          <div style={{marginTop:6}}>銘柄選びの優先順位：①半導体 → ②AI関連 → ③当日最強セクター（日次モニターのセクター売買代金順を参照） → ④材料株。年初にテーマを決め、代表的な大型株を継続的に監視する。</div>
+          <div style={{marginTop:6,fontSize:11,color:"var(--inkFaint)"}}>エントリー・利確・損切りの詳細な判断基準（押し目/高値ブレイク、飛び付き買い禁止、利確シグナル、移動平均線の解釈など）は、下の各銘柄の分析結果に自動反映されています。</div>
+        </div>
+        {/* 資金管理・分割買いツール：総資金とリスク許容%から、各銘柄カードの損切り幅に応じた株数目安を計算する。
+            値はsettingsとしてlocalStorageに自動保存される。計算はentry/stopが既にある各カードで行う（下部）。 */}
+        <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 14px",marginBottom:14,display:"flex",flexWrap:"wrap",gap:14,alignItems:"center"}}>
+          <div style={{fontSize:12,fontWeight:700,color:"var(--ink)"}}>資金管理設定</div>
+          <label style={{display:"flex",alignItems:"center",gap:6,fontSize:12,color:"var(--inkSoft)"}}>総資金
+            <input type="number" min="0" step="10000" value={s.settings?.totalCapital??""} placeholder="例：1000000"
+              onChange={e=>setS({...s,settings:{...s.settings,totalCapital:e.target.value}})}
+              style={{width:120,fontSize:13,padding:"3px 6px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}/>円
+          </label>
+          <label style={{display:"flex",alignItems:"center",gap:6,fontSize:12,color:"var(--inkSoft)"}}>1トレードの許容損失
+            <input type="number" min="0.1" max="10" step="0.1" value={s.settings?.riskPct??1}
+              onChange={e=>setS({...s,settings:{...s.settings,riskPct:e.target.value}})}
+              style={{width:60,fontSize:13,padding:"3px 6px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}/>%
+          </label>
         </div>
         {analysisItems.length===0
           ? <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13,border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)"}}>
@@ -1344,7 +1475,10 @@ function App(){
                   return <div key={w.code} className="card">
                     <div className="card-hd" style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
                       <div><div className="card-t">{w.name}</div><div className="card-n mono">{w.code}</div></div>
-                      <button className="iconbtn" title="分析対象から外す" onClick={()=>toggleAnalysisTarget(w.code)}>×</button>
+                      <div style={{display:"flex",alignItems:"center",gap:6}}>
+                        {a && <button className="action-btn" onClick={()=>openJournalDraft(w,a)}>記録に追加</button>}
+                        <button className="iconbtn" title="分析対象から外す" onClick={()=>toggleAnalysisTarget(w.code)}>×</button>
+                      </div>
                     </div>
                     {!a
                       ? <div style={{fontSize:12.5,color:"var(--inkSoft)"}}>
@@ -1362,6 +1496,8 @@ function App(){
                           </div>
                           {a.marketEnv && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>{a.marketEnv}</div>}
                           {a.tradeRules?.watchStatus && <div style={{fontSize:11.5,fontWeight:700,color:"var(--accent)",background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>⏳ {a.tradeRules.watchStatus}</div>}
+                          {/* エントリーのタイミングルール（最新版）：初押し／高値ブレイクに該当する最有力タイミング(★5)を強調表示 */}
+                          {a.tradeRules?.entryPattern && <div style={{fontSize:11.5,fontWeight:700,color:"var(--up)",background:"var(--upBg)",border:"1px solid var(--up)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>★★★★★ {a.tradeRules.entryPattern.label}</div>}
                           {/* 決算期待値：発表10日前からカウントダウンを目立つ色で表示。星は過去の上方/下方修正比率・
                               直近決算の良し悪し・現在の株価の過熱度からサーバー側で自動算出（旧・手動評価は廃止）。 */}
                           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6,
@@ -1381,6 +1517,32 @@ function App(){
                             {a.tradeRules.avoidChecklist.filter(c=>c.hit).map(c=>
                               <span key={c.key} className="chip" style={{fontSize:10.5,display:"inline-block",
                                 background:"var(--downBg)",borderColor:"var(--down)",color:"var(--down)"}}>⚠ {c.label}</span>)}
+                          </div>}
+                          {/* エントリーのタイミングルール（最新版）：毎回確認するチェックリスト。板の厚み・セクターは自動取得不可のため手動確認の注記のみ */}
+                          {a.tradeRules?.entryTimingChecklist && <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:6}}>
+                            {a.tradeRules.entryTimingChecklist.map(c=>
+                              <span key={c.key} className="chip" style={{fontSize:10,display:"inline-block",
+                                background:c.pass===true?"var(--upBg)":"var(--band)",borderColor:c.pass===true?"var(--up)":"var(--rule)",
+                                color:c.pass===true?"var(--up)":"var(--inkSoft)"}}>{c.pass===true?"☑":"☐"} {c.label}</span>)}
+                          </div>}
+                          {a.tradeRules?.positionSizeNote && <div style={{fontSize:11,fontWeight:700,color:"var(--ink)",marginBottom:8}}>🔰 {a.tradeRules.positionSizeNote}</div>}
+                          {/* 資金管理・分割買いツール：設定済みの総資金・リスク%とこのカードのentry/stopから株数目安を計算する */}
+                          {!s.settings?.totalCapital
+                            ? <div style={{fontSize:10.5,color:"var(--inkFaint)",marginBottom:8}}>💰 株数目安を見るには、上部の「資金管理設定」で総資金を入力してください。</div>
+                            : (()=>{const ps=computePositionSize(s.settings.totalCapital,s.settings.riskPct,a.entry,a.stop,w.market);
+                                return !ps
+                                  ? <div style={{fontSize:10.5,color:"var(--inkFaint)",marginBottom:8}}>💰 株数目安：算出できません（損切り幅が0以下等）。</div>
+                                  : ps.suggestedShares<=0
+                                    ? <div style={{fontSize:10.5,color:"var(--inkFaint)",marginBottom:8}}>💰 リスク許容額に対して損切り幅が大きく、最小単元にも届きません。</div>
+                                    : <div style={{fontSize:11,color:"var(--ink)",background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"6px 8px",marginBottom:8,lineHeight:1.7}}>
+                                        💰 株数目安 <b className="mono">{ps.suggestedShares.toLocaleString()}株</b>（投入額目安 <span className="mono">{Math.round(ps.investAmount).toLocaleString()}円</span>）
+                                        <div style={{fontSize:10.5,color:"var(--inkSoft)",marginTop:2}}>分割買い目安：①打診買い {ps.tranches[0].toLocaleString()}株 → ②反転確認後 {ps.tranches[1].toLocaleString()}株 → ③節目上抜け後 {ps.tranches[2].toLocaleString()}株</div>
+                                      </div>;
+                              })()}
+                          {/* 利確ルール（最新版）：+5〜8%到達／5分足短期線割れ／急騰後の高値更新失敗+陰線continue のいずれかで利確シグナル */}
+                          {(a.tradeRules?.exitChecklist?.some(c=>c.hit)) && <div style={{marginBottom:8}}>
+                            {a.tradeRules.exitChecklist.filter(c=>c.hit).map(c=>
+                              <div key={c.key} className="chip" style={{background:"var(--upBg)",borderColor:"var(--up)",color:"var(--up)",marginRight:4,marginBottom:4,display:"inline-block",fontSize:11,fontWeight:700}}>💰 {c.label}</div>)}
                           </div>}
                           {(a.signals?.buy?.length>0) && <div style={{marginBottom:8}}>
                             {a.signals.buy.map(sig=><div key={sig.key} className="chip" style={{background:"var(--upBg)",borderColor:"var(--up)",color:"var(--up)",marginRight:4,marginBottom:4,display:"inline-block",fontSize:11}}>▲ {sig.label}</div>)}
@@ -1403,13 +1565,21 @@ function App(){
                               <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>利確単価(目安)</div>
                               <div className="mono" style={{fontSize:22,fontWeight:800,color:"var(--up)",lineHeight:1.3}}>{a.target.toLocaleString()}</div>
                               <div style={{color:"var(--inkSoft)",fontSize:11,marginTop:2}}>{a.targetReason}</div>
+                              {a.fullExitTarget!=null && <div style={{color:"var(--inkSoft)",fontSize:11,marginTop:4}}>
+                                全部利確ライン（目安） <span className="mono" style={{color:"var(--up)",fontWeight:700}}>{a.fullExitTarget.toLocaleString()}</span>（+5〜8%到達で100株すべての利確を検討）
+                              </div>}
+                              {a.tradeRules?.reboundTargetNote && <div style={{color:"var(--inkSoft)",fontSize:11,marginTop:4}}>📈 {a.tradeRules.reboundTargetNote}</div>}
                             </div>
                           </div>
+                          {a.tradeRules?.profitTakingNote && <div style={{fontSize:11,color:"var(--inkSoft)",marginTop:8}}>⚠️ {a.tradeRules.profitTakingNote}</div>}
+                          {a.tradeRules?.entryBasisNote && <div style={{fontSize:10.5,color:"var(--inkFaint)",marginTop:6,lineHeight:1.6}}>ℹ️ {a.tradeRules.entryBasisNote}</div>}
+                          {a.tradeRules?.timeHorizonNote && <div style={{fontSize:10.5,color:"var(--inkFaint)",marginTop:6,lineHeight:1.6}}>⏱️ {a.tradeRules.timeHorizonNote}</div>}
+                          {a.tradeRules?.lossCutPhilosophyNote && <div style={{fontSize:10.5,color:"var(--inkFaint)",marginTop:6,lineHeight:1.6}}>✂️ {a.tradeRules.lossCutPhilosophyNote}</div>}
                           <div style={{marginTop:10,paddingTop:8,borderTop:"1px solid var(--ruleSoft)",fontSize:11,color:"var(--inkSoft)",lineHeight:1.6}}>
-                            25日線 {a.indicators.ma25??"—"}　75日線 {a.indicators.ma75??"—"}　100日線 {a.indicators.ma100??"—"}<br/>
+                            5日線 {a.indicators.ma5Daily??"—"}　25日線 {a.indicators.ma25??"—"}　75日線 {a.indicators.ma75??"—"}　100日線 {a.indicators.ma100??"—"}<br/>
                             RSI14 {a.indicators.rsi??"—"}　RCI26 {a.indicators.rci26??"—"}　ATR14 {a.indicators.atr14??"—"}<br/>
                             BB-2σ {a.indicators.bbLower2??"—"}　BB-3σ {a.indicators.bbLower3??"—"}<br/>
-                            直近サポート {a.indicators.support}　直近レジスタンス {a.indicators.resistance}<br/>
+                            直近サポート {a.indicators.support}　直近レジスタンス {a.indicators.resistance}　価格帯別出来高POC {a.indicators.volumeProfilePOC??"—"}<br/>
                             {a.tradeRules?.marginRatio!=null && <>信用倍率(貸借倍率) {a.tradeRules.marginRatio}倍
                               {a.tradeRules.marginBadge==="danger" && <span style={{color:"var(--down)",fontWeight:700}}>（厳重注意）</span>}
                               {a.tradeRules.marginBadge==="caution" && <span style={{color:"var(--down)"}}>（慎重）</span>}
@@ -1417,7 +1587,7 @@ function App(){
                             52週高値 {a.indicators.high52w}　52週安値 {a.indicators.low52w}<br/>
                             {(a.indicators.intradayHigh!=null)
                               ? <>当日高値 {a.indicators.intradayHigh}　当日安値 {a.indicators.intradayLow}　VWAP {a.indicators.vwap??"—"}<br/>
-                                  5分足RSI {a.indicators.rsi5m??"—"}　15分足RSI {a.indicators.rsi15m??"—"}<br/></>
+                                  5分足RSI {a.indicators.rsi5m??"—"}　15分足RSI {a.indicators.rsi15m??"—"}　5分足短期線 {a.indicators.ma5Short??"—"}<br/></>
                               : <>当日の分足データなし（市場時間外の可能性）<br/></>}
                             {a.fundamentalNote}
                           </div>
@@ -1427,6 +1597,81 @@ function App(){
               </div>
             </div>}
         <p className="foot" style={{marginTop:16}}>※ テクニカル指標は過去1年の日足終値（25日/75日/100日移動平均・RSI14・RCI26・ATR14・ボリンジャーバンド20,±2σ/±3σ・52週高値安値）に加え、当日の1分足・5分足・15分足をリアルタイムに取得し、当日高値安値・VWAP・短期RSIを購入/損切り/利確単価の算出に反映しています（市場時間外は分足データなしで日足のみの算出になります）。パンパカパン・ゴールデンクロス・複合底打ち等のシグナル判定を含みます。エントリー適性チェック（上昇トレンド・出来高増加・押し目・VWAP）、見送り条件（出来高過少・地合い不安定）、決算またぎの目安（yfinance取得可能な場合のみ）も自動判定しています。ファンダメンタルはyfinance取得可能な範囲（PER・PBR・配当利回り・予想EPS)を使用しています。</p>
+      </div>}
+
+      {/* ===== 記録（17章：売買記録・トレードジャーナル） ===== */}
+      {tab==="journal" && <div style={{marginTop:18}}>
+        <div className="sec-head">記録</div>
+        <div className="sec-note">エントリー理由・相場環境・撤退条件を記録し、後から結果と学びを追記します。データはこの端末のブラウザにのみ保存されます（サーバーには送信されません）。</div>
+
+        {journalDraft && <div className="card" style={{marginTop:12,marginBottom:16,padding:"14px 16px"}}>
+          <div style={{fontWeight:700,marginBottom:8}}>記録の下書き：{journalDraft.name}（{journalDraft.code}）</div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:10,marginBottom:8}}>
+            <label style={{fontSize:12,color:"var(--inkSoft)"}}>区分
+              <select value={journalDraft.action} onChange={e=>setJournalDraft({...journalDraft,action:e.target.value})} style={{marginLeft:6,fontSize:13}}>
+                {["新規買い","買い増し","利確","損切り","見送り"].map(a=><option key={a} value={a}>{a}</option>)}
+              </select>
+            </label>
+            <label style={{fontSize:12,color:"var(--inkSoft)"}}>価格
+              <input type="number" value={journalDraft.price} onChange={e=>setJournalDraft({...journalDraft,price:e.target.value})}
+                style={{marginLeft:6,width:100,fontSize:13,padding:"2px 6px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}/>
+            </label>
+            <label style={{fontSize:12,color:"var(--inkSoft)"}}>株数
+              <input type="number" value={journalDraft.shares} onChange={e=>setJournalDraft({...journalDraft,shares:e.target.value})}
+                style={{marginLeft:6,width:90,fontSize:13,padding:"2px 6px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}/>
+            </label>
+          </div>
+          <div style={{fontSize:11.5,color:"var(--inkSoft)",marginBottom:6}}>
+            エントリー時プラン：購入{journalDraft.entryPlan.entry?.toLocaleString?.()??"—"}／損切り{journalDraft.entryPlan.stop?.toLocaleString?.()??"—"}／利確{journalDraft.entryPlan.target?.toLocaleString?.()??"—"}
+            {journalDraft.marketEnvAtEntry && <> ・地合い：{journalDraft.marketEnvAtEntry}</>}
+          </div>
+          <label style={{display:"block",fontSize:12,color:"var(--inkSoft)",marginBottom:8}}>理由
+            <textarea value={journalDraft.reason} onChange={e=>setJournalDraft({...journalDraft,reason:e.target.value})}
+              rows={2} style={{display:"block",width:"100%",fontSize:12.5,padding:6,marginTop:4,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}/>
+          </label>
+          <div style={{display:"flex",gap:8}}>
+            <button className="btn primary" onClick={saveJournalEntry}>記録を保存</button>
+            <button className="btn" onClick={()=>setJournalDraft(null)}>破棄</button>
+          </div>
+        </div>}
+
+        {s.journal.length===0
+          ? <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13,border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)"}}>
+              記録はまだありません。「銘柄分析」タブの各カードにある「記録に追加」ボタンから記録できます。
+            </div>
+          : <>
+              <div style={{fontSize:12,color:"var(--inkSoft)",marginBottom:8}}>
+                合計{s.journal.length}件（{["成功","失敗","引分","未定"].map(r=>`${r}${s.journal.filter(j=>j.result===r).length}`).join("・")}）
+              </div>
+              <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                {s.journal.map(j=><div key={j.id} className="card" style={{padding:"12px 14px"}}>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6}}>
+                    <div>
+                      <b>{j.name}</b> <span className="mono" style={{fontSize:12,color:"var(--inkSoft)"}}>{j.code}</span>
+                      <span style={{marginLeft:8,fontSize:12,color:"var(--inkSoft)"}}>{j.action}　{j.price?Number(j.price).toLocaleString():"—"}円 × {j.shares||"—"}株</span>
+                    </div>
+                    <span style={{fontSize:11,color:"var(--inkFaint)"}}>{new Date(j.createdAt).toLocaleString()}</span>
+                  </div>
+                  {j.reason && <div style={{fontSize:12,color:"var(--inkSoft)",marginTop:4}}>理由：{j.reason}</div>}
+                  {j.marketEnvAtEntry && <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:2}}>地合い：{j.marketEnvAtEntry}</div>}
+                  <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:2}}>
+                    プラン：購入{j.entryPlan?.entry?.toLocaleString?.()??"—"}／損切り{j.entryPlan?.stop?.toLocaleString?.()??"—"}／利確{j.entryPlan?.target?.toLocaleString?.()??"—"}
+                  </div>
+                  <div style={{display:"flex",flexWrap:"wrap",gap:10,alignItems:"center",marginTop:8}}>
+                    <label style={{fontSize:12,color:"var(--inkSoft)"}}>結果
+                      <select value={j.result} onChange={e=>updateJournalEntry(j.id,{result:e.target.value})} style={{marginLeft:6,fontSize:12.5}}>
+                        {["未定","成功","失敗","引分"].map(r=><option key={r} value={r}>{r}</option>)}
+                      </select>
+                    </label>
+                    <button className="iconbtn" style={{marginLeft:"auto"}} title="削除" onClick={()=>deleteJournalEntry(j.id)}>×</button>
+                  </div>
+                  <label style={{display:"block",fontSize:11.5,color:"var(--inkSoft)",marginTop:6}}>学び・次回改善点
+                    <textarea value={j.lessonNote} onChange={e=>updateJournalEntry(j.id,{lessonNote:e.target.value})}
+                      rows={2} style={{display:"block",width:"100%",fontSize:12,padding:6,marginTop:4,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}/>
+                  </label>
+                </div>)}
+              </div>
+            </>}
       </div>}
 
       {/* ===== NEWS（9章・9-1章・9-2章） ===== */}
@@ -1448,15 +1693,18 @@ function App(){
           </div>
           <div className="sec-note">上のボタンで、各サブタブのニュースをGoogleニュースRSSから更新できます（登録銘柄の株価等は更新されません。それらも含めて更新する場合は「日本市場」タブのボタンを使ってください）。「サマリー」「海外市況」「登録銘柄」「適時開示」にはアメリカ市場（ダウ30社）のニュースも含みます。「適時開示」は日本の登録銘柄について当日を含む直近10日分のTDnet開示を種類を問わず（決算・上方修正・下方修正・新株予約権発行など）全件表示します（アメリカ株はTDnet対象外のためGoogleニュースのIR関連キーワードで近似）。「登録銘柄」は社名が見出しに出てくるニュース全般（優先度上位の銘柄まで）です。見出しをクリックすると元記事が開きます。</div>
           <div className="subtabs">
-            {NEWS_SUBTABS.map(t=><button key={t.key} className={"chip"+(newsSubTab===t.key?" on":"")} onClick={()=>setNewsSubTab(t.key)}>{t.label}</button>)}
+            {NEWS_SUBTABS.map(t=><button key={t.key} className={"chip"+(newsSubTab===t.key?" on":"")} onClick={()=>{setNewsSubTab(t.key);setNewsShowCount(NEWS_PAGE_SIZE);}}>{t.label}</button>)}
           </div>
           {hasImportant && <div style={{display:"flex",alignItems:"center",gap:10,background:"var(--upBg)",border:"1px solid var(--up)",borderRadius:4,padding:"10px 14px",marginBottom:12}}>
             <span style={{fontSize:13,fontWeight:700,color:"var(--up)"}}>⚠ 重要ニュースを含みます</span>
             <span style={{fontSize:12,color:"var(--inkSoft)"}}>サプライズ決算・戦争紛争・パンデミック・大規模災害・株価暴落に関連する見出しに印を付けています。</span>
           </div>}
           <div className="card" style={{padding:"14px 16px 6px"}}>
-            <NewsList items={listFor} showName={showCode}/>
+            <NewsList items={listFor.slice(0,newsShowCount)} showName={showCode}/>
           </div>
+          {listFor.length>newsShowCount && <div style={{textAlign:"center",marginTop:10}}>
+            <button className="btn" onClick={()=>setNewsShowCount(c=>c+NEWS_PAGE_SIZE)}>もっと見る（残り{listFor.length-newsShowCount}件）</button>
+          </div>}
         </div>;
       })()}
 

@@ -316,6 +316,7 @@ IR_KEYWORDS = [
     "決算", "上方修正", "下方修正", "業績予想", "業績修正", "自己株式", "自社株買い", "配当",
     "株式分割", "適時開示", "増資", "決算短信", "通期", "四半期", "特別損失", "特別利益",
     "新株予約権", "有価証券報告書", "開示", "IR", "本決算", "決算発表",
+    "月次売上高", "月次業績", "月次",  # TSMC等が発表する月次売上高のような月次開示も拾う
 ]
 
 
@@ -325,8 +326,16 @@ def _is_ir_news(title):
 
 def _title_mentions_name(name, title):
     """Googleニュースの検索結果はクエリ語の一部だけに一致した無関係記事（noteの個人ブログ等）も
-    紛れ込むため、IRキーワードだけでなく銘柄名自体が見出しに含まれているかも確認する。"""
-    return name.lower() in title.lower()
+    紛れ込むため、IRキーワードだけでなく銘柄名自体が見出しに含まれているかも確認する。
+    「三菱重工業」→見出しは「三菱重工」のように、末尾の「業」を省いた略称で報じられることが
+    多いため、その形も許容する（ユーザー要望：三菱重工の提携記事が拾えていなかったため
+    2026-07-14追加。「重工」等の実在する短い略称に絞るため、name自体が4文字超の場合のみ対象）。"""
+    t = title.lower()
+    if name.lower() in t:
+        return True
+    if name.endswith("業") and len(name) > 4 and name[:-1].lower() in t:
+        return True
+    return False
 
 
 def _sort_and_strip(items):
@@ -880,8 +889,15 @@ def build_stock_news(watchlist):
         code = w.get("code", "")
         if not name:
             continue
-        candidates = google_news(name + " 決算 適時開示 業績", 4, max_age_days=STOCK_NEWS_MAX_AGE_DAYS)
+        # TSMC等、月次売上高を発表する銘柄向けに専用クエリも足す。「決算 適時開示 業績」に
+        # 「月次売上高」まで一緒に混ぜるとGoogleニュースの関連度検索が広がりすぎて無関係な
+        # 記事が増えてしまうため、別クエリとして分けて結果だけ合流させる。
+        candidates = (google_news(name + " 決算 適時開示 業績", 4, max_age_days=STOCK_NEWS_MAX_AGE_DAYS)
+                      + google_news(name + " 月次売上高", 2, max_age_days=STOCK_NEWS_MAX_AGE_DAYS))
         ir_only = [it for it in candidates if _is_ir_news(it["title"]) and _title_mentions_name(name, it["title"])]
+        # 2クエリ分を連結しているため、後半（月次売上高クエリ）の記事が新しくても件数上限で
+        # 弾かれないよう、上限を適用する前に公開日時の新しい順へ並べ替える。
+        ir_only.sort(key=lambda it: it.get("_ts", 0), reverse=True)
         for it in ir_only[:2]:
             items.append({**it, "code": code, "name": name})
 
@@ -926,8 +942,12 @@ def build_disclosure_news(watchlist):
         code = w.get("code", "")
         if not name:
             continue
-        candidates = google_news(name + " 決算 適時開示 業績", 4, max_age_days=STOCK_NEWS_MAX_AGE_DAYS)
+        candidates = (google_news(name + " 決算 適時開示 業績", 4, max_age_days=STOCK_NEWS_MAX_AGE_DAYS)
+                      + google_news(name + " 月次売上高", 2, max_age_days=STOCK_NEWS_MAX_AGE_DAYS))
         ir_only = [it for it in candidates if _is_ir_news(it["title"]) and _title_mentions_name(name, it["title"])]
+        # 2クエリ分を連結しているため、後半（月次売上高クエリ）の記事が新しくても件数上限で
+        # 弾かれないよう、上限を適用する前に公開日時の新しい順へ並べ替える。
+        ir_only.sort(key=lambda it: it.get("_ts", 0), reverse=True)
         for it in ir_only[:2]:
             items.append({**it, "code": code, "name": name})
 
@@ -937,24 +957,42 @@ def build_disclosure_news(watchlist):
 # ニュースタブ「登録銘柄」サブタブ用：適時開示（決算・IR関連キーワードのみ）とは別に、社名が
 # そのままニュース見出しに出てくる一般ニュースを拾う（決算・IR以外の材料も見たいというニーズに
 # 対応）。登録銘柄数が多い場合に検索回数が膨らむため、優先度順の上位に限定する。
-STOCK_NAME_NEWS_LIMIT = 15
+STOCK_NAME_NEWS_LIMIT = 25  # 2026-07-14 ユーザー要望により15→25へ増加（表示数を増やす）
 
-# 社名一致は広く拾う分、Amazon「プライムデー」等のセール告知・PR記事が紛れ込みやすい
-# （判断材料としての価値が薄いため除外する）。
+# 社名一致は広く拾う分、無関係な記事が紛れ込みやすい（判断材料としての価値が薄いため除外する）。
+# ①Amazon「プライムデー」等のセール告知・広告・商品レビュー記事（Amazon/Microsoft/Appleのような
+# 一般名詞に近い社名で特に多い）②楽天グループ（楽天イーグルス）・ソフトバンクグループ
+# （ソフトバンクホークス）のように社名がプロ野球チーム名と重なる銘柄のスポーツ結果記事。
+# いずれもユーザー要望（2026-07-14「プロ野球の結果やAmazon/Microsoft/Appleの広告が多い」）で追加。
 STOCK_NAME_NEWS_EXCLUDE_KEYWORDS = [
+    # 広告・セール・商品レビュー・お買い得情報のまとめ記事
     "セール", "プライムデー", "タイムセール", "クーポン", "割引", "％オフ", "%オフ", "ポイント還元",
-    "PR", "広告",
+    "PR", "広告", "キャンペーン", "送料無料", "福袋", "初売り", "ブラックフライデー", "サイバーマンデー",
+    "レビュー", "開封", "おすすめ", "ランキング", "まとめ買い", "本日限定", "特価", "お買い得", "特別価格",
+    "ベストセラー",
+    # プロ野球・スポーツ結果（楽天イーグルス・ソフトバンクホークス等、社名とチーム名が重なるため）
+    "プロ野球", "野球", "イーグルス", "ホークス", "甲子園", "高校野球", "Jリーグ", "パ・リーグ", "セ・リーグ",
 ]
 
+# 上記キーワードでは拾いきれない、商品お買い得情報まとめを主とするアフィリエイト/SEOブログ媒体は
+# 出典（媒体名）そのものを除外する（判断材料としての価値が薄いニュースが多いため）。
+STOCK_NAME_NEWS_EXCLUDE_SOURCES = ["All About ニュース", "電撃ホビーウェブ", "uzurea.net", "PUNKLOID"]
 
-def _is_promo_news(title):
-    return any(k in title for k in STOCK_NAME_NEWS_EXCLUDE_KEYWORDS)
+
+def _is_promo_news(title, source=""):
+    if any(k in title for k in STOCK_NAME_NEWS_EXCLUDE_KEYWORDS):
+        return True
+    return any(s == source for s in STOCK_NAME_NEWS_EXCLUDE_SOURCES)
 
 
 def build_stock_name_news(watchlist):
     """優先度順（優先→通常→様子見）に上位STOCK_NAME_NEWS_LIMIT銘柄まで、社名そのもので
     Googleニュースを検索し、見出しに社名を含むものだけを返す（IRキーワードでの絞り込みはしない）。
-    セール告知等のPR記事はSTOCK_NAME_NEWS_EXCLUDE_KEYWORDSで除外する。"""
+    セール告知等のPR記事はSTOCK_NAME_NEWS_EXCLUDE_KEYWORDSで除外する。
+    社名単体の検索に加えて "site:nikkei.com" を明示的に組み合わせたクエリも実行し、結果を合流させる。
+    日経新聞の記事はGoogleニュースの関連度順検索だけだと他の媒体に埋もれやすいため、業務提携等の
+    一般ニュース（三菱重工の協業・フジクラ等）でも日経の記事を積極的に拾えるようにする
+    （ユーザー要望：「日経のニュースは積極的に表示してほしい」2026-07-14）。"""
     order = {"優先": 0, "通常": 1, "様子見": 2}
     wl = sorted(watchlist, key=lambda w: order.get(w.get("watch", "通常"), 1))[:STOCK_NAME_NEWS_LIMIT]
     items = []
@@ -962,16 +1000,30 @@ def build_stock_name_news(watchlist):
         name, code = w.get("name", ""), w.get("code", "")
         if not name:
             continue
-        candidates = google_news(name, 4, max_age_days=STOCK_NEWS_MAX_AGE_DAYS)
+        candidates = (google_news(name, 4, max_age_days=STOCK_NEWS_MAX_AGE_DAYS)
+                      + google_news(name + " site:nikkei.com", 5, max_age_days=STOCK_NEWS_MAX_AGE_DAYS))
         matched = [it for it in candidates
-                   if _title_mentions_name(name, it["title"]) and not _is_promo_news(it["title"])]
-        for it in matched[:2]:
+                   if _title_mentions_name(name, it["title"]) and not _is_promo_news(it["title"], it.get("source", ""))]
+        # 2クエリにまたがって同じ記事がヒットすることがあるため、URLで重複除去してから新しい順に整える。
+        seen_urls = set()
+        deduped = []
+        for it in matched:
+            if it["url"] in seen_urls:
+                continue
+            seen_urls.add(it["url"])
+            deduped.append(it)
+        deduped.sort(key=lambda it: it.get("_ts", 0), reverse=True)
+        for it in deduped[:3]:
             items.append({**it, "code": code, "name": name})
     return _sort_and_strip(items)
 
 
 # 9-1章：国内市況・海外市況のサブタブ用にクエリを分けて取得する
-MACRO_QUERIES_DOMESTIC = ["日経平均 見通し", "日銀 金融政策 決定", "ドル円 相場"]
+# "site:nikkei.com" は日本経済新聞（nikkei.com）の記事に絞り込むGoogleニュースRSS検索クエリ。
+# 本文は会員限定でも見出しはGoogleニュース経由で無料表示できるため、見出しだけでも拾えるようにする
+# （ユーザー要望：「日経新聞のニュースは見出しだけでもあげれない？」「日経のニュースは積極的に
+# 表示してほしい、ニュースの表示数を増やして」2026-07-14）。
+MACRO_QUERIES_DOMESTIC = ["日経平均 見通し", "日銀 金融政策 決定", "ドル円 相場", "site:nikkei.com 株式市場"]
 MACRO_QUERIES_OVERSEAS = ["FRB 利上げ 金利", "米国株式市場 ダウ"]
 
 
@@ -980,10 +1032,10 @@ def build_macro_news():
     複数クエリの結果を連結後、公開日時の降順に並べ替えてから返す。"""
     domestic = []
     for q in MACRO_QUERIES_DOMESTIC:
-        domestic.extend(google_news(q, 3))
+        domestic.extend(google_news(q, 6))
     overseas = []
     for q in MACRO_QUERIES_OVERSEAS:
-        overseas.extend(google_news(q, 3))
+        overseas.extend(google_news(q, 6))
     return _sort_and_strip(domestic), _sort_and_strip(overseas)
 
 
@@ -1088,24 +1140,57 @@ def _rci(values, n=26):
     return (1 - 6 * d2 / (n * (n * n - 1))) * 100
 
 
-def _market_environment():
-    """技術分析ルール指示書 1-7章・4-3章：相場環境（日経平均のトレンド）を判定し、
-    地合いの良し悪しに応じたコメントを返す。分析対象銘柄ごとに毎回取得すると重いため、
-    build_analysis() 内で1回だけ計算して全銘柄で使い回す。"""
+def _index_trend(symbol):
+    """指数1本のトレンド（25日線に対する位置）と前日比を返す。取得失敗時はNone。"""
     try:
-        h = yf.Ticker("^N225").history(period="3mo")
+        h = yf.Ticker(symbol).history(period="3mo")
         closes = h["Close"].dropna().tolist()
         if len(closes) < 25:
-            return "相場環境：データ不足のため判定できません"
+            return None
         ma25 = _sma(closes, 25)
         current = closes[-1]
+        prev = closes[-2] if len(closes) >= 2 else current
+        change_pct = (current - prev) / prev * 100 if prev else None
         if current > ma25 * 1.01:
-            return "地合い良好（日経平均が25日線より上で上昇トレンド）"
-        if current < ma25 * 0.99:
-            return "地合い不安定（日経平均が25日線より下で下落トレンド）→ デイトレード推奨"
-        return "地合い中立（日経平均は25日線付近で横ばい）"
+            trend = "up"
+        elif current < ma25 * 0.99:
+            trend = "down"
+        else:
+            trend = "flat"
+        return {"current": current, "changePct": change_pct, "trend": trend}
     except Exception:
-        return "相場環境：取得できませんでした"
+        return None
+
+
+_TREND_LABEL = {"up": "上昇", "down": "下落", "flat": "横ばい"}
+
+
+def _market_environment():
+    """動画「スマホで2億円を稼いだ天才ママ」の教え①②：個別株より先に日経平均・NASDAQ・SOX指数の
+    方向を確認する。日経平均のトレンドで地合い良好/不安定/中立を判定し、NASDAQ・SOXの状況も
+    一言添える。日経平均の前日比（nikkeiChangePct）は、個別銘柄との相対的な強さ（ルール⑪：
+    市場全体が下がっても下がらない銘柄は強い銘柄）の判定にも使う。分析対象銘柄ごとに毎回
+    取得すると重いため、build_analysis() 内で1回だけ計算して全銘柄で使い回す。"""
+    n225 = _index_trend("^N225")
+    if not n225:
+        return {"text": "相場環境：データ不足のため判定できません", "nikkeiChangePct": None, "bad": False}
+
+    if n225["trend"] == "up":
+        text = "地合い良好（日経平均が25日線より上で上昇トレンド）"
+    elif n225["trend"] == "down":
+        text = "地合い不安定（日経平均が25日線より下で下落トレンド）→ デイトレード推奨"
+    else:
+        text = "地合い中立（日経平均は25日線付近で横ばい）"
+
+    support_bits = []
+    for label, sym in (("NASDAQ", "^IXIC"), ("SOX", "^SOX")):
+        idx = _index_trend(sym)
+        if idx:
+            support_bits.append(f"{label} {_TREND_LABEL[idx['trend']]}")
+    if support_bits:
+        text += "／" + "・".join(support_bits)
+
+    return {"text": text, "nikkeiChangePct": n225["changePct"], "bad": n225["trend"] == "down"}
 
 
 def _fetch_intraday(tk, interval):
@@ -1129,6 +1214,27 @@ def _vwap(closes, volumes):
     if total_vol <= 0:
         return None
     return sum(c * v for c, v in zip(closes, volumes)) / total_vol
+
+
+def _volume_profile_poc(closes, volumes, lookback=60, bins=20):
+    """動画「テスタさん」の教え⑧：価格帯別出来高。直近lookback日の値幅をbins分割し、
+    最も出来高が集中した価格帯（POC=Point of Control）の中心値を返す。現在値がPOCより下なら
+    戻り待ちの売り（上値抵抗）、上なら押し目買い（支持線）が出やすいと解釈する。"""
+    n = min(len(closes), len(volumes), lookback)
+    if n < 20:
+        return None
+    window_closes = closes[-n:]
+    window_volumes = volumes[-n:]
+    lo, hi = min(window_closes), max(window_closes)
+    if hi <= lo:
+        return None
+    bin_width = (hi - lo) / bins
+    bucket_vol = [0.0] * bins
+    for c, v in zip(window_closes, window_volumes):
+        idx = min(int((c - lo) / bin_width), bins - 1)
+        bucket_vol[idx] += v
+    max_idx = max(range(bins), key=lambda i: bucket_vol[i])
+    return lo + bin_width * (max_idx + 0.5)
 
 
 def _days_to_earnings(tk):
@@ -1183,11 +1289,13 @@ def _margin_badge(ratio):
     return "normal", f"貸借倍率{ratio:.2f}倍（通常水準）"
 
 
-def analyze_stock(w, market_env=""):
+def analyze_stock(w, market_env=None):
     """12-1章・technical_analysis_rules.md：ローソク足パターン・移動平均線の並び／クロス・
     ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
     最有力のシグナルに基づいて購入・損切り・利確の目安単価と算出根拠を返す。
     値はあくまで目安であり断定的な推奨ではない(12-2章の方針)。"""
+    if not isinstance(market_env, dict):
+        market_env = {"text": market_env or "", "nikkeiChangePct": None, "bad": False}
     code = w.get("code", "")
     sym = _yf_symbol(w)
     tk = yf.Ticker(sym)
@@ -1231,6 +1339,11 @@ def analyze_stock(w, market_env=""):
     rsi_5m = _rsi(m5["closes"], 14) if m5 and len(m5["closes"]) >= 15 else None
     rsi_15m = _rsi(m15["closes"], 14) if m15 and len(m15["closes"]) >= 15 else None
 
+    # ---- エントリーのタイミングルール（最新版）：判断の基準線として使う「5分足短期線」（5本SMA）と
+    # 「5分足直近安値」。損切り位置を先に決めるルール・初押し判定の両方で使い回す。----
+    ma5_short = _sma(m5["closes"], 5) if m5 and len(m5["closes"]) >= 5 else None
+    recent_low_5m = min(m5["lows"][-3:]) if m5 and len(m5["lows"]) >= 3 else None
+
     # ---- trading_rules_追加分ルール①③：GU（ギャップアップ）率と、寄り付き高値からの押し目形成有無。
     # 「様子見(初押し待ち)」判定と「寄り付き高値を追わない」警告の両方でこの2つを使う。----
     today_open = opens[-1] if opens else None
@@ -1241,8 +1354,13 @@ def analyze_stock(w, market_env=""):
         peak = max(m1["closes"])
         pullback_formed = m1["closes"][-1] <= peak * 0.997  # 高値から0.3%以上の押し目
 
+    # ---- 動画「テスタさん」の教え①②：移動平均線は「その期間に買った投資家の平均取得価格」として
+    # 見る。5日線（数日〜1週間の短期）・25日線（約1カ月、短期・スイングで最重視）・75日線
+    # （数カ月の大きなトレンド）の3本を日足ベースで使う。5日線はma25_s等と同じ日足の並びで、
+    # 5分足の「ma5_short」（ザラ場のエントリー判定用）とは別物なので混同しないこと。----
+    ma5_s = _sma_series(closes, 5)
     ma25_s, ma75_s, ma100_s = _sma_series(closes, 25), _sma_series(closes, 75), _sma_series(closes, 100)
-    ma25, ma75, ma100 = ma25_s[-1], ma75_s[-1], ma100_s[-1]
+    ma5_daily, ma25, ma75, ma100 = ma5_s[-1], ma25_s[-1], ma75_s[-1], ma100_s[-1]
     rsi = _rsi(closes, 14)
     bb_mid, bb_upper2, bb_lower2 = _bollinger(closes, 20, 2)
     _, bb_upper3, bb_lower3 = _bollinger(closes, 20, 3)
@@ -1250,6 +1368,7 @@ def analyze_stock(w, market_env=""):
     lookback = min(60, n)
     support = min(closes[-lookback:])
     resistance = max(closes[-lookback:])
+    volume_profile_poc = _volume_profile_poc(closes, volumes)
     high52w = max(highs[-min(252, len(highs)):]) if highs else current
     low52w = min(lows[-min(252, len(lows)):]) if lows else current
     vol_avg5 = sum(volumes[-6:-1]) / 5 if len(volumes) >= 6 else None
@@ -1266,6 +1385,40 @@ def analyze_stock(w, market_env=""):
 
     low_zone = current <= high52w * 0.8   # 条件C等：52週高値の-20%以下＝安値圏
     high_zone = current >= high52w * 0.95  # 条件B等：52週高値の-5%以内＝高値圏
+
+    # ---- エントリーのタイミングルール（最新版）：①銘柄の強さ（上昇トレンド・出来高急増・高値圏維持、
+    # 地合い）が揃っていればAランクとし、「押し目を待つ」のではなく「押しても崩れないことを確認して
+    # 買う」方針に切り替える。セクター全体の強さ・板の厚みはyfinanceで自動取得できないため、
+    # ここでは自動判定できる範囲（トレンド・出来高・高値圏・地合い）のみでAランクを判定し、
+    # セクター・板については後述のentryTimingChecklistで手動確認を促す。----
+    is_uptrend_early = ma25 is not None and current > ma25
+    market_env_bad = bool(market_env.get("bad"))
+    a_rank_setup = bool(is_uptrend_early and vol_surge and high_zone and not market_env_bad)
+
+    # ---- 動画「スマホで2億円を稼いだ天才ママ」の教え⑪：市場全体が下がっても下がらない銘柄は
+    # 「強い銘柄」、市場が上がっているのに売られている銘柄は「弱い銘柄」と判断する。日経平均の
+    # 前日比（market_env、build_analysis()内で1回だけ取得）と当銘柄の前日比を比較する。----
+    nikkei_chg = market_env.get("nikkeiChangePct")
+    relative_strength_note = None
+    if nikkei_chg is not None:
+        if nikkei_chg <= -0.3 and change_pct >= 0:
+            relative_strength_note = (f"日経平均{nikkei_chg:+.1f}%に対し当銘柄は{change_pct:+.1f}%＝"
+                                       f"地合いが悪い中でも下がらない強い銘柄")
+        elif nikkei_chg >= 0.3 and change_pct <= -1:
+            relative_strength_note = (f"日経平均{nikkei_chg:+.1f}%に対し当銘柄は{change_pct:+.1f}%＝"
+                                       f"地合いが良い中で売られている弱い銘柄")
+
+    # ---- ②③：Aランクの銘柄では「初押し」（上昇開始後、初めて5分足短期線付近まで押し・
+    # 出来高が減らない）と「高値ブレイク」（高値更新・出来高増加・ブレイク後もすぐ戻されない）
+    # の2パターンだけを最有力エントリーとして狙う（★5）。「押し目待ち症候群」対策として、
+    # これらが揃っていれば「もっと安く」を待たず100点を待たない。----
+    entry_pattern = None
+    if a_rank_setup:
+        if (pullback_formed and not vol_thin and ma5_short is not None
+                and current >= ma5_short * 0.995):
+            entry_pattern = {"key": "hatsuoshi", "label": "初押し（上昇開始後、初めて5分足短期線付近まで押し・出来高減らず）"}
+        elif intraday_high is not None and current >= intraday_high * 0.998:
+            entry_pattern = {"key": "takaneBreak", "label": "高値ブレイク（高値更新・出来高増加・ブレイク後もすぐ戻されない）"}
 
     # ---- ローソク足の形（直近1本）----
     o, c, hi, lo = opens[-1], closes[-1], highs[-1], lows[-1]
@@ -1300,6 +1453,32 @@ def analyze_stock(w, market_env=""):
     if low_zone and is_harami:
         buy_signals.append({"key": "haramiLow", "label": "安値圏でのはらみ線", "price": c})
 
+    # ---- 動画「1_UnOn0ayww」の教え⑤：上放れ並び赤（窓を開けて上昇・陽線が並ぶ・さらに上放れる、
+    # 強い買い資金が継続して入っているサイン）。直近3本が陽線で終値が切り上がり、いずれかの日に
+    # 窓（ギャップアップ）を伴い、出来高も増えていることを条件とする。----
+    uwabanare_narabe_aka = False
+    if n >= 4:
+        last3_bull = all(closes[i] > opens[i] for i in range(-3, 0))
+        rising_closes = closes[-1] > closes[-2] > closes[-3]
+        gapped_up = opens[-1] > closes[-2] or opens[-2] > closes[-3]
+        if last3_bull and rising_closes and gapped_up and vol_surge:
+            uwabanare_narabe_aka = True
+            buy_signals.append({"key": "uwabanareNarabeAka",
+                                 "label": "上放れ並び赤（陽線が並び窓を開けて上放れ、強い買い資金が継続して入っている）",
+                                 "price": current})
+
+    # ---- 動画「1_UnOn0ayww」の教え⑩：下落途中ではなく、売りが一巡してから買う。当日大きく
+    # 下げた銘柄が、直近の1分足で安値を更新しなくなった＝売り圧力が一段落した兆候として捉える。----
+    dip_stabilized = False
+    if m1 and len(m1["lows"]) >= 4 and change_pct is not None and change_pct <= -1.5:
+        recent_lows = m1["lows"][-4:]
+        session_low = min(m1["lows"])
+        if recent_lows[-1] >= min(recent_lows[:-1]) and recent_lows[-1] > session_low * 1.001:
+            dip_stabilized = True
+            buy_signals.append({"key": "dipStabilized",
+                                 "label": "下落が一巡し、直近の1分足で安値を更新していない（売り一巡・戻り狙いの目安）",
+                                 "price": current})
+
     # 条件G：パンパカパン（25>75>100が全て右肩上がり）
     panpakapan = False
     if ma25 and ma75 and ma100 and ma25 > ma75 > ma100:
@@ -1312,6 +1491,20 @@ def analyze_stock(w, market_env=""):
                 "label": f"パンパカパン形成（25日線{ma25:.1f}＞75日線{ma75:.1f}＞100日線{ma100:.1f}が全て上昇）",
                 "price": ma25,
             })
+            # ---- 動画「1_UnOn0ayww」の教え⑥：株価が25日線に何度も接近するとトレンド転換しやすく、
+            # 特に3回目の接近は要警戒。直近20日で終値が25日線の±1%以内に入った回数を数える。----
+            approach_count = sum(
+                1 for i in range(-min(20, n), 0)
+                if ma25_s[i] is not None and abs(closes[i] - ma25_s[i]) / ma25_s[i] <= 0.01
+            )
+            if approach_count >= 3:
+                panpakapan_third_touch = approach_count
+            else:
+                panpakapan_third_touch = None
+        else:
+            panpakapan_third_touch = None
+    else:
+        panpakapan_third_touch = None
 
     # 条件H／2-4条件G：ゴールデンクロス／デッドクロス（直近5日以内）
     golden_cross = dead_cross = False
@@ -1333,6 +1526,16 @@ def analyze_stock(w, market_env=""):
     bb3_touch = bb_lower3 is not None and current <= bb_lower3
     if bb3_touch:
         buy_signals.append({"key": "bb3", "label": f"ボリンジャーバンド-3σ（{bb_lower3:.1f}）にタッチ", "price": bb_lower3})
+
+    # ---- 動画「スマホで2億円を稼いだ天才ママ」の教え⑥⑦（キーエンス型の反発）：陰線が続き
+    # -2σを下回っていた銘柄が、-2σを上に抜け返し、出来高も伴う＝反転の兆候を確認してからの
+    # 逆張り。前足がバンド内（現在の-2σ基準の近似）に沈んでいて、直近足で上に抜け返した形を見る。----
+    bb2_rebound = bool(bb_lower2 is not None and n >= 2
+                        and closes[-2] <= bb_lower2 and current > bb_lower2 and vol_surge)
+    if bb2_rebound:
+        buy_signals.append({"key": "bb2Rebound",
+                             "label": f"ボリンジャーバンド-2σ（{bb_lower2:.1f}）を上に抜け返し、出来高も伴う反発（反転確認後の打診買い候補）",
+                             "price": bb_lower2})
 
     # 条件（複合底打ち）：4条件のうち2つ以上
     bottom_conditions = [
@@ -1359,17 +1562,47 @@ def analyze_stock(w, market_env=""):
     if near_resistance_count >= 3 and current < resistance * 0.98:
         sell_signals.append({"key": "resistanceReject", "label": f"上値抵抗線（{resistance:.1f}）に複数回はね返される", "price": resistance})
 
+    # ---- 動画「テスタさん」の教え⑦⑨：過去に例のない大商いを伴って急落し、5日・25日・75日線を
+    # 一気に割った場合は「戻りを期待しない」水準として最も警戒する。その価格帯で買った投資家の
+    # 大部分が含み損になり、戻っても売りが出やすいため。ニュースの有無は問わず、株価と出来高の
+    # 変化自体を根拠にする。----
+    volume_extreme = bool(len(volumes) >= 61 and volumes[-1] > max(volumes[-61:-1]) * 1.2)
+    broke_5d = bool(ma5_daily is not None and current < ma5_daily)
+    broke_25d = bool(ma25 is not None and current < ma25)
+    broke_75d = bool(ma75 is not None and current < ma75)
+    catastrophic_volume_crash = bool(volume_extreme and change_pct is not None and change_pct <= -5
+                                      and broke_5d and broke_25d and broke_75d)
+    if catastrophic_volume_crash:
+        sell_signals.append({"key": "catastrophicVolumeCrash",
+                              "label": "過去に例のない大商いを伴う急落で5日・25日・75日線を一気に割った（戻りを期待しない水準）",
+                              "price": current})
+
+    # ---- 動画「テスタさん」の教え⑥：出来高を伴わない上昇は一時的な可能性を疑う ----
+    thin_volume_rise = bool(is_bull and vol_thin)
+
     # ---- 強度（★1〜5）：最有力シグナルの種類で判定 ----
     signal_keys = {s["key"] for s in buy_signals}
-    if "panpakapan" in signal_keys:
+    if {"panpakapan", "uwabanareNarabeAka"} & signal_keys:
         strength = 5
     elif "compoundBottom" in signal_keys and bottom_count >= 3:
         strength = 4
-    elif {"goldenCross", "bb3", "compoundBottom"} & signal_keys:
+    elif {"goldenCross", "bb3", "bb2Rebound", "dipStabilized", "compoundBottom"} & signal_keys:
         strength = 3
     elif buy_signals:
         strength = 2
     else:
+        strength = 1
+    # ---- エントリーのタイミングルール（最新版）②③：「初押し」「高値ブレイク」は最も期待値が
+    # 高いポイント（★5）として、他のシグナル判定より優先して星評価に反映する。----
+    if entry_pattern:
+        strength = 5
+    # ---- 動画「1_UnOn0ayww」の教え⑥：パンパカパン中に25日線への接近が3回目以降なら、
+    # トレンド転換の警戒サインとして星評価を1段階格下げする。----
+    if panpakapan_third_touch:
+        strength = max(1, strength - 1)
+    # ---- 動画「テスタさん」の教え⑦⑨：過去に例のない大商いを伴う急落で主要移動平均線を
+    # 一気に割った銘柄は、他のシグナルの強さに関わらず最も低い★1まで格下げする（戻りを期待しない）。----
+    if catastrophic_volume_crash:
         strength = 1
 
     # ---- ファンダメンタル ----
@@ -1382,6 +1615,7 @@ def analyze_stock(w, market_env=""):
             "dividendYield": info.get("dividendYield"),
             "forwardEps": info.get("forwardEps"),
             "trailingEps": info.get("trailingEps"),
+            "marketCap": info.get("marketCap"),
         }
     except Exception:
         pass
@@ -1401,7 +1635,8 @@ def analyze_stock(w, market_env=""):
     # trading_rules.mdのチャート確認優先順位（出来高→移動平均線→VWAP→ボリンジャーバンド→RSI）に合わせ、
     # 複数シグナルが同時点灯した場合はこの順で「最有力の根拠」を選ぶ（VWAP/RSIは単独の買いシグナルを
     # 持たず、entry調整の理由として別途entry_reasonsに追記される）。
-    priority = ["volBull", "volShadow", "panpakapan", "goldenCross", "bb3", "compoundBottom", "dojiLow", "haramiLow"]
+    priority = ["volBull", "volShadow", "uwabanareNarabeAka", "panpakapan", "goldenCross", "bb3", "bb2Rebound",
+                "dipStabilized", "compoundBottom", "dojiLow", "haramiLow"]
     primary = None
     for key in priority:
         primary = next((s for s in buy_signals if s["key"] == key), None)
@@ -1414,6 +1649,11 @@ def analyze_stock(w, market_env=""):
     # （現在値からかけ離れた）水準になってしまうため、その場合は割引係数を半分に弱める。
     already_pulled_back = vwap is not None and current < vwap
     pullback_factor = 0.5 if already_pulled_back else 1.0
+    # ---- エントリーのタイミングルール（最新版）②⑤：「初押し」「高値ブレイク」に該当するAランクの
+    # 好機では「もっと安く」を待たず、押し目の深追いをやめて現在値に近い水準（80点のタイミング）を
+    # 採用する（100点を待って置いていかれることを避けるルール）。----
+    if entry_pattern:
+        pullback_factor *= 0.4
     if primary:
         entry = current - atr_ref * 0.3 * pullback_factor
         entry_reasons = [f"{primary['label']}が点灯。{atr_label}({atr_ref:.1f})から見た現実的な押し目水準として{entry:.1f}を採用"]
@@ -1422,6 +1662,8 @@ def analyze_stock(w, market_env=""):
         entry_reasons = [f"該当する買いシグナルなし。{atr_label}から見た現在値近辺のわずかな押し目を暫定的に採用"]
     if already_pulled_back:
         entry_reasons.append(f"現在値が当日VWAP({vwap:.1f})より下＝ザラ場内で既に押し目が入っているため、追加の押し目調整を弱めて算出")
+    if entry_pattern:
+        entry_reasons.append(f"{entry_pattern['label']}のAランクの好機のため、押し目を深追いせず現在値に近い水準を採用（100株から）")
     if rsi is not None and rsi >= 70:
         entry -= atr_ref * 0.2 * pullback_factor
         entry_reasons.append(f"RSI({rsi:.0f})が買われすぎ水準のためやや低めに調整")
@@ -1484,6 +1726,24 @@ def analyze_stock(w, market_env=""):
     if intraday_low is not None and stop < intraday_low < entry:
         stop = intraday_low
         stop_reasons.append(f"当日安値({intraday_low:.1f})を下限目安として調整")
+
+    # ---- エントリーのタイミングルール（最新版）⑦：損切り位置を「買う前に」決めるルール。候補は
+    # 5分足直近安値割れ／VWAP割れ／5分足短期線の明確な割れの3つ。このうちentryより下でATR基準の
+    # stopより浅い（＝entryに近い）ものがあれば、より早く「間違いだった」と判断できる基準として
+    # 採用する（ATR基準より深くする方向へは動かさない＝安全側のみ）。----
+    stop_candidates = []
+    if recent_low_5m is not None and recent_low_5m < entry:
+        stop_candidates.append(("5分足直近安値", recent_low_5m))
+    if vwap is not None and vwap < entry:
+        stop_candidates.append(("VWAP", vwap))
+    if ma5_short is not None and ma5_short < entry:
+        stop_candidates.append(("5分足短期線", ma5_short))
+    if stop_candidates:
+        tightest_label, tightest_price = max(stop_candidates, key=lambda x: x[1])
+        if tightest_price > stop:
+            stop = tightest_price
+            stop_reasons.append(f"{tightest_label}({tightest_price:.1f})を割ったら損切りと判断（買う前に損切り位置を決めるルール）")
+
     # entryより低いことを必ず保証する（浅めの最小値幅を最低ラインとして確保）
     min_gap = max(entry * 0.002, 1)
     if stop >= entry:
@@ -1503,6 +1763,24 @@ def analyze_stock(w, market_env=""):
         target = target_cap
         target_reasons.append("trading_rules.mdの利確目安(+3〜5%、欲張らない)に基づき+5%水準を上限にキャップ")
 
+    # ---- 利確ルール（最新版）：利益目標+5〜8%に達したら100株すべての利確を検討する全部利確ライン。
+    # 上のtarget(+3〜5%が目安)は一部利確・様子見の目安、こちらは「そこまで伸びたら欲張らず全部閉じる」
+    # という上限ラインとして別に返す（買う前に決めるルールのため、ここもentry確定時点で計算する）。----
+    full_exit_target = entry * 1.08
+
+    # ---- 動画「1_UnOn0ayww」の教え⑪：逆張り（下落からの戻り狙い）で買った場合の目標は基本的に
+    # 25日移動平均線への戻り、地合いが強ければボリンジャーバンド+2σまで引っ張ることも検討する。
+    # 実際のtarget/full_exit_target（当日ATRベースで値幅制限内に収まるよう算出）は変更せず、
+    # 参考情報としてのみ返す（複数日単位の水準をそのまま単価にすると値幅制限を超える非現実的な
+    # 価格になる教訓があるため、既存のATRベース計算を上書きしない）。----
+    rebound_target_note = None
+    reversal_signal_keys = {"volShadow", "bb3", "bb2Rebound", "dipStabilized", "compoundBottom"}
+    if primary and primary["key"] in reversal_signal_keys:
+        if ma25 is not None and ma25 > entry:
+            rebound_target_note = f"逆張りの場合の戻り目安は25日線（{ma25:.1f}）"
+            if not market_env_bad and bb_upper2 is not None and bb_upper2 > ma25:
+                rebound_target_note += f"。地合いが強ければボリンジャーバンド+2σ（{bb_upper2:.1f}）まで引っ張ることも検討"
+
     # ---- 東証の値幅制限（ストップ高・ストップ安）を必ず超えないようにする（日本株のみ）----
     if w.get("market", "JP") != "US":
         day_lo, day_hi = tse_price_limit(prev)
@@ -1519,6 +1797,8 @@ def analyze_stock(w, market_env=""):
             if target > day_hi:
                 target = day_hi
                 target_reasons.append(f"ストップ高({day_hi:.1f})を上限として調整")
+            if full_exit_target > day_hi:
+                full_exit_target = day_hi
 
     # ---- 最終安全確認：ここまでの調整後も stop < entry < target の順序を必ず保証する ----
     min_gap = max(entry * 0.002, 1)
@@ -1528,10 +1808,9 @@ def analyze_stock(w, market_env=""):
         target = entry + min_gap
 
     # ---- trading_rules.md：エントリー適性・見送り条件のチェックリスト（自動判定できる範囲のみ）----
-    is_uptrend = ma25 is not None and current > ma25
+    is_uptrend = is_uptrend_early
     is_pullback = is_uptrend and not high_zone  # 上昇トレンド中で直近高値からは離れている＝押し目
     above_vwap = vwap is not None and current > vwap
-    market_env_bad = "不安定" in (market_env or "")
     entry_checklist = [
         {"key": "uptrend", "label": "上昇トレンド（現在値が25日線より上）", "pass": bool(is_uptrend)},
         {"key": "volume", "label": "出来高増加", "pass": bool(vol_surge)},
@@ -1543,6 +1822,33 @@ def analyze_stock(w, market_env=""):
         {"key": "badMarket", "label": "地合いが悪い", "hit": bool(market_env_bad)},
         {"key": "weakSector", "label": "セクターが弱い（日次モニターのセクター順で要確認）", "hit": None},
     ]
+
+    # ---- 動画「1_UnOn0ayww」の教え⑥：パンパカパン中の25日線への3回目以降の接近はトレンド転換に警戒 ----
+    if panpakapan_third_touch:
+        avoid_checklist.append({"key": "panpakapanThirdTouch",
+                                 "label": f"パンパカパン中に25日線へ{panpakapan_third_touch}回目の接近＝トレンド転換に警戒",
+                                 "hit": True})
+
+    # ---- 動画「テスタさん」の教え⑦⑨：過去に例のない大商いを伴う急落で主要移動平均線を一気に割った ----
+    if catastrophic_volume_crash:
+        avoid_checklist.append({"key": "catastrophicVolumeCrash",
+                                 "label": "過去に例のない大商いを伴う急落で5日・25日・75日線を一気に割っている（戻りを期待しない）",
+                                 "hit": True})
+
+    # ---- 動画「テスタさん」の教え⑥：出来高を伴わない上昇は一時的な可能性を疑う ----
+    if thin_volume_rise:
+        avoid_checklist.append({"key": "thinVolumeRise", "label": "出来高を伴わない上昇（一時的な値動きの可能性）", "hit": True})
+
+    # ---- 動画「テスタさん」の教え⑧：価格帯別出来高（POC）が現在値の上か下かで支持線/抵抗線を判断 ----
+    if volume_profile_poc is not None:
+        if current < volume_profile_poc * 0.995:
+            avoid_checklist.append({"key": "poIsResistance",
+                                     "label": f"価格帯別出来高の厚い価格帯（{volume_profile_poc:.1f}）が上に控えており上値抵抗になりやすい",
+                                     "hit": True})
+        elif current > volume_profile_poc * 1.005:
+            entry_checklist.append({"key": "poIsSupport",
+                                     "label": f"価格帯別出来高の厚い価格帯（{volume_profile_poc:.1f}）が下に控えており支持線になりやすい",
+                                     "pass": True})
 
     # ---- trading_rules_追加分ルール③：GU日に寄り付き高値を追いかけていないか ----
     chasing_gu_high = bool(gu_pct is not None and gu_pct >= 5 and intraday_high is not None
@@ -1557,6 +1863,34 @@ def analyze_stock(w, market_env=""):
         avoid_checklist.append({"key": "awayFromMaVwap",
                                  "label": f"現在値がVWAP/移動平均線から+{entry_dev_pct:.1f}%乖離（高値掴みリスク、待てないなら見送り）",
                                  "hit": True})
+
+    # ---- エントリーのタイミングルール（最新版）⑥：飛び付き買い禁止の4条件。長い陽線の天井・
+    # RSIだけが高い（出来高等の他の裏付けがない）・5分足短期線からの大きな乖離・利益確定売りが
+    # 出そうな上値抵抗線付近、のいずれかに該当すれば見送りチップとして警告する。----
+    long_bull_top = bool(high_zone and is_bull and body >= rng * 0.7)
+    if long_bull_top:
+        avoid_checklist.append({"key": "longBullTop", "label": "高値圏での長い陽線の天井（飛び付き買い注意）", "hit": True})
+
+    rsi_only_high = bool(rsi is not None and rsi >= 75 and not vol_surge and not buy_signals)
+    if rsi_only_high:
+        avoid_checklist.append({"key": "rsiOnlyHigh", "label": f"RSI({rsi:.0f})だけが高く出来高等の裏付けがない（飛び付き買い注意）", "hit": True})
+
+    away_from_5m_ma = bool(ma5_short is not None and ma5_short > 0 and current > ma5_short * 1.03)
+    if away_from_5m_ma:
+        dev5m = (current - ma5_short) / ma5_short * 100
+        avoid_checklist.append({"key": "awayFrom5mMa", "label": f"5分足短期線から+{dev5m:.1f}%大きく乖離（飛び付き買い注意）", "hit": True})
+
+    near_resistance_now = bool(near_resistance_count >= 3 and resistance > 0 and current >= resistance * 0.98)
+    if near_resistance_now:
+        avoid_checklist.append({"key": "profitTakingZone", "label": f"上値抵抗線（{resistance:.1f}）付近＝利益確定売りが出そうな位置（飛び付き買い注意）", "hit": True})
+
+    # ---- 動画「スマホで2億円を稼いだ天才ママ」の教え⑪：地合いが良いのに売られている「弱い銘柄」は
+    # 見送り警告、地合いが悪いのに下がらない「強い銘柄」はエントリー適性チップとして加点表示する。----
+    if relative_strength_note:
+        if nikkei_chg is not None and nikkei_chg >= 0.3 and change_pct <= -1:
+            avoid_checklist.append({"key": "weakerThanMarket", "label": relative_strength_note, "hit": True})
+        else:
+            entry_checklist.append({"key": "strongerThanMarket", "label": relative_strength_note, "pass": True})
 
     # ---- trading_rules_追加分ルール②：貸借倍率（kabutanスクレイピング、日本株のみ）----
     margin_ratio = _kabutan_margin_ratio(w.get("code", "")) if w.get("market", "JP") == "JP" else None
@@ -1604,7 +1938,89 @@ def analyze_stock(w, market_env=""):
     elif days_to_earnings is not None and 7 < days_to_earnings <= 30:
         earnings_note = f"次回決算まで{days_to_earnings}日"
 
+    # ---- 動画「スマホで2億円を稼いだ天才ママ」の教え⑫：成否が二択のイベント（決算等）に大金を
+    # 賭けない。決算が目前(2日以内)の場合は結果次第で大きく振れるため、ポジションを抑える注意を出す。----
+    if days_to_earnings is not None and 0 <= days_to_earnings <= 2:
+        avoid_checklist.append({"key": "binaryEventNear",
+                                 "label": f"決算発表まで{days_to_earnings}日＝結果次第で大きく振れる二択イベント目前（大きく張らない）",
+                                 "hit": True})
+
+    # ---- エントリーのタイミングルール（最新版）：毎回確認するチェックリスト。セクターの強さ・
+    # 板の厚みはyfinanceで自動取得できないため手動確認の注記（pass:None）にとどめ、それ以外は
+    # ここまでに計算済みの値を再利用する。損切り位置・100株スタートは常に「決まっている」方針。----
+    entry_timing_checklist = [
+        {"key": "sectorStrong", "label": "セクターは強いか（日次モニターのセクター売買代金順で要確認）", "pass": None},
+        {"key": "marketGood", "label": "地合いは良いか", "pass": (not market_env_bad) if market_env.get("text") else None},
+        {"key": "volumeUp", "label": "出来高は増えているか", "pass": bool(vol_surge)},
+        {"key": "highUpdate", "label": "高値更新・高値圏を維持しているか", "pass": bool(high_zone)},
+        {"key": "above5mMa", "label": "5分足短期線の上か", "pass": bool(current >= ma5_short) if ma5_short is not None else None},
+        {"key": "bidAbsorb", "label": "板は売りを吸収しているか（自動取得非対応、ご自身でご確認ください）", "pass": None},
+        {"key": "stopDecided", "label": "損切り位置は決めたか（下の損切り単価を参照）", "pass": True},
+        {"key": "start100", "label": "100株から入るか（迷うなら100株。最初から全力はしない）", "pass": True},
+    ]
+    position_size_note = ("最初は100株の打診買い。迷うなら100株だけ。値動きを確認してから計画的に追加、"
+                           "ダメなら損切り。最初から全力はしない・無計画なナンピンはしない。")
+
+    # ---- 利確ルール（最新版）：値幅の目標到達だけでなく、①利益目標+5〜8%到達 ②5分足短期線を
+    # 終値で明確に割った ③急騰後に高値更新できず陰線が続いた、のいずれかを「利確を検討すべき」
+    # シグナルとして返す。「もっと上がるかも」でルールを変えないよう、条件が揃えば機械的に示す。----
+    profit_pct_from_entry = (current - entry) / entry * 100 if entry else None
+    ma5_short_break = bool(ma5_short is not None and ma5_short > 0 and current < ma5_short * 0.997)
+    last2_bearish = bool(n >= 2 and closes[-1] < opens[-1] and closes[-2] < opens[-2])
+    no_new_high_recent = bool(n >= 6 and current < max(highs[-6:-1]))
+    surged_recently = bool(change_1w is not None and change_1w >= 8)
+    stall_after_surge = bool(surged_recently and no_new_high_recent and last2_bearish)
+    # ---- 動画「1_UnOn0ayww」の教え⑫：ボリンジャーバンド+3σを超えるような過熱状態は利益確定を検討 ----
+    bb3_upper_touch = bool(bb_upper3 is not None and current >= bb_upper3)
+    exit_checklist = [
+        {"key": "profitTargetHit",
+         "label": f"利益目標+5〜8%に到達（現在値は目安買値から{profit_pct_from_entry:+.1f}%）→100株すべての利確を検討",
+         "hit": bool(profit_pct_from_entry is not None and profit_pct_from_entry >= 5)},
+        {"key": "ma5ShortBreakExit", "label": "5分足短期線を終値で明確に割った→利確", "hit": ma5_short_break},
+        {"key": "stallAfterSurge", "label": "急騰後に高値更新できず陰線が続いている→利確", "hit": stall_after_surge},
+        {"key": "bb3UpperTouch", "label": f"ボリンジャーバンド+3σ（{bb_upper3:.1f}）到達＝過熱感が高く利益確定を検討" if bb_upper3 is not None else "",
+         "hit": bb3_upper_touch},
+    ]
+    profit_taking_note = "「もっと上がるかも」でルールを変えない。利確シグナルが出たら機械的に実行する。"
+
+    # ---- 動画「テスタさん」の教え③④⑮：移動平均線は「その期間に買った投資家の平均取得価格」。
+    # 時間軸ごとに見る線・損切り基準を最初に決め、短期と長期の売却基準を混ぜない。----
+    time_horizon_note = ("移動平均線は投資家の平均取得価格。時間軸は買う前に決める："
+                          "数日＝5日線／数週間〜数カ月のスイング＝25日線（最重視）／大きなトレンド＝75日線。"
+                          "短期と長期の売却基準を混ぜない。")
+    # ---- 動画「テスタさん」の教え⑩⑪⑫⑬：自分の取得価格は市場にとって意味がない。損切りは
+    # 失敗ではなく利益確定の一部。勝率100%を目指さず、小さい損失と大きい利益の合計で残す。----
+    loss_cut_philosophy_note = ("自分の取得価格は市場にとって意味がない。損切りは失敗ではなく利益確定の一部。"
+                                 "損切り後に回復したら、売値より高くても買い直してよい。勝率100%は目指さない。")
+
+    # ---- 動画「スマホで2億円を稼いだ天才ママ」の教え⑨⑩：テクニカルで入った銘柄はテクニカルで出る、
+    # ファンダで入った銘柄はファンダで出る（買った根拠と売る根拠を一致させる）。この分析はテクニカル
+    # シグナル・当日値幅を根拠に単価を算出しているため、原則テクニカル基準（このカードのシグナル・
+    # 利確/損切りチェックリスト）で出口を判断する旨を明記する。ファンダメンタルズを主な根拠に買う
+    # 場合は、この単価をそのまま使わずファンダの前提が崩れるまで保有する、という別基準になる点に注意。----
+    entry_basis_note = ("この目安はテクニカル根拠（チャート・出来高）で算出しています。買った根拠と"
+                         "売る根拠を一致させるため、利確・損切りもテクニカル基準（本カードのシグナルや"
+                         "チェックリスト）に従ってください。事業内容・業績等のファンダメンタルズを主な"
+                         "根拠に買う場合は、この単価は使わずファンダの前提が崩れない限り保有する、という"
+                         "別の基準になります。")
+
     fund_notes = []
+    # ---- 動画「1_UnOn0ayww」の教え④：海外投資家が買いやすい大型株を優先する。時価総額の目安を
+    # fundamentalNoteに表示するだけでなく、entryChecklist/avoidChecklistにも反映し、実際の
+    # エントリー判断（星評価につながるチェック項目）に使えるようにする（日本株のみ。米国株は
+    # yfinanceのmarketCapがUSD建てで単位が異なるため対象外）。----
+    mcap = fundamentals.get("marketCap")
+    if mcap and w.get("market", "JP") != "US":
+        mcap_oku = mcap / 1e8
+        if mcap_oku >= 1000:
+            size_label = "大型株"
+            entry_checklist.append({"key": "largeCap", "label": f"時価総額 約{mcap_oku:,.0f}億円の大型株（海外投資家の資金が入りやすい）", "pass": True})
+        elif mcap_oku >= 300:
+            size_label = "中型株"
+        else:
+            size_label = "小型株"
+            avoid_checklist.append({"key": "smallCap", "label": f"時価総額 約{mcap_oku:,.0f}億円の小型株（海外投資家の資金が入りにくい可能性）", "hit": True})
+        fund_notes.append(f"時価総額 約{mcap_oku:,.0f}億円（{size_label}、海外投資家の資金が入りやすいのは大型株）")
     per, pbr, div = fundamentals.get("per"), fundamentals.get("pbr"), fundamentals.get("dividendYield")
     if per:
         fund_notes.append(f"PER {per:.1f}倍" + ("（60倍超のため成長期待の織り込み過ぎに注意）" if per > 60 else ""))
@@ -1625,13 +2041,15 @@ def analyze_stock(w, market_env=""):
         "entry": round(entry, 2), "entryReason": "・".join(entry_reasons),
         "stop": round(stop, 2), "stopReason": "・".join(stop_reasons),
         "target": round(target, 2), "targetReason": "・".join(target_reasons),
+        "fullExitTarget": round(full_exit_target, 2),
         "strength": strength,
-        "marketEnv": market_env,
+        "marketEnv": market_env.get("text"),
         "signals": {
             "buy": [{"key": s["key"], "label": s["label"]} for s in buy_signals],
             "sell": [{"key": s["key"], "label": s["label"]} for s in sell_signals],
         },
         "indicators": {
+            "ma5Daily": round(ma5_daily, 2) if ma5_daily is not None else None,
             "ma25": round(ma25, 2) if ma25 else None,
             "ma75": round(ma75, 2) if ma75 else None,
             "ma100": round(ma100, 2) if ma100 else None,
@@ -1640,6 +2058,7 @@ def analyze_stock(w, market_env=""):
             "bbUpper2": round(bb_upper2, 2) if bb_upper2 else None,
             "bbLower2": round(bb_lower2, 2) if bb_lower2 else None,
             "bbLower3": round(bb_lower3, 2) if bb_lower3 else None,
+            "volumeProfilePOC": round(volume_profile_poc, 2) if volume_profile_poc is not None else None,
             "support": round(support, 2), "resistance": round(resistance, 2),
             "high52w": round(high52w, 2), "low52w": round(low52w, 2),
             "atr14": round(atr14, 2) if atr14 is not None else None,
@@ -1649,6 +2068,7 @@ def analyze_stock(w, market_env=""):
             "vwap": round(vwap, 2) if vwap is not None else None,
             "rsi5m": round(rsi_5m, 1) if rsi_5m is not None else None,
             "rsi15m": round(rsi_15m, 1) if rsi_15m is not None else None,
+            "ma5Short": round(ma5_short, 2) if ma5_short is not None else None,
         },
         "fundamentalNote": "・".join(fund_notes) if fund_notes else "取得できるファンダメンタルデータがありません",
         "daysToEarnings": days_to_earnings,  # 決算またぎ期待値機能：10日前からのカウントダウン表示に使う
@@ -1661,6 +2081,16 @@ def analyze_stock(w, market_env=""):
             "watchStatus": watch_status,
             "marginRatio": round(margin_ratio, 2) if margin_ratio is not None else None,
             "marginBadge": margin_badge,
+            "entryPattern": entry_pattern,
+            "entryTimingChecklist": entry_timing_checklist,
+            "positionSizeNote": position_size_note,
+            "exitChecklist": exit_checklist,
+            "profitTakingNote": profit_taking_note,
+            "entryBasisNote": entry_basis_note,
+            "relativeStrengthNote": relative_strength_note,
+            "reboundTargetNote": rebound_target_note,
+            "timeHorizonNote": time_horizon_note,
+            "lossCutPhilosophyNote": loss_cut_philosophy_note,
         },
     }
 
