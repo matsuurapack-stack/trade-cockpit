@@ -635,6 +635,11 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
   const regCodes=useMemo(()=>new Set(watchlist.map(w=>w.code)),[watchlist]);
   const results=useMemo(()=>{const t=q.trim().toLowerCase();if(!t)return[];
     return candidates.filter(m=>!regCodes.has(m.code)&&(m.code.toLowerCase().includes(t)||m.name.toLowerCase().includes(t)||m.sector.toLowerCase().includes(t))).slice(0,8);},[q,regCodes,candidates]);
+  // 「検索しても候補が出てこない」問い合わせ対応：日経225+主要30社／ダウ30社は最初から登録済み
+  // （MASTER・DEFAULT_WATCHLIST）のため、有名企業ほど検索しても新規候補が0件になりやすい。
+  // resultsが空のとき、実は既に登録済みなだけなのかを判定してユーザーに明示する。
+  const alreadyRegisteredMatch=useMemo(()=>{const t=q.trim().toLowerCase();if(!t)return null;
+    return candidates.find(m=>regCodes.has(m.code)&&(m.code.toLowerCase().includes(t)||m.name.toLowerCase().includes(t)))||null;},[q,regCodes,candidates]);
   const addStock=(m)=>{if(watchlist.length>=max){alert("登録は最大"+max+"社までです。");return;}
     if(regCodes.has(m.code))return; setWatchlist([...watchlist,{id:m.code,...m,watch:"通常",note:"",theme:""}]);setQ("");};
   const addManual=()=>{
@@ -685,6 +690,9 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
         {q && <button className="iconbtn" onClick={()=>setQ("")}>×</button>}
       </div>
       {q.trim() && <div className="results">
+        {results.length===0 && alreadyRegisteredMatch && <div className="res-row" style={{fontSize:12.5,color:"var(--inkSoft)"}}>
+          「{alreadyRegisteredMatch.name}」({alreadyRegisteredMatch.code}／{alreadyRegisteredMatch.sector})は既に登録済みです。下の一覧の該当セクターを開いてご確認ください。
+        </div>}
         {results.map(m=>
           <button key={m.code} className="res-row" onClick={()=>addStock(m)}>
             <span className="mono" style={{fontSize:12,width:60,color:"var(--inkSoft)"}}>{m.code}</span>
@@ -990,7 +998,16 @@ function App(){
       const quotes=quotesOverride||s.stockQuotes;
       const withCurrent=items.map(w=>({...w,current:quotes[w.code]?.t}));
       const ar=await fetch("/api/analysis",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(withCurrent)});
-      if(ar.ok){const ad=await ar.json();setS(p=>({...p,analysisData:{...p.analysisData,...(ad.analysis||{})}}));}
+      if(ar.ok){
+        const ad=await ar.json();
+        // 診断用：この取得で実際にサーバーへ送った現在値(currentSent)と取得時刻(fetchedAt)を
+        // 結果に添えておく。「反映されない」不具合の切り分け（現在値送信自体が古いのか、
+        // 表示側が古いままなのか）をカードで直接確認できるようにする。
+        const stampedAt=nowHHMM();
+        const withCurrentByCode=Object.fromEntries(withCurrent.map(w=>[w.code,w.current]));
+        Object.entries(ad.analysis||{}).forEach(([code,r])=>{r._fetchedAt=stampedAt;r._currentSent=withCurrentByCode[code];});
+        setS(p=>({...p,analysisData:{...p.analysisData,...(ad.analysis||{})}}));
+      }
     }catch(e){}
     setAnalyzing(false);
   };
@@ -1491,7 +1508,9 @@ function App(){
                         </div>
                       : <div>
                           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
-                            <div className="mono" style={{fontSize:12,color:"var(--inkSoft)"}}>現在値 {a.current.toLocaleString()}</div>
+                            <div className="mono" style={{fontSize:12,color:"var(--inkSoft)"}}>現在値 {a.current.toLocaleString()}
+                              {a._fetchedAt && <span style={{marginLeft:8,fontSize:10.5,color:"var(--inkFaint)"}} title={`この分析結果の取得時刻。サーバーへ送った現在値：${a._currentSent!=null?a._currentSent:"（未送信＝日足終値で算出）"}`}>（取得 {a._fetchedAt}）</span>}
+                            </div>
                             <div title="シグナル強度" style={{color:"var(--star)",fontSize:13,letterSpacing:1}}>{"★".repeat(a.strength||0)}{"☆".repeat(5-(a.strength||0))}</div>
                           </div>
                           {a.marketEnv && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>{a.marketEnv}</div>}
