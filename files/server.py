@@ -301,6 +301,7 @@ def get_sns_posts(handle, n=15):
                     "title": e.get("title", ""),
                     "url": _nitter_tweet_url(handle, e.get("link", "")),
                     "published": _fmt_published(e),
+                    "_ts": _published_ts(e),
                 })
             if out:
                 return out
@@ -1016,6 +1017,36 @@ def build_stock_name_news(watchlist):
         for it in deduped[:3]:
             items.append({**it, "code": code, "name": name})
     return _sort_and_strip(items)
+
+
+# 指示書(2026-07-16)項目4：ニュースタブの「SNS」サブタブ用。旧SNSタブ（複数アカウント切替表示）は
+# 廃止し、旧SNSタブで対象にしていた10アカウントの投稿のうち登録銘柄の社名に言及しているものだけを
+# 「SNS」タグとしてニュースタブに混ぜて表示する（銘柄名一致の判定は_title_mentions_nameを流用）。
+SNS_TAG_HANDLES = [
+    "kabu_st0ck", "aryarya", "kanpo_blog", "4ki4", "sak_07_",
+    "sou_btc", "min_fx", "nicosokufx", "nikkei", "hitsuzikai",
+]
+
+
+def build_sns_news(watchlist):
+    items = []
+    for handle in SNS_TAG_HANDLES:
+        posts = get_sns_posts(handle, n=30)
+        for w in watchlist:
+            name, code = w.get("name", ""), w.get("code", "")
+            if not name:
+                continue
+            for p in posts:
+                if _title_mentions_name(name, p.get("title", "")):
+                    items.append({**p, "source": f"X (@{handle})", "code": code, "name": name})
+    seen_urls = set()
+    deduped = []
+    for it in items:
+        if it["url"] in seen_urls:
+            continue
+        seen_urls.add(it["url"])
+        deduped.append(it)
+    return _sort_and_strip(deduped)
 
 
 # 9-1章：国内市況・海外市況のサブタブ用にクエリを分けて取得する
@@ -2154,12 +2185,6 @@ class Handler(SimpleHTTPRequestHandler):
             quotes = get_index_quotes()
             now = datetime.datetime.now().strftime("%H:%M:%S")
             self._send_json({"quotes": quotes, "fetchedAt": now})
-        elif self.path.startswith("/api/sns"):
-            qs = urllib.parse.urlparse(self.path).query
-            handle = urllib.parse.parse_qs(qs).get("handle", [""])[0]
-            print(f"[取得] SNS（@{handle}）…")
-            posts = get_sns_posts(handle) if handle else []
-            self._send_json({"posts": posts})
         elif self.path.startswith("/api/edinet-doc"):
             self._proxy_edinet_doc()
         else:
@@ -2205,12 +2230,14 @@ class Handler(SimpleHTTPRequestHandler):
             stock = build_stock_news(watchlist)
             stock_name_news = build_stock_name_news(watchlist)
             disclosure_news = build_disclosure_news(watchlist)
+            sns_news = build_sns_news(watchlist)
             macro_domestic, macro_overseas = build_macro_news()
             macro_all = macro_domestic + macro_overseas
             self._send_json({
                 "stockNews": stock,  # 9章：決算・IR・適時開示のみに絞り込み済み
                 "stockNameNews": stock_name_news,  # 「登録銘柄」サブタブ：IR以外も含む社名一致ニュース
                 "disclosureNews": disclosure_news,  # 「適時開示」サブタブ：当日含む直近10日分・種類問わず全件
+                "snsNews": sns_news,  # 「SNS」サブタブ：@kanpo_blog の投稿のうち登録銘柄に言及したもの
                 "macroNews": macro_all,
                 "macroNewsDomestic": macro_domestic,  # 9-1章：国内市況サブタブ
                 "macroNewsOverseas": macro_overseas,  # 9-1章：海外市況サブタブ
