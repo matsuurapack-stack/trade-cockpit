@@ -2,11 +2,10 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "trade-cockpit",
+      "name": "running-tracker",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["server.py"],
-      "port": 8765,
-      "cwd": "files"
+      "runtimeArgs": ["-m", "http.server", "8899", "--directory", "C:/Users/MATSUURA/OneDrive/デスクトップ/ランニング"],
+      "port": 8899
     }
   ]
 }
