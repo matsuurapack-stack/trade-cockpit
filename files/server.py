@@ -10,6 +10,8 @@ import os
 import re
 import json
 import time
+import base64
+import secrets
 import calendar
 import datetime
 import threading
@@ -28,7 +30,30 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 IS_CLOUD = bool(os.environ.get("RENDER") or os.environ.get("PORT"))
 PORT = int(os.environ.get("PORT", 8765))
-HOST = "0.0.0.0" if IS_CLOUD else "127.0.0.1"
+# スマホ・他PCから同じWi-Fiで開けるように、ローカル実行時も0.0.0.0（全ネットワークIF）で
+# 待ち受ける（127.0.0.1固定だとPC自身からしかアクセスできなかった）。
+# 自宅Wi-Fi内での利用はパスワード等のアクセス制限を付けない方針（ユーザー承認済み・
+# [[trade-cockpit-multi-pc-access]]）。同じWi-Fi内の他端末からは誰でも見えるため、
+# 公衆Wi-Fi等では使わないこと。
+# インターネット公開（Render等のクラウド）時は、下記APP_PASSWORD環境変数を設定すると
+# Basic認証がかかる（立花証券API連携後は気配値等の実データが漏れるため、クラウド公開時は
+# 設定必須の運用。ローカル/LAN利用時は未設定のままでよい）。
+HOST = "0.0.0.0"
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+
+
+def _lan_ip():
+    """このPCのLAN内IPアドレスを推定する（実際に通信はしない。失敗時はNone）。"""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except Exception:
+        return None
 
 
 # APIキー類はfiles/secrets.json（gitignore済み・未コミット）に置く。ファイルが無い/キー未設定
@@ -2262,6 +2287,28 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
+    def _authorized(self):
+        """APP_PASSWORD環境変数が設定されている場合のみBasic認証を要求する（クラウド公開用。
+        ローカル/LAN利用時は未設定のままでよく、その場合は常にTrueを返す＝従来通り無認証）。
+        ユーザー名は何でもよく、パスワードだけ照合する。"""
+        if not APP_PASSWORD:
+            return True
+        header = self.headers.get("Authorization", "")
+        if header.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(header[6:]).decode("utf-8", errors="replace")
+                _, _, pw = decoded.partition(":")
+                if secrets.compare_digest(pw, APP_PASSWORD):
+                    return True
+            except Exception:
+                pass
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Trade Cockpit"')
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write("パスワードが必要です。".encode("utf-8"))
+        return False
+
     def end_headers(self):
         # trade-cockpit.html等の静的配信はブラウザ側のキャッシュにより、コード修正後に
         # リロードしても古い見た目のままになることがあったため、常にキャッシュさせない。
@@ -2269,6 +2316,8 @@ class Handler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_GET(self):
+        if not self._authorized():
+            return
         if self.path.startswith("/api/quotes"):
             print("[取得] 指数・為替 …")
             quotes = get_index_quotes()
@@ -2329,6 +2378,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(pdf)
 
     def do_POST(self):
+        if not self._authorized():
+            return
         if self.path.startswith("/api/news"):
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length) if length else b"[]"
@@ -2425,6 +2476,11 @@ def main():
     else:
         print("  ブラウザが自動で開きます。開かない場合は下記を開いてください：")
         print(f"  http://localhost:{PORT}/trade-cockpit.html")
+        lan_ip = _lan_ip()
+        if lan_ip:
+            print("  --- スマホ・他PCから使う場合（同じWi-Fiに接続してください） ---")
+            print(f"  http://{lan_ip}:{PORT}/trade-cockpit.html")
+            print("  ※初回、Windowsのファイアウォール確認画面が出たら「アクセスを許可する」を選んでください。")
         print("  使い終わったら、このウィンドウを閉じてください。")
     print("=" * 52)
     with httpd:
