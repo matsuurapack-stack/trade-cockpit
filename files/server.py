@@ -2316,11 +2316,6 @@ class Handler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_GET(self):
-        if self.path.startswith("/api/_authcheck"):
-            # 診断用（一時）：APP_PASSWORDがサーバー側で認識されているか、値の中身は返さず
-            # 設定有無と文字数だけ返す。Renderでの環境変数反映確認用。
-            self._send_json({"passwordSet": bool(APP_PASSWORD), "length": len(APP_PASSWORD)})
-            return
         if not self._authorized():
             return
         if self.path.startswith("/api/quotes"):
