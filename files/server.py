@@ -53,6 +53,13 @@ try:
     import feedparser
 except ImportError:
     feedparser = None
+try:
+    # 立花証券e支店API（登録銘柄の日本株リアルタイム時価取得用）。
+    # 認証ファイル(files/e_api_authid.txt・e_api_private_key.pem)が無いPC（他PC/共有先等）
+    # でも他機能に影響しないよう、未導入・未設定時は静かにNoneのまま動作させる。
+    import tachibana_api
+except ImportError:
+    tachibana_api = None
 
 INDEX = {
     "usdjpy": "JPY=X", "nikkei": "^N225", "dow": "^DJI",
@@ -179,7 +186,40 @@ def get_stock_quotes(watchlist):
             }
         except Exception as e:
             print("  個別銘柄失敗", code, sym, e)
+
+    _overlay_tachibana_prices(out, watchlist)
     return out
+
+
+def _overlay_tachibana_prices(out, watchlist):
+    """日本株について、yfinance（遅延）の現在値・高値・安値・前日終値を立花証券APIの
+    実測値で上書きする。turnoverはpDV（出来高）×現在値で再計算。spark（履歴）はyfinance
+    データのまま維持する（立花のスナップショットには日足履歴が無いため）。
+    未接続（認証ファイル無し・ログイン失敗・通信エラー等）の場合は何もせず、
+    既存のyfinance値をそのまま使う（機能低下のみで停止しない）。"""
+    if tachibana_api is None:
+        return
+    jp_codes = [w.get("code", "") for w in watchlist if w.get("market", "JP") == "JP" and w.get("code")]
+    if not jp_codes:
+        return
+    try:
+        live = tachibana_api.get_market_price(jp_codes)
+    except Exception as e:
+        print("  立花証券API 時価取得失敗（yfinanceの値を継続使用）", e)
+        return
+    for code, v in live.items():
+        if code not in out or v.get("t") is None:
+            continue
+        out[code]["t"] = v["t"]
+        if v.get("p") is not None:
+            out[code]["p"] = v["p"]
+        if v.get("high") is not None:
+            out[code]["high"] = v["high"]
+        if v.get("low") is not None:
+            out[code]["low"] = v["low"]
+        if v.get("volume") is not None:
+            out[code]["turnover"] = v["t"] * v["volume"]
+        out[code]["liveSource"] = "tachibana"
 
 
 def _fmt_published(entry):

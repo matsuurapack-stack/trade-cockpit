@@ -19,3 +19,7 @@ files/earnings_ratings.json
 
 # APIキー・トークン類（jQuants/EDINET等。絶対にコミットしない）
 files/secrets.json
+
+# 立花証券e支店API 認証情報（認証ID・秘密鍵。絶対にコミットしない）
+files/e_api_authid.txt
+files/e_api_private_key.pem
