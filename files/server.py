@@ -2327,8 +2327,19 @@ class Handler(SimpleHTTPRequestHandler):
             self._proxy_edinet_doc()
         elif self.path.startswith("/api/stock-history"):
             self._stock_history()
+        elif self.path == "/" or self.path == "":
+            self.send_response(302)
+            self.send_header("Location", "/trade-cockpit.html")
+            self.end_headers()
+        elif self.path.split("?", 1)[0] == "/trade-cockpit.html":
+            super().do_GET()  # 本体HTMLのみ静的配信。それ以外のファイル一覧・個別ファイルは
+            # 一切配信しない（ディレクトリ一覧表示や、認証情報ファイル(e_api_authid.txt・
+            # e_api_private_key.pem・secrets.json)への直接アクセスを防ぐため。2026-08-20
+            # 発覚：SimpleHTTPRequestHandlerはデフォルトでフォルダ内の全ファイルを静的配信・
+            # 一覧表示してしまうため、必要なファイル1つだけを明示的に許可するホワイトリスト方式にした）。
         else:
-            super().do_GET()  # HTMLなどの静的配信
+            self.send_response(404)
+            self.end_headers()
 
     _CODE_RE = re.compile(r"^[0-9A-Za-z]{1,10}$")
 
