@@ -1028,6 +1028,9 @@ def build_disclosure_news(watchlist):
 # そのままニュース見出しに出てくる一般ニュースを拾う（決算・IR以外の材料も見たいというニーズに
 # 対応）。登録銘柄数が多い場合に検索回数が膨らむため、優先度順の上位に限定する。
 STOCK_NAME_NEWS_LIMIT = 25  # 2026-07-14 ユーザー要望により15→25へ増加（表示数を増やす）
+# 日本株1銘柄あたり、この件数以上NQNが取れていればGoogleニュースでの補完はしない
+# （2026-08-20 ユーザー要望：広告・野球結果混入を避けるため、まず立花証券APIを優先する）。
+STOCK_NAME_NEWS_NQN_MIN = 2
 
 # 社名一致は広く拾う分、無関係な記事が紛れ込みやすい（判断材料としての価値が薄いため除外する）。
 # ①Amazon「プライムデー」等のセール告知・広告・商品レビュー記事（Amazon/Microsoft/Appleのような
@@ -1103,13 +1106,34 @@ def build_stock_name_news(watchlist):
     社名単体の検索に加えて "site:nikkei.com" を明示的に組み合わせたクエリも実行し、結果を合流させる。
     日経新聞の記事はGoogleニュースの関連度順検索だけだと他の媒体に埋もれやすいため、業務提携等の
     一般ニュース（三菱重工の協業・フジクラ等）でも日経の記事を積極的に拾えるようにする
-    （ユーザー要望：「日経のニュースは積極的に表示してほしい」2026-07-14）。"""
+    （ユーザー要望：「日経のニュースは積極的に表示してほしい」2026-07-14）。
+
+    日本株は、銘柄コードで確実に関連付けられ広告・野球結果等のノイズも混じらない立花証券API
+    のNQN等を優先する。NQNの件数が少ない銘柄（小型株など報道量が少ない場合）だけ、不足分を
+    Googleニュースで補う（ユーザー要望：「Yahoo!ファイナンス由来だと広告や野球結果が混じる」
+    2026-08-20。完全にNQNのみにすると報道の少ない銘柄でニュース欄が空になるため、ハイブリッド
+    方式を選択）。米国株はNQN対象外のため従来通りGoogleニュースのみ。"""
     order = {"優先": 0, "通常": 1, "様子見": 2}
     wl = sorted(watchlist, key=lambda w: order.get(w.get("watch", "通常"), 1))[:STOCK_NAME_NEWS_LIMIT]
     items = []
+
+    # 先にNQNを銘柄コードごとに集計しておき、Googleニュースで補う必要があるか判定する。
+    tachibana_items = _tachibana_stock_news([w for w in wl if w.get("market", "JP") != "US"])
+    items += tachibana_items
+    tachibana_count = {}
+    for it in tachibana_items:
+        tachibana_count[it["code"]] = tachibana_count.get(it["code"], 0) + 1
+
     for w in wl:
         name, code = w.get("name", ""), w.get("code", "")
+        market = w.get("market", "JP")
         if not name:
+            continue
+        nqn_n = tachibana_count.get(code, 0)
+        if market != "US" and nqn_n >= STOCK_NAME_NEWS_NQN_MIN:
+            continue  # NQNで十分な件数が取れている銘柄はGoogleニュースを使わない（ノイズ回避）
+        quota = 3 if market == "US" else max(0, STOCK_NAME_NEWS_NQN_MIN - nqn_n)
+        if quota == 0:
             continue
         candidates = (google_news(name, 4, max_age_days=STOCK_NEWS_MAX_AGE_DAYS)
                       + google_news(name + " site:nikkei.com", 5, max_age_days=STOCK_NEWS_MAX_AGE_DAYS))
@@ -1124,11 +1148,8 @@ def build_stock_name_news(watchlist):
             seen_urls.add(it["url"])
             deduped.append(it)
         deduped.sort(key=lambda it: it.get("_ts", 0), reverse=True)
-        for it in deduped[:3]:
+        for it in deduped[:quota]:
             items.append({**it, "code": code, "name": name})
-
-    # 日本株は銘柄コードで確実に関連付けできる立花証券APIのNQN等も合流させる（社名一致より精度が高い）。
-    items += _tachibana_stock_news([w for w in wl if w.get("market", "JP") != "US"])
 
     return _sort_and_strip(items)
 
