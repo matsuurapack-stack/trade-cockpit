@@ -219,6 +219,10 @@ def _overlay_tachibana_prices(out, watchlist):
             out[code]["low"] = v["low"]
         if v.get("volume") is not None:
             out[code]["turnover"] = v["t"] * v["volume"]
+        if v.get("ask") is not None:
+            out[code]["ask"] = v["ask"]
+        if v.get("bid") is not None:
+            out[code]["bid"] = v["bid"]
         out[code]["liveSource"] = "tachibana"
 
 
@@ -1026,6 +1030,47 @@ def _is_promo_news(title, source=""):
     return any(s == source for s in STOCK_NAME_NEWS_EXCLUDE_SOURCES)
 
 
+# 立花証券APIのニュースヘッダー機能（NQN＝日経QUICKニュース等の実況速報）。銘柄コードでの
+# 関連付けのため、社名の文字列一致に頼るGoogleニュース検索より誤ヒットが無く速報性も高い。
+# カテゴリ: 100=ニュース、120=AI開示速報(決算関連)、129=AI開示速報(その他)。
+# 110(AI市況状況速報)は個別銘柄との紐付けが薄いため対象外。
+TACHIBANA_NEWS_CATEGORIES = ["100", "120", "129"]
+TACHIBANA_NEWS_DAYS = 2  # 直近何日分を見るか（当日中心。株価同様に毎回取り直すため長すぎる範囲は不要）
+
+
+def _tachibana_stock_news(jp_items):
+    """登録銘柄（日本株）に銘柄コードで関連付いたNQN等の見出しを返す（build_stock_name_newsと
+    同じ形式：code/name/title/url/source/published/_ts）。urlは元記事が無い速報のため空文字。
+    未接続・エラー時は空リスト（Googleニュースの結果はそのまま生きる＝機能低下のみで停止しない）。"""
+    if tachibana_api is None or not jp_items:
+        return []
+    code_to_name = {w.get("code"): w.get("name") for w in jp_items if w.get("code") and w.get("name")}
+    if not code_to_name:
+        return []
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    now = datetime.datetime.now(jst)
+    today_str = now.strftime("%Y%m%d")
+    date_from = (now - datetime.timedelta(days=TACHIBANA_NEWS_DAYS)).strftime("%Y%m%d")
+    try:
+        headlines = tachibana_api.get_news_headlines(TACHIBANA_NEWS_CATEGORIES, date_from, today_str, limit=100)
+    except Exception as e:
+        print("  立花証券API ニュース取得失敗（Googleニュースの結果のみ使用）", e)
+        return []
+    items = []
+    for h in headlines:
+        matched = [c for c in h["codes"] if c in code_to_name]
+        if not matched:
+            continue
+        d, tm = h.get("date", ""), h.get("time", "")
+        hhmm = f"{tm[:2]}:{tm[2:]}" if len(tm) == 4 else ""
+        published = f"{d[4:6]}/{d[6:8]} {hhmm}" if len(d) == 8 and hhmm else ""
+        ts = _tdnet_date_sort_key(d, hhmm) if len(d) == 8 and hhmm else 0
+        for code in matched:
+            items.append({"code": code, "name": code_to_name[code], "title": h["headline"], "url": "",
+                           "source": "NQN", "published": published, "_ts": ts})
+    return items
+
+
 def build_stock_name_news(watchlist):
     """優先度順（優先→通常→様子見）に上位STOCK_NAME_NEWS_LIMIT銘柄まで、社名そのもので
     Googleニュースを検索し、見出しに社名を含むものだけを返す（IRキーワードでの絞り込みはしない）。
@@ -1056,6 +1101,10 @@ def build_stock_name_news(watchlist):
         deduped.sort(key=lambda it: it.get("_ts", 0), reverse=True)
         for it in deduped[:3]:
             items.append({**it, "code": code, "name": name})
+
+    # 日本株は銘柄コードで確実に関連付けできる立花証券APIのNQN等も合流させる（社名一致より精度が高い）。
+    items += _tachibana_stock_news([w for w in wl if w.get("market", "JP") != "US"])
+
     return _sort_and_strip(items)
 
 
@@ -2227,8 +2276,29 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json({"quotes": quotes, "fetchedAt": now})
         elif self.path.startswith("/api/edinet-doc"):
             self._proxy_edinet_doc()
+        elif self.path.startswith("/api/stock-history"):
+            self._stock_history()
         else:
             super().do_GET()  # HTMLなどの静的配信
+
+    _CODE_RE = re.compile(r"^[0-9A-Za-z]{1,10}$")
+
+    def _stock_history(self):
+        """日本の個別株チャート用：立花証券APIの日足履歴（分割調整済み・上場来）を返す。
+        TradingView無料埋め込みが東証再配信制限で使えないJP個別株の代替表示用。
+        認証未設定・API側エラー時は空配列を返す（フロント側でTradingView本体誘導にフォールバック）。"""
+        qs = urllib.parse.urlparse(self.path).query
+        code = urllib.parse.parse_qs(qs).get("code", [""])[0]
+        if not code or not self._CODE_RE.match(code) or tachibana_api is None:
+            self._send_json({"history": []})
+            return
+        try:
+            print(f"[取得] 日足履歴（立花証券API） {code} …")
+            history = tachibana_api.get_daily_history(code)
+        except Exception as e:
+            print("  日足履歴取得失敗", code, e)
+            history = []
+        self._send_json({"history": history})
 
     _DOC_ID_RE = re.compile(r"^[A-Za-z0-9]+$")
 

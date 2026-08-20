@@ -135,6 +135,7 @@ td{padding:7px 10px;vertical-align:middle}
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.6/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef, useMemo } = React;
@@ -535,7 +536,10 @@ function NewsList({items,showName}){
     {items.map((it,i)=>{
       const meta=[showName?it.name:null,it.source,it.published].filter(Boolean).join(" ・ ");
       const important=isImportantNews(it.title);
-      return <a key={i} className={"news-item"+(important?" important":"")} href={it.url} target="_blank" rel="noopener noreferrer">
+      // NQN等の速報見出し（立花証券API）は元記事URLが無いため、リンクにせずカード表示にする
+      const Tag=it.url?"a":"div";
+      const linkProps=it.url?{href:it.url,target:"_blank",rel:"noopener noreferrer"}:{};
+      return <Tag key={i} className={"news-item"+(important?" important":"")} {...linkProps}>
         {important&&<span className="news-alert-badge">⚠ 重要</span>}
         {showName&&it.code&&<span className="news-tag">{it.code}</span>}
         <span className="news-body">
@@ -544,7 +548,7 @@ function NewsList({items,showName}){
           {meta&&<span className="news-meta">{meta}</span>}
         </span>
         <SourceThumb source={it.source}/>
-      </a>;
+      </Tag>;
     })}
   </div>;
 }
@@ -857,11 +861,13 @@ function App(){
   const [newsSubTab,setNewsSubTab]=useState("summary"); // 9-1章：ニュースタブのサブ切り替え
   const NEWS_PAGE_SIZE=15; // 「もっと見る」：初期表示件数・1クリックあたりの追加表示件数
   const [newsShowCount,setNewsShowCount]=useState(NEWS_PAGE_SIZE); // サブタブごとにリセットする表示件数
-  const [chartModal,setChartModal]=useState(null); // {symbol,name} 5章：登録銘柄行の「チャート」ボタン用モーダル
+  const [chartModal,setChartModal]=useState(null); // {symbol,name,code,market} 5章：登録銘柄行の「チャート」ボタン用モーダル
   const [cBB,setCBB]=useState(true),[cRSI,setCRSI]=useState(true),[cMA,setCMA]=useState(false);
   const [openMetrics,setOpenMetrics]=useState(()=>new Set()); // 8章：日次モニターでチャートを開いている項目
+  const [jpHistoryMsg,setJpHistoryMsg]=useState(""); // 立花証券API日足チャートの読み込み状態
   const fileRef=useRef();
   const modalChartRef=useRef();
+  const jpChartRef=useRef(); // 立花証券APIの日足データで描くJP個別株チャート（TradingView埋め込み不可の代替）
   const metricRefs=useRef({});
   const [monitorFetching,setMonitorFetching]=useState(false);
   const [monitorMsg,setMonitorMsg]=useState("");
@@ -1266,6 +1272,46 @@ function App(){
     sc.innerHTML=JSON.stringify({symbol:chartModal.symbol,interval:"D",timezone:"Asia/Tokyo",theme:"light",style:"1",locale:"ja",studies,width:"100%",height:480,allow_symbol_change:false});
     c.appendChild(sc);},[chartModal,cBB,cRSI,cMA]);
 
+  // 5-2章：JP個別株（TradingView無料埋め込み不可）は立花証券APIの日足データで自前描画する。
+  useEffect(()=>{
+    if(!chartModal||embeddable(chartModal.symbol)||chartModal.market!=="JP"||!chartModal.code)return;
+    if(typeof LightweightCharts==="undefined"){setJpHistoryMsg("チャート描画ライブラリの読み込みに失敗しました。通信環境をご確認ください。");return;}
+    let cancelled=false;
+    setJpHistoryMsg("読み込み中…");
+    fetch("/api/stock-history?code="+encodeURIComponent(chartModal.code))
+      .then(r=>r.json())
+      .then(d=>{
+        if(cancelled)return;
+        const hist=d.history||[];
+        const el=jpChartRef.current;
+        if(!el)return;
+        el.innerHTML="";
+        if(hist.length===0){setJpHistoryMsg("立花証券APIからチャートデータを取得できませんでした（未接続、または銘柄が対象外の可能性があります）。下のボタンからTradingView本体でご確認ください。");return;}
+        setJpHistoryMsg("");
+        const chart=LightweightCharts.createChart(el,{width:el.clientWidth||680,height:440,
+          layout:{background:{color:"transparent"},textColor:"#565A52"},
+          grid:{vertLines:{color:"#D6D8CF"},horzLines:{color:"#D6D8CF"}},
+          timeScale:{borderColor:"#C6C8BF"},rightPriceScale:{borderColor:"#C6C8BF"}});
+        const series=chart.addCandlestickSeries({upColor:"#AE3A34",downColor:"#2C6A48",borderVisible:false,
+          wickUpColor:"#AE3A34",wickDownColor:"#2C6A48"}); // 日本の相場慣習に合わせ赤=上昇・緑=下落
+        series.setData(hist.map(r=>({time:r.date,open:r.open,high:r.high,low:r.low,close:r.close})));
+        chart.timeScale().fitContent();
+        // モーダル表示直後はレイアウト確定前でclientWidthが0のことがあるため、
+        // ResizeObserverで実測幅が変わるたびに追従させる（ウィンドウリサイズも含めて一本化）。
+        const ro=new ResizeObserver(entries=>{
+          const w=entries[0]?.contentRect?.width;
+          if(w)chart.applyOptions({width:Math.floor(w)});
+        });
+        ro.observe(el);
+        // モーダルのレイアウトが1フレーム遅れて確定する環境向けの保険（ResizeObserverだけでは
+        // 追従しないケースがあったため、初期化直後に実測幅で明示的にも合わせておく）。
+        requestAnimationFrame(()=>{if(el.clientWidth)chart.applyOptions({width:el.clientWidth});});
+        el._cleanup=()=>{ro.disconnect();chart.remove();};
+      })
+      .catch(()=>{if(!cancelled)setJpHistoryMsg("取得に失敗しました。start.batのサーバーが起動しているかご確認ください。");});
+    return()=>{cancelled=true;if(jpChartRef.current&&jpChartRef.current._cleanup)jpChartRef.current._cleanup();};
+  },[chartModal]);
+
   const openTV=(tv)=>{if(tv)window.open("https://jp.tradingview.com/chart/?symbol="+encodeURIComponent(tv),"_blank");};
 
   // 8章：日次モニターの項目クリックでチャートをトグル開閉
@@ -1386,7 +1432,7 @@ function App(){
           stockQuotes={s.stockQuotes} analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
           earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
           priorityTargets={s.priorityTargets} onTogglePriority={togglePriorityTarget}
-          onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name})}/>
+          onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}/>
         <p className="foot">※ ニュースはGoogleニュースRSSを利用しています。売買を推奨するものではなく、最終判断はご自身で。</p>
       </div>}
 
@@ -1403,7 +1449,7 @@ function App(){
           stockQuotes={s.stockQuotes} analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
           earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
           priorityTargets={s.priorityTargets} onTogglePriority={togglePriorityTarget}
-          onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name})}/>
+          onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}/>
         <p className="foot" style={{marginTop:16}}>※ 対象は現行のダウ工業株30種平均構成銘柄。業種分類は日本市場と同じ東証33業種の枠組みで統一しています（GICSセクターではありません）。アメリカ市場銘柄のニュース・決算・IRは「ニュース」タブのサマリー・海外市況・適時開示に統合表示しています。</p>
       </div>}
 
@@ -1609,6 +1655,12 @@ function App(){
                             </div>
                             <div title="シグナル強度" style={{color:"var(--star)",fontSize:13,letterSpacing:1}}>{"★".repeat(a.strength||0)}{"☆".repeat(5-(a.strength||0))}</div>
                           </div>
+                          {/* 立花証券APIの最良気配（板の全体深度ではない）。日本株のみ・未接続時は非表示 */}
+                          {w.market==="JP" && (num(s.stockQuotes[w.code]?.bid)!=null || num(s.stockQuotes[w.code]?.ask)!=null) &&
+                            <div className="mono" style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>
+                              気配　買 {s.stockQuotes[w.code]?.bid!=null?num(s.stockQuotes[w.code].bid).toLocaleString():"—"}
+                              　/　売 {s.stockQuotes[w.code]?.ask!=null?num(s.stockQuotes[w.code].ask).toLocaleString():"—"}
+                            </div>}
                           {a.marketEnv && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>{a.marketEnv}</div>}
                           {a.tradeRules?.watchStatus && <div style={{fontSize:11.5,fontWeight:700,color:"var(--accent)",background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>⏳ {a.tradeRules.watchStatus}</div>}
                           {/* エントリーのタイミングルール（最新版）：初押し／高値ブレイクに該当する最有力タイミング(★5)を強調表示 */}
@@ -1841,9 +1893,12 @@ function App(){
           </div>}
           {embeddable(chartModal.symbol)
             ? <div key="modaltvchart" ref={modalChartRef} style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",background:"var(--card)",minHeight:484}}></div>
-            : <div key="modaljpfallback" style={{border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)",minHeight:300,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14,padding:24,textAlign:"center"}}>
-                <div style={{fontSize:12.5,color:"var(--inkSoft)",lineHeight:1.7,maxWidth:420}}>日本の個別株は、TradingViewの無料埋め込みチャートでは表示できません（東証データの再配信制限のため）。下のボタンからTradingView本体で開いてください。</div>
-                <button className="btn primary" onClick={()=>openTV(chartModal.symbol)}>↗ TradingViewで開く</button>
+            : <div key="modaljpchart">
+                <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>日本の個別株はTradingViewの無料埋め込みチャートでは表示できないため（東証データの再配信制限）、立花証券APIの日足データ（分割調整済み・上場来）で描画しています。</div>
+                {jpHistoryMsg && <div style={{fontSize:12.5,color:"var(--inkSoft)",padding:"10px 2px"}}>{jpHistoryMsg}</div>}
+                {/* 読み込み中もdisplay:noneにしない（非表示状態でチャート初期化するとサイズが0のまま固定される問題があったため、常にレイアウトに乗せておく） */}
+                <div ref={jpChartRef} style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",background:"var(--card)",minHeight:440}}></div>
+                <div style={{marginTop:10,textAlign:"right"}}><button className="ghost" onClick={()=>openTV(chartModal.symbol)}>↗ TradingViewで開く</button></div>
               </div>}
         </div>
       </div>}

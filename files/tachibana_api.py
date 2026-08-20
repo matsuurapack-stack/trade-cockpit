@@ -16,6 +16,7 @@ import datetime
 import json
 import os
 import threading
+import urllib.parse
 
 from Crypto.Cipher import PKCS1_OAEP
 from Crypto.Hash import SHA256
@@ -116,7 +117,7 @@ _session = None
 _session_date = None
 _p_no = 1
 
-PRICE_COLUMNS = "pDPP,pPRP,pDYWP,pDYRP,pDV,pDHP,pDLP,pDOP"
+PRICE_COLUMNS = "pDPP,pPRP,pDYWP,pDYRP,pDV,pDHP,pDLP,pDOP,pQAP,pQBP"
 PRICE_CHUNK = 40  # 一括問い合わせの銘柄数上限（未検証の上限に余裕を持たせた保守的な値）
 
 
@@ -161,8 +162,9 @@ def _request_price(price_url, codes):
 
 
 def get_market_price(codes, use_prod=True):
-    """日本株コードのリストから現在値・前日終値・高値・安値・出来高等を取得する。
-    戻り値は {code: {t, p, high, low, change, changePct, volume}}。
+    """日本株コードのリストから現在値・前日終値・高値・安値・出来高・気配値等を取得する。
+    戻り値は {code: {t, p, high, low, change, changePct, volume, ask, bid}}。
+    ask/bidは最良気配（板の全体の深さは未取得。歩み値・発注機能とあわせて必要になれば拡張する）。
     銘柄コードが無効等の理由で応答に含まれないコードは戻り値にも含まれない。"""
     out = {}
     codes = [c for c in dict.fromkeys(codes) if c]  # 重複除去・順序保持
@@ -199,8 +201,120 @@ def get_market_price(codes, use_prod=True):
                 "change": _num(row.get("pDYWP")),
                 "changePct": _num(row.get("pDYRP")),
                 "volume": _num(row.get("pDV")),
+                "ask": _num(row.get("pQAP")),  # 売気配（最良気配。板の全体深度は未取得）
+                "bid": _num(row.get("pQBP")),  # 買気配
             }
     return out
+
+
+def get_daily_history(code, sizyou_c="00", use_prod=True):
+    """個別株の日足データ（分割調整済み・上場来〜20年分）を古い順のリストで返す。
+    各要素: {date:"YYYY-MM-DD", open, high, low, close, volume}
+    TradingView無料埋め込みが東証再配信制限で使えないJP個別株チャート用。
+    2026-08-20 実測: リクエストはsUrlPrice宛、sIssueCode+sSizyouC（1銘柄のみ・期間指定不可）。
+    分割調整後の pDOPxK/pDHPxK/pDLPxK/pDPPxK/pDVxK を使う（xK無しは未調整の生値）。"""
+    sess = _ensure_session(use_prod=use_prod)
+    payload = {
+        "sCLMID": "CLMMfdsGetMarketPriceHistory",
+        "sIssueCode": code,
+        "sSizyouC": sizyou_c,
+        "p_no": str(_next_p_no()),
+        "p_sd_date": _now_p_sd_date(),
+        "sJsonOfmt": "5",
+    }
+    resp = _http.request(
+        "POST", sess["sUrlPrice"],
+        body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        retries=urllib3.Retry(total=2, backoff_factor=1.0),
+    )
+    result = json.loads(resp.data.decode("shift_jis", errors="replace"))
+
+    if result.get("p_errno") not in (None, "0"):
+        sess = _ensure_session(use_prod=use_prod, force=True)
+        payload["p_no"] = str(_next_p_no())
+        resp = _http.request(
+            "POST", sess["sUrlPrice"],
+            body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        result = json.loads(resp.data.decode("shift_jis", errors="replace"))
+        if result.get("p_errno") not in (None, "0"):
+            raise RuntimeError(f"立花証券API 日足取得失敗: {result.get('p_err')}")
+
+    out = []
+    for row in result.get("aCLMMfdsMarketPriceHistory", []):
+        d = row.get("sDate", "")
+        if len(d) != 8:
+            continue
+        o, h, l, c = _num(row.get("pDOPxK")), _num(row.get("pDHPxK")), _num(row.get("pDLPxK")), _num(row.get("pDPPxK"))
+        if None in (o, h, l, c):
+            continue
+        out.append({
+            "date": f"{d[0:4]}-{d[4:6]}-{d[6:8]}",
+            "open": o, "high": h, "low": l, "close": c,
+            "volume": _num(row.get("pDVxK")),
+        })
+    out.sort(key=lambda r: r["date"])
+    return out
+
+
+def get_news_headlines(categories, date_from, date_to, limit=100, use_prod=True):
+    """ニュースヘッダー問合取得（CLMMfdsGetNewsHead）。日経QUICKニュース(NQN)等の速報見出し。
+    2026-08-20 実測: リクエストはsUrlMaster宛。1回のリクエストでカテゴリは1つのみ指定可のため、
+    categories（例: ["100","120","129"]）ごとに複数回呼んで連結する。
+    カテゴリコード: 100=ニュース、110=AI市況状況速報、120=AI開示速報(決算関連)、129=AI開示速報(その他)。
+    date_from/date_to は "YYYYMMDD"。見出し(p_HDL)はShiftJISをURLエンコードしてからBASE64化された
+    値なので、BASE64復号→URLデコード(cp932)の順で元の日本語見出しに戻す。
+    戻り値: [{date, time, category, codes:[...], headline}, ...]（新しい順ではない。呼び出し側で整列する）"""
+    sess = _ensure_session(use_prod=use_prod)
+    out = []
+    for cg in categories:
+        payload = {
+            "sCLMID": "CLMMfdsGetNewsHead",
+            "p_CG": cg,
+            "p_DT_FROM": date_from,
+            "p_DT_TO": date_to,
+            "p_REC_OFST": "0",
+            "p_REC_LIMT": str(limit),
+            "p_no": str(_next_p_no()),
+            "p_sd_date": _now_p_sd_date(),
+            "sJsonOfmt": "5",
+        }
+        resp = _http.request(
+            "POST", sess["sUrlMaster"],
+            body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            retries=urllib3.Retry(total=2, backoff_factor=1.0),
+        )
+        result = json.loads(resp.data.decode("shift_jis", errors="replace"))
+        if result.get("p_errno") not in (None, "0"):
+            continue
+        for row in result.get("aCLMMfdsNewsHead", []):
+            headline = _decode_headline(row.get("p_HDL", ""))
+            if not headline:
+                continue
+            isl = row.get("p_ISL", "") or ""
+            out.append({
+                "date": row.get("p_DT", ""),
+                "time": row.get("p_TM", ""),
+                "category": cg,
+                "codes": [c for c in isl.split("|") if c],
+                "headline": headline,
+            })
+    return out
+
+
+def _decode_headline(hdl):
+    """p_HDL（ShiftJISをURLエンコード→BASE64化された見出し）を元の文字列に戻す。"""
+    if not hdl:
+        return ""
+    try:
+        padded = hdl + "=" * (-len(hdl) % 4)
+        raw = base64.b64decode(padded).decode("ascii")
+        return urllib.parse.unquote(raw, encoding="cp932", errors="replace")
+    except Exception:
+        return ""
 
 
 if __name__ == "__main__":
