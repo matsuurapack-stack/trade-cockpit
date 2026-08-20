@@ -56,8 +56,9 @@ def _load_private_key():
     try:
         return RSA.import_key(content)
     except Exception as e:
-        # 診断用（一時）：鍵の中身は出さず、行数・先頭行・末尾行（本来固定の定型文なので
-        # 秘密ではない）だけログに出す。クラウド環境でのSecret File設定ミスの切り分け用。
+        # 鍵の中身は出さず、行数・先頭行・末尾行（本来固定の定型文なので秘密ではない）だけ
+        # サーバーログに出す。クラウド環境でのSecret File設定ミス（BEGIN/END行の欠落等、
+        # 2026-08-20に実際に発生）の切り分け用。
         lines = content.splitlines()
         print(f"  [診断] 秘密鍵の読み込み失敗: {e}")
         print(f"  [診断] 行数={len(lines)} 文字数={len(content)}")
@@ -66,9 +67,15 @@ def _load_private_key():
         raise
 
 
+_JST = datetime.timezone(datetime.timedelta(hours=9))
+
+
 def _now_p_sd_date():
-    return datetime.datetime.now().strftime("%Y.%m.%d-%H:%M:%S.") + \
-        f"{datetime.datetime.now().microsecond // 1000:03d}"
+    # p_sd_dateはサーバー側で日本時間との時刻差をチェックされるため、実行環境のOSタイムゾーンに
+    # 依存せず必ず日本時間(JST)で送る（2026-08-20判明：Render等UTC環境のPCではdatetime.now()が
+    # UTCを返し、9時間分ズレて「p_sd_date is exceed time limit」エラーになっていた）。
+    now = datetime.datetime.now(_JST)
+    return now.strftime("%Y.%m.%d-%H:%M:%S.") + f"{now.microsecond // 1000:03d}"
 
 
 def _decrypt_field(value, priv_key):
