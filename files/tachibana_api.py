@@ -52,7 +52,18 @@ def _load_authid():
 
 def _load_private_key():
     with open(PRIVKEY_PATH, "r", encoding="utf-8") as f:
-        return RSA.import_key(f.read())
+        content = f.read()
+    try:
+        return RSA.import_key(content)
+    except Exception as e:
+        # 診断用（一時）：鍵の中身は出さず、行数・先頭行・末尾行（本来固定の定型文なので
+        # 秘密ではない）だけログに出す。クラウド環境でのSecret File設定ミスの切り分け用。
+        lines = content.splitlines()
+        print(f"  [診断] 秘密鍵の読み込み失敗: {e}")
+        print(f"  [診断] 行数={len(lines)} 文字数={len(content)}")
+        print(f"  [診断] 先頭行={lines[0]!r}" if lines else "  [診断] 空ファイル")
+        print(f"  [診断] 末尾行={lines[-1]!r}" if lines else "")
+        raise
 
 
 def _now_p_sd_date():
