@@ -2442,6 +2442,75 @@ def build_analysis(watchlist):
                 out[code] = r
         except Exception as e:
             print("  分析失敗", code, e)
+
+    # 2026-08-21 ユーザー要望：銘柄分析カードに銘柄詳細情報・信用残情報・証金残情報・逆日歩情報・
+    # ニュース（見出し＋本文）を追加。立花証券APIの仕様書（e_api_web_access添付のCLMMfdsGetIssueDetail
+    # 等）に基づく。日本株のみ対象（これらは東証個別株向けの情報のため）。4種の残高情報はコード最大120件
+    # まで一括取得できるAPI仕様のため、対象銘柄をまとめて1回ずつ問い合わせる（銘柄ごとに個別リクエスト
+    # しない）。ニュースの本文は1件ずつ別リクエストが必要なため、銘柄ごとに件数を絞って取得する。
+    jp_codes = [w.get("code", "") for w in watchlist if w.get("market", "JP") != "US" and w.get("code")]
+    if tachibana_api is not None and jp_codes:
+        try:
+            issue_detail = tachibana_api.get_issue_detail(jp_codes)
+        except Exception as e:
+            print("  銘柄詳細情報取得失敗", e)
+            issue_detail = {}
+        try:
+            syoukin_zan = tachibana_api.get_syoukin_zan(jp_codes)
+        except Exception as e:
+            print("  証金残情報取得失敗", e)
+            syoukin_zan = {}
+        try:
+            shinyou_zan = tachibana_api.get_shinyou_zan(jp_codes)
+        except Exception as e:
+            print("  信用残情報取得失敗", e)
+            shinyou_zan = {}
+        try:
+            hibu_info = tachibana_api.get_hibu_info(jp_codes)
+        except Exception as e:
+            print("  逆日歩情報取得失敗", e)
+            hibu_info = {}
+        for code in jp_codes:
+            if code not in out:
+                continue
+            out[code]["issueDetail"] = issue_detail.get(code) or None
+            out[code]["syoukinZan"] = syoukin_zan.get(code) or None
+            out[code]["shinyouZan"] = shinyou_zan.get(code) or None
+            out[code]["hibuInfo"] = hibu_info.get(code) or None
+            out[code]["stockNews"] = _stock_news_for(code)
+    return out
+
+
+def _stock_news_for(code, limit=3):
+    """個別銘柄のニュースを見出し＋本文つきで返す（銘柄分析カード用）。build_stock_name_news・
+    _tachibana_stock_newsは登録銘柄一覧をまとめて処理する用途で見出しのみだが、こちらは1銘柄分を
+    p_IS指定で絞り込み取得し、本文（get_news_body、1件ごとに別リクエスト）も付ける。件数は
+    呼び出し回数を抑えるため直近limit件に絞る。取得失敗時は空リスト（カード全体は表示を継続）。"""
+    if tachibana_api is None or not code:
+        return []
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    now = datetime.datetime.now(jst)
+    today_str = now.strftime("%Y%m%d")
+    date_from = (now - datetime.timedelta(days=30)).strftime("%Y%m%d")
+    try:
+        heads = tachibana_api.get_stock_news(code, date_from, today_str, limit=20)
+    except Exception as e:
+        print(f"  銘柄別ニュース取得失敗（{code}）", e)
+        return []
+    heads.sort(key=lambda h: _tdnet_date_sort_key(
+        h.get("date", ""), f"{h['time'][:2]}:{h['time'][2:]}" if len(h.get("time", "")) == 4 else "00:00"
+    ), reverse=True)
+    out = []
+    for h in heads[:limit]:
+        try:
+            body = tachibana_api.get_news_body(h.get("id", ""))
+        except Exception as e:
+            print(f"  ニュース本文取得失敗（{h.get('id')}）", e)
+            body = ""
+        d, tm = h.get("date", ""), h.get("time", "")
+        hhmm = f"{tm[:2]}:{tm[2:]}" if len(tm) == 4 else ""
+        published = f"{d[4:6]}/{d[6:8]} {hhmm}" if len(d) == 8 and hhmm else ""
+        out.append({"headline": h.get("headline", ""), "body": body, "published": published})
     return out
 
 

@@ -141,6 +141,10 @@ td{padding:7px 10px;vertical-align:middle}
 const { useState, useEffect, useRef, useMemo } = React;
 
 const num = (v) => (v === "" || v == null || isNaN(+v) ? null : +v);
+// 2026-08-21 ユーザー要望：銘柄分析カードの「PTSの注記」〜「利確/損切シグナルチップ」の区間
+// （エントリーチェックリスト・決算期待値の★・タイミングチェック・資金管理の株数目安等）を
+// 一時的に非表示にする。コードは削除せず残しているため、復活させたい場合はtrueに戻すだけでよい。
+const SHOW_ANALYSIS_CHECKLISTS = false;
 // 2026-08-21 ユーザー要望：登録銘柄検索を読み仮名でも引っかかるようにする。カタカナ→ひらがな変換
 // で正規化してから比較することで、社名がカタカナのみの銘柄（○○ホールディングス等）はこれだけで
 // ひらがな検索に対応できる。漢字を含む社名は変換だけでは読みにならないため、MASTER定義末尾の
@@ -1812,6 +1816,7 @@ function App(){
                             <EarningsStars value={a.autoEarningsStars||0}/>
                           </div>
                           {a.tradeRules?.earningsNote && <div style={{fontSize:11.5,color:"var(--ink)",background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"6px 8px",marginBottom:8,lineHeight:1.6}}>📅 {a.tradeRules.earningsNote}</div>}
+                          {SHOW_ANALYSIS_CHECKLISTS && <>
                           {a.tradeRules?.ptsNote && <div style={{fontSize:11,color:"var(--inkFaint)",marginBottom:8,lineHeight:1.5}}>ℹ️ {a.tradeRules.ptsNote}</div>}
                           {a.tradeRules && <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:8}}>
                             {a.tradeRules.entryChecklist.filter(c=>c.pass!=null).map(c=>
@@ -1854,6 +1859,7 @@ function App(){
                           {(a.signals?.sell?.length>0) && <div style={{marginBottom:8}}>
                             {a.signals.sell.map(sig=><div key={sig.key} className="chip" style={{background:"var(--downBg)",borderColor:"var(--down)",color:"var(--down)",marginRight:4,marginBottom:4,display:"inline-block",fontSize:11}}>▼ {sig.label}</div>)}
                           </div>}
+                          </>}
                           <div style={{display:"flex",flexDirection:"column",gap:10}}>
                             <div>
                               <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>購入単価(目安)</div>
@@ -1895,6 +1901,59 @@ function App(){
                               : <>当日の分足データなし（市場時間外の可能性）<br/></>}
                             {a.fundamentalNote}
                           </div>
+                          {/* 2026-08-21 ユーザー要望：立花証券API（e_api_web_access仕様書のCLMMfdsGetIssueDetail・
+                              CLMMfdsGetSyoukinZan・CLMMfdsGetShinyouZan・CLMMfdsGetHibuInfo・CLMMfdsGetNewsHead/Body）
+                              から取得した銘柄詳細情報・信用残情報・証金残情報・逆日歩情報・ニュースを表示する
+                              （日本株のみ。build_analysis参照。未接続・取得失敗時は該当ブロックごと非表示）。 */}
+                          {a.issueDetail && <div style={{marginTop:10,paddingTop:9,borderTop:"1px solid var(--ruleSoft)"}}>
+                            <div style={{fontSize:12.5,fontWeight:700,color:"var(--ink)",marginBottom:6}}>銘柄詳細情報</div>
+                            <table style={{width:"100%",fontSize:12.5,borderCollapse:"collapse"}}><tbody>
+                              <tr><td style={{color:"var(--inkSoft)",padding:"2px 0"}}>PER（予想）</td><td style={{textAlign:"right"}}>{a.issueDetail.pRPER||"—"}</td>
+                                  <td style={{color:"var(--inkSoft)",padding:"2px 0 2px 14px"}}>PBR（実績）</td><td style={{textAlign:"right"}}>{a.issueDetail.pSPBR||"—"}</td></tr>
+                              <tr><td style={{color:"var(--inkSoft)",padding:"2px 0"}}>EPS（予想）</td><td style={{textAlign:"right"}}>{a.issueDetail.pEPSF||"—"}</td>
+                                  <td style={{color:"var(--inkSoft)",padding:"2px 0 2px 14px"}}>BPS（実績）</td><td style={{textAlign:"right"}}>{a.issueDetail.pBPSB||"—"}</td></tr>
+                              <tr><td style={{color:"var(--inkSoft)",padding:"2px 0"}}>ROE（予想）</td><td style={{textAlign:"right"}}>{a.issueDetail.pROEL||"—"}</td>
+                                  <td style={{color:"var(--inkSoft)",padding:"2px 0 2px 14px"}}>配当利回り（予想）</td><td style={{textAlign:"right"}}>{a.issueDetail.pSYIE||"—"}</td></tr>
+                              <tr><td style={{color:"var(--inkSoft)",padding:"2px 0"}}>株式益回り</td><td style={{textAlign:"right"}}>{a.issueDetail.pSPRO||"—"}</td>
+                                  <td style={{color:"var(--inkSoft)",padding:"2px 0 2px 14px"}}>配当権利落日</td><td style={{textAlign:"right"}}>{a.issueDetail.pCLOE||"—"}</td></tr>
+                              <tr><td style={{color:"var(--inkSoft)",padding:"2px 0"}}>年初来高値</td><td style={{textAlign:"right"}}>{a.issueDetail.pYHPR||"—"}{a.issueDetail.pYHPD&&<span style={{color:"var(--inkFaint)",fontSize:10.5}}>（{a.issueDetail.pYHPD}）</span>}</td>
+                                  <td style={{color:"var(--inkSoft)",padding:"2px 0 2px 14px"}}>年初来安値</td><td style={{textAlign:"right"}}>{a.issueDetail.pYLPR||"—"}{a.issueDetail.pYLPD&&<span style={{color:"var(--inkFaint)",fontSize:10.5}}>（{a.issueDetail.pYLPD}）</span>}</td></tr>
+                            </tbody></table>
+                          </div>}
+                          {a.shinyouZan && <div style={{marginTop:10,paddingTop:9,borderTop:"1px solid var(--ruleSoft)"}}>
+                            <div style={{fontSize:12.5,fontWeight:700,color:"var(--ink)",marginBottom:6}}>信用残情報{a.shinyouZan.pMBD&&<span style={{fontWeight:400,color:"var(--inkFaint)",fontSize:11}}>（{a.shinyouZan.pMBD}時点）</span>}</div>
+                            <table style={{width:"100%",fontSize:12.5,borderCollapse:"collapse"}}>
+                              <thead><tr style={{color:"var(--inkFaint)"}}><td></td><td style={{textAlign:"right"}}>買残</td><td style={{textAlign:"right"}}>売残</td><td style={{textAlign:"right"}}>信用倍率</td></tr></thead>
+                              <tbody>
+                                <tr><td style={{color:"var(--inkSoft)"}}>合算</td><td style={{textAlign:"right"}}>{a.shinyouZan.pMBBQ||"—"}</td><td style={{textAlign:"right"}}>{a.shinyouZan.pMBSQ||"—"}</td><td style={{textAlign:"right",fontWeight:700}}>{a.shinyouZan.pMBRQ||"—"}倍</td></tr>
+                                <tr><td style={{color:"var(--inkSoft)"}}>制度信用</td><td style={{textAlign:"right"}}>{a.shinyouZan.pMBB6||"—"}</td><td style={{textAlign:"right"}}>{a.shinyouZan.pMBS6||"—"}</td><td style={{textAlign:"right"}}>{a.shinyouZan.pMBR6||"—"}倍</td></tr>
+                                <tr><td style={{color:"var(--inkSoft)"}}>一般信用</td><td style={{textAlign:"right"}}>{a.shinyouZan.pMBB3||"—"}</td><td style={{textAlign:"right"}}>{a.shinyouZan.pMBS3||"—"}</td><td style={{textAlign:"right"}}>{a.shinyouZan.pMBR3||"—"}倍</td></tr>
+                              </tbody>
+                            </table>
+                          </div>}
+                          {a.syoukinZan && <div style={{marginTop:10,paddingTop:9,borderTop:"1px solid var(--ruleSoft)"}}>
+                            <div style={{fontSize:12.5,fontWeight:700,color:"var(--ink)",marginBottom:6}}>証金残情報{a.syoukinZan.pSFD&&<span style={{fontWeight:400,color:"var(--inkFaint)",fontSize:11}}>（{a.syoukinZan.pSFD}時点・{a.syoukinZan.pSFKS==="2"?"確報":"速報"}）</span>}</div>
+                            <div style={{fontSize:12.5,color:"var(--ink)",lineHeight:1.8}}>
+                              融資残 <b className="mono">{a.syoukinZan.pSFF6||"—"}</b>（前日比 {a.syoukinZan.pSFG6||"—"}）　貸株残 <b className="mono">{a.syoukinZan.pSFS6||"—"}</b>（前日比 {a.syoukinZan.pSSG6||"—"}）<br/>
+                              差引残 <b className="mono">{a.syoukinZan.pSFN6||"—"}</b>（前日比 {a.syoukinZan.pSFC6||"—"}）　貸借倍率 <b className="mono">{a.syoukinZan.pSFR6||"—"}</b>倍　回転日数 {a.syoukinZan.pSFD6||"—"}日
+                            </div>
+                          </div>}
+                          {a.hibuInfo && <div style={{marginTop:10,paddingTop:9,borderTop:"1px solid var(--ruleSoft)"}}>
+                            <div style={{fontSize:12.5,fontWeight:700,color:"var(--ink)",marginBottom:6}}>逆日歩情報</div>
+                            <div style={{fontSize:12.5,color:"var(--ink)"}}>
+                              {a.hibuInfo.pBWRQ ? <>逆日歩 <b className="mono" style={{color:"var(--down)"}}>{a.hibuInfo.pBWRQ}円</b>（信用売り方は要注意）</> : "逆日歩なし"}
+                            </div>
+                          </div>}
+                          {a.stockNews && a.stockNews.length>0 && <div style={{marginTop:10,paddingTop:9,borderTop:"1px solid var(--ruleSoft)"}}>
+                            <div style={{fontSize:12.5,fontWeight:700,color:"var(--ink)",marginBottom:6}}>ニュース</div>
+                            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                              {a.stockNews.map((n,i)=>
+                                <div key={i} style={{fontSize:12,lineHeight:1.6}}>
+                                  <div style={{fontWeight:700,color:"var(--ink)"}}>{n.headline}{n.published&&<span style={{fontWeight:400,color:"var(--inkFaint)",marginLeft:6,fontSize:10.5}}>{n.published}</span>}</div>
+                                  {n.body && <div style={{color:"var(--inkSoft)",marginTop:2,whiteSpace:"pre-wrap"}}>{n.body}</div>}
+                                </div>)}
+                            </div>
+                          </div>}
                         </div>}
                   </div>;
                 })}

@@ -315,6 +315,7 @@ def get_news_headlines(categories, date_from, date_to, limit=100, use_prod=True)
                 continue
             isl = row.get("p_ISL", "") or ""
             out.append({
+                "id": row.get("p_ID", ""),  # get_news_body()にそのまま渡せば本文が引ける
                 "date": row.get("p_DT", ""),
                 "time": row.get("p_TM", ""),
                 "category": cg,
@@ -324,8 +325,154 @@ def get_news_headlines(categories, date_from, date_to, limit=100, use_prod=True)
     return out
 
 
+def get_stock_news(code, date_from, date_to, limit=20, use_prod=True):
+    """個別銘柄コード指定（p_IS）でニュースヘッダーを問合せる（CLMMfdsGetNewsHead）。
+    get_news_headlines()はカテゴリ横断で取得後にクライアント側でコード一致を絞り込むのに対し、
+    こちらはAPI側で1銘柄に絞ってもらえるため、銘柄分析カードでの1銘柄分の取得に向く。
+    戻り値: [{id,date,time,codes:[...],headline}, ...]（新しい順とは限らないため呼び出し側で整列）。"""
+    sess = _ensure_session(use_prod=use_prod)
+    payload = {
+        "sCLMID": "CLMMfdsGetNewsHead",
+        "p_IS": code,
+        "p_DT_FROM": date_from,
+        "p_DT_TO": date_to,
+        "p_REC_OFST": "0",
+        "p_REC_LIMT": str(limit),
+        "p_no": str(_next_p_no()),
+        "p_sd_date": _now_p_sd_date(),
+        "sJsonOfmt": "5",
+    }
+    resp = _http.request(
+        "POST", sess["sUrlMaster"],
+        body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        retries=urllib3.Retry(total=2, backoff_factor=1.0),
+    )
+    result = json.loads(resp.data.decode("shift_jis", errors="replace"))
+    if result.get("p_errno") not in (None, "0"):
+        return []
+    out = []
+    for row in result.get("aCLMMfdsNewsHead", []):
+        headline = _decode_headline(row.get("p_HDL", ""))
+        if not headline:
+            continue
+        isl = row.get("p_ISL", "") or ""
+        out.append({
+            "id": row.get("p_ID", ""),
+            "date": row.get("p_DT", ""),
+            "time": row.get("p_TM", ""),
+            "codes": [c for c in isl.split("|") if c],
+            "headline": headline,
+        })
+    return out
+
+
+def get_news_body(news_id, use_prod=True):
+    """ニュースID（get_news_headlines/get_stock_newsのid）から本文（CLMMfdsGetNewsBody）を取得する。
+    取得失敗・該当なしの場合は空文字を返す。"""
+    if not news_id:
+        return ""
+    sess = _ensure_session(use_prod=use_prod)
+    payload = {
+        "sCLMID": "CLMMfdsGetNewsBody",
+        "p_ID": news_id,
+        "p_no": str(_next_p_no()),
+        "p_sd_date": _now_p_sd_date(),
+        "sJsonOfmt": "5",
+    }
+    resp = _http.request(
+        "POST", sess["sUrlMaster"],
+        body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        retries=urllib3.Retry(total=2, backoff_factor=1.0),
+    )
+    result = json.loads(resp.data.decode("shift_jis", errors="replace"))
+    if result.get("p_errno") not in (None, "0"):
+        return ""
+    rows = result.get("aCLMMfdsNewsBody", [])
+    if not rows:
+        return ""
+    return _decode_headline(rows[0].get("p_TX", ""))  # p_TXも見出しと同じBASE64+URLエンコード方式
+
+
+MFDS_ISSUE_CHUNK = 120  # sTargetIssueCodeは最大120銘柄まで（超過分は取引所側で無視される）
+
+
+def _mfds_issue_query(clmid, codes, list_key, use_prod=True):
+    """CLMMfdsGetIssueDetail・CLMMfdsGetSyoukinZan・CLMMfdsGetShinyouZan・CLMMfdsGetHibuInfo共通の
+    「銘柄コードをカンマ区切りで渡し、配列で返ってくる」問合せ処理。応答を銘柄コードキーの辞書にして返す。"""
+    sess = _ensure_session(use_prod=use_prod)
+
+    def _do(sess):
+        payload = {
+            "sCLMID": clmid,
+            "sTargetIssueCode": ",".join(codes),
+            "p_no": str(_next_p_no()),
+            "p_sd_date": _now_p_sd_date(),
+            "sJsonOfmt": "5",
+        }
+        resp = _http.request(
+            "POST", sess["sUrlMaster"],
+            body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            retries=urllib3.Retry(total=2, backoff_factor=1.0),
+        )
+        return json.loads(resp.data.decode("shift_jis", errors="replace"))
+
+    result = _do(sess)
+    if result.get("p_errno") not in (None, "0"):
+        sess = _ensure_session(use_prod=use_prod, force=True)
+        result = _do(sess)
+        if result.get("p_errno") not in (None, "0"):
+            return {}
+    out = {}
+    for row in result.get(list_key, []):
+        code = row.get("sIssueCode")
+        if code:
+            out[code] = row
+    return out
+
+
+def _mfds_issue_query_chunked(clmid, codes, list_key, use_prod=True):
+    out = {}
+    codes = [c for c in dict.fromkeys(codes) if c]
+    for i in range(0, len(codes), MFDS_ISSUE_CHUNK):
+        try:
+            out.update(_mfds_issue_query(clmid, codes[i:i + MFDS_ISSUE_CHUNK], list_key, use_prod=use_prod))
+        except Exception as e:
+            print(f"  {clmid} 取得失敗", e)
+    return out
+
+
+def get_issue_detail(codes, use_prod=True):
+    """銘柄詳細情報（CLMMfdsGetIssueDetail）：PER・PBR・EPS・BPS・ROE・配当利回り・年初来高値安値等。
+    戻り値: {code: {sIssueCode, pBPSB, pCLOE, pEPSF, pEXRD, pIDVE, pROEL, pRPER, pSPBR, pSPRO, pSYIE,
+    pYHPD, pYHPR, pYLPD, pYLPR}}（項目の意味はPDF仕様書参照。空文字は値なしの意味）。"""
+    return _mfds_issue_query_chunked("CLMMfdsGetIssueDetail", codes, "aCLMMfdsIssueDetail", use_prod=use_prod)
+
+
+def get_syoukin_zan(codes, use_prod=True):
+    """証金残情報（CLMMfdsGetSyoukinZan）：日証金の融資残・貸株残・回転日数・貸借倍率等。
+    戻り値: {code: {sIssueCode, pSFC6, pSFD, pSFD6, pSFF6, pSFG6, pSFKS, pSFL6, pSFN6, pSFP6, pSFR6,
+    pSFS6, pSSG6, pSSL6, pSSP6}}。"""
+    return _mfds_issue_query_chunked("CLMMfdsGetSyoukinZan", codes, "aCLMMfdsSyoukinZan", use_prod=use_prod)
+
+
+def get_shinyou_zan(codes, use_prod=True):
+    """信用残情報（CLMMfdsGetShinyouZan）：信用買残・売残（一般/制度/合算）・信用倍率等。
+    戻り値: {code: {sIssueCode, pMBB3, pMBB6, pMBBQ, pMBC3, pMBC6, pMBCQ, pMBD, pMBN3, pMBN6, pMBNQ,
+    pMBR3, pMBR6, pMBRQ, pMBS3, pMBS6, pMBSQ}}。"""
+    return _mfds_issue_query_chunked("CLMMfdsGetShinyouZan", codes, "aCLMMfdsShinyouZan", use_prod=use_prod)
+
+
+def get_hibu_info(codes, use_prod=True):
+    """逆日歩情報（CLMMfdsGetHibuInfo）。戻り値: {code: {sIssueCode, pBWRQ}}（pBWRQ=逆日歩）。"""
+    return _mfds_issue_query_chunked("CLMMfdsGetHibuInfo", codes, "aCLMMfdsHibuInfo", use_prod=use_prod)
+
+
 def _decode_headline(hdl):
-    """p_HDL（ShiftJISをURLエンコード→BASE64化された見出し）を元の文字列に戻す。"""
+    """p_HDL・p_TX（ShiftJISをURLエンコード→BASE64化された文字列）を元の文字列に戻す。
+    ニュース見出し・本文どちらも同じエンコード方式のため共用する。"""
     if not hdl:
         return ""
     try:
