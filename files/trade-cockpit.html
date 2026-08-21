@@ -514,7 +514,7 @@ const emptyState=()=>({
   stockNews:"",marketNews:"", // 旧フロント・バックアップ互換のためのテキスト版ニュース（7章で市況メモ等のUIは削除済み、フィールドのみ残置）
   stockNewsList:[], macroNewsList:[], macroNewsDomestic:[], macroNewsOverseas:[], usStockNewsList:[], stockQuotes:{},
   usQuotesFetchedDate:"", // アメリカ市場の自動更新（毎朝6時・1日1回）が今日すでに実行済みかの判定用
-  breakoutLevels:{}, // 出来高ブレイクアウト判定の基準値（{code:{high20,volAvg5}}）。1日1回計算。
+  breakoutLevels:{}, // 出来高ブレイクアウト判定の基準値（{code:{highLookback,volAvg5}}）。1日1回計算。
   breakoutLevelsFetchedDate:"", // 上記が今日すでに計算済みかの判定用
   stockNameNewsList:[], usStockNameNewsList:[], // ニュースタブ「登録銘柄」サブタブ：IR以外も含む社名一致ニュース
   disclosureNewsList:[], usDisclosureNewsList:[], // ニュースタブ「適時開示」サブタブ：当日含む直近10日分・種類問わず全件
@@ -864,7 +864,7 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                   <td style={{textAlign:"center",whiteSpace:"nowrap"}}>
                     <button className="action-btn" style={{marginRight:5}} onClick={()=>onOpenChart(w)}>チャート</button>
                     <button className={"action-btn"+(inAnalysis?" on":"")} style={{marginRight:5}} onClick={()=>onToggleAnalysis(w.code)}>{inAnalysis?"✓ 分析中":"分析"}</button>
-                    <button className={"action-btn"+(inWatch?" on":"")} style={{marginRight:5}} onClick={()=>onToggleWatch(w.code)} title="「監視銘柄」タブでまとめて確認する対象にする">{inWatch?"✓ 監視銘柄":"監視銘柄"}</button>
+                    {market==="JP" && <button className={"action-btn"+(inWatch?" on":"")} style={{marginRight:5}} onClick={()=>onToggleWatch(w.code)} title="「監視銘柄」タブでまとめて確認する対象にする（日本市場のみ）">{inWatch?"✓ 監視銘柄":"監視銘柄"}</button>}
                     {market==="JP" && <button className={"action-btn"+(inEarnings?" on":"")} style={{marginRight:5}} onClick={()=>onToggleEarnings(w.code)}>{inEarnings?"✓ 決算":"決算"}</button>}
                     <button className="iconbtn" style={{color:c.level>0?c.fg:"var(--inkSoft)"}} onClick={()=>delStock(w.id)}>×</button>
                   </td>
@@ -892,10 +892,10 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
   }),[items,stockQuotes]);
   return <div style={{marginTop:18}}>
     <div className="sec-head">監視銘柄　{items.length}件</div>
-    <div className="sec-note">「日本市場」「アメリカ市場」タブの「監視銘柄」ボタン、または出来高ブレイクアウト条件（直近20営業日高値を出来高1.5倍以上で上抜け）への自動該当で追加されます。</div>
+    <div className="sec-note">「日本市場」タブの「監視銘柄」ボタン、または出来高ブレイクアウト条件（直近3か月高値を出来高1.5倍以上で上抜け）への自動該当で追加されます（日本市場のみ対象）。</div>
     <div style={{marginTop:12,border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,overflow:"hidden"}}>
       {sorted.length===0 ?
-        <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13}}>監視銘柄はまだありません。「日本市場」「アメリカ市場」タブの一覧で「監視銘柄」ボタンを押すと、ここに追加されます。</div> :
+        <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13}}>監視銘柄はまだありません。「日本市場」タブの一覧で「監視銘柄」ボタンを押すと、ここに追加されます。</div> :
         <div style={{overflowX:"auto"}}><table style={{minWidth:860}}>
           <thead><tr style={{background:"var(--band)"}}><th>コード</th><th>銘柄</th><th>テーマ</th><th>現在値</th><th>前日比</th><th>高値</th><th>安値</th><th></th></tr></thead>
           <tbody>{sorted.map(w=>{
@@ -1122,8 +1122,8 @@ function App(){
     setUsFetching(false);
   };
 
-  // 出来高ブレイクアウト（直近20営業日高値を5日平均出来高の1.5倍以上で上抜け）の基準値を
-  // 取得する。銘柄分析タブのentry算出と同じ定義（server.pyのget_breakout_levels）。
+  // 出来高ブレイクアウト（直近3か月高値を5日平均出来高の1.5倍以上で上抜け。2026-08-21：参照期間を
+  // 20営業日→3か月に変更）の基準値を取得する。銘柄分析タブのentry算出と同じ定義（server.pyのget_breakout_levels）。
   // 基準値自体は日中変わらないため1日1回だけ取得し、現在値との比較は下のuseMemoで毎回軽く行う
   // （2026-08-20 ユーザー要望：登録銘柄全体を対象にしたブレイクアウトの機械的なアラート）。
   const fetchBreakoutLevels=async(watchlistSubset)=>{
@@ -1193,7 +1193,9 @@ function App(){
   // 12章：分析タブの対象銘柄（日本市場・アメリカ市場どちらの登録銘柄からも追加され得る）
   const allWatch=useMemo(()=>[...s.watchlist,...s.watchlistUS],[s.watchlist,s.watchlistUS]);
   const analysisItems=useMemo(()=>s.analysisTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean),[s.analysisTargets,allWatch]);
-  const watchTargetItems=useMemo(()=>s.watchTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean),[s.watchTargets,allWatch]);
+  // 2026-08-21 ユーザー要望：監視銘柄は日本市場に限定（アメリカ市場タブの「監視銘柄」ボタンは
+  // 撤去済みだが、念のためここでも日本株以外は除外しておく）。
+  const watchTargetItems=useMemo(()=>s.watchTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean).filter(w=>w.market==="JP"),[s.watchTargets,allWatch]);
   const [analyzing,setAnalyzing]=useState(false);
   const fetchAnalysisFor=async(items)=>{
     if(!items||!items.length)return;
@@ -1277,9 +1279,10 @@ function App(){
   },[sectorLaggards]);
 
   // 出来高ブレイクアウト（登録銘柄全体・日本株のみ）：get_breakout_levels()で1日1回計算した
-  // 基準値（high20・volAvg5）と、30秒おきに更新される現在値(t)・当日出来高(volume)を比較する
-  // 軽い処理。analyze_stock()のbreakout_confirmedと同一基準（直近20営業日高値を、5日平均出来高の
-  // 1.5倍以上の出来高を伴って上抜け）。sectorLaggardsと同じく登録銘柄全体が対象（2026-08-20 ユーザー要望）。
+  // 基準値（highLookback・volAvg5）と、30秒おきに更新される現在値(t)・当日出来高(volume)を比較する
+  // 軽い処理。analyze_stock()のbreakout_confirmedと同一基準（直近3か月高値を、5日平均出来高の
+  // 1.5倍以上の出来高を伴って上抜け。2026-08-21：参照期間を20営業日→3か月に変更）。
+  // sectorLaggardsと同じく登録銘柄全体が対象（2026-08-20 ユーザー要望）。
   const breakoutAlerts=useMemo(()=>{
     const out=[];
     s.watchlist.forEach(w=>{
@@ -1289,8 +1292,8 @@ function App(){
       const t=num(qt.t),vol=num(qt.volume);
       if(t==null||vol==null)return;
       const volRatio=levels.volAvg5?vol/levels.volAvg5:null;
-      if(t>levels.high20 && volRatio!=null && volRatio>=1.5){
-        out.push({code:w.code,name:w.name,high20:levels.high20,t,volRatio});
+      if(t>levels.highLookback && volRatio!=null && volRatio>=1.5){
+        out.push({code:w.code,name:w.name,highLookback:levels.highLookback,t,volRatio});
       }
     });
     return out;
@@ -1304,7 +1307,7 @@ function App(){
       if(s.watchTargets.includes(item.code))return;
       setS(p=>p.watchTargets.includes(item.code)?p:{...p,watchTargets:[...p.watchTargets,item.code]});
       notifyDesktop(`▲ ${item.name} ${item.code}：出来高ブレイクアウト→監視銘柄に追加`,
-        `直近20営業日高値${item.high20.toLocaleString()}を出来高${item.volRatio.toFixed(1)}倍で上抜け`);
+        `直近3か月高値${item.highLookback.toLocaleString()}を出来高${item.volRatio.toFixed(1)}倍で上抜け`);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[breakoutAlerts]);

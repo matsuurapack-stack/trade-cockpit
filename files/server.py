@@ -1496,13 +1496,18 @@ def _tachibana_daily_arrays(code):
     return closes, opens, highs, lows, volumes
 
 
+# 2026-08-21 ユーザー要望：出来高ブレイクアウト判定の高値の参照期間を「直近20営業日」から
+# 「直近3か月」に変更。1か月≒21営業日として3か月分=63営業日とする。
+BREAKOUT_LOOKBACK_DAYS = 63
+
+
 def get_breakout_levels(watchlist):
-    """登録銘柄（日本株）ごとに、出来高ブレイクアウト判定に使う基準値（直近20営業日高値・
-    直近5日平均出来高）だけを軽量に返す。analyze_stock()と同じ定義（20営業日高値、5日平均
+    """登録銘柄（日本株）ごとに、出来高ブレイクアウト判定に使う基準値（直近3か月高値・
+    直近5日平均出来高）だけを軽量に返す。analyze_stock()と同じ定義（3か月高値、5日平均
     出来高の1.5倍）だが、RSI・ボリンジャー・PDF解析等は一切行わないため大幅に軽い。
     この基準値は日中変わらないため、フロント側は1日1回だけ呼べばよい（30秒おきの現在値更新の
     たびにここを叩く必要はない。現在値との比較はフロント側で行う）。
-    戻り値：{code: {high20, volAvg5}}（取得失敗した銘柄は含まれない＝機械的にスキップ）。"""
+    戻り値：{code: {highLookback, volAvg5}}（取得失敗した銘柄は含まれない＝機械的にスキップ）。"""
     out = {}
     for w in watchlist:
         if w.get("market", "JP") == "US":
@@ -1514,13 +1519,13 @@ def get_breakout_levels(watchlist):
         if not arrays:
             continue
         _closes, _opens, highs, _lows, volumes = arrays
-        # 当日分は_tachibana_daily_arrays()が末尾に合成しているため、直近20営業日高値・5日平均
-        # 出来高は「当日を含まない」直近の確定済み日から数える（[-21:-1]は当日を除いた20日分）。
-        if len(highs) < 21 or len(volumes) < 6:
+        # 当日分は_tachibana_daily_arrays()が末尾に合成しているため、直近3か月高値・5日平均
+        # 出来高は「当日を含まない」直近の確定済み日から数える（[-(N+1):-1]は当日を除いたN日分）。
+        if len(highs) < BREAKOUT_LOOKBACK_DAYS + 1 or len(volumes) < 6:
             continue
-        high20 = max(highs[-21:-1])
+        high_lookback = max(highs[-(BREAKOUT_LOOKBACK_DAYS + 1):-1])
         vol_avg5 = sum(volumes[-6:-1]) / 5
-        out[code] = {"high20": round(high20, 2), "volAvg5": round(vol_avg5, 0)}
+        out[code] = {"highLookback": round(high_lookback, 2), "volAvg5": round(vol_avg5, 0)}
     return out
 
 
@@ -1684,11 +1689,12 @@ def analyze_stock(w, market_env=None):
     change_1w = (current - closes[-6]) / closes[-6] * 100 if n >= 6 and closes[-6] else None
 
     # ---- ユーザー要望(2026-08-20)：「購入単価（目安）」は下で拾う（押し目）のではなく、上昇
-    # トレンドで出来高を伴って直近高値を上抜けた水準を採用する。直近20営業日高値（当日を含まない）
-    # を、直近5日平均の1.5倍以上の出来高（既存vol_surgeと同一基準）を伴って上抜けていれば
-    # ブレイクアウト成立とし、その高値をentryに採用する（後段で最終的に上書き。既存の初押し等の
-    # 細かいエントリー判定はそのまま残し、ブレイクアウト成立時だけ優先表示する）。----
-    breakout_lookback_high = max(highs[-21:-1]) if len(highs) >= 21 else None
+    # トレンドで出来高を伴って直近高値を上抜けた水準を採用する。直近3か月高値（当日を含まない。
+    # 2026-08-21：参照期間を20営業日→3か月＝BREAKOUT_LOOKBACK_DAYS営業日に変更）を、直近5日
+    # 平均の1.5倍以上の出来高（既存vol_surgeと同一基準）を伴って上抜けていればブレイクアウト成立
+    # とし、その高値をentryに採用する（後段で最終的に上書き。既存の初押し等の細かいエントリー
+    # 判定はそのまま残し、ブレイクアウト成立時だけ優先表示する）。----
+    breakout_lookback_high = max(highs[-(BREAKOUT_LOOKBACK_DAYS + 1):-1]) if len(highs) >= BREAKOUT_LOOKBACK_DAYS + 1 else None
     breakout_confirmed = bool(breakout_lookback_high is not None and vol_surge and current > breakout_lookback_high)
     vol_ratio_for_breakout = (volumes[-1] / vol_avg5) if (vol_avg5 and breakout_confirmed) else None
 
@@ -2040,12 +2046,12 @@ def analyze_stock(w, market_env=None):
     if breakout_confirmed:
         entry = breakout_lookback_high
         entry_reasons = [
-            f"直近20営業日高値({breakout_lookback_high:.1f})を、5日平均出来高の{vol_ratio_for_breakout:.1f}倍の"
+            f"直近3か月高値({breakout_lookback_high:.1f})を、5日平均出来高の{vol_ratio_for_breakout:.1f}倍の"
             f"出来高を伴って上抜け。押し目を待たず、上昇トレンドのブレイクアウト水準を目安値に採用。"
         ]
         entry_pattern = {
-            "key": "breakout20high",
-            "label": f"出来高ブレイクアウト（直近20営業日高値{breakout_lookback_high:.1f}を出来高{vol_ratio_for_breakout:.1f}倍で上抜け）",
+            "key": "breakoutLookbackHigh",
+            "label": f"出来高ブレイクアウト（直近3か月高値{breakout_lookback_high:.1f}を出来高{vol_ratio_for_breakout:.1f}倍で上抜け）",
         }
 
     # ---- 損切り単価(目安)：ATR相当(当日実測 or 日次ATR)の1倍を損切り幅の目安とする（ザラ場内で許容できる下振れ）。
