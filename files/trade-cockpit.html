@@ -441,6 +441,15 @@ const DEFAULT_WATCHLIST=(()=>{const seen=new Set();return MASTER.filter(m=>m.mar
 // 初期登録銘柄（アメリカ市場）：MASTERのダウ平均構成30社をそのまま初期値にする（6-1章）。
 const DEFAULT_WATCHLIST_US=(()=>{const seen=new Set();return MASTER.filter(m=>m.market==="US"&&!m.extra&&m.code&&!seen.has(m.code)&&seen.add(m.code))
   .map(m=>({id:m.code,...m,watch:"通常",note:"",theme:""}));})();
+// マイルールの初期値（旧・固定リマインド文を分割）。ユーザーが「記録」タブで追加・編集・削除できる。
+const DEFAULT_MY_RULES=[
+  "最優先は負けないこと",
+  "逆指値は絶対に下げない",
+  "基本は持ち越さない（自信ある銘柄のみ例外）",
+  "ノートレードも立派な判断",
+  "銘柄選びの優先順位：①半導体 → ②AI関連 → ③当日最強セクター（日次モニターのセクター売買代金順を参照） → ④材料株",
+  "年初にテーマを決め、代表的な大型株を継続的に監視する",
+];
 const emptyState=()=>({
   date:todayISO(), watchlist:DEFAULT_WATCHLIST, watchlistUS:DEFAULT_WATCHLIST_US, metrics:emptyMetrics(),
   stockNews:"",marketNews:"", // 旧フロント・バックアップ互換のためのテキスト版ニュース（7章で市況メモ等のUIは削除済み、フィールドのみ残置）
@@ -458,6 +467,10 @@ const emptyState=()=>({
   notifyEnabled:true, // 10-5章：重要ニュース通知バナーのオン/オフ
   settings:{totalCapital:"",riskPct:1}, // 資金管理：総資金・1トレードの許容損失%（銘柄分析タブの株数計算に使用）
   journal:[], // 売買記録（トレードジャーナル）。1件＝{id,createdAt,code,name,action,price,shares,entryPlan,marketEnvAtEntry,reason,result,lessonNote}
+  // マイルール：追加・オンオフ・削除できる自分のトレードルール一覧。1件＝{id,text,active,createdAt}。
+  // 「記録」タブの学び（lessonNote）から「マイルールに追加」ボタンで随時アップデートできる
+  // （2026-08-20 ユーザー要望：良いトレード・気づきの都度マイルールを育てたい）。
+  myRules:DEFAULT_MY_RULES.map((text,i)=>({id:"default-"+i,text,active:true,createdAt:null})),
 });
 // 1章：255社デフォルトを後から追加したため、既にlocalStorageに保存済みだったユーザーは
 // 保存データの登録銘柄がそのまま優先され、新しいデフォルト銘柄が反映されないケースがある。
@@ -1268,6 +1281,17 @@ function App(){
   const updateJournalEntry=(id,patch)=>setS(p=>({...p,journal:p.journal.map(j=>j.id===id?{...j,...patch}:j)}));
   const deleteJournalEntry=(id)=>{if(!confirm("この記録を削除しますか？"))return;setS(p=>({...p,journal:p.journal.filter(j=>j.id!==id)}));};
 
+  // マイルール：追加・オンオフ・削除。良いトレード・気づきの都度アップデートできるようにする
+  // （2026-08-20 ユーザー要望）。トグルで一時的に無効化もできる（削除せず参照だけ残したい場合）。
+  const [newRuleText,setNewRuleText]=useState("");
+  const addMyRule=(text)=>{
+    const t=(text||"").trim();
+    if(!t)return;
+    setS(p=>({...p,myRules:[{id:Date.now()+Math.random(),text:t,active:true,createdAt:new Date().toISOString()},...p.myRules]}));
+  };
+  const toggleMyRule=(id)=>setS(p=>({...p,myRules:p.myRules.map(r=>r.id===id?{...r,active:!r.active}:r)}));
+  const deleteMyRule=(id)=>setS(p=>({...p,myRules:p.myRules.filter(r=>r.id!==id)}));
+
   const rollToNextDay=()=>{if(!confirm("今日の値を前日値へ繰り越し、新しい一日にします（登録銘柄・分析対象銘柄は保持）。よろしいですか？"))return;
     setS(p=>({...emptyState(),date:todayISO(),watchlist:p.watchlist,watchlistUS:p.watchlistUS,analysisTargets:p.analysisTargets,
       autoScanEnabled:p.autoScanEnabled,
@@ -1733,13 +1757,34 @@ function App(){
         <div className="sec-head">記録</div>
         <div className="sec-note">エントリー理由・相場環境・撤退条件を記録し、後から結果と学びを追記します。データはこの端末のブラウザにのみ保存されます（サーバーには送信されません）。</div>
 
-        {/* 自身のトレードルール（trading_rules.md）：常に忘れないための固定リマインド。
-            2026-08-20：銘柄分析タブをすっきりさせるためこちらに移設。 */}
-        <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14,fontSize:12,lineHeight:1.8,color:"var(--inkSoft)"}}>
-          <div style={{fontWeight:700,color:"var(--ink)",marginBottom:4}}>自分のトレードルール（要点）</div>
-          最優先は負けないこと・<b style={{color:"var(--ink)"}}>逆指値は絶対に下げない</b>・基本は持ち越さない（自信ある銘柄のみ例外）・ノートレードも立派な判断。
-          <div style={{marginTop:6}}>銘柄選びの優先順位：①半導体 → ②AI関連 → ③当日最強セクター（日次モニターのセクター売買代金順を参照） → ④材料株。年初にテーマを決め、代表的な大型株を継続的に監視する。</div>
-          <div style={{marginTop:6,fontSize:11,color:"var(--inkFaint)"}}>エントリー・利確・損切りの詳細な判断基準（押し目/高値ブレイク、飛び付き買い禁止、利確シグナル、移動平均線の解釈など）は、銘柄分析タブの各銘柄の分析結果に自動反映されています。</div>
+        {/* マイルール：追加・オンオフ・削除できる自分のトレードルール一覧。2026-08-20：
+            固定リマインド文をやめ、良いトレード・気づきの都度育てられる形にした。
+            エントリー・利確・損切りの機械的な判定（押し目/高値ブレイク・出来高ブレイクアウト等）は
+            別物として銘柄分析タブの各カードに自動反映されている（このマイルールは自由記述の
+            自己ルールで、ここでの自動判定はしない）。 */}
+        <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+            <div style={{fontWeight:700,color:"var(--ink)",fontSize:13}}>マイルール</div>
+            <span style={{fontSize:11,color:"var(--inkFaint)"}}>{s.myRules.filter(r=>r.active).length}/{s.myRules.length}件 有効</span>
+          </div>
+          <div style={{display:"flex",gap:8,marginBottom:10}}>
+            <input value={newRuleText} onChange={e=>setNewRuleText(e.target.value)}
+              onKeyDown={e=>{if(e.key==="Enter"){addMyRule(newRuleText);setNewRuleText("");}}}
+              placeholder="新しいルールを追加（例：決算またぎは自信がある銘柄のみ）"
+              style={{flex:1,fontSize:12.5,padding:"6px 8px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}/>
+            <button className="btn" onClick={()=>{addMyRule(newRuleText);setNewRuleText("");}}>追加</button>
+          </div>
+          {s.myRules.length===0
+            ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>まだルールがありません。上の欄から追加するか、下の記録の「学び」から追加できます。</div>
+            : <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                {s.myRules.map(r=>
+                  <label key={r.id} style={{display:"flex",alignItems:"center",gap:8,fontSize:12.5,padding:"4px 2px",
+                      color:r.active?"var(--ink)":"var(--inkFaint)",textDecoration:r.active?"none":"line-through"}}>
+                    <input type="checkbox" checked={r.active} onChange={()=>toggleMyRule(r.id)}/>
+                    <span style={{flex:1}}>{r.text}</span>
+                    <button className="iconbtn" title="削除" onClick={()=>deleteMyRule(r.id)}>×</button>
+                  </label>)}
+              </div>}
         </div>
         {/* 資金管理・分割買いツール：総資金とリスク許容%から、銘柄分析タブの各カードの損切り幅に
             応じた株数目安を計算する。値はsettingsとしてlocalStorageに自動保存される。
@@ -1856,6 +1901,8 @@ function App(){
                     <textarea value={j.lessonNote} onChange={e=>updateJournalEntry(j.id,{lessonNote:e.target.value})}
                       rows={2} style={{display:"block",width:"100%",fontSize:12,padding:6,marginTop:4,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}/>
                   </label>
+                  {j.lessonNote?.trim() && <button className="action-btn" style={{marginTop:6}}
+                      onClick={()=>addMyRule(j.lessonNote)}>＋ この学びをマイルールに追加</button>}
                 </div>)}
               </div>
             </>}
