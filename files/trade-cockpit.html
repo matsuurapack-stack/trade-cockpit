@@ -445,6 +445,7 @@ const emptyState=()=>({
   date:todayISO(), watchlist:DEFAULT_WATCHLIST, watchlistUS:DEFAULT_WATCHLIST_US, metrics:emptyMetrics(),
   stockNews:"",marketNews:"", // 旧フロント・バックアップ互換のためのテキスト版ニュース（7章で市況メモ等のUIは削除済み、フィールドのみ残置）
   stockNewsList:[], macroNewsList:[], macroNewsDomestic:[], macroNewsOverseas:[], usStockNewsList:[], stockQuotes:{},
+  usQuotesFetchedDate:"", // アメリカ市場の自動更新（毎朝6時・1日1回）が今日すでに実行済みかの判定用
   stockNameNewsList:[], usStockNameNewsList:[], // ニュースタブ「登録銘柄」サブタブ：IR以外も含む社名一致ニュース
   disclosureNewsList:[], usDisclosureNewsList:[], // ニュースタブ「適時開示」サブタブ：当日含む直近10日分・種類問わず全件
   snsNewsList:[], usSnsNewsList:[], // ニュースタブ「SNS」サブタブ：@kanpo_blogの投稿のうち登録銘柄に言及したもの
@@ -531,7 +532,7 @@ function SourceThumb({source,style}){
 // 10-5章：announcements(運営からの新着情報)を渡すと、ニュース一覧の間に自然に挟み込んで表示する。
 // interval件ごとに1件挟む（末尾到達で先頭に戻る簡易ローテーション）。
 function NewsList({items,showName}){
-  if(!items||!items.length) return <div className="news-empty">まだ取得していません。ブリーフィングの「リアルタイムデータを反映」を押してください。</div>;
+  if(!items||!items.length) return <div className="news-empty">まだ取得していません。自動更新（起動直後・1時間おき）をお待ちください。</div>;
   return <div className="news-list">
     {items.map((it,i)=>{
       const meta=[showName?it.name:null,it.source,it.published].filter(Boolean).join(" ・ ");
@@ -878,13 +879,19 @@ function App(){
 
   useEffect(()=>{try{localStorage.setItem(KEY,JSON.stringify(s));}catch{}},[s]);
 
-  const showConnError=()=>alert("サーバーに接続できません。start.bat を実行し、開いた http://localhost:8765/trade-cockpit.html のページで使ってください。");
   const nowHHMM=()=>{const d=new Date();return `${d.getHours()}:${String(d.getMinutes()).padStart(2,"0")}`;};
 
-  // ニュース（登録銘柄IR＋国内/海外市況）を取得する。refreshAll（全タブ連動）から呼ばれる。
+  // 手動更新ボタンを廃止し、タブごとに決まった間隔で自動更新する方式に変更（2026-08-20
+  // ユーザー要望）。setInterval/setTimeoutのコールバックは初回マウント時のsを掴んだまま
+  // 古くなる（stale closure）ため、常に最新のsを読めるようsRefを介して参照する。
+  const sRef=useRef(s);
+  useEffect(()=>{sRef.current=s;},[s]);
+
+  // ニュース（登録銘柄IR＋国内/海外市況）を取得する。1時間おきの自動更新から呼ばれる。
   const fetchNewsOnly=async()=>{
+    const cur=sRef.current;
     try{
-      const nr=await fetch("/api/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlist)});
+      const nr=await fetch("/api/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(cur.watchlist)});
       if(nr.ok){const nd=await nr.json();
         setS(p=>({...p,
           stockNewsList:Array.isArray(nd.stockNews)?nd.stockNews:p.stockNewsList,
@@ -897,7 +904,7 @@ function App(){
           stockNews:nd.stockNewsText||p.stockNews,marketNews:nd.macroNewsText||p.marketNews}));}
     }catch(e){}
     try{
-      const nru=await fetch("/api/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlistUS)});
+      const nru=await fetch("/api/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(cur.watchlistUS)});
       if(nru.ok){const ndu=await nru.json();
         setS(p=>({...p,
           usStockNewsList:Array.isArray(ndu.stockNews)?ndu.stockNews:p.usStockNewsList,
@@ -905,67 +912,82 @@ function App(){
           usDisclosureNewsList:Array.isArray(ndu.disclosureNews)?ndu.disclosureNews:p.usDisclosureNewsList,
           usSnsNewsList:Array.isArray(ndu.snsNews)?ndu.snsNews:p.usSnsNewsList}));}
     }catch(e){}
+    setNewsMsg(nowHHMM()+" 自動更新");
   };
   const [newsFetching,setNewsFetching]=useState(false);
+  const [newsMsg,setNewsMsg]=useState("");
 
-  // 5章：どのタブの「リアルタイムデータを反映」ボタンを押しても、日次モニター・日本市場・
-  // アメリカ市場・ニュースの4タブすべて（＋分析タブの対象銘柄の再計算）を同時に更新する。
-  const refreshAll=async()=>{
-    setMonitorFetching(true);setMonitorMsg("取得中…");
-    setJpFetching(true);setJpMsg("取得中…");
-    setUsFetching(true);setUsMsg("取得中…");
-    setNewsFetching(true);
-    let mergedQuotes=s.stockQuotes;
-    let hadError=false;
-    // 指数・日本株(277社)・米国株(30社)を同時並行で叩くとyfinance/Yahoo側のレート制限に
-    // 引っかかりやすく、1つの失敗がPromise.allで全体を巻き込んで「サーバーに接続できません」
-    // が誤って出てしまっていたため、逐次実行にし、1つ失敗しても他は続行するようにした。
+  // 日次モニター（指数・為替等）＋日本市場（登録銘柄の現在値）を30秒おきに自動更新する。
+  const fetchMonitorAndJP=async()=>{
+    setMonitorFetching(true);setJpFetching(true);
     try{
       const qr=await fetch("/api/quotes");
-      if(!qr.ok) throw new Error("quotes");
-      const qd=await qr.json();
-      setS(p=>{const nm={...p.metrics};
-        Object.entries(qd.quotes||{}).forEach(([k,v])=>{
-          if(nm[k]!=null&&v){nm[k]={...nm[k],
-            t:(v.t!=null?String(v.t):nm[k].t),
-            p:(v.p!=null?String(v.p):nm[k].p),
-            spark:(Array.isArray(v.spark)?v.spark:nm[k].spark)};}
-        });
-        return {...p,metrics:nm};});
-      setMonitorMsg((qd.fetchedAt||nowHHMM())+" 取得完了");
-    }catch(e){hadError=true;setMonitorMsg("");}
-
+      if(qr.ok){
+        const qd=await qr.json();
+        setS(p=>{const nm={...p.metrics};
+          Object.entries(qd.quotes||{}).forEach(([k,v])=>{
+            if(nm[k]!=null&&v){nm[k]={...nm[k],
+              t:(v.t!=null?String(v.t):nm[k].t),
+              p:(v.p!=null?String(v.p):nm[k].p),
+              spark:(Array.isArray(v.spark)?v.spark:nm[k].spark)};}
+          });
+          return {...p,metrics:nm};});
+        setMonitorMsg((qd.fetchedAt||nowHHMM())+" 自動更新");
+      }
+    }catch(e){}
     try{
-      const srJP=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlist)});
-      if(!srJP.ok) throw new Error("stock-quotes-jp");
-      const sdJP=await srJP.json();
-      mergedQuotes={...mergedQuotes,...(sdJP.quotes||{})};
-      setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sdJP.quotes||{})}}));
-      setJpMsg(nowHHMM()+" 取得完了");
-    }catch(e){hadError=true;setJpMsg("");}
-
-    try{
-      const srUS=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlistUS)});
-      if(!srUS.ok) throw new Error("stock-quotes-us");
-      const sdUS=await srUS.json();
-      mergedQuotes={...mergedQuotes,...(sdUS.quotes||{})};
-      setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sdUS.quotes||{})}}));
-      setUsMsg(nowHHMM()+" 取得完了");
-    }catch(e){hadError=true;setUsMsg("");}
-
-    try{ await fetchNewsOnly(); }catch(e){hadError=true;}
-    setNewsFetching(false);
-
-    if(analysisItems.length){
-      setJpMsg("分析データを再計算中…");setUsMsg("分析データを再計算中…");
-      await fetchAnalysisFor(analysisItems,mergedQuotes);
-      const doneAt=nowHHMM()+" 取得完了";
-      setJpMsg(doneAt);setUsMsg(doneAt);
-    }
-    setMonitorFetching(false);setJpFetching(false);setUsFetching(false);
-    if(hadError)showConnError();
+      const srJP=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(sRef.current.watchlist)});
+      if(srJP.ok){
+        const sdJP=await srJP.json();
+        setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sdJP.quotes||{})}}));
+        setJpMsg(nowHHMM()+" 自動更新");
+      }
+    }catch(e){}
+    setMonitorFetching(false);setJpFetching(false);
   };
-  const anyFetching=monitorFetching||jpFetching||usFetching||newsFetching;
+
+  // アメリカ市場（登録銘柄の現在値）は朝6時（日本時間・端末時刻基準）に1日1回だけ自動更新する。
+  const fetchUS=async()=>{
+    setUsFetching(true);
+    try{
+      const srUS=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(sRef.current.watchlistUS)});
+      if(srUS.ok){
+        const sdUS=await srUS.json();
+        setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sdUS.quotes||{})},usQuotesFetchedDate:todayISO()}));
+        setUsMsg(nowHHMM()+" 自動更新");
+      }
+    }catch(e){}
+    setUsFetching(false);
+  };
+
+  useEffect(()=>{
+    fetchMonitorAndJP();
+    const id=setInterval(fetchMonitorAndJP,30*1000);
+    return ()=>clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
+
+  useEffect(()=>{
+    fetchNewsOnly();
+    const id=setInterval(fetchNewsOnly,60*60*1000);
+    return ()=>clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
+
+  useEffect(()=>{
+    // 今日まだ一度も取得していなければ（アプリを開いた直後に空欄のままにしないよう）即時取得。
+    if(s.usQuotesFetchedDate!==todayISO())fetchUS();
+    let intervalId=null;
+    const now=new Date();
+    const next=new Date(now.getFullYear(),now.getMonth(),now.getDate(),6,0,0,0);
+    if(now>=next)next.setDate(next.getDate()+1);
+    const timeoutId=setTimeout(()=>{
+      fetchUS();
+      intervalId=setInterval(fetchUS,24*60*60*1000);
+    },next-now);
+    return ()=>{clearTimeout(timeoutId);if(intervalId)clearInterval(intervalId);};
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
 
   const set=(patch)=>setS(p=>({...p,...patch}));
   const setMetric=(k,f,v)=>setS(p=>({...p,metrics:{...p.metrics,[k]:{...p.metrics[k],[f]:v}}}));
@@ -978,7 +1000,7 @@ function App(){
   const allWatch=useMemo(()=>[...s.watchlist,...s.watchlistUS],[s.watchlist,s.watchlistUS]);
   const analysisItems=useMemo(()=>s.analysisTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean),[s.analysisTargets,allWatch]);
   const [analyzing,setAnalyzing]=useState(false);
-  const fetchAnalysisFor=async(items,quotesOverride)=>{
+  const fetchAnalysisFor=async(items)=>{
     if(!items||!items.length)return;
     setAnalyzing(true);
     // 再取得中に前回の結果を残したままにすると、取得に失敗した場合でも古い（現在値と食い違った）
@@ -986,14 +1008,10 @@ function App(){
     // 「データを取得できませんでした」と正直に表示されるようにする。
     setS(p=>{const ad={...p.analysisData};items.forEach(w=>{delete ad[w.code];});return {...p,analysisData:ad};});
     try{
-      // 登録銘柄テーブルの現在値（直前の「リアルタイムデータを反映」で取得済み）をcurrentとして
-      // 同封する。分析APIは内部でyfinanceに別途問い合わせるため、これを渡さないとタイミング次第で
-      // テーブルの最新値と分析結果の現在値がズレる（反映直後に分析しても最新値が反映されない不具合）。
-      // quotesOverride: refreshAllがsetS直後に呼ぶ際、setSが非同期でクロージャ内のs.stockQuotes
-      // がまだ更新前の値のままになるため、取得したての最新値を明示的に渡してもらうための引数
-      // （渡さないと「表の現在値は最新だが分析の単価だけ古い現在値のまま」というズレが起きる）。
-      const quotes=quotesOverride||s.stockQuotes;
-      const withCurrent=items.map(w=>({...w,current:quotes[w.code]?.t}));
+      // 登録銘柄テーブルの現在値（30秒おきの自動更新で取得済み）をcurrentとして同封する。
+      // 分析APIは内部でyfinanceに別途問い合わせるため、これを渡さないと分析結果側の単価が
+      // テーブルの最新値とズレることがある。
+      const withCurrent=items.map(w=>({...w,current:s.stockQuotes[w.code]?.t}));
       const ar=await fetch("/api/analysis",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(withCurrent)});
       if(ar.ok){
         const ad=await ar.json();
@@ -1377,11 +1395,10 @@ function App(){
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
           <div className="sec-head">日次モニター</div>
           <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
-            {monitorMsg && <span style={{fontSize:11,color:"var(--inkSoft)"}}>{monitorMsg}</span>}
-            <button className="btn primary" onClick={refreshAll} disabled={anyFetching}>{monitorFetching?"取得中…":"リアルタイムデータを反映"}</button>
+            <span style={{fontSize:11,color:"var(--inkSoft)"}}>{monitorFetching?"更新中…":monitorMsg}</span>
           </div>
         </div>
-        <div className="sec-note">「リアルタイムデータを反映」を押すたびに、ドル円・日経平均・ダウ・ナスダック・SOX・米10年債・S&P500・KOSPI・日経225先物・NYダウ先物・WTI原油・金・銅 を今日値／前日値ともに取得します（数値は遅延あり）。</div>
+        <div className="sec-note">30秒おきに自動更新します。ドル円・日経平均・ダウ・ナスダック・SOX・米10年債・S&P500・KOSPI・日経225先物・NYダウ先物・WTI原油・金・銅 を今日値／前日値ともに取得します（数値は遅延あり）。</div>
         <div className="sec-note" style={{marginTop:-4,marginBottom:14}}>項目をクリックするとリアルタイムチャートが下に開きます。</div>
         <ThemeSectorRanking watchlistAll={watchlistAll} stockQuotes={s.stockQuotes}/>
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:1,background:"var(--rule)",border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden"}}>
@@ -1416,7 +1433,7 @@ function App(){
               </div>}
             </React.Fragment>;})}
         </div>
-        <p className="foot">※ 「リアルタイムデータを反映」は、start.bat で起動したローカルサーバー経由で取得します。数値は遅延あり（前営業日終値〜数十分遅れ）でリアルタイムの板ではありません。</p>
+        <p className="foot">※ 30秒おきに自動更新されます（start.bat で起動したローカルサーバー経由）。数値は遅延あり（前営業日終値〜数十分遅れ）でリアルタイムの板ではありません。</p>
       </div>}
 
       {/* ===== BRIEFING（日本市場） ===== */}
@@ -1424,8 +1441,7 @@ function App(){
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8,marginTop:18}}>
           <div className="sec-head">日本市場</div>
           <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
-            {jpMsg && <span style={{fontSize:11,color:"var(--inkSoft)"}}>{jpMsg}</span>}
-            <button className="btn primary" onClick={refreshAll} disabled={anyFetching}>{jpFetching?"取得中…":"リアルタイムデータを反映"}</button>
+            <span style={{fontSize:11,color:"var(--inkSoft)"}}>{jpFetching?"更新中…":jpMsg?jpMsg+"（30秒おき自動更新）":""}</span>
           </div>
         </div>
         <SectorWatchlist market="JP" watchlist={s.watchlist} setWatchlist={setWatchlistJP} candidates={masterJP} max={MAX}
@@ -1441,8 +1457,7 @@ function App(){
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8,marginTop:18}}>
           <div className="sec-head">アメリカ市場</div>
           <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
-            {usMsg && <span style={{fontSize:11,color:"var(--inkSoft)"}}>{usMsg}</span>}
-            <button className="btn primary" onClick={refreshAll} disabled={anyFetching}>{usFetching?"取得中…":"リアルタイムデータを反映"}</button>
+            <span style={{fontSize:11,color:"var(--inkSoft)"}}>{usFetching?"更新中…":usMsg?usMsg+"（毎朝6時に自動更新）":"毎朝6時に自動更新"}</span>
           </div>
         </div>
         <SectorWatchlist market="US" watchlist={s.watchlistUS} setWatchlist={setWatchlistUS} candidates={masterUS} max={MAX_US}
@@ -1458,9 +1473,9 @@ function App(){
       {tab==="earnings" && <div style={{marginTop:18}}>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
           <div className="sec-head">決算分析</div>
-          <button className="btn primary" onClick={()=>fetchEarningsDetailFor(earningsItems)} disabled={earningsFetching||!earningsItems.length}>{earningsFetching?"取得中…":"最新の情報に更新"}</button>
+          {earningsFetching && <span style={{fontSize:11,color:"var(--inkSoft)"}}>取得中…</span>}
         </div>
-        <div className="sec-note" style={{fontSize:13}}>TDnetから取得した直近の決算短信（決算・業績関連のみ）の実績・通期会社計画・進捗率・予想修正の有無を、数値ベースの決定的な処理で抜き出して表示します（AIによる要約ではありません）。アメリカ株はTDnet対象外のため取得できません。</div>
+        <div className="sec-note" style={{fontSize:13}}>TDnetから取得した直近の決算短信（決算・業績関連のみ）の実績・通期会社計画・進捗率・予想修正の有無を、数値ベースの決定的な処理で抜き出して表示します（AIによる要約ではありません）。アメリカ株はTDnet対象外のため取得できません。「決算」ボタンで銘柄を選んだ瞬間に自動で取得します。</div>
         {earningsItems.length===0
           ? <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:14,border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)"}}>
               決算分析の対象銘柄がありません。「日本市場」タブの登録銘柄一覧で「決算」ボタンを押すと、ここに追加されます。
@@ -1562,7 +1577,7 @@ function App(){
       {tab==="analysis" && <div style={{marginTop:18}}>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
           <div className="sec-head">銘柄分析</div>
-          <button className="btn primary" onClick={refreshAll} disabled={anyFetching}>{analyzing?"取得中…":"リアルタイムデータを反映"}</button>
+          {analyzing && <span style={{fontSize:11,color:"var(--inkSoft)"}}>取得中…</span>}
         </div>
         {/* 12-2章：免責表示（必須・常時表示・断定的表現を避ける） */}
         <div style={{background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14,fontSize:12.5,lineHeight:1.7,color:"var(--inkSoft)"}}>
@@ -1857,9 +1872,9 @@ function App(){
         return <div style={{marginTop:18}}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
             <div className="sec-head">ニュース</div>
-            <button className="btn primary" onClick={refreshAll} disabled={anyFetching}>{newsFetching?"取得中…":"リアルタイムデータを反映"}</button>
+            <span style={{fontSize:11,color:"var(--inkSoft)"}}>{newsFetching?"更新中…":newsMsg?newsMsg+"（1時間おき自動更新）":"1時間おきに自動更新"}</span>
           </div>
-          <div className="sec-note">上のボタンで、各サブタブのニュースをGoogleニュースRSSから更新できます（登録銘柄の株価等は更新されません。それらも含めて更新する場合は「日本市場」タブのボタンを使ってください）。「サマリー」「海外市況」「登録銘柄」「適時開示」にはアメリカ市場（ダウ30社）のニュースも含みます。「適時開示」は日本の登録銘柄について当日を含む直近10日分のTDnet開示を種類を問わず（決算・上方修正・下方修正・新株予約権発行など）全件表示します（アメリカ株はTDnet対象外のためGoogleニュースのIR関連キーワードで近似）。「登録銘柄」は社名が見出しに出てくるニュース全般（優先度上位の銘柄まで）です。「SNS」は旧SNSタブで対象にしていた10アカウントの投稿のうち登録銘柄について言及したものだけを表示します。見出しをクリックすると元記事が開きます。</div>
+          <div className="sec-note">1時間おきに自動更新します。日本株は銘柄コードで確実に関連付けられる立花証券APIのニュース（NQN等）を優先し、報道の少ない銘柄だけGoogleニュースで補完します（広告・野球結果等は除外済み）。「サマリー」「海外市況」「登録銘柄」「適時開示」にはアメリカ市場（ダウ30社）のニュースも含みます。「適時開示」は日本の登録銘柄について当日を含む直近10日分のTDnet開示を種類を問わず（決算・上方修正・下方修正・新株予約権発行など）全件表示します（アメリカ株はTDnet対象外のためGoogleニュースのIR関連キーワードで近似）。「登録銘柄」は社名またはNQNの銘柄コードでの一致で拾ったニュース全般（優先度上位の銘柄まで）です。「SNS」は旧SNSタブで対象にしていた10アカウントの投稿のうち登録銘柄について言及したものだけを表示します。見出しをクリックすると元記事が開きます（NQN等、元記事URLの無い速報はクリックできません）。</div>
           <div className="subtabs">
             {NEWS_SUBTABS.map(t=><button key={t.key} className={"chip"+(newsSubTab===t.key?" on":"")} onClick={()=>{setNewsSubTab(t.key);setNewsShowCount(NEWS_PAGE_SIZE);}}>{t.label}</button>)}
           </div>
