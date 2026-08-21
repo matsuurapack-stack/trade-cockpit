@@ -214,6 +214,7 @@ def get_market_price(codes, use_prod=True):
             out[code] = {
                 "t": _num(row.get("pDPP")),
                 "p": _num(row.get("pPRP")),
+                "open": _num(row.get("pDOP")),  # 当日始値（日足履歴に当日分を合成する用途にも使う）
                 "high": _num(row.get("pDHP")),
                 "low": _num(row.get("pDLP")),
                 "change": _num(row.get("pDYWP")),

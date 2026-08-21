@@ -1455,6 +1455,46 @@ def _margin_badge(ratio):
     return "normal", f"貸借倍率{ratio:.2f}倍（通常水準）"
 
 
+def _tachibana_daily_arrays(code):
+    """立花証券APIの日足履歴（分割調整済み・上場来）から closes/opens/highs/lows/volumes を作る。
+    日足履歴は前営業日までの確定値のみのため、当日分は時価情報（ライブ気配）から合成して
+    末尾に追加する（yfinanceのhistory()が当日分もリアルタイムに含めて返す挙動に合わせるため。
+    これをしないと当日のopens[-1]/highs[-1]/lows[-1]が前営業日のままなのに終値だけ
+    current_overrideで当日値に差し替わり、ギャップアップ判定・ローソク足形状の判定がずれる）。
+    直近400営業日に絞る（52週高値等の計算には十分で、6000件超をそのまま扱うより軽い）。
+    失敗・データ不足時はNoneを返し、呼び出し側でyfinanceにフォールバックする。"""
+    if tachibana_api is None or not code:
+        return None
+    try:
+        hist = tachibana_api.get_daily_history(code)
+    except Exception as e:
+        print(f"  立花証券API 日足取得失敗（{code}）。yfinanceにフォールバック", e)
+        return None
+    if len(hist) < 20:
+        return None
+    hist = hist[-400:]
+    closes = [r["close"] for r in hist]
+    opens = [r["open"] for r in hist]
+    highs = [r["high"] for r in hist]
+    lows = [r["low"] for r in hist]
+    volumes = [r["volume"] for r in hist]
+
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    today_str = datetime.datetime.now(jst).strftime("%Y-%m-%d")
+    if hist[-1]["date"] != today_str:
+        try:
+            live = tachibana_api.get_market_price([code]).get(code)
+        except Exception:
+            live = None
+        if live and live.get("t") is not None and live.get("open") is not None:
+            closes.append(live["t"])
+            opens.append(live["open"])
+            highs.append(live.get("high") if live.get("high") is not None else live["t"])
+            lows.append(live.get("low") if live.get("low") is not None else live["t"])
+            volumes.append(live.get("volume") if live.get("volume") is not None else 0)
+    return closes, opens, highs, lows, volumes
+
+
 def analyze_stock(w, market_env=None):
     """12-1章・technical_analysis_rules.md：ローソク足パターン・移動平均線の並び／クロス・
     ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
@@ -1464,19 +1504,27 @@ def analyze_stock(w, market_env=None):
         market_env = {"text": market_env or "", "nikkeiChangePct": None, "bad": False}
     code = w.get("code", "")
     sym = _yf_symbol(w)
-    tk = yf.Ticker(sym)
-    # Yahoo側の一時的なレート制限で日足が空/不足で返ってくることがあり、その場合そのまま
-    # 「データを取得できませんでした」になってしまっていたため、1回だけ間を置いて再試行する。
-    h = tk.history(period="1y")
-    if len(h.get("Close", [])) < 20:
-        time.sleep(1.5)
-        tk = yf.Ticker(sym)
+    tk = yf.Ticker(sym)  # 分足・決算カレンダー・ファンダメンタルは相当データが無いためyfinanceのまま使用
+
+    # 日足（移動平均・RSI・ボリンジャー等、分析の中核部分）は日本株なら立花証券APIを優先する
+    # （yfinanceのレート制限リスクを避けるため。2026-08-20ユーザー要望）。取得できない場合のみ
+    # yfinanceにフォールバックする。
+    arrays = _tachibana_daily_arrays(code) if w.get("market", "JP") != "US" else None
+    if arrays:
+        closes, opens, highs, lows, volumes = arrays
+    else:
+        # Yahoo側の一時的なレート制限で日足が空/不足で返ってくることがあり、その場合そのまま
+        # 「データを取得できませんでした」になってしまっていたため、1回だけ間を置いて再試行する。
         h = tk.history(period="1y")
-    closes = h["Close"].dropna().tolist()
-    opens = h["Open"].dropna().tolist()
-    highs = h["High"].dropna().tolist()
-    lows = h["Low"].dropna().tolist()
-    volumes = h["Volume"].dropna().tolist()
+        if len(h.get("Close", [])) < 20:
+            time.sleep(1.5)
+            tk = yf.Ticker(sym)
+            h = tk.history(period="1y")
+        closes = h["Close"].dropna().tolist()
+        opens = h["Open"].dropna().tolist()
+        highs = h["High"].dropna().tolist()
+        lows = h["Low"].dropna().tolist()
+        volumes = h["Volume"].dropna().tolist()
     if len(closes) < 20:
         return None
     n = len(closes)
