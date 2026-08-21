@@ -141,6 +141,13 @@ td{padding:7px 10px;vertical-align:middle}
 const { useState, useEffect, useRef, useMemo } = React;
 
 const num = (v) => (v === "" || v == null || isNaN(+v) ? null : +v);
+// 2026-08-21 ユーザー要望：登録銘柄検索を読み仮名でも引っかかるようにする。カタカナ→ひらがな変換
+// で正規化してから比較することで、社名がカタカナのみの銘柄（○○ホールディングス等）はこれだけで
+// ひらがな検索に対応できる。漢字を含む社名は変換だけでは読みにならないため、MASTER定義末尾の
+// JP_KANAで個別に読み（ひらがな）を補う（未収録分はkana=""のままだが、コード・社名・業種での
+// 検索は従来どおり有効）。
+const toHiragana = (str) => String(str||"").replace(/[ァ-ヶ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60));
+const normKana = (str) => toHiragana(String(str||"").toLowerCase());
 const todayISO = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; };
 const WD = ["日","月","火","水","木","金","土"];
 const MAX = 300;
@@ -364,6 +371,54 @@ const MASTER = [
   M("SOX","半導体ETF(SOXX)",SECTOR_INDEX,"IDX","NASDAQ:SOXX",true),M("VIX","VIX短期ETF(VIXY)",SECTOR_INDEX,"IDX","BATS:VIXY",true),
 ];
 
+// 2026-08-21 ユーザー要望：日本株の登録検索を読み仮名（ひらがな）でも引っかかるようにする。
+// 社名がカタカナのみの銘柄はtoHiragana()による正規化だけで検索可能なため、ここには漢字を
+// 含む社名の読みだけを用意する（読みが未収録のコードはkana=""のままになるが、コード・社名・
+// 業種での検索は従来どおり有効。読みに誤りがあれば個別に直せるようコードごとの連想配列にしてある）。
+const JP_KANA = {
+  "1332":"にっすい","1801":"たいせいけんせつ","1802":"おおばやしぐみ","1803":"しみずけんせつ",
+  "1808":"はせこうこーぽれーしょん","1812":"かじま","1925":"だいわはうすこうぎょう","1928":"せきすいはうす",
+  "1963":"にっきほーるでぃんぐす","2002":"にっしんせいふんぐるーぷほんしゃ","2269":"めいじほーるでぃんぐす",
+  "2282":"にほんはむ","2768":"そうじつ","2802":"あじのもと","3099":"みつこしいせたんほーるでぃんぐす",
+  "3289":"とうきゅうふどうさんほーるでぃんぐす","3401":"ていじん","3402":"とうれ","3407":"あさひかせい",
+  "3861":"おうじほーるでぃんぐす","4005":"すみともかがく","4021":"にっさんかがく","4042":"とうそー",
+  "4063":"しんえつかがくこうぎょう","4151":"きょうわきりん","4183":"みついかがく","4188":"みつびしけみかるぐるーぷ",
+  "4307":"のむらそうごうけんきゅうしょ","4324":"でんつうぐるーぷ","4452":"かおう","4502":"たけだやくひんこうぎょう",
+  "4503":"あすてらすせいやく","4506":"すみともふぁーま","4507":"しおのぎせいやく","4519":"ちゅうがいせいやく",
+  "4568":"だいいちさんきょう","4578":"おおつかほーるでぃんぐす","4755":"らくてんぐるーぷ",
+  "4901":"ふじふぃるむほーるでぃんぐす","4911":"しせいどう","5019":"いでみつこうさん","5101":"よこはまごむ",
+  "5214":"にっぽんでんきがらす","5233":"たいへいようせめんと","5301":"とうかいかーぼん","5401":"にっぽんせいてつ",
+  "5406":"こうべせいこうしょ","5631":"にほんせいこうしょ","5706":"みついきんぞく","5711":"みつびしまてりある",
+  "5713":"すみともきんぞくこうざん","5801":"ふるかわでんきこうぎょう","5802":"すみともでんきこうぎょう",
+  "6178":"にほんゆうせい","6302":"すみともじゅうきかいこうぎょう","6305":"ひたちけんき","6361":"えばら",
+  "6367":"だいきんこうぎょう","6471":"にほんせいこう","6501":"ひたちせいさくしょ","6503":"みつびしでんき",
+  "6504":"ふじでんき","6506":"やすかわでんき","6702":"ふじつう","6841":"よこがわでんき","6971":"きょうせら",
+  "6976":"たいようゆうでん","6981":"むらたせいさくしょ","6988":"にっとうでんこう","7011":"みつびしじゅうこうぎょう",
+  "7012":"かわさきじゅうこうぎょう","7186":"よこはまふぃなんしゃるぐるーぷ","7201":"にっさんじどうしゃ",
+  "7202":"いすずじどうしゃ","7203":"とよたじどうしゃ","7211":"みつびしじどうしゃ","7272":"やまははつどうき",
+  "7453":"りょうひんけいかく","7912":"だいにっぽんいんさつ","7974":"にんてんどう","8001":"いとうちゅうしょうじ",
+  "8002":"まるべに","8015":"とよたつうしょう","8031":"みついぶっさん","8035":"とうきょうえれくとろん",
+  "8053":"すみともしょうじ","8058":"みつびししょうじ","8233":"たかしまや","8252":"まるいぐるーぷ",
+  "8304":"あおぞらぎんこう","8306":"みつびしゆーえふじぇいふぃなんしゃるぐるーぷ","8309":"みついすみもととらすとぐるーぷ",
+  "8316":"みついすみともふぃなんしゃるぐるーぷ","8331":"ちばぎんこう","8601":"だいわしょうけんぐるーぷほんしゃ",
+  "8604":"のむらほーるでぃんぐす","8697":"にほんとりひきじょぐるーぷ","8750":"だいいちらいふぐるーぷ",
+  "8766":"とうきょうかいじょうほーるでぃんぐす","8801":"みついふどうさん","8802":"みつびしじしょ",
+  "8804":"とうきょうたてもの","8830":"すみともふどうさん","9001":"とうぶてつどう","9005":"とうきゅう",
+  "9007":"おだきゅうでんてつ","9008":"けいおうでんてつ","9009":"けいせいでんてつ","9020":"ひがしにほんりょかくてつどう",
+  "9021":"にしにほんりょかくてつどう","9022":"とうかいりょかくてつどう","9101":"にっぽんゆうせん",
+  "9104":"しょうせんみつい","9107":"かわさききせん","9201":"にほんこうくう","9501":"とうきょうでんりょくほーるでぃんぐす",
+  "9502":"ちゅうぶでんりょく","9503":"かんさいでんりょく","9531":"とうきょうがす","9532":"おおさかがす","9602":"とうほう",
+  "7182":"ゆうちょぎんこう","5016":"じぇいえっくすきんぞく","4091":"にほんさんそほーるでぃんぐす",
+  "4612":"にほんぺいんとほーるでぃんぐす","5334":"にほんとくしゅとうぎょう","8593":"みつびしえいちしーきゃぴたる",
+  "7181":"かんぽせいめいほけん","9435":"ひかりつうしん","2587":"さんとりーしょくひんいんたーなしょなる",
+  "5844":"きょうとふぃなんしゃるぐるーぷ","1942":"かんでんこう","4186":"とうきょうおうかこうぎょう",
+  "8359":"はちじゅうにながのぎんこう","8439":"とうきょうせんちゅりー","6997":"にほんけみこん",
+  "6327":"きたがわせいき","1969":"たかさごねつがくこうぎょう","7747":"あさひいんてっく","9962":"みすみぐるーぷほんしゃ",
+  "3104":"ふじぼうほーるでぃんぐす","4368":"ふそうかがくこうぎょう","1961":"さんきこうぎょう","3891":"にっぽんこうどしこうぎょう",
+  "NI225":"にっけい","USDJPY":"どるえん","SOX":"はんどうたい","VIX":"たんき",
+};
+MASTER.forEach(m=>{ if(m.market==="JP"||m.market==="IDX") m.kana = JP_KANA[m.code]||""; });
+
 // ===== カラールール（セクター・銘柄共通。3章の仕様）=====
 // 上昇率(%)は0.5%刻みで6段階(0-0.5/0.5-1.0/1.0-1.5/1.5-2.0/2.0-2.5/2.5超)に区分し、1段階ずつ赤/緑を濃くする。
 // 最終段階(2.5%超)は上限なくすべて同じ最も濃い色で頭打ちにする。
@@ -455,6 +510,8 @@ const emptyState=()=>({
   stockNews:"",marketNews:"", // 旧フロント・バックアップ互換のためのテキスト版ニュース（7章で市況メモ等のUIは削除済み、フィールドのみ残置）
   stockNewsList:[], macroNewsList:[], macroNewsDomestic:[], macroNewsOverseas:[], usStockNewsList:[], stockQuotes:{},
   usQuotesFetchedDate:"", // アメリカ市場の自動更新（毎朝6時・1日1回）が今日すでに実行済みかの判定用
+  breakoutLevels:{}, // 出来高ブレイクアウト判定の基準値（{code:{high20,volAvg5}}）。1日1回計算。
+  breakoutLevelsFetchedDate:"", // 上記が今日すでに計算済みかの判定用
   stockNameNewsList:[], usStockNameNewsList:[], // ニュースタブ「登録銘柄」サブタブ：IR以外も含む社名一致ニュース
   disclosureNewsList:[], usDisclosureNewsList:[], // ニュースタブ「適時開示」サブタブ：当日含む直近10日分・種類問わず全件
   snsNewsList:[], usSnsNewsList:[], // ニュースタブ「SNS」サブタブ：@kanpo_blogの投稿のうち登録銘柄に言及したもの
@@ -462,8 +519,10 @@ const emptyState=()=>({
   analysisData:{}, // analysisData: 12-1章の分析結果（購入/損切り/利確の目安・算出根拠）をコードごとに保持
   earningsTargets:[], // earningsTargets: 登録銘柄テーブルの「決算」ボタンで追加した銘柄コード一覧（決算分析タブで使用）
   earningsDetail:{}, // earningsDetail: 直近の決算短信（TDnet）のタイトル・URL・数値要約をコードごとに保持
-  priorityTargets:[], // 指示書2026-07-16項目2：「本日優先」ボタンで追加した銘柄コード一覧（最大9社、自動スキャン対象。「翌朝へ」で日次リセット）
-  autoScanEnabled:false, // 自動スキャン(5分おき)のオン/オフ。「翌朝へ」でもリセットしない（日をまたぐ設定）
+  watchTargets:[], // 2026-08-21 ユーザー要望：「監視銘柄」タブの対象銘柄コード一覧（上限なし）。
+  // 「日本市場」「アメリカ市場」タブの「監視銘柄」ボタン、または出来高ブレイクアウト条件への
+  // 自動該当（下のbreakoutAlerts）で追加される。「翌朝へ」でもリセットしない（旧priorityTargets・
+  // 旧autoScanEnabled＝5分おき自動スキャン機能は本機能に置き換えて撤去済み）。
   notifyEnabled:true, // 10-5章：重要ニュース通知バナーのオン/オフ
   settings:{totalCapital:"",riskPct:1}, // 資金管理：総資金・1トレードの許容損失%（銘柄分析タブの株数計算に使用）
   journal:[], // 売買記録（トレードジャーナル）。1件＝{id,createdAt,code,name,action,price,shares,entryPlan,marketEnvAtEntry,reason,result,lessonNote}
@@ -641,19 +700,24 @@ function EarningsProgressChart({trend,latestDetail}){
 
 // 6-1章：銘柄検索・登録＋セクター別アコーディオン表示（2〜5章の仕様）を市場ごとに再利用するための共通コンポーネント。
 // 日本市場・アメリカ市場タブの両方で、このコンポーネントをそのまま使い回すことで「全く同じ仕様・UI」を担保する。
-function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,priorityTargets,onTogglePriority,onOpenChart}){
+function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,watchTargets,onToggleWatch,onOpenChart}){
   const [q,setQ]=useState("");
   const [manualSector,setManualSector]=useState(SECTOR_CHOICES[0]);
   const [openSectors,setOpenSectors]=useState(()=>new Set());
+  const rowRefs=useRef({}); // code -> <tr>要素。検索で既登録銘柄がヒットした際にスクロールで見せるため（2026-08-21 ユーザー要望）
+  const [jumpHighlight,setJumpHighlight]=useState(null); // 直前にジャンプした銘柄コード。数秒だけ行を強調表示する
 
   const regCodes=useMemo(()=>new Set(watchlist.map(w=>w.code)),[watchlist]);
-  const results=useMemo(()=>{const t=q.trim().toLowerCase();if(!t)return[];
-    return candidates.filter(m=>!regCodes.has(m.code)&&(m.code.toLowerCase().includes(t)||m.name.toLowerCase().includes(t)||m.sector.toLowerCase().includes(t))).slice(0,8);},[q,regCodes,candidates]);
+  // 2026-08-21 ユーザー要望：コード・企業名に加え、読み仮名（ひらがな・カタカナどちらで入力しても
+  // ヒットする）でも検索できるようにする。normKana()でクエリ・候補側の双方をひらがなに正規化して
+  // 比較するため、社名がカタカナのみの銘柄は読み未収録でもこれだけで検索可能になる。
+  const results=useMemo(()=>{const t=normKana(q.trim());if(!t)return[];
+    return candidates.filter(m=>!regCodes.has(m.code)&&(normKana(m.code).includes(t)||normKana(m.name).includes(t)||normKana(m.kana).includes(t)||normKana(m.sector).includes(t))).slice(0,8);},[q,regCodes,candidates]);
   // 「検索しても候補が出てこない」問い合わせ対応：日経225+主要30社／ダウ30社は最初から登録済み
   // （MASTER・DEFAULT_WATCHLIST）のため、有名企業ほど検索しても新規候補が0件になりやすい。
   // resultsが空のとき、実は既に登録済みなだけなのかを判定してユーザーに明示する。
-  const alreadyRegisteredMatch=useMemo(()=>{const t=q.trim().toLowerCase();if(!t)return null;
-    return candidates.find(m=>regCodes.has(m.code)&&(m.code.toLowerCase().includes(t)||m.name.toLowerCase().includes(t)))||null;},[q,regCodes,candidates]);
+  const alreadyRegisteredMatch=useMemo(()=>{const t=normKana(q.trim());if(!t)return null;
+    return candidates.find(m=>regCodes.has(m.code)&&(normKana(m.code).includes(t)||normKana(m.name).includes(t)||normKana(m.kana).includes(t)))||null;},[q,regCodes,candidates]);
   const addStock=(m)=>{if(watchlist.length>=max){alert("登録は最大"+max+"社までです。");return;}
     if(regCodes.has(m.code))return; setWatchlist([...watchlist,{id:m.code,...m,watch:"通常",note:"",theme:""}]);setQ("");};
   const addManual=()=>{
@@ -694,19 +758,33 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
   },[watchlist,stockQuotes,sectorOrder]);
   const toggleSector=(sec)=>setOpenSectors(prev=>{const n=new Set(prev);n.has(sec)?n.delete(sec):n.add(sec);return n;});
 
+  // 2026-08-21 ユーザー要望：検索した銘柄が既に登録済みだった場合、そのセクターを開いて実際の行まで
+  // スクロールする（メッセージを出すだけで終わらせない）。アコーディオンの開閉は次の描画を経てから
+  // でないとDOMに行が無くscrollIntoViewできないため、setTimeoutで1フレーム分待つ。
+  const jumpToRegistered=(m)=>{
+    setOpenSectors(prev=>new Set(prev).add(m.sector));
+    setQ("");
+    setJumpHighlight(m.code);
+    setTimeout(()=>{
+      rowRefs.current[m.code]?.scrollIntoView({behavior:"smooth",block:"center"});
+    },50);
+    setTimeout(()=>setJumpHighlight(prev=>prev===m.code?null:prev),2500);
+  };
+
   return <div style={{marginTop:18}}>
     <div className="sec-head">登録銘柄　{watchlist.length}/{max}</div>
     <div className="sec-note">自動保存されます。</div>
     <div style={{position:"relative"}}>
       <div style={{display:"flex",alignItems:"center",gap:8,border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,padding:"8px 12px"}}>
-        <input value={q} onChange={e=>setQ(e.target.value)} placeholder={market==="JP"?"銘柄コード・企業名・セクターで検索（例：6981、村田、化学）":"ティッカー・企業名・セクターで検索（例：AAPL、Apple、電気機器）"}
+        <input value={q} onChange={e=>setQ(e.target.value)} placeholder={market==="JP"?"銘柄コード・企業名・読み仮名・セクターで検索（例：6981、村田、むらた、化学）":"ティッカー・企業名・セクターで検索（例：AAPL、Apple、電気機器）"}
           style={{flex:1,border:"none",background:"transparent",outline:"none",fontSize:14}}/>
         {q && <button className="iconbtn" onClick={()=>setQ("")}>×</button>}
       </div>
       {q.trim() && <div className="results">
-        {results.length===0 && alreadyRegisteredMatch && <div className="res-row" style={{fontSize:12.5,color:"var(--inkSoft)"}}>
-          「{alreadyRegisteredMatch.name}」({alreadyRegisteredMatch.code}／{alreadyRegisteredMatch.sector})は既に登録済みです。下の一覧の該当セクターを開いてご確認ください。
-        </div>}
+        {results.length===0 && alreadyRegisteredMatch && <button className="res-row" style={{fontSize:12.5,color:"var(--inkSoft)",textAlign:"left"}}
+          onClick={()=>jumpToRegistered(alreadyRegisteredMatch)}>
+          「{alreadyRegisteredMatch.name}」({alreadyRegisteredMatch.code}／{alreadyRegisteredMatch.sector})は既に登録済みです。クリックすると該当セクターを開いて表示します。
+        </button>}
         {results.map(m=>
           <button key={m.code} className="res-row" onClick={()=>addStock(m)}>
             <span className="mono" style={{fontSize:12,width:60,color:"var(--inkSoft)"}}>{m.code}</span>
@@ -750,8 +828,10 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                 const c=changeColor(pct);
                 const inAnalysis=analysisTargets.includes(w.code);
                 const inEarnings=earningsTargets.includes(w.code);
-                const inPriority=priorityTargets.includes(w.code);
-                return <tr key={w.id} style={{borderTop:"1px solid var(--ruleSoft)",background:c.bg,color:c.level>0?c.fg:"var(--ink)"}}>
+                const inWatch=watchTargets.includes(w.code);
+                const isJumpTarget=jumpHighlight===w.code;
+                return <tr key={w.id} ref={el=>{rowRefs.current[w.code]=el;}}
+                  style={{borderTop:"1px solid var(--ruleSoft)",background:isJumpTarget?"var(--accent)":c.bg,color:isJumpTarget?"var(--card)":(c.level>0?c.fg:"var(--ink)"),transition:"background 0.4s, color 0.4s"}}>
                   <td className="mono" style={{fontWeight:700,fontSize:14}}>{w.code}</td>
                   <td style={{fontSize:16,fontWeight:600}}>{w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
                   <td>
@@ -765,7 +845,7 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                   <td style={{textAlign:"center",whiteSpace:"nowrap"}}>
                     <button className="action-btn" style={{marginRight:5}} onClick={()=>onOpenChart(w)}>チャート</button>
                     <button className={"action-btn"+(inAnalysis?" on":"")} style={{marginRight:5}} onClick={()=>onToggleAnalysis(w.code)}>{inAnalysis?"✓ 分析中":"分析"}</button>
-                    <button className={"action-btn"+(inPriority?" on":"")} style={{marginRight:5}} onClick={()=>onTogglePriority(w.code)} title="自動スキャン(5分おき)・デスクトップ通知の対象にする（最大9社）">{inPriority?"✓ 本日優先":"本日優先"}</button>
+                    <button className={"action-btn"+(inWatch?" on":"")} style={{marginRight:5}} onClick={()=>onToggleWatch(w.code)} title="「監視銘柄」タブでまとめて確認する対象にする">{inWatch?"✓ 監視銘柄":"監視銘柄"}</button>
                     {market==="JP" && <button className={"action-btn"+(inEarnings?" on":"")} style={{marginRight:5}} onClick={()=>onToggleEarnings(w.code)}>{inEarnings?"✓ 決算":"決算"}</button>}
                     <button className="iconbtn" style={{color:c.level>0?c.fg:"var(--inkSoft)"}} onClick={()=>delStock(w.id)}>×</button>
                   </td>
@@ -773,6 +853,56 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
             </table></div>}
           </div>;
         })}
+    </div>
+  </div>;
+}
+
+// 監視銘柄タブ（2026-08-21 ユーザー要望）：「日本市場」「アメリカ市場」タブの「監視銘柄」
+// ボタン、または出来高ブレイクアウト条件への自動該当でwatchTargetsに入った銘柄を、市場を
+// 問わずまとめて確認する。列構成はSectorWatchlistの登録銘柄テーブルと同じだが、対象が
+// 少数精鋭になる想定のためセクター別アコーディオンにはせず前日比の大きい順にフラット表示する。
+// 「本日優先」に相当するボタンは無く、末尾の「削除」はwatchTargetsから外すだけ（実際の登録
+// 銘柄一覧からは削除しない。完全な登録解除は「日本市場」「アメリカ市場」タブの×で行う）。
+function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart}){
+  const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
+    return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
+  const sorted=useMemo(()=>[...items].sort((a,b)=>{
+    const pa=pctOf(a.code),pb=pctOf(b.code);
+    if(pa==null&&pb==null)return 0; if(pa==null)return 1; if(pb==null)return -1;
+    return pb-pa;
+  }),[items,stockQuotes]);
+  return <div style={{marginTop:18}}>
+    <div className="sec-head">監視銘柄　{items.length}件</div>
+    <div className="sec-note">「日本市場」「アメリカ市場」タブの「監視銘柄」ボタン、または出来高ブレイクアウト条件（直近20営業日高値を出来高1.5倍以上で上抜け）への自動該当で追加されます。</div>
+    <div style={{marginTop:12,border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,overflow:"hidden"}}>
+      {sorted.length===0 ?
+        <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13}}>監視銘柄はまだありません。「日本市場」「アメリカ市場」タブの一覧で「監視銘柄」ボタンを押すと、ここに追加されます。</div> :
+        <div style={{overflowX:"auto"}}><table style={{minWidth:860}}>
+          <thead><tr style={{background:"var(--band)"}}><th>コード</th><th>銘柄</th><th>テーマ</th><th>現在値</th><th>前日比</th><th>高値</th><th>安値</th><th></th></tr></thead>
+          <tbody>{sorted.map(w=>{
+            const qt=stockQuotes[w.code]||{};
+            const ct=num(qt.t),cp=num(qt.p),chi=num(qt.high),clo=num(qt.low);
+            const delta=ct!=null&&cp!=null?ct-cp:null;
+            const pct=pctOf(w.code);
+            const c=changeColor(pct);
+            const inAnalysis=analysisTargets.includes(w.code);
+            const inEarnings=earningsTargets.includes(w.code);
+            return <tr key={w.code} style={{borderTop:"1px solid var(--ruleSoft)",background:c.bg,color:c.level>0?c.fg:"var(--ink)"}}>
+              <td className="mono" style={{fontWeight:700,fontSize:14}}>{w.code}</td>
+              <td style={{fontSize:16,fontWeight:600}}>{w.name}</td>
+              <td style={{fontSize:12,color:w.theme?"var(--accent)":"var(--inkFaint)"}}>{w.theme||"—"}</td>
+              <td className="mono" style={{fontWeight:800,fontSize:17,color:c.fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
+              <td className="mono" style={{fontWeight:700,fontSize:16,color:c.fg,whiteSpace:"nowrap"}}>{delta!=null?(delta>0?"+":"")+delta.toLocaleString(undefined,{maximumFractionDigits:2})+(pct!=null?` (${pct>0?"+":""}${pct.toFixed(2)}%)`:""):"—"}</td>
+              <td className="mono" style={{color:c.level>0?c.fgSoft:"var(--inkSoft)",whiteSpace:"nowrap"}}>{chi!=null?chi.toLocaleString():"—"}</td>
+              <td className="mono" style={{color:c.level>0?c.fgSoft:"var(--inkSoft)",whiteSpace:"nowrap"}}>{clo!=null?clo.toLocaleString():"—"}</td>
+              <td style={{textAlign:"center",whiteSpace:"nowrap"}}>
+                <button className="action-btn" style={{marginRight:5}} onClick={()=>onOpenChart(w)}>チャート</button>
+                <button className={"action-btn"+(inAnalysis?" on":"")} style={{marginRight:5}} onClick={()=>onToggleAnalysis(w.code)}>{inAnalysis?"✓ 分析中":"分析"}</button>
+                {w.market==="JP" && <button className={"action-btn"+(inEarnings?" on":"")} style={{marginRight:5}} onClick={()=>onToggleEarnings(w.code)}>{inEarnings?"✓ 決算":"決算"}</button>}
+                <button className="action-btn" onClick={()=>onRemove(w.code)}>削除</button>
+              </td>
+            </tr>;})}</tbody>
+        </table></div>}
     </div>
   </div>;
 }
@@ -973,12 +1103,44 @@ function App(){
     setUsFetching(false);
   };
 
+  // 出来高ブレイクアウト（直近20営業日高値を5日平均出来高の1.5倍以上で上抜け）の基準値を
+  // 取得する。銘柄分析タブのentry算出と同じ定義（server.pyのget_breakout_levels）。
+  // 基準値自体は日中変わらないため1日1回だけ取得し、現在値との比較は下のuseMemoで毎回軽く行う
+  // （2026-08-20 ユーザー要望：登録銘柄全体を対象にしたブレイクアウトの機械的なアラート）。
+  const fetchBreakoutLevels=async(watchlistSubset)=>{
+    try{
+      const r=await fetch("/api/breakout-levels",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(watchlistSubset)});
+      if(r.ok){
+        const d=await r.json();
+        setS(p=>({...p,breakoutLevels:{...p.breakoutLevels,...(d.levels||{})}}));
+      }
+    }catch(e){}
+  };
+
   useEffect(()=>{
     fetchMonitorAndJP();
     const id=setInterval(fetchMonitorAndJP,30*1000);
     return ()=>clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
+
+  useEffect(()=>{
+    // 今日まだ計算していなければ登録銘柄全体（日本株）で即時計算し、以後は日付が変わるまで再計算しない。
+    if(s.breakoutLevelsFetchedDate!==todayISO()){
+      fetchBreakoutLevels(s.watchlist).then(()=>setS(p=>({...p,breakoutLevelsFetchedDate:todayISO()})));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
+
+  useEffect(()=>{
+    // 日中に銘柄を追加登録した場合、その銘柄だけ基準値が無いままになるため、不足分だけ追加取得する。
+    // 本日分の初回一括取得（上のuseEffect）が終わるまでは「全銘柄が不足」に見えてしまい二重取得
+    // になるため、初回取得が完了済み（breakoutLevelsFetchedDateが今日）の場合のみ動く。
+    if(s.breakoutLevelsFetchedDate!==todayISO())return;
+    const missing=s.watchlist.filter(w=>!s.breakoutLevels[w.code]);
+    if(missing.length)fetchBreakoutLevels(missing);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[s.watchlist.length,s.breakoutLevelsFetchedDate]);
 
   useEffect(()=>{
     fetchNewsOnly();
@@ -1012,6 +1174,7 @@ function App(){
   // 12章：分析タブの対象銘柄（日本市場・アメリカ市場どちらの登録銘柄からも追加され得る）
   const allWatch=useMemo(()=>[...s.watchlist,...s.watchlistUS],[s.watchlist,s.watchlistUS]);
   const analysisItems=useMemo(()=>s.analysisTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean),[s.analysisTargets,allWatch]);
+  const watchTargetItems=useMemo(()=>s.watchTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean),[s.watchTargets,allWatch]);
   const [analyzing,setAnalyzing]=useState(false);
   const fetchAnalysisFor=async(items)=>{
     if(!items||!items.length)return;
@@ -1047,18 +1210,11 @@ function App(){
     if(missing.length)fetchAnalysisFor(missing);
   },[s.analysisTargets]);
 
-  // ===== 指示書2026-07-16 項目2・3：自動スキャン＋デスクトップ通知 =====
-  // 「本日優先」に登録した最大9社だけを対象に、既存のanalyze_stock()（分析タブと同じ購入/損切/
-  // 利確・星評価ロジック）を5分おきに呼び直す。対象を9社に絞ることで、登録銘柄全体(300社超)に
-  // 同じ処理をかけた場合のYahoo側レート制限・数分がかりの待ち時間を避けられる（詳細は実装時の相談
-  // 参照）。ブラウザのタブを開いている間だけ動作する方式（ユーザー確認済み：サーバー常駐＋Windows
-  // トーストは見送り）。
-  const AUTO_SCAN_INTERVAL_MS = 5 * 60 * 1000;
-  const priorityItems = useMemo(()=>s.priorityTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean),[s.priorityTargets,allWatch]);
-  const [autoScanRunning,setAutoScanRunning]=useState(false);
-  const [autoScanMsg,setAutoScanMsg]=useState("");
+  // ===== デスクトップ通知（セクター内逆行銘柄・出来高ブレイクアウトの監視銘柄自動追加で使用） =====
+  // 2026-08-21 ユーザー要望：旧「本日優先」5分おき自動スキャン機能（priorityTargets・
+  // autoScanEnabled・9社上限）は「監視銘柄」タブに置き換えて撤去した。通知の許可取得・送信の
+  // 仕組み自体はそのまま残し、下のsectorLaggards・breakoutAlertsから利用する。
   const [notifyPermission,setNotifyPermission]=useState(typeof Notification!=="undefined"?Notification.permission:"unsupported");
-  const lastSignalRef=useRef({}); // code -> 前回スキャン時のシグナル文言（新規出現の判定に使う。タブを開き直すとリセットされる）
   const notifiedLaggardsRef=useRef(new Set()); // 通知済みのセクター内逆行銘柄コード（同じ銘柄への通知連打を防ぐ。日をまたぐか再読み込みでリセット）
 
   const requestNotifyPermission=async()=>{
@@ -1101,60 +1257,38 @@ function App(){
     });
   },[sectorLaggards]);
 
-  // 自動スキャン本体：①登録銘柄全体の現在値を再取得（セクター内逆行判定を最新化）
-  // ②「本日優先」9社だけ分析APIを呼び直し、新規に買いシグナル／様子見シグナルが
-  // 出た瞬間だけ通知する（同じシグナルが続いている間は毎回通知しない）。
-  const runAutoScan=async()=>{
-    setAutoScanRunning(true);
-    try{
-      const [qrJP,qrUS]=await Promise.all([
-        fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlist)}),
-        fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(s.watchlistUS)}),
-      ]);
-      const [qdJP,qdUS]=await Promise.all([qrJP.ok?qrJP.json():null,qrUS.ok?qrUS.json():null]);
-      let latestQuotes=s.stockQuotes;
-      if(qdJP||qdUS){
-        latestQuotes={...s.stockQuotes,...(qdJP?.quotes||{}),...(qdUS?.quotes||{})};
-        setS(p=>({...p,stockQuotes:latestQuotes}));
+  // 出来高ブレイクアウト（登録銘柄全体・日本株のみ）：get_breakout_levels()で1日1回計算した
+  // 基準値（high20・volAvg5）と、30秒おきに更新される現在値(t)・当日出来高(volume)を比較する
+  // 軽い処理。analyze_stock()のbreakout_confirmedと同一基準（直近20営業日高値を、5日平均出来高の
+  // 1.5倍以上の出来高を伴って上抜け）。sectorLaggardsと同じく登録銘柄全体が対象（2026-08-20 ユーザー要望）。
+  const breakoutAlerts=useMemo(()=>{
+    const out=[];
+    s.watchlist.forEach(w=>{
+      const levels=s.breakoutLevels[w.code];
+      if(!levels)return;
+      const qt=s.stockQuotes[w.code]||{};
+      const t=num(qt.t),vol=num(qt.volume);
+      if(t==null||vol==null)return;
+      const volRatio=levels.volAvg5?vol/levels.volAvg5:null;
+      if(t>levels.high20 && volRatio!=null && volRatio>=1.5){
+        out.push({code:w.code,name:w.name,high20:levels.high20,t,volRatio});
       }
-      if(priorityItems.length){
-        const withCurrent=priorityItems.map(w=>({...w,current:latestQuotes[w.code]?.t}));
-        const ar=await fetch("/api/analysis",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(withCurrent)});
-        if(ar.ok){
-          const ad=await ar.json();
-          const results=ad.analysis||{};
-          setS(p=>({...p,analysisData:{...p.analysisData,...results}}));
-          Object.entries(results).forEach(([code,r])=>{
-            const w=priorityItems.find(x=>x.code===code);
-            if(!w)return;
-            const prev=lastSignalRef.current[code]||{};
-            const entryLabel=r.tradeRules?.entryPattern?.label;
-            const topBuyLabel=r.signals?.buy?.[0]?.label;
-            const watchLabel=r.tradeRules?.watchStatus;
-            if(entryLabel&&entryLabel!==prev.entry){
-              notifyDesktop(`▲ ${w.name} ${w.code}：買いシグナル発生`,entryLabel);
-            }else if(topBuyLabel&&topBuyLabel!==prev.buy){
-              notifyDesktop(`▲ ${w.name} ${w.code}：シグナル検知`,topBuyLabel);
-            }
-            if(watchLabel&&watchLabel!==prev.watch){
-              notifyDesktop(`⏳ ${w.name} ${w.code}：様子見シグナル`,watchLabel);
-            }
-            lastSignalRef.current[code]={entry:entryLabel,buy:topBuyLabel,watch:watchLabel};
-          });
-        }
-      }
-    }catch(e){}
-    setAutoScanRunning(false);
-    setAutoScanMsg(nowHHMM()+" 自動スキャン実行");
-  };
+    });
+    return out;
+  },[s.watchlist,s.breakoutLevels,s.stockQuotes]);
 
+  // 出来高ブレイクアウト条件に該当した銘柄は、表示するだけでなく「監視銘柄」へ自動追加する
+  // （2026-08-21 ユーザー要望：「記録」タブのチップ表示は撤去し、監視銘柄タブに一本化）。
+  // 既にwatchTargetsに入っていれば重複追加も再通知もしない（冪等）。
   useEffect(()=>{
-    if(!s.autoScanEnabled)return;
-    runAutoScan();
-    const timer=setInterval(runAutoScan,AUTO_SCAN_INTERVAL_MS);
-    return ()=>clearInterval(timer);
+    breakoutAlerts.forEach(item=>{
+      if(s.watchTargets.includes(item.code))return;
+      setS(p=>p.watchTargets.includes(item.code)?p:{...p,watchTargets:[...p.watchTargets,item.code]});
+      notifyDesktop(`▲ ${item.name} ${item.code}：出来高ブレイクアウト→監視銘柄に追加`,
+        `直近20営業日高値${item.high20.toLocaleString()}を出来高${item.volRatio.toFixed(1)}倍で上抜け`);
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[s.autoScanEnabled,s.priorityTargets.join(",")]);
+  },[breakoutAlerts]);
 
   // 決算分析タブの対象銘柄。「決算」ボタンで追加され、直近の決算短信（TDnet）のタイトル・
   // 数値要約を取得して表示する（要約の作り方は適時開示タブと同じ、9章のsummarize_earnings_pdf）。
@@ -1244,20 +1378,14 @@ function App(){
     setTab("earnings");
   };
 
-  // 指示書2026-07-16項目2：登録銘柄テーブルの「本日優先」ボタン。自動スキャン(5分おき)・
-  // デスクトップ通知の対象銘柄を最大9社まで手動選択する（多すぎると分析APIの呼び出しが
-  // 重くなるため上限を設けている）。
-  const MAX_PRIORITY_TARGETS=9;
-  const togglePriorityTarget=(code)=>{
-    setS(p=>{
-      if(p.priorityTargets.includes(code)) return {...p,priorityTargets:p.priorityTargets.filter(c=>c!==code)};
-      if(p.priorityTargets.length>=MAX_PRIORITY_TARGETS){
-        alert(`本日優先は最大${MAX_PRIORITY_TARGETS}社までです。`);
-        return p;
-      }
-      return {...p,priorityTargets:[...p.priorityTargets,code]};
-    });
+  // 2026-08-21 ユーザー要望：登録銘柄テーブルの「監視銘柄」ボタン。「監視銘柄」タブでまとめて
+  // 確認する対象銘柄を上限なく手動選択する（旧「本日優先」＝5分おき自動スキャン機能はここで撤去）。
+  const toggleWatchTarget=(code)=>{
+    setS(p=>p.watchTargets.includes(code)
+      ?{...p,watchTargets:p.watchTargets.filter(c=>c!==code)}
+      :{...p,watchTargets:[...p.watchTargets,code]});
   };
+  const removeWatchTarget=(code)=>setS(p=>({...p,watchTargets:p.watchTargets.filter(c=>c!==code)}));
 
   // 売買記録（トレードジャーナル）：銘柄分析カードの「記録に追加」ボタンから、そのカードの
   // entry/stop/target/marketEnv/entryReasonを初期値にしたドラフトを開き、「記録」タブへ遷移する。
@@ -1294,7 +1422,7 @@ function App(){
 
   const rollToNextDay=()=>{if(!confirm("今日の値を前日値へ繰り越し、新しい一日にします（登録銘柄・分析対象銘柄は保持）。よろしいですか？"))return;
     setS(p=>({...emptyState(),date:todayISO(),watchlist:p.watchlist,watchlistUS:p.watchlistUS,analysisTargets:p.analysisTargets,
-      autoScanEnabled:p.autoScanEnabled,
+      watchTargets:p.watchTargets,
       metrics:Object.fromEntries(Object.entries(p.metrics).map(([k,v])=>[k,{t:"",p:v.t}]))}));};
   const exportJSON=()=>{const blob=new Blob([JSON.stringify(s,null,2)],{type:"application/json"});
     const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="trade-cockpit-"+s.date+".json";a.click();URL.revokeObjectURL(url);};
@@ -1407,6 +1535,7 @@ function App(){
       <div className="tabs">
         <button className={"tab"+(tab==="monitor"?" on":"")} onClick={()=>setTab("monitor")}>日次モニター</button>
         <button className={"tab"+(tab==="news"?" on":"")} onClick={()=>setTab("news")}>ニュース</button>
+        <button className={"tab"+(tab==="watch"?" on":"")} onClick={()=>setTab("watch")}>監視銘柄</button>
         <button className={"tab"+(tab==="us"?" on":"")} onClick={()=>setTab("us")}>アメリカ市場</button>
         <button className={"tab"+(tab==="briefing"?" on":"")} onClick={()=>setTab("briefing")}>日本市場</button>
         <button className={"tab"+(tab==="earnings"?" on":"")} onClick={()=>setTab("earnings")}>決算分析</button>
@@ -1460,6 +1589,13 @@ function App(){
         <p className="foot">※ 30秒おきに自動更新されます（start.bat で起動したローカルサーバー経由）。数値は遅延あり（前営業日終値〜数十分遅れ）でリアルタイムの板ではありません。</p>
       </div>}
 
+      {/* ===== 監視銘柄（2026-08-21 ユーザー要望） ===== */}
+      {tab==="watch" && <WatchTargetsPanel items={watchTargetItems} stockQuotes={s.stockQuotes}
+        analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
+        earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
+        onRemove={removeWatchTarget}
+        onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}/>}
+
       {/* ===== BRIEFING（日本市場） ===== */}
       {tab==="briefing" && <div>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8,marginTop:18}}>
@@ -1471,7 +1607,7 @@ function App(){
         <SectorWatchlist market="JP" watchlist={s.watchlist} setWatchlist={setWatchlistJP} candidates={masterJP} max={MAX}
           stockQuotes={s.stockQuotes} analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
           earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
-          priorityTargets={s.priorityTargets} onTogglePriority={togglePriorityTarget}
+          watchTargets={s.watchTargets} onToggleWatch={toggleWatchTarget}
           onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}/>
         <p className="foot">※ ニュースはGoogleニュースRSSを利用しています。売買を推奨するものではなく、最終判断はご自身で。</p>
       </div>}
@@ -1487,7 +1623,7 @@ function App(){
         <SectorWatchlist market="US" watchlist={s.watchlistUS} setWatchlist={setWatchlistUS} candidates={masterUS} max={MAX_US}
           stockQuotes={s.stockQuotes} analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
           earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
-          priorityTargets={s.priorityTargets} onTogglePriority={togglePriorityTarget}
+          watchTargets={s.watchTargets} onToggleWatch={toggleWatchTarget}
           onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}/>
         <p className="foot" style={{marginTop:16}}>※ 対象は現行のダウ工業株30種平均構成銘柄。業種分類は日本市場と同じ東証33業種の枠組みで統一しています（GICSセクターではありません）。アメリカ市場銘柄のニュース・決算・IRは「ニュース」タブのサマリー・海外市況・適時開示に統合表示しています。</p>
       </div>}
@@ -1803,30 +1939,17 @@ function App(){
           </label>
           <div style={{fontSize:11,color:"var(--inkFaint)"}}>※ 銘柄分析タブの各銘柄カードで、この設定を使った株数目安が表示されます。</div>
         </div>
-        {/* 指示書2026-07-16 項目2・3：自動スキャン＋デスクトップ通知。「本日優先」9社を5分おきに
-            自動で再分析し、新規の買い/様子見シグナルが出た瞬間にブラウザのデスクトップ通知を出す
-            （ブラウザのタブを開いている間だけ動作）。セクター内逆行銘柄は登録銘柄全体が対象。
-            2026-08-20：銘柄分析タブをすっきりさせるためこちらに移設。 */}
+        {/* デスクトップ通知＋セクター内逆行銘柄。セクター内逆行銘柄は登録銘柄全体が対象。
+            2026-08-20：銘柄分析タブをすっきりさせるためこちらに移設。
+            2026-08-21：旧「本日優先」5分おき自動スキャン機能は「監視銘柄」タブに置き換えて撤去。
+            出来高ブレイクアウトの該当銘柄も、ここへのチップ表示ではなく監視銘柄タブへの自動追加に変更。 */}
         <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14}}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10}}>
-            <div style={{fontSize:13,fontWeight:700,color:"var(--ink)"}}>📡 自動スキャン（本日優先・{priorityItems.length}/{MAX_PRIORITY_TARGETS}社）</div>
-            <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
-              {notifyPermission!=="granted" &&
-                <button className="btn" onClick={requestNotifyPermission}>{notifyPermission==="unsupported"?"通知非対応ブラウザ":"デスクトップ通知を許可"}</button>}
-              <label style={{display:"flex",alignItems:"center",gap:6,fontSize:12.5,cursor:"pointer"}}>
-                <input type="checkbox" checked={s.autoScanEnabled} onChange={e=>set({autoScanEnabled:e.target.checked})}/>自動スキャンを有効にする(5分おき)
-              </label>
-            </div>
+            <div style={{fontSize:13,fontWeight:700,color:"var(--ink)"}}>🔔 デスクトップ通知</div>
+            {notifyPermission!=="granted" &&
+              <button className="btn" onClick={requestNotifyPermission}>{notifyPermission==="unsupported"?"通知非対応ブラウザ":"デスクトップ通知を許可"}</button>}
           </div>
-          <div className="sec-note" style={{marginTop:8}}>「日本市場」「アメリカ市場」タブの登録銘柄一覧で「本日優先」ボタンを押すと、ここでの自動スキャン対象になります（最大9社）。有効にすると、5分おきに現在値の再取得と分析を自動実行し、新しい買い/様子見シグナルが出たタイミングでデスクトップ通知します（通知にはブラウザの許可が必要・タブを開いている間のみ動作）。</div>
-          {autoScanMsg && <div style={{marginTop:6,fontSize:11,color:"var(--inkSoft)"}}>{autoScanRunning?"スキャン中…":autoScanMsg}</div>}
-          {priorityItems.length>0 && <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:10}}>
-            {priorityItems.map(w=>{
-              const a=s.analysisData[w.code];
-              const label=a?.tradeRules?.entryPattern?.label?"買いシグナル":(a?.tradeRules?.watchStatus?"様子見":"監視中");
-              return <span key={w.code} className="chip" style={{cursor:"default"}}>{w.name}（{w.code}）：{label}</span>;
-            })}
-          </div>}
+          <div className="sec-note" style={{marginTop:8}}>セクター内逆行銘柄の検知、出来高ブレイクアウト該当銘柄の「監視銘柄」への自動追加のタイミングで、ブラウザのデスクトップ通知でお知らせします（許可が必要・タブを開いている間のみ動作）。</div>
           {sectorLaggards.length>0 && <div style={{marginTop:12,paddingTop:10,borderTop:"1px solid var(--ruleSoft)"}}>
             <div style={{fontSize:12.5,fontWeight:700,color:"var(--ink)",marginBottom:6}}>↗ セクター内逆行銘柄（弱いセクターの中で一人勝ちしている銘柄）</div>
             <div style={{display:"flex",flexWrap:"wrap",gap:6}}>

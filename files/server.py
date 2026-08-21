@@ -244,6 +244,7 @@ def _overlay_tachibana_prices(out, watchlist):
             out[code]["low"] = v["low"]
         if v.get("volume") is not None:
             out[code]["turnover"] = v["t"] * v["volume"]
+            out[code]["volume"] = v["volume"]  # フロント側の出来高ブレイクアウト判定用
         if v.get("ask") is not None:
             out[code]["ask"] = v["ask"]
         if v.get("bid") is not None:
@@ -1495,6 +1496,34 @@ def _tachibana_daily_arrays(code):
     return closes, opens, highs, lows, volumes
 
 
+def get_breakout_levels(watchlist):
+    """登録銘柄（日本株）ごとに、出来高ブレイクアウト判定に使う基準値（直近20営業日高値・
+    直近5日平均出来高）だけを軽量に返す。analyze_stock()と同じ定義（20営業日高値、5日平均
+    出来高の1.5倍）だが、RSI・ボリンジャー・PDF解析等は一切行わないため大幅に軽い。
+    この基準値は日中変わらないため、フロント側は1日1回だけ呼べばよい（30秒おきの現在値更新の
+    たびにここを叩く必要はない。現在値との比較はフロント側で行う）。
+    戻り値：{code: {high20, volAvg5}}（取得失敗した銘柄は含まれない＝機械的にスキップ）。"""
+    out = {}
+    for w in watchlist:
+        if w.get("market", "JP") == "US":
+            continue  # 立花証券APIの日足はJP専用のため対象外
+        code = w.get("code", "")
+        if not code:
+            continue
+        arrays = _tachibana_daily_arrays(code)
+        if not arrays:
+            continue
+        _closes, _opens, highs, _lows, volumes = arrays
+        # 当日分は_tachibana_daily_arrays()が末尾に合成しているため、直近20営業日高値・5日平均
+        # 出来高は「当日を含まない」直近の確定済み日から数える（[-21:-1]は当日を除いた20日分）。
+        if len(highs) < 21 or len(volumes) < 6:
+            continue
+        high20 = max(highs[-21:-1])
+        vol_avg5 = sum(volumes[-6:-1]) / 5
+        out[code] = {"high20": round(high20, 2), "volAvg5": round(vol_avg5, 0)}
+    return out
+
+
 def analyze_stock(w, market_env=None):
     """12-1章・technical_analysis_rules.md：ローソク足パターン・移動平均線の並び／クロス・
     ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
@@ -2520,6 +2549,16 @@ class Handler(SimpleHTTPRequestHandler):
             quotes = get_stock_quotes(watchlist)
             now = datetime.datetime.now().strftime("%H:%M:%S")
             self._send_json({"quotes": quotes, "fetchedAt": now})
+        elif self.path.startswith("/api/breakout-levels"):
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b"[]"
+            try:
+                watchlist = json.loads(raw.decode("utf-8") or "[]")
+            except Exception:
+                watchlist = []
+            print(f"[取得] 出来高ブレイクアウト基準値（対象 {len(watchlist)} 銘柄）…")
+            levels = get_breakout_levels(watchlist)
+            self._send_json({"levels": levels})
         elif self.path.startswith("/api/analysis"):
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length) if length else b"[]"
