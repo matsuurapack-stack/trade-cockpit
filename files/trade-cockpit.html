@@ -720,7 +720,12 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
     return candidates.find(m=>regCodes.has(m.code)&&(normKana(m.code).includes(t)||normKana(m.name).includes(t)||normKana(m.kana).includes(t)))||null;},[q,regCodes,candidates]);
   const addStock=(m)=>{if(watchlist.length>=max){alert("登録は最大"+max+"社までです。");return;}
     if(regCodes.has(m.code))return; setWatchlist([...watchlist,{id:m.code,...m,watch:"通常",note:"",theme:""}]);setQ("");};
-  const addManual=()=>{
+  const [sectorGuessing,setSectorGuessing]=useState(false);
+  // 2026-08-21 ユーザー要望：マスターリストに無い銘柄を手動登録する際、業種プルダウンの手動選択に
+  // 頼らずyfinanceから東証33業種を推定して自動で埋める（guess_sector()、server.py参照）。
+  // 完全な精度は保証できないため、推定できなかった場合はプルダウンで選んだ値（manualSector）を
+  // そのまま使う（従来どおり）。
+  const addManual=async()=>{
     const raw=q.trim();if(!raw)return;if(watchlist.length>=max){alert("最大"+max+"社");return;}
     let code=raw,name=raw;
     if(!/^[0-9]{4}[0-9A-Za-z]?$/.test(raw)){
@@ -728,7 +733,17 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
       if(!input||!input.trim())return;
       code=input.trim();
     }
-    setWatchlist([...watchlist,{id:Date.now()+Math.random(),code,name,sector:manualSector,market,tvSymbol:(market==="JP"?"TSE:"+code:code),watch:"通常",note:"",theme:""}]);setQ("");};
+    let sector=manualSector;
+    setSectorGuessing(true);
+    try{
+      const r=await fetch("/api/guess-sector",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({code,market})});
+      if(r.ok){
+        const d=await r.json();
+        if(d.sector&&SECTOR_CHOICES.includes(d.sector))sector=d.sector;
+      }
+    }catch(e){}
+    setSectorGuessing(false);
+    setWatchlist([...watchlist,{id:Date.now()+Math.random(),code,name,sector,market,tvSymbol:(market==="JP"?"TSE:"+code:code),watch:"通常",note:"",theme:""}]);setQ("");};
   const delStock=(id)=>setWatchlist(watchlist.filter(w=>w.id!==id));
   const editTheme=(w)=>{
     const input=prompt(`「${w.name}」のテーマ（例：AI関連、インバウンド、半導体）`,w.theme||"");
@@ -793,11 +808,11 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
             <span style={{color:"var(--accent)",fontWeight:700}}>＋</span>
           </button>)}
         <div className="res-row" style={{background:"var(--band)",fontSize:12.5,color:"var(--inkSoft)",display:"flex",alignItems:"center",gap:8}}>
-          <span>＋「{q.trim()}」を手動登録：業種</span>
-          <select value={manualSector} onChange={e=>setManualSector(e.target.value)} style={{fontSize:12}}>
+          <span>＋「{q.trim()}」を手動登録：業種（登録時に自動推定・違えば選び直せます）</span>
+          <select value={manualSector} onChange={e=>setManualSector(e.target.value)} style={{fontSize:12}} disabled={sectorGuessing}>
             {SECTOR_CHOICES.map(s=><option key={s} value={s}>{s}</option>)}
           </select>
-          <button className="btn" style={{fontSize:11.5,padding:"2px 10px"}} onClick={addManual}>登録</button>
+          <button className="btn" style={{fontSize:11.5,padding:"2px 10px"}} onClick={addManual} disabled={sectorGuessing}>{sectorGuessing?"業種を判定中…":"登録"}</button>
         </div>
       </div>}
     </div>

@@ -1524,6 +1524,70 @@ def get_breakout_levels(watchlist):
     return out
 
 
+# 2026-08-21 ユーザー要望：マスターリスト（MASTER・約277社）に無い銘柄を「手動登録」する際、
+# 東証33業種のどれに当たるかをyfinanceのsector/industry（GICS準拠・英語）から推定する。
+# yfinanceは業種名を東証33業種とは異なる分類・英語で返すため、キーワードで簡易マッピングする。
+# 完全一致は保証できない前提の「たたき台」であり、フロント側では引き続き手動で選び直せる
+# （2026-08-21 ユーザー確認済み：yfinance推定で進める。多少不正確・取得が遅い場合がある前提）。
+_YF_INDUSTRY_TO_SECTOR33 = [
+    # (industryに含まれていれば優先的にマッチさせるキーワード, 東証33業種)
+    ("semiconductor", "電気機器"), ("consumer electronics", "電気機器"), ("computer hardware", "電気機器"),
+    ("electronic", "電気機器"),
+    ("software", "情報・通信業"), ("internet", "情報・通信業"), ("telecom", "情報・通信業"), ("media", "情報・通信業"),
+    ("bank", "銀行業"),
+    ("insurance", "保険業"),
+    ("capital markets", "証券、商品先物取引業"), ("asset management", "証券、商品先物取引業"), ("securities", "証券、商品先物取引業"),
+    ("credit services", "その他金融業"),
+    ("auto ", "輸送用機器"), ("automobile", "輸送用機器"), ("aerospace", "輸送用機器"),
+    ("apparel", "繊維製品"), ("textile", "繊維製品"),
+    ("retail", "小売業"), ("department store", "小売業"), ("grocery", "小売業"), ("restaurant", "小売業"),
+    ("beverage", "食料品"), ("packaged food", "食料品"), ("food", "食料品"),
+    ("household", "化学"), ("chemical", "化学"),
+    ("steel", "鉄鋼"),
+    ("copper", "非鉄金属"), ("aluminum", "非鉄金属"), ("industrial metals", "非鉄金属"), ("mining", "鉱業"),
+    ("paper", "パルプ・紙"),
+    ("machinery", "機械"), ("industrial machinery", "機械"),
+    ("railroad", "陸運業"), ("trucking", "陸運業"), ("freight", "陸運業"), ("logistics", "陸運業"),
+    ("marine shipping", "海運業"), ("shipping", "海運業"),
+    ("airline", "空運業"), ("airport", "空運業"),
+    ("engineering & construction", "建設業"), ("construction", "建設業"),
+    ("real estate", "不動産業"), ("reit", "不動産業"),
+    ("utilities—regulated electric", "電気・ガス業"), ("utilities—regulated gas", "電気・ガス業"), ("utilit", "電気・ガス業"),
+    ("oil", "石油・石炭製品"), ("gas ", "石油・石炭製品"), ("energy", "石油・石炭製品"),
+    ("medical", "精密機器"), ("diagnostics", "精密機器"), ("biotechnology", "医薬品"), ("drug", "医薬品"), ("pharma", "医薬品"),
+    ("rubber", "ゴム製品"), ("tire", "ゴム製品"),
+    ("glass", "ガラス・土石製品"), ("cement", "ガラス・土石製品"),
+]
+# yfinanceのsector（大分類）だけで判定する場合のフォールバック（industryでマッチしなかった場合用）
+_YF_SECTOR_TO_SECTOR33 = {
+    "technology": "情報・通信業", "communication services": "情報・通信業",
+    "financial services": "その他金融業", "financial": "その他金融業",
+    "healthcare": "医薬品",
+    "consumer cyclical": "小売業", "consumer defensive": "食料品",
+    "industrials": "機械", "basic materials": "化学",
+    "energy": "石油・石炭製品", "utilities": "電気・ガス業", "real estate": "不動産業",
+}
+
+
+def guess_sector(code, market):
+    """MASTERに無い銘柄の東証33業種をyfinanceから推定する（失敗時はNone）。"""
+    if yf is None or not code:
+        return None
+    try:
+        sym = code if market == "US" else code + ".T"
+        info = yf.Ticker(sym).info or {}
+        industry = str(info.get("industry") or "").lower()
+        sector = str(info.get("sector") or "").lower()
+        for kw, s33 in _YF_INDUSTRY_TO_SECTOR33:
+            if kw in industry:
+                return s33
+        if sector in _YF_SECTOR_TO_SECTOR33:
+            return _YF_SECTOR_TO_SECTOR33[sector]
+    except Exception as e:
+        print(f"  業種推定失敗（{code}）", e)
+    return None
+
+
 def analyze_stock(w, market_env=None):
     """12-1章・technical_analysis_rules.md：ローソク足パターン・移動平均線の並び／クロス・
     ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
@@ -2559,6 +2623,18 @@ class Handler(SimpleHTTPRequestHandler):
             print(f"[取得] 出来高ブレイクアウト基準値（対象 {len(watchlist)} 銘柄）…")
             levels = get_breakout_levels(watchlist)
             self._send_json({"levels": levels})
+        elif self.path.startswith("/api/guess-sector"):
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                body = {}
+            code = str(body.get("code") or "").strip()
+            market = body.get("market") or "JP"
+            print(f"[取得] 業種推定（{code}／{market}）…")
+            sector = guess_sector(code, market)
+            self._send_json({"sector": sector})
         elif self.path.startswith("/api/analysis"):
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length) if length else b"[]"
