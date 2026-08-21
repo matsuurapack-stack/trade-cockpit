@@ -1584,59 +1584,6 @@ function App(){
           本分析は算出根拠の一つに過ぎず、投資判断は必ずご自身の判断で行ってください。数値を鵜呑みにせず、最終判断はご自身の責任で行ってください。
           購入・損切り・利確の各単価は「推奨」ではなく、あくまで目安・参考値です。
         </div>
-        {/* 自身のトレードルール（trading_rules.md）：常に忘れないための固定リマインド */}
-        <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14,fontSize:12,lineHeight:1.8,color:"var(--inkSoft)"}}>
-          <div style={{fontWeight:700,color:"var(--ink)",marginBottom:4}}>自分のトレードルール（要点）</div>
-          最優先は負けないこと・<b style={{color:"var(--ink)"}}>逆指値は絶対に下げない</b>・基本は持ち越さない（自信ある銘柄のみ例外）・ノートレードも立派な判断。
-          <div style={{marginTop:6}}>銘柄選びの優先順位：①半導体 → ②AI関連 → ③当日最強セクター（日次モニターのセクター売買代金順を参照） → ④材料株。年初にテーマを決め、代表的な大型株を継続的に監視する。</div>
-          <div style={{marginTop:6,fontSize:11,color:"var(--inkFaint)"}}>エントリー・利確・損切りの詳細な判断基準（押し目/高値ブレイク、飛び付き買い禁止、利確シグナル、移動平均線の解釈など）は、下の各銘柄の分析結果に自動反映されています。</div>
-        </div>
-        {/* 資金管理・分割買いツール：総資金とリスク許容%から、各銘柄カードの損切り幅に応じた株数目安を計算する。
-            値はsettingsとしてlocalStorageに自動保存される。計算はentry/stopが既にある各カードで行う（下部）。 */}
-        <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 14px",marginBottom:14,display:"flex",flexWrap:"wrap",gap:14,alignItems:"center"}}>
-          <div style={{fontSize:12,fontWeight:700,color:"var(--ink)"}}>資金管理設定</div>
-          <label style={{display:"flex",alignItems:"center",gap:6,fontSize:12,color:"var(--inkSoft)"}}>総資金
-            <input type="number" min="0" step="10000" value={s.settings?.totalCapital??""} placeholder="例：1000000"
-              onChange={e=>setS({...s,settings:{...s.settings,totalCapital:e.target.value}})}
-              style={{width:120,fontSize:13,padding:"3px 6px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}/>円
-          </label>
-          <label style={{display:"flex",alignItems:"center",gap:6,fontSize:12,color:"var(--inkSoft)"}}>1トレードの許容損失
-            <input type="number" min="0.1" max="10" step="0.1" value={s.settings?.riskPct??1}
-              onChange={e=>setS({...s,settings:{...s.settings,riskPct:e.target.value}})}
-              style={{width:60,fontSize:13,padding:"3px 6px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}/>%
-          </label>
-        </div>
-        {/* 指示書2026-07-16 項目2・3：自動スキャン＋デスクトップ通知。「本日優先」9社を5分おきに
-            自動で再分析し、新規の買い/様子見シグナルが出た瞬間にブラウザのデスクトップ通知を出す
-            （ブラウザのタブを開いている間だけ動作）。セクター内逆行銘柄は登録銘柄全体が対象。 */}
-        <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14}}>
-          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10}}>
-            <div style={{fontSize:13,fontWeight:700,color:"var(--ink)"}}>📡 自動スキャン（本日優先・{priorityItems.length}/{MAX_PRIORITY_TARGETS}社）</div>
-            <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
-              {notifyPermission!=="granted" &&
-                <button className="btn" onClick={requestNotifyPermission}>{notifyPermission==="unsupported"?"通知非対応ブラウザ":"デスクトップ通知を許可"}</button>}
-              <label style={{display:"flex",alignItems:"center",gap:6,fontSize:12.5,cursor:"pointer"}}>
-                <input type="checkbox" checked={s.autoScanEnabled} onChange={e=>set({autoScanEnabled:e.target.checked})}/>自動スキャンを有効にする(5分おき)
-              </label>
-            </div>
-          </div>
-          <div className="sec-note" style={{marginTop:8}}>「日本市場」「アメリカ市場」タブの登録銘柄一覧で「本日優先」ボタンを押すと、ここでの自動スキャン対象になります（最大9社）。有効にすると、5分おきに現在値の再取得と分析を自動実行し、新しい買い/様子見シグナルが出たタイミングでデスクトップ通知します（通知にはブラウザの許可が必要・タブを開いている間のみ動作）。</div>
-          {autoScanMsg && <div style={{marginTop:6,fontSize:11,color:"var(--inkSoft)"}}>{autoScanRunning?"スキャン中…":autoScanMsg}</div>}
-          {priorityItems.length>0 && <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:10}}>
-            {priorityItems.map(w=>{
-              const a=s.analysisData[w.code];
-              const label=a?.tradeRules?.entryPattern?.label?"買いシグナル":(a?.tradeRules?.watchStatus?"様子見":"監視中");
-              return <span key={w.code} className="chip" style={{cursor:"default"}}>{w.name}（{w.code}）：{label}</span>;
-            })}
-          </div>}
-          {sectorLaggards.length>0 && <div style={{marginTop:12,paddingTop:10,borderTop:"1px solid var(--ruleSoft)"}}>
-            <div style={{fontSize:12.5,fontWeight:700,color:"var(--ink)",marginBottom:6}}>↗ セクター内逆行銘柄（弱いセクターの中で一人勝ちしている銘柄）</div>
-            <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
-              {sectorLaggards.slice(0,10).map(item=>
-                <span key={item.code} className="chip" style={{cursor:"default"}}>{item.name}（{item.code}）：{item.pct>0?"+":""}{item.pct.toFixed(2)}% / {item.sector}平均{item.sectorAvg.toFixed(2)}%</span>)}
-            </div>
-          </div>}
-        </div>
         {analysisItems.length===0
           ? <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13,border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)"}}>
               分析対象の銘柄がありません。「日本市場」「アメリカ市場」タブの登録銘柄一覧で「分析」ボタンを押すと、ここに追加されます。
@@ -1785,6 +1732,64 @@ function App(){
       {tab==="journal" && <div style={{marginTop:18}}>
         <div className="sec-head">記録</div>
         <div className="sec-note">エントリー理由・相場環境・撤退条件を記録し、後から結果と学びを追記します。データはこの端末のブラウザにのみ保存されます（サーバーには送信されません）。</div>
+
+        {/* 自身のトレードルール（trading_rules.md）：常に忘れないための固定リマインド。
+            2026-08-20：銘柄分析タブをすっきりさせるためこちらに移設。 */}
+        <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14,fontSize:12,lineHeight:1.8,color:"var(--inkSoft)"}}>
+          <div style={{fontWeight:700,color:"var(--ink)",marginBottom:4}}>自分のトレードルール（要点）</div>
+          最優先は負けないこと・<b style={{color:"var(--ink)"}}>逆指値は絶対に下げない</b>・基本は持ち越さない（自信ある銘柄のみ例外）・ノートレードも立派な判断。
+          <div style={{marginTop:6}}>銘柄選びの優先順位：①半導体 → ②AI関連 → ③当日最強セクター（日次モニターのセクター売買代金順を参照） → ④材料株。年初にテーマを決め、代表的な大型株を継続的に監視する。</div>
+          <div style={{marginTop:6,fontSize:11,color:"var(--inkFaint)"}}>エントリー・利確・損切りの詳細な判断基準（押し目/高値ブレイク、飛び付き買い禁止、利確シグナル、移動平均線の解釈など）は、銘柄分析タブの各銘柄の分析結果に自動反映されています。</div>
+        </div>
+        {/* 資金管理・分割買いツール：総資金とリスク許容%から、銘柄分析タブの各カードの損切り幅に
+            応じた株数目安を計算する。値はsettingsとしてlocalStorageに自動保存される。
+            2026-08-20：銘柄分析タブをすっきりさせるためこちらに移設（計算自体は銘柄分析タブの各カードで行う）。 */}
+        <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 14px",marginBottom:14,display:"flex",flexWrap:"wrap",gap:14,alignItems:"center"}}>
+          <div style={{fontSize:12,fontWeight:700,color:"var(--ink)"}}>資金管理設定</div>
+          <label style={{display:"flex",alignItems:"center",gap:6,fontSize:12,color:"var(--inkSoft)"}}>総資金
+            <input type="number" min="0" step="10000" value={s.settings?.totalCapital??""} placeholder="例：1000000"
+              onChange={e=>setS({...s,settings:{...s.settings,totalCapital:e.target.value}})}
+              style={{width:120,fontSize:13,padding:"3px 6px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}/>円
+          </label>
+          <label style={{display:"flex",alignItems:"center",gap:6,fontSize:12,color:"var(--inkSoft)"}}>1トレードの許容損失
+            <input type="number" min="0.1" max="10" step="0.1" value={s.settings?.riskPct??1}
+              onChange={e=>setS({...s,settings:{...s.settings,riskPct:e.target.value}})}
+              style={{width:60,fontSize:13,padding:"3px 6px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}/>%
+          </label>
+          <div style={{fontSize:11,color:"var(--inkFaint)"}}>※ 銘柄分析タブの各銘柄カードで、この設定を使った株数目安が表示されます。</div>
+        </div>
+        {/* 指示書2026-07-16 項目2・3：自動スキャン＋デスクトップ通知。「本日優先」9社を5分おきに
+            自動で再分析し、新規の買い/様子見シグナルが出た瞬間にブラウザのデスクトップ通知を出す
+            （ブラウザのタブを開いている間だけ動作）。セクター内逆行銘柄は登録銘柄全体が対象。
+            2026-08-20：銘柄分析タブをすっきりさせるためこちらに移設。 */}
+        <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10}}>
+            <div style={{fontSize:13,fontWeight:700,color:"var(--ink)"}}>📡 自動スキャン（本日優先・{priorityItems.length}/{MAX_PRIORITY_TARGETS}社）</div>
+            <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+              {notifyPermission!=="granted" &&
+                <button className="btn" onClick={requestNotifyPermission}>{notifyPermission==="unsupported"?"通知非対応ブラウザ":"デスクトップ通知を許可"}</button>}
+              <label style={{display:"flex",alignItems:"center",gap:6,fontSize:12.5,cursor:"pointer"}}>
+                <input type="checkbox" checked={s.autoScanEnabled} onChange={e=>set({autoScanEnabled:e.target.checked})}/>自動スキャンを有効にする(5分おき)
+              </label>
+            </div>
+          </div>
+          <div className="sec-note" style={{marginTop:8}}>「日本市場」「アメリカ市場」タブの登録銘柄一覧で「本日優先」ボタンを押すと、ここでの自動スキャン対象になります（最大9社）。有効にすると、5分おきに現在値の再取得と分析を自動実行し、新しい買い/様子見シグナルが出たタイミングでデスクトップ通知します（通知にはブラウザの許可が必要・タブを開いている間のみ動作）。</div>
+          {autoScanMsg && <div style={{marginTop:6,fontSize:11,color:"var(--inkSoft)"}}>{autoScanRunning?"スキャン中…":autoScanMsg}</div>}
+          {priorityItems.length>0 && <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:10}}>
+            {priorityItems.map(w=>{
+              const a=s.analysisData[w.code];
+              const label=a?.tradeRules?.entryPattern?.label?"買いシグナル":(a?.tradeRules?.watchStatus?"様子見":"監視中");
+              return <span key={w.code} className="chip" style={{cursor:"default"}}>{w.name}（{w.code}）：{label}</span>;
+            })}
+          </div>}
+          {sectorLaggards.length>0 && <div style={{marginTop:12,paddingTop:10,borderTop:"1px solid var(--ruleSoft)"}}>
+            <div style={{fontSize:12.5,fontWeight:700,color:"var(--ink)",marginBottom:6}}>↗ セクター内逆行銘柄（弱いセクターの中で一人勝ちしている銘柄）</div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+              {sectorLaggards.slice(0,10).map(item=>
+                <span key={item.code} className="chip" style={{cursor:"default"}}>{item.name}（{item.code}）：{item.pct>0?"+":""}{item.pct.toFixed(2)}% / {item.sector}平均{item.sectorAvg.toFixed(2)}%</span>)}
+            </div>
+          </div>}
+        </div>
 
         {journalDraft && <div className="card" style={{marginTop:12,marginBottom:16,padding:"14px 16px"}}>
           <div style={{fontWeight:700,marginBottom:8}}>記録の下書き：{journalDraft.name}（{journalDraft.code}）</div>

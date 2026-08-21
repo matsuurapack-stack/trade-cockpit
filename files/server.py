@@ -1542,6 +1542,15 @@ def analyze_stock(w, market_env=None):
     vol_thin = vol_avg5 is not None and volumes[-1] < vol_avg5 * 0.7
     change_1w = (current - closes[-6]) / closes[-6] * 100 if n >= 6 and closes[-6] else None
 
+    # ---- ユーザー要望(2026-08-20)：「購入単価（目安）」は下で拾う（押し目）のではなく、上昇
+    # トレンドで出来高を伴って直近高値を上抜けた水準を採用する。直近20営業日高値（当日を含まない）
+    # を、直近5日平均の1.5倍以上の出来高（既存vol_surgeと同一基準）を伴って上抜けていれば
+    # ブレイクアウト成立とし、その高値をentryに採用する（後段で最終的に上書き。既存の初押し等の
+    # 細かいエントリー判定はそのまま残し、ブレイクアウト成立時だけ優先表示する）。----
+    breakout_lookback_high = max(highs[-21:-1]) if len(highs) >= 21 else None
+    breakout_confirmed = bool(breakout_lookback_high is not None and vol_surge and current > breakout_lookback_high)
+    vol_ratio_for_breakout = (volumes[-1] / vol_avg5) if (vol_avg5 and breakout_confirmed) else None
+
     # ---- trading_rules_追加分ルール①：好決算日等の様子見ルール。5%以上のGU or 出来高急増で、
     # 寄り付きから60分未満・かつ押し目がまだ形成されていなければ「様子見中」とする。----
     watch_status = None
@@ -1883,6 +1892,20 @@ def analyze_stock(w, market_env=None):
             basis_note = "市場時間外のため直近終値・決算内容に基づき算出"
         entry = entry * (1 - effective_discount / 100)
         entry_reasons.append(f"決算・増資の材料を反映し目安を-{effective_discount:.1f}%引き下げ（{basis_note}）")
+
+    # ---- ブレイクアウト成立時は、上記の押し目ベースの算出を上書きし、直近高値の上抜け水準を
+    # 目安値として採用する（ユーザー要望2026-08-20：「下で拾う単価はダメ。上昇トレンドで入る」）。
+    # stop/targetはこのentryを基準に後段で算出されるため、以降の計算すべてに一貫して反映される。----
+    if breakout_confirmed:
+        entry = breakout_lookback_high
+        entry_reasons = [
+            f"直近20営業日高値({breakout_lookback_high:.1f})を、5日平均出来高の{vol_ratio_for_breakout:.1f}倍の"
+            f"出来高を伴って上抜け。押し目を待たず、上昇トレンドのブレイクアウト水準を目安値に採用。"
+        ]
+        entry_pattern = {
+            "key": "breakout20high",
+            "label": f"出来高ブレイクアウト（直近20営業日高値{breakout_lookback_high:.1f}を出来高{vol_ratio_for_breakout:.1f}倍で上抜け）",
+        }
 
     # ---- 損切り単価(目安)：ATR相当(当日実測 or 日次ATR)の1倍を損切り幅の目安とする（ザラ場内で許容できる下振れ）。
     # entry確定後に算出するため、当日安値による下限調整をentryにも先に反映済み（旧実装は
