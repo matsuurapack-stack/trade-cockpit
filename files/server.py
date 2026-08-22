@@ -16,6 +16,7 @@ import calendar
 import datetime
 import threading
 import webbrowser
+import unicodedata
 import urllib.parse
 import urllib.request
 from http.server import SimpleHTTPRequestHandler
@@ -336,48 +337,6 @@ def google_news(query, n=2, max_age_days=NEWS_MAX_AGE_DAYS):
         return out
     except Exception:
         return []
-
-
-# 6-2章：SNSタブ。X公式の埋め込みタイムライン(widgets.js)はsyndication.twitter.comが
-# 429(レート制限)を頻発して表示できないため、Nitter(Xの代替フロントエンド)のRSSフィードを
-# サーバー側で取得する方式に切り替えた（ニュースタブのGoogleニュースRSSと同じ手法）。
-# Nitterの公開インスタンスは不安定なため、複数インスタンスを順に試す。
-NITTER_INSTANCES = ["nitter.net", "xcancel.com", "nitter.privacyredirect.com"]
-
-
-def _nitter_tweet_url(handle, nitter_link):
-    """NitterのURL(https://nitter.net/handle/status/12345#m)から実際のXの投稿URLを組み立てる。"""
-    m = re.search(r"/status/(\d+)", nitter_link or "")
-    if m:
-        return f"https://x.com/{handle}/status/{m.group(1)}"
-    return f"https://x.com/{handle}"
-
-
-def get_sns_posts(handle, n=15):
-    """指定アカウントの直近投稿をNitter RSS経由で取得する。全インスタンス失敗時は空配列を返し、
-    フロント側で「Xで開く」フォールバック表示に切り替える。投稿文だけのシンプル表示のため、
-    画像等の付加情報は取得しない（安定性優先）。"""
-    if feedparser is None:
-        return []
-    for host in NITTER_INSTANCES:
-        url = f"https://{host}/{handle}/rss"
-        try:
-            feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
-            if feed.bozo or not feed.entries:
-                continue
-            out = []
-            for e in feed.entries[:n]:
-                out.append({
-                    "title": e.get("title", ""),
-                    "url": _nitter_tweet_url(handle, e.get("link", "")),
-                    "published": _fmt_published(e),
-                    "_ts": _published_ts(e),
-                })
-            if out:
-                return out
-        except Exception as ex:
-            print("  SNS取得失敗", host, handle, ex)
-    return []
 
 
 #  9章：登録銘柄ニュースは「決算を含むIR・適時開示」のみに絞る。GoogleニュースRSSには構造化
@@ -1044,19 +1003,43 @@ STOCK_NAME_NEWS_EXCLUDE_KEYWORDS = [
     "PR", "広告", "キャンペーン", "送料無料", "福袋", "初売り", "ブラックフライデー", "サイバーマンデー",
     "レビュー", "開封", "おすすめ", "ランキング", "まとめ買い", "本日限定", "特価", "お買い得", "特別価格",
     "ベストセラー",
-    # プロ野球・スポーツ結果（楽天イーグルス・ソフトバンクホークス等、社名とチーム名が重なるため）
-    "プロ野球", "野球", "イーグルス", "ホークス", "甲子園", "高校野球", "Jリーグ", "パ・リーグ", "セ・リーグ",
+    # プロ野球・スポーツ結果（楽天イーグルス・ソフトバンクホークス・日本ハムファイターズ・
+    # 鹿島アントラーズ等、社名とチーム名が重なるため。2026-08-21 ユーザー指摘：日本ハム(2282)・
+    # 鹿島(1812)のスポーツニュース混入が残っていたため追加調査のうえ拡充。試合結果記事は見出しに
+    # 「野球」「サッカー」等の一般語を含まないことが多く（例：「日本ハム・清宮虎、移籍後初登板も
+    # サヨナラ負け」）、実際にヒットした見出しから頻出語を拾って追加した。
+    "プロ野球", "野球", "イーグルス", "ホークス", "ファイターズ", "甲子園", "高校野球",
+    "Jリーグ", "J1リーグ", "J2リーグ", "明治安田", "パ・リーグ", "セ・リーグ", "サッカー", "アントラーズ",
+    "サヨナラ", "1軍", "2軍", "登板", "先発", "被安打", "ユース", "サンケイスポーツ", "FOOTBALL ZONE",
+    "高校サッカードットコム",
 ]
 
-# 上記キーワードでは拾いきれない、商品お買い得情報まとめを主とするアフィリエイト/SEOブログ媒体は
-# 出典（媒体名）そのものを除外する（判断材料としての価値が薄いニュースが多いため）。
-STOCK_NAME_NEWS_EXCLUDE_SOURCES = ["All About ニュース", "電撃ホビーウェブ", "uzurea.net", "PUNKLOID"]
+# 上記キーワードでは拾いきれない、商品お買い得情報まとめを主とするアフィリエイト/SEOブログ媒体・
+# スポーツ専門媒体は出典（媒体名）そのものを除外する（判断材料としての価値が薄いニュースが多いため）。
+# スポーツ媒体は2026-08-21 ユーザー指摘（日本ハム・鹿島の混入）を受けて実際にヒットした
+# 見出しの出典から追加（BASEBALL KING・道新スポーツ・スポニチ・サンスポ等）。
+STOCK_NAME_NEWS_EXCLUDE_SOURCES = [
+    "All About ニュース", "電撃ホビーウェブ", "uzurea.net", "PUNKLOID",
+    "BASEBALL KING", "道新スポーツ", "スポニチ Sponichi Annex", "サンスポ", "Goal.com",
+    "スポーツブル", "サッカー批評Web", "sportingnews.com", "targma.jp", "デイリースポーツ",
+    "日刊スポーツ", "スポーツ報知", "東スポWEB", "Full-Count", "THE ANSWER", "SOCCER DIGEST Web",
+]
 
 
 def _is_promo_news(title, source=""):
-    if any(k in title for k in STOCK_NAME_NEWS_EXCLUDE_KEYWORDS):
+    # 2026-08-22 ユーザー指摘対応：「Ｊリーグ」のように全角英字で書かれた見出しは、半角の
+    # "Jリーグ"キーワードでは一致しないまま素通りしていた。NFKC正規化（全角英数→半角）で
+    # 比較してから判定することで、全角/半角どちらの表記でも確実に弾けるようにする。
+    norm_title = unicodedata.normalize("NFKC", title)
+    if any(unicodedata.normalize("NFKC", k) in norm_title for k in STOCK_NAME_NEWS_EXCLUDE_KEYWORDS):
         return True
-    return any(s == source for s in STOCK_NAME_NEWS_EXCLUDE_SOURCES)
+    if any(s == source for s in STOCK_NAME_NEWS_EXCLUDE_SOURCES):
+        return True
+    # 2026-08-21 ユーザー指摘対応：Yahoo!ニュース等の集約媒体はsourceが「Yahoo!ニュース」に
+    # なり、実際の配信元（東スポWEB・サンケイスポーツ等）は見出し末尾に「（〇〇）」として
+    # 埋め込まれるだけのため、上のsource完全一致だけでは弾けない。見出し中にスポーツ媒体名が
+    # 含まれていないかも追加でチェックする。
+    return any(unicodedata.normalize("NFKC", s) in norm_title for s in STOCK_NAME_NEWS_EXCLUDE_SOURCES)
 
 
 # 立花証券APIのニュースヘッダー機能（NQN＝日経QUICKニュース等の実況速報）。銘柄コードでの
@@ -1153,36 +1136,6 @@ def build_stock_name_news(watchlist):
             items.append({**it, "code": code, "name": name})
 
     return _sort_and_strip(items)
-
-
-# 指示書(2026-07-16)項目4：ニュースタブの「SNS」サブタブ用。旧SNSタブ（複数アカウント切替表示）は
-# 廃止し、旧SNSタブで対象にしていた10アカウントの投稿のうち登録銘柄の社名に言及しているものだけを
-# 「SNS」タグとしてニュースタブに混ぜて表示する（銘柄名一致の判定は_title_mentions_nameを流用）。
-SNS_TAG_HANDLES = [
-    "kabu_st0ck", "aryarya", "kanpo_blog", "4ki4", "sak_07_",
-    "sou_btc", "min_fx", "nicosokufx", "nikkei", "hitsuzikai",
-]
-
-
-def build_sns_news(watchlist):
-    items = []
-    for handle in SNS_TAG_HANDLES:
-        posts = get_sns_posts(handle, n=30)
-        for w in watchlist:
-            name, code = w.get("name", ""), w.get("code", "")
-            if not name:
-                continue
-            for p in posts:
-                if _title_mentions_name(name, p.get("title", "")):
-                    items.append({**p, "source": f"X (@{handle})", "code": code, "name": name})
-    seen_urls = set()
-    deduped = []
-    for it in items:
-        if it["url"] in seen_urls:
-            continue
-        seen_urls.add(it["url"])
-        deduped.append(it)
-    return _sort_and_strip(deduped)
 
 
 # 9-1章：国内市況・海外市況のサブタブ用にクエリを分けて取得する
@@ -1433,7 +1386,7 @@ _MARGIN_RATIO_RE = re.compile(
 def _kabutan_margin_ratio(code):
     """銘柄コードから信用倍率(貸借倍率)を取得する。kabutanはUser-Agent未指定のリクエストを
     403で拒否するため、ブラウザ相当のUAを付与する。ページ構造の変化・アクセス失敗時はNoneを返し、
-    分析全体は失敗させない（ニュース/SNS取得の他の外部データ取得と同じ、失敗を許容する方針）。"""
+    分析全体は失敗させない（ニュース取得等の他の外部データ取得と同じ、失敗を許容する方針）。"""
     try:
         req = urllib.request.Request(f"https://kabutan.jp/stock/?code={code}", headers={"User-Agent": KABUTAN_UA})
         with urllib.request.urlopen(req, timeout=5) as res:
@@ -2618,6 +2571,25 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception as e:
             print("  日足履歴取得失敗", code, e)
             history = []
+        # 2026-08-22 ユーザー要望：日足履歴は前営業日までの確定値のみのため、当日分がチャートに
+        # 反映されないまま（_tachibana_daily_arraysと同じ理由）。当日の値がまだ含まれていなければ、
+        # 時価情報（ライブ気配）から当日分の仮の日足を合成して末尾に追加する。
+        jst = datetime.timezone(datetime.timedelta(hours=9))
+        today_str = datetime.datetime.now(jst).strftime("%Y-%m-%d")
+        if history and history[-1].get("date") != today_str:
+            try:
+                live = tachibana_api.get_market_price([code]).get(code)
+            except Exception:
+                live = None
+            if live and live.get("t") is not None and live.get("open") is not None:
+                history = history + [{
+                    "date": today_str,
+                    "open": live["open"],
+                    "high": live.get("high") if live.get("high") is not None else live["t"],
+                    "low": live.get("low") if live.get("low") is not None else live["t"],
+                    "close": live["t"],
+                    "volume": live.get("volume") if live.get("volume") is not None else 0,
+                }]
         self._send_json({"history": history})
 
     _DOC_ID_RE = re.compile(r"^[A-Za-z0-9]+$")
@@ -2662,14 +2634,12 @@ class Handler(SimpleHTTPRequestHandler):
             stock = build_stock_news(watchlist)
             stock_name_news = build_stock_name_news(watchlist)
             disclosure_news = build_disclosure_news(watchlist)
-            sns_news = build_sns_news(watchlist)
             macro_domestic, macro_overseas = build_macro_news()
             macro_all = macro_domestic + macro_overseas
             self._send_json({
                 "stockNews": stock,  # 9章：決算・IR・適時開示のみに絞り込み済み
                 "stockNameNews": stock_name_news,  # 「登録銘柄」サブタブ：IR以外も含む社名一致ニュース
                 "disclosureNews": disclosure_news,  # 「適時開示」サブタブ：当日含む直近10日分・種類問わず全件
-                "snsNews": sns_news,  # 「SNS」サブタブ：@kanpo_blog の投稿のうち登録銘柄に言及したもの
                 "macroNews": macro_all,
                 "macroNewsDomestic": macro_domestic,  # 9-1章：国内市況サブタブ
                 "macroNewsOverseas": macro_overseas,  # 9-1章：海外市況サブタブ

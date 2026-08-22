@@ -82,6 +82,14 @@
   現行は `server.py` の `_auto_earnings_stars()` が過去の上方/下方修正比率・直近決算の良し悪し・
   現在の株価の過熱度（RSI・52週高値/安値からの位置）から自動算出し、`analyze_stock()` の
   戻り値 `autoEarningsStars` としてそのまま表示するのみ（編集不可）。
+- **ニュースタブ「SNS」サブタブ**（Nitter＝X代替フロントエンドのRSS経由で10アカウントの投稿を
+  取得し、登録銘柄への言及だけを表示する機能）— 撤去済み（2026-08-22）。2023年にXがゲストAPIを
+  締め出して以降、Nitterの公開インスタンス（`nitter.net`・`xcancel.com`・
+  `nitter.privacyredirect.com`）が軒並み機能停止（403拒否・ダミー応答・接続タイムアウト）してお
+  り実用不可と判明したため撤去。`server.py` の `get_sns_posts`・`build_sns_news`・
+  `SNS_TAG_HANDLES`・`NITTER_INSTANCES`、HTML側の `snsNewsList`/`usSnsNewsList`/`snsAll`・
+  「SNS」サブタブは全て削除済み。再実装する場合はNitterに頼らない別のデータ源
+  （X公式APIの有料プラン等）が必要。
 
 ## レガシー（もう使わない）
 

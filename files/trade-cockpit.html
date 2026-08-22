@@ -518,7 +518,6 @@ const emptyState=()=>({
   breakoutLevelsFetchedDate:"", // 上記が今日すでに計算済みかの判定用
   stockNameNewsList:[], usStockNameNewsList:[], // ニュースタブ「登録銘柄」サブタブ：IR以外も含む社名一致ニュース
   disclosureNewsList:[], usDisclosureNewsList:[], // ニュースタブ「適時開示」サブタブ：当日含む直近10日分・種類問わず全件
-  snsNewsList:[], usSnsNewsList:[], // ニュースタブ「SNS」サブタブ：@kanpo_blogの投稿のうち登録銘柄に言及したもの
   analysisTargets:[], // analysisTargets: 5章「分析」ボタンで追加した銘柄コード一覧（12章の分析タブで使用）
   analysisData:{}, // analysisData: 12-1章の分析結果（購入/損切り/利確の目安・算出根拠）をコードごとに保持
   earningsTargets:[], // earningsTargets: 登録銘柄テーブルの「決算」ボタンで追加した銘柄コード一覧（決算分析タブで使用）
@@ -607,8 +606,8 @@ function SourceThumb({source,style}){
 
 // 10-5章：announcements(運営からの新着情報)を渡すと、ニュース一覧の間に自然に挟み込んで表示する。
 // interval件ごとに1件挟む（末尾到達で先頭に戻る簡易ローテーション）。
-function NewsList({items,showName}){
-  if(!items||!items.length) return <div className="news-empty">まだ取得していません。自動更新（起動直後・1時間おき）をお待ちください。</div>;
+function NewsList({items,showName,emptyText}){
+  if(!items||!items.length) return <div className="news-empty">{emptyText||"まだ取得していません。自動更新（起動直後・1時間おき）をお待ちください。"}</div>;
   return <div className="news-list">
     {items.map((it,i)=>{
       const meta=[showName?it.name:null,it.source,it.published].filter(Boolean).join(" ・ ");
@@ -1059,7 +1058,6 @@ function App(){
           stockNewsList:Array.isArray(nd.stockNews)?nd.stockNews:p.stockNewsList,
           stockNameNewsList:Array.isArray(nd.stockNameNews)?nd.stockNameNews:p.stockNameNewsList,
           disclosureNewsList:Array.isArray(nd.disclosureNews)?nd.disclosureNews:p.disclosureNewsList,
-          snsNewsList:Array.isArray(nd.snsNews)?nd.snsNews:p.snsNewsList,
           macroNewsList:Array.isArray(nd.macroNews)?nd.macroNews:p.macroNewsList,
           macroNewsDomestic:Array.isArray(nd.macroNewsDomestic)?nd.macroNewsDomestic:p.macroNewsDomestic,
           macroNewsOverseas:Array.isArray(nd.macroNewsOverseas)?nd.macroNewsOverseas:p.macroNewsOverseas,
@@ -1071,8 +1069,7 @@ function App(){
         setS(p=>({...p,
           usStockNewsList:Array.isArray(ndu.stockNews)?ndu.stockNews:p.usStockNewsList,
           usStockNameNewsList:Array.isArray(ndu.stockNameNews)?ndu.stockNameNews:p.usStockNameNewsList,
-          usDisclosureNewsList:Array.isArray(ndu.disclosureNews)?ndu.disclosureNews:p.usDisclosureNewsList,
-          usSnsNewsList:Array.isArray(ndu.snsNews)?ndu.snsNews:p.usSnsNewsList}));}
+          usDisclosureNewsList:Array.isArray(ndu.disclosureNews)?ndu.disclosureNews:p.usDisclosureNewsList}));}
     }catch(e){}
     setNewsMsg(nowHHMM()+" 自動更新");
   };
@@ -1347,7 +1344,6 @@ function App(){
   // 適時開示：日本の登録銘柄＋アメリカ市場（ダウ30社）の開示・IR・決算ニュースを、当日含む
   // 直近10日分・種類を問わず全件まとめて表示する
   const disclosureAll=useMemo(()=>mergeByDate(s.disclosureNewsList,s.usDisclosureNewsList),[s.disclosureNewsList,s.usDisclosureNewsList]);
-  const snsAll=useMemo(()=>mergeByDate(s.snsNewsList,s.usSnsNewsList),[s.snsNewsList,s.usSnsNewsList]); // 指示書2026-07-16項目4：ニュースタブ「SNS」サブタブ
   // 登録銘柄：IR以外も含む社名一致ニュース（日本＋アメリカ）
   const stockNameNewsAll=useMemo(()=>mergeByDate(s.stockNameNewsList,s.usStockNameNewsList),[s.stockNameNewsList,s.usStockNameNewsList]);
   // 海外市況：マクロの海外市況クエリに加え、アメリカ市場登録銘柄のニュースも含める
@@ -1549,8 +1545,7 @@ function App(){
       </div>
 
       {/* タブ並び順：日次モニター→ニュース→アメリカ市場(6-1)→日本市場→決算分析→銘柄分析(12章)。
-          日次モニターは6章の並びに含まれないが、要望により先頭に配置。SNSは旧・専用タブから
-          ニュースタブ内「SNS」サブタブへ統合済み（指示書2026-07-16項目4）。
+          日次モニターは6章の並びに含まれないが、要望により先頭に配置。
           決算分析：登録銘柄テーブルの「決算」ボタンで追加した銘柄の直近決算短信を表示するタブ
           （tabキーはearnings、内部状態はearningsTargets/earningsDetail）。「銘柄分析」は元「分析」タブ
           （tabキーはanalysisのまま、ラベルのみ変更）で、混同を避けるため隣に並べている。 */}
@@ -2115,18 +2110,17 @@ function App(){
           {key:"domestic",label:"国内市況"},
           {key:"overseas",label:"海外市況"},
           {key:"registered",label:"登録銘柄"},
-          {key:"sns",label:"SNS"},
           {key:"disclosure",label:"適時開示"},
         ];
-        const listFor={summary:newsSummary,domestic:s.macroNewsDomestic,overseas:overseasAll,registered:stockNameNewsAll,sns:snsAll,disclosure:disclosureAll}[newsSubTab];
-        const showCode=newsSubTab==="summary"||newsSubTab==="disclosure"||newsSubTab==="registered"||newsSubTab==="sns";
+        const listFor={summary:newsSummary,domestic:s.macroNewsDomestic,overseas:overseasAll,registered:stockNameNewsAll,disclosure:disclosureAll}[newsSubTab];
+        const showCode=newsSubTab==="summary"||newsSubTab==="disclosure"||newsSubTab==="registered";
         const hasImportant=listFor.some(it=>isImportantNews(it.title));
         return <div style={{marginTop:18}}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
             <div className="sec-head">ニュース</div>
             <span style={{fontSize:11,color:"var(--inkSoft)"}}>{newsFetching?"更新中…":newsMsg?newsMsg+"（1時間おき自動更新）":"1時間おきに自動更新"}</span>
           </div>
-          <div className="sec-note">1時間おきに自動更新します。日本株は銘柄コードで確実に関連付けられる立花証券APIのニュース（NQN等）を優先し、報道の少ない銘柄だけGoogleニュースで補完します（広告・野球結果等は除外済み）。「サマリー」「海外市況」「登録銘柄」「適時開示」にはアメリカ市場（ダウ30社）のニュースも含みます。「適時開示」は日本の登録銘柄について当日を含む直近10日分のTDnet開示を種類を問わず（決算・上方修正・下方修正・新株予約権発行など）全件表示します（アメリカ株はTDnet対象外のためGoogleニュースのIR関連キーワードで近似）。「登録銘柄」は社名またはNQNの銘柄コードでの一致で拾ったニュース全般（優先度上位の銘柄まで）です。「SNS」は旧SNSタブで対象にしていた10アカウントの投稿のうち登録銘柄について言及したものだけを表示します。見出しをクリックすると元記事が開きます（NQN等、元記事URLの無い速報はクリックできません）。</div>
+          <div className="sec-note">1時間おきに自動更新します。日本株は銘柄コードで確実に関連付けられる立花証券APIのニュース（NQN等）を優先し、報道の少ない銘柄だけGoogleニュースで補完します（広告・野球結果等は除外済み）。「サマリー」「海外市況」「登録銘柄」「適時開示」にはアメリカ市場（ダウ30社）のニュースも含みます。「適時開示」は日本の登録銘柄について当日を含む直近10日分のTDnet開示を種類を問わず（決算・上方修正・下方修正・新株予約権発行など）全件表示します（アメリカ株はTDnet対象外のためGoogleニュースのIR関連キーワードで近似）。「登録銘柄」は社名またはNQNの銘柄コードでの一致で拾ったニュース全般（優先度上位の銘柄まで）です。見出しをクリックすると元記事が開きます（NQN等、元記事URLの無い速報はクリックできません）。</div>
           <div className="subtabs">
             {NEWS_SUBTABS.map(t=><button key={t.key} className={"chip"+(newsSubTab===t.key?" on":"")} onClick={()=>{setNewsSubTab(t.key);setNewsShowCount(NEWS_PAGE_SIZE);}}>{t.label}</button>)}
           </div>
