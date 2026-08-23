@@ -779,12 +779,15 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
   // 2026-08-21 ユーザー要望：検索した銘柄が既に登録済みだった場合、そのセクターを開いて実際の行まで
   // スクロールする（メッセージを出すだけで終わらせない）。アコーディオンの開閉は次の描画を経てから
   // でないとDOMに行が無くscrollIntoViewできないため、setTimeoutで1フレーム分待つ。
+  // 2026-08-22 判明：behavior:"smooth"はrequestAnimationFrameベースのアニメーションのため、
+  // タブが非アクティブ/背面描画状態だと開始すらしないままスクロール位置が変わらないことがある
+  // （ユーザー報告で再現）。アニメーションに依存しない"instant"に変更し、確実に移動させる。
   const jumpToRegistered=(m)=>{
     setOpenSectors(prev=>new Set(prev).add(m.sector));
     setQ("");
     setJumpHighlight(m.code);
     setTimeout(()=>{
-      rowRefs.current[m.code]?.scrollIntoView({behavior:"smooth",block:"center"});
+      rowRefs.current[m.code]?.scrollIntoView({behavior:"instant",block:"center"});
     },50);
     setTimeout(()=>setJumpHighlight(prev=>prev===m.code?null:prev),2500);
   };
