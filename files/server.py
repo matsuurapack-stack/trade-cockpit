@@ -1546,6 +1546,69 @@ def guess_sector(code, market):
     return None
 
 
+# 2026-08-22 ユーザー要望：「日本市場」タブの銘柄検索を、日経225中心の手動キュレーションリスト
+# （MASTER、約277社）だけでなく東証上場銘柄全体（約4400銘柄。ETF・投資信託等を含む）に広げる。
+# 立花証券APIの株式銘柄マスタ（sGyousyuCode）は東証33業種を使っているが、名称の区切り記号や
+# 表記が本アプリのSECTOR_CHOICES（trade-cockpit.html）とわずかに異なる（例:「石油石炭製品」
+# vs「石油・石炭製品」）ため、コードで確実にマッピングする。9999（ETF・投資信託等、個別企業
+# ではない）は対応先が無いためマッピングしない＝呼び出し側で除外する。
+GYOSHU_CODE_TO_SECTOR33 = {
+    "0050": "水産・農林業", "1050": "鉱業", "2050": "建設業", "3050": "食料品",
+    "3100": "繊維製品", "3150": "パルプ・紙", "3200": "化学", "3250": "医薬品",
+    "3300": "石油・石炭製品", "3350": "ゴム製品", "3400": "ガラス・土石製品", "3450": "鉄鋼",
+    "3500": "非鉄金属", "3550": "金属製品", "3600": "機械", "3650": "電気機器",
+    "3700": "輸送用機器", "3750": "精密機器", "3800": "その他製品", "4050": "電気・ガス業",
+    "5050": "陸運業", "5100": "海運業", "5150": "空運業", "5200": "倉庫・運輸関連業",
+    "5250": "情報・通信業", "6050": "卸売業", "6100": "小売業", "7050": "銀行業",
+    "7100": "証券、商品先物取引業", "7150": "保険業", "7200": "その他金融業",
+    "8050": "不動産業", "9050": "サービス業",
+}
+
+JP_ISSUE_MASTER_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jp_issue_master_cache.json")
+_jp_issue_master_cache = None  # プロセス内メモリキャッシュ（起動後1回取得すればよい）
+
+
+def get_jp_issue_master():
+    """東証上場の株式銘柄マスタ全件を{code:{name,kana,sector}}で返す（個別企業のみ。ETF・投資信託
+    等はsGyousyuCode=9999でマッピング先が無いため除外）。プロセス内メモリに載ったらそれを使い回し、
+    無ければ当日分のファイルキャッシュ（JP_ISSUE_MASTER_CACHE_PATH）を見る。それも無い/日付が
+    古い場合のみ立花証券APIに問い合わせる（4000件超のため数秒かかる。ユーザー確認済み：
+    サーバー起動時に1回取得してファイルにキャッシュする方針）。取得失敗時は空dict。"""
+    global _jp_issue_master_cache
+    if _jp_issue_master_cache is not None:
+        return _jp_issue_master_cache
+    today = datetime.date.today().isoformat()
+    try:
+        with open(JP_ISSUE_MASTER_CACHE_PATH, encoding="utf-8") as f:
+            cached = json.load(f)
+        if cached.get("date") == today and cached.get("items"):
+            _jp_issue_master_cache = cached["items"]
+            print(f"[取得] 銘柄マスタ（ファイルキャッシュ・{len(_jp_issue_master_cache)}件）")
+            return _jp_issue_master_cache
+    except Exception:
+        pass
+    out = {}
+    if tachibana_api is not None:
+        try:
+            print("[取得] 銘柄マスタ（立花証券API・全銘柄）…")
+            raw = tachibana_api.get_issue_master_kabu()
+            for r in raw:
+                sector = GYOSHU_CODE_TO_SECTOR33.get(r["gyoshuCode"])
+                if not sector:
+                    continue  # ETF・投資信託等（9999）は対象外
+                out[r["code"]] = {"name": r["name"], "kana": r["kana"], "sector": sector}
+        except Exception as e:
+            print("  銘柄マスタ取得失敗", e)
+    _jp_issue_master_cache = out
+    if out:
+        try:
+            with open(JP_ISSUE_MASTER_CACHE_PATH, "w", encoding="utf-8") as f:
+                json.dump({"date": today, "items": out}, f, ensure_ascii=False)
+        except Exception as e:
+            print("  銘柄マスタキャッシュ保存失敗", e)
+    return out
+
+
 def analyze_stock(w, market_env=None):
     """12-1章・technical_analysis_rules.md：ローソク足パターン・移動平均線の並び／クロス・
     ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
@@ -2540,6 +2603,9 @@ class Handler(SimpleHTTPRequestHandler):
             self._proxy_edinet_doc()
         elif self.path.startswith("/api/stock-history"):
             self._stock_history()
+        elif self.path.startswith("/api/jp-issue-master"):
+            items = get_jp_issue_master()
+            self._send_json({"items": items})
         elif self.path == "/" or self.path == "":
             self.send_response(302)
             self.send_header("Location", "/trade-cockpit.html")

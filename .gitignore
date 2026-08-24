@@ -17,6 +17,9 @@ Thumbs.db
 # 決算またぎ期待値の星評価（ユーザーデータ。OneDrive共有フォルダ経由で共有する運用のためgit管理はしない）
 files/earnings_ratings.json
 
+# 東証上場銘柄マスタの当日キャッシュ（起動のたびに立花証券APIから自動生成。ソースではない）
+files/jp_issue_master_cache.json
+
 # APIキー・トークン類（jQuants/EDINET等。絶対にコミットしない）
 files/secrets.json
 

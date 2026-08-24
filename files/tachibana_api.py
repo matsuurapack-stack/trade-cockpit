@@ -470,6 +470,47 @@ def get_hibu_info(codes, use_prod=True):
     return _mfds_issue_query_chunked("CLMMfdsGetHibuInfo", codes, "aCLMMfdsHibuInfo", use_prod=use_prod)
 
 
+def get_issue_master_kabu(use_prod=True):
+    """東証上場の株式銘柄マスタ全件（CLMMfdsGetMasterData、対象機能ID=CLMIssueMstKabu）を取得する。
+    マスタダウンロード（CLMEventDownload・WebSocket配信）と違い、こちらはREQUEST/RESPONSE型の
+    問合せなので通常のHTTPリクエスト1回で全銘柄分の応答が返る（2026-08-22 ユーザー要望：日本市場
+    タブの検索候補を、日経225中心の手動キュレーションリスト(MASTER)だけでなく上場銘柄全体に
+    広げたい、に対応）。戻り値: [{code, name, kana, gyoshuCode}, ...]（コード昇順とは限らない）。
+    sIssueNameは全角スペース区切りの正式名称のまま返す（例:"極 洋"）。空白除去や業種コードから
+    東証33業種名への変換は呼び出し側（server.py）で行う。"""
+    sess = _ensure_session(use_prod=use_prod)
+    payload = {
+        "sCLMID": "CLMMfdsGetMasterData",
+        "sTargetCLMID": "CLMIssueMstKabu",
+        "sTargetColumn": "sIssueCode,sIssueName,sIssueNameKana,sGyousyuCode",
+        "p_no": str(_next_p_no()),
+        "p_sd_date": _now_p_sd_date(),
+        "sJsonOfmt": "5",
+    }
+    resp = _http.request(
+        "POST", sess["sUrlMaster"],
+        body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        retries=urllib3.Retry(total=2, backoff_factor=1.0),
+        timeout=urllib3.Timeout(connect=10, read=60),  # 全銘柄分のため応答が大きく、通常より長めに待つ
+    )
+    result = json.loads(resp.data.decode("shift_jis", errors="replace"))
+    if result.get("p_errno") not in (None, "0"):
+        raise RuntimeError(f"銘柄マスタ取得失敗: {result.get('p_err')}")
+    out = []
+    for row in result.get("CLMIssueMstKabu", []):
+        code = row.get("sIssueCode")
+        if not code:
+            continue
+        out.append({
+            "code": code,
+            "name": (row.get("sIssueName") or "").replace("　", "").replace(" ", ""),
+            "kana": row.get("sIssueNameKana") or "",
+            "gyoshuCode": row.get("sGyousyuCode") or "",
+        })
+    return out
+
+
 def _decode_headline(hdl):
     """p_HDL・p_TX（ShiftJISをURLエンコード→BASE64化された文字列）を元の文字列に戻す。
     ニュース見出し・本文どちらも同じエンコード方式のため共用する。"""

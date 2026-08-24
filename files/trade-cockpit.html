@@ -1187,7 +1187,23 @@ function App(){
   const setMetric=(k,f,v)=>setS(p=>({...p,metrics:{...p.metrics,[k]:{...p.metrics[k],[f]:v}}}));
   const setWatchlistJP=(wl)=>set({watchlist:wl});
   const setWatchlistUS=(wl)=>set({watchlistUS:wl});
-  const masterJP=useMemo(()=>MASTER.filter(m=>m.market==="JP"||m.market==="IDX"),[]);
+  // 2026-08-22 ユーザー要望：「日本市場」タブの検索候補を、日経225中心の手動キュレーション
+  // リスト（MASTER、約277社）だけでなく東証上場銘柄全体（約4400社）に広げる。立花証券APIの
+  // 株式銘柄マスタをサーバー側でキャッシュ済みの/api/jp-issue-masterから1回だけ取得し、
+  // MASTERに無いコードだけ追加する（MASTERにある分は読み仮名等を手動で整えてあるためそちらを優先）。
+  const [jpIssueMaster,setJpIssueMaster]=useState(null);
+  useEffect(()=>{
+    fetch("/api/jp-issue-master").then(r=>r.ok?r.json():null).then(d=>{if(d)setJpIssueMaster(d.items||{});}).catch(()=>{});
+  },[]);
+  const masterJP=useMemo(()=>{
+    const curated=MASTER.filter(m=>m.market==="JP"||m.market==="IDX");
+    if(!jpIssueMaster)return curated;
+    const known=new Set(curated.map(m=>m.code));
+    const extra=Object.entries(jpIssueMaster)
+      .filter(([code])=>!known.has(code))
+      .map(([code,v])=>({code,name:v.name,sector:v.sector,kana:v.kana,market:"JP",tvSymbol:"TSE:"+code}));
+    return [...curated,...extra];
+  },[jpIssueMaster]);
   const masterUS=useMemo(()=>MASTER.filter(m=>m.market==="US"),[]);
 
   // 12章：分析タブの対象銘柄（日本市場・アメリカ市場どちらの登録銘柄からも追加され得る）
