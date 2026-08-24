@@ -1080,7 +1080,15 @@ function App(){
   const [newsMsg,setNewsMsg]=useState("");
 
   // 日次モニター（指数・為替等）＋日本市場（登録銘柄の現在値）を30秒おきに自動更新する。
+  // 2026-08-24 判明：Render無料プラン（メモリ512MB上限）で「Ran out of memory」により
+  // サーバーが繰り返しクラッシュする不具合が発生。登録銘柄278社分の株価取得（立花証券APIを
+  // 分割して複数回叩く重い処理）が30秒おきに走る一方、取得に30秒以上かかることがあり、
+  // 前回の取得が終わる前に次の取得が二重・三重に走ってメモリを食い潰していたのが主因と判明。
+  // 実行中フラグで多重起動を防ぐ（ローカル/LANでも無駄なリクエスト重複を避けられるため常時有効）。
+  const monitorFetchingRef=useRef(false);
   const fetchMonitorAndJP=async()=>{
+    if(monitorFetchingRef.current)return;
+    monitorFetchingRef.current=true;
     setMonitorFetching(true);setJpFetching(true);
     try{
       const qr=await fetch("/api/quotes");
@@ -1106,6 +1114,7 @@ function App(){
       }
     }catch(e){}
     setMonitorFetching(false);setJpFetching(false);
+    monitorFetchingRef.current=false;
   };
 
   // アメリカ市場（登録銘柄の現在値）は朝6時（日本時間・端末時刻基準）に1日1回だけ自動更新する。
