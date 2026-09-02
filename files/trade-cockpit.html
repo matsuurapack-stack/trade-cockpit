@@ -516,6 +516,8 @@ const emptyState=()=>({
   usQuotesFetchedDate:"", // アメリカ市場の自動更新（毎朝6時・1日1回）が今日すでに実行済みかの判定用
   breakoutLevels:{}, // 出来高ブレイクアウト判定の基準値（{code:{highLookback,volAvg5}}）。1日1回計算。
   breakoutLevelsFetchedDate:"", // 上記が今日すでに計算済みかの判定用
+  marketRisk:null, // Trade Cockpit v2 Phase3：TODAY'S MARKET用のMarket Risk Score等（{text,marketRiskScore,marketRiskLabel,marketCondition}）。1日1回計算。
+  marketRiskFetchedDate:"", // 上記が今日すでに計算済みかの判定用
   stockNameNewsList:[], usStockNameNewsList:[], // ニュースタブ「登録銘柄」サブタブ：IR以外も含む社名一致ニュース
   disclosureNewsList:[], usDisclosureNewsList:[], // ニュースタブ「適時開示」サブタブ：当日含む直近10日分・種類問わず全件
   analysisTargets:[], // analysisTargets: 5章「分析」ボタンで追加した銘柄コード一覧（12章の分析タブで使用）
@@ -891,6 +893,20 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
 // 少数精鋭になる想定のためセクター別アコーディオンにはせず前日比の大きい順にフラット表示する。
 // 「本日優先」に相当するボタンは無く、末尾の「削除」はwatchTargetsから外すだけ（実際の登録
 // 銘柄一覧からは削除しない。完全な登録解除は「日本市場」「アメリカ市場」タブの×で行う）。
+// Relative Strength計算（Trade Cockpit v2 Phase1・設計案8-9番）。個別銘柄の当日騰落率と、
+// 市場全体（日経平均）・所属セクター平均との差分からRS Scoreを0-100に正規化する。監視銘柄タブ
+// （WatchTargetsPanel）・日次モニターのTODAY'S MARKET（TodaysMarketCard）の両方で使う共通関数。
+// 重みは初期値（w1=w2=3）。運用しながら調整する想定で、ハードコードだがこの1箇所にまとめてある。
+function calcRsScore(pct,marketPct,sectorAvg){
+  if(pct==null)return {marketRS:null,sectorRS:null,rsScore:null};
+  const marketRS=marketPct!=null?pct-marketPct:null;
+  const sectorRS=sectorAvg!=null?pct-sectorAvg:null;
+  if(marketRS==null&&sectorRS==null)return {marketRS,sectorRS,rsScore:null};
+  const raw=(marketRS||0)*3+(sectorRS||0)*3;
+  const rsScore=Math.max(0,Math.min(100,Math.round(50+raw)));
+  return {marketRS,sectorRS,rsScore};
+}
+
 // Status判定（Trade Cockpit v2 Phase1）。ルールベース・軽量計算のみ（サーバー側analyze_stock()は
 // 呼ばない＝279銘柄規模でも重くならないよう、既に画面上にある値〈stockQuotes・sector平均・
 // breakoutLevels〉だけから算出する）。RS Scoreの重み付けは初期値。運用しながら調整する想定。
@@ -962,14 +978,8 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
 
   const enriched=useMemo(()=>items.map(w=>{
     const pct=pctOf(w.code);
-    const marketRS=(pct!=null&&marketPct!=null)?pct-marketPct:null;
     const sectorAvg=sectorAvgMap[w.sector];
-    const sectorRS=(pct!=null&&sectorAvg!=null)?pct-sectorAvg:null;
-    let rsScore=null;
-    if(marketRS!=null||sectorRS!=null){
-      const raw=(marketRS||0)*3+(sectorRS||0)*3;
-      rsScore=Math.max(0,Math.min(100,Math.round(50+raw)));
-    }
+    const {marketRS,sectorRS,rsScore}=calcRsScore(pct,marketPct,sectorAvg);
     const levels=breakoutLevels?.[w.code];
     const qt=stockQuotes[w.code]||{};
     const vol=num(qt.volume);
@@ -1524,6 +1534,77 @@ const groupStocks=(items,stockQuotes,keyFn)=>{
   }).sort((a,b)=>(b.totalTurnover-a.totalTurnover));
 };
 
+// TODAY'S MARKET（Trade Cockpit v2 Phase3・設計案27・68・69番）。日次モニターの最上部に置き、
+// 「今日の地合い→強い/弱いセクター→RS上位銘柄数」を1画面で把握できるようにする。Market Risk Score
+// はサーバー側_market_environment()（25日線トレンド判定）が必要なため/api/market-riskを叩くが、
+// 重い処理（3か月分の日足取得×4指数）のため1日1回だけ自動取得し、以降は手動更新ボタンに委ねる
+// （breakoutLevelsと同じキャッシュパターン）。日経/NASDAQ/SOX/US10Yの数値自体は既存のmetrics
+// （30秒おきに自動更新済み）をそのまま使うため追加リクエストは発生しない。
+function TodaysMarketCard({metrics,watchlistAll,stockQuotes,marketRisk,onRefresh,refreshing}){
+  const pctOfMetric=(key)=>{const m=metrics[key];if(!m)return null;const t=num(m.t),p=num(m.p);
+    return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
+  const marketPct=pctOfMetric("nikkei");
+
+  const sectorGroups=useMemo(()=>groupStocks(watchlistAll||[],stockQuotes,w=>w.sector),[watchlistAll,stockQuotes]);
+  const strongSectors=useMemo(()=>[...sectorGroups].filter(g=>g.avgPct!=null).sort((a,b)=>b.avgPct-a.avgPct).slice(0,3),[sectorGroups]);
+  const weakSectors=useMemo(()=>[...sectorGroups].filter(g=>g.avgPct!=null).sort((a,b)=>a.avgPct-b.avgPct).slice(0,3),[sectorGroups]);
+  const sectorAvgMap=useMemo(()=>Object.fromEntries(sectorGroups.map(g=>[g.key,g.avgPct])),[sectorGroups]);
+
+  const rsStrongCount=useMemo(()=>{
+    if(marketPct==null)return null;
+    let n=0;
+    (watchlistAll||[]).forEach(w=>{
+      const qt=stockQuotes[w.code]||{};const t=num(qt.t),p=num(qt.p);
+      const pct=(t!=null&&p!=null&&p)?(t-p)/p*100:null;
+      const {rsScore}=calcRsScore(pct,marketPct,sectorAvgMap[w.sector]);
+      if(rsScore!=null&&rsScore>=75)n++;
+    });
+    return n;
+  },[watchlistAll,stockQuotes,marketPct,sectorAvgMap]);
+
+  const riskMeta=marketRisk?.marketRiskLabel;
+  const riskColor=riskMeta==="RISK OFF"?"var(--down)":riskMeta==="HIGH RISK"?"var(--accent)":riskMeta==="LOW RISK"?"var(--up)":"var(--inkSoft)";
+  const quickIdx=[["日経","nikkei",0],["NASDAQ","nasdaq",0],["SOX","sox",0],["US10Y","us10y",2]];
+
+  return <div className="card" style={{padding:"12px 16px",marginBottom:16}}>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+      <div style={{fontWeight:800,fontSize:14}}>TODAY'S MARKET</div>
+      <button className="action-btn" onClick={onRefresh} disabled={refreshing}>{refreshing?"更新中…":"更新"}</button>
+    </div>
+    {marketRisk==null
+      ? <div style={{fontSize:12,color:"var(--inkFaint)",marginTop:6}}>{refreshing?"取得中…":"未取得（「更新」で取得できます）"}</div>
+      : <>
+        <div style={{display:"flex",alignItems:"baseline",gap:10,marginTop:8}}>
+          <span style={{fontWeight:800,fontSize:20,color:riskColor}}>{marketRisk.marketRiskLabel||"—"}</span>
+          {marketRisk.marketRiskScore!=null && <span className="mono" style={{fontSize:16,color:"var(--inkSoft)"}}>{marketRisk.marketRiskScore} / 100</span>}
+        </div>
+        {marketRisk.text && <div style={{fontSize:11.5,color:"var(--inkSoft)",marginTop:4}}>{marketRisk.text}</div>}
+        <div style={{display:"flex",gap:14,flexWrap:"wrap",marginTop:10}}>
+          {quickIdx.map(([label,key,dp])=>{
+            const m=metrics[key]||{};const t=num(m.t);const pct=pctOfMetric(key);
+            return <div key={key} style={{fontSize:12}}>
+              <span style={{color:"var(--inkSoft)"}}>{label}</span>{" "}
+              <span className="mono" style={{fontWeight:700}}>{t!=null?t.toFixed(dp):"—"}</span>{" "}
+              {pct!=null && <span className="mono" style={{color:pct>0?"var(--up)":pct<0?"var(--down)":"var(--inkSoft)"}}>{pct>0?"+":""}{pct.toFixed(2)}%</span>}
+            </div>;})}
+        </div>
+        <div style={{display:"flex",gap:24,flexWrap:"wrap",marginTop:10}}>
+          {strongSectors.length>0 && <div style={{fontSize:12}}>
+            <span style={{color:"var(--inkSoft)"}}>強いセクター：</span>
+            {strongSectors.map(g=><span key={g.key} className="chip" style={{fontSize:10.5,marginRight:4}}>{g.key} {g.avgPct>0?"+":""}{g.avgPct.toFixed(1)}%</span>)}
+          </div>}
+          {weakSectors.length>0 && <div style={{fontSize:12}}>
+            <span style={{color:"var(--inkSoft)"}}>弱いセクター：</span>
+            {weakSectors.map(g=><span key={g.key} className="chip" style={{fontSize:10.5,marginRight:4}}>{g.key} {g.avgPct>0?"+":""}{g.avgPct.toFixed(1)}%</span>)}
+          </div>}
+          {rsStrongCount!=null && <div style={{fontSize:12}}>
+            <span style={{color:"var(--inkSoft)"}}>Relative Strength銘柄：</span>
+            <span style={{fontWeight:700}}>{rsStrongCount}</span></div>}
+        </div>
+      </>}
+  </div>;
+}
+
 // 日次モニター先頭に表示するランキングパネル。「市場→テーマ→セクター→銘柄」の確認順序を
 // タブを跨がずに把握できるようにする（4〜6章対応）。テーマは登録銘柄にユーザーが手動で
 // 付けたタグのみを対象にするため、1件も設定されていなければテーマ欄は非表示にする。
@@ -1726,6 +1807,25 @@ function App(){
     if(missing.length)fetchBreakoutLevels(missing);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[s.watchlist.length,s.breakoutLevelsFetchedDate]);
+
+  // TODAY'S MARKET（Trade Cockpit v2 Phase3）：Market Risk Scoreの取得。breakoutLevelsと同じく
+  // 重い処理のため1日1回のみ自動取得し、以降はTodaysMarketCardの「更新」ボタンで手動再取得する。
+  const [marketRiskFetching,setMarketRiskFetching]=useState(false);
+  const fetchMarketRisk=async()=>{
+    setMarketRiskFetching(true);
+    try{
+      const r=await fetch("/api/market-risk");
+      if(r.ok){
+        const d=await r.json();
+        setS(p=>({...p,marketRisk:d,marketRiskFetchedDate:todayISO()}));
+      }
+    }catch(e){}
+    setMarketRiskFetching(false);
+  };
+  useEffect(()=>{
+    if(s.marketRiskFetchedDate!==todayISO())fetchMarketRisk();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
 
   useEffect(()=>{
     fetchNewsOnly();
@@ -2223,6 +2323,8 @@ function App(){
         </div>
         <div className="sec-note">30秒おきに自動更新します。ドル円・日経平均・ダウ・ナスダック・SOX・米10年債・S&P500・KOSPI・日経225先物・NYダウ先物・WTI原油・金・銅 を今日値／前日値ともに取得します（数値は遅延あり）。</div>
         <div className="sec-note" style={{marginTop:-4,marginBottom:14}}>項目をクリックするとリアルタイムチャートが下に開きます。</div>
+        <TodaysMarketCard metrics={s.metrics} watchlistAll={watchlistAll} stockQuotes={s.stockQuotes}
+          marketRisk={s.marketRisk} onRefresh={fetchMarketRisk} refreshing={marketRiskFetching}/>
         <ThemeSectorRanking watchlistAll={watchlistAll} stockQuotes={s.stockQuotes}/>
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:1,background:"var(--rule)",border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden"}}>
           {METRICS.map(m=>{const v=s.metrics[m.key];const t=num(v.t),p=num(v.p);

@@ -2787,6 +2787,17 @@ class Handler(SimpleHTTPRequestHandler):
         elif self.path.startswith("/api/chatgpt-import/list"):
             imports = investment_db.list_chatgpt_imports(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"imports": imports})
+        elif self.path.startswith("/api/market-risk"):
+            # Trade Cockpit v2 Phase3（設計案27番）：日次モニター最上部のTODAY'S MARKET用。
+            # _market_environment()は指数のトレンド判定に3か月分の日足を毎回取得するため軽くは
+            # ないが、analyze_stock()と同じ処理を再利用するだけで新規の重い計算は増やしていない。
+            # フロント側は1日1回だけ呼ぶ想定（breakoutLevelsと同じキャッシュパターン）。
+            env = _market_environment()
+            self._send_json({
+                "text": env.get("text"), "nikkeiChangePct": env.get("nikkeiChangePct"),
+                "marketRiskScore": env.get("marketRiskScore"), "marketRiskLabel": env.get("marketRiskLabel"),
+                "marketCondition": env.get("marketCondition"),
+            })
         elif self.path.startswith("/api/trade-candidates"):
             candidates = investment_db.list_trade_candidates(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"candidates": candidates})
