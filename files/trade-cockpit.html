@@ -533,6 +533,13 @@ const emptyState=()=>({
   // 「記録」タブの学び（lessonNote）から「マイルールに追加」ボタンで随時アップデートできる
   // （2026-08-20 ユーザー要望：良いトレード・気づきの都度マイルールを育てたい）。
   myRules:DEFAULT_MY_RULES.map((text,i)=>({id:"default-"+i,text,active:true,createdAt:null})),
+  // 2026-09-02 ユーザー要望「投資判断ログ」機能：記録(journal)・マイルール(myRules)をサーバー
+  // 側DB（Neon Postgres）へ移行し、将来MCP/API経由でChatGPT/Claudeから読み書きできるようにする。
+  // 「記録」タブの「サーバーDBへ移行」ボタンで一度だけtrueにする。true化後は、journal・myRulesは
+  // 引き続きこのオブジェクト内（即時反映用）にも保持しつつ、サーバーAPIへも都度同期する
+  // （ベストエフォート＝失敗しても画面上の操作は止めない。既存の外部API連携と同じ方針）。
+  investmentLogMigrated:false,
+  investmentLog:[], // 投資判断ログ（日次の相場観＋銘柄評価）。サーバーDBのdaily_logをそのままキャッシュ
 });
 // 1章：255社デフォルトを後から追加したため、既にlocalStorageに保存済みだったユーザーは
 // 保存データの登録銘柄がそのまま優先され、新しいデフォルト銘柄が反映されないケースがある。
@@ -947,6 +954,180 @@ const computePositionSize=(totalCapital,riskPct,entry,stop,market)=>{
   return {suggestedShares,investAmount:suggestedShares*entry,tranches:[t1,t2,t3]};
 };
 
+// 投資判断ログの「銘柄評価」1件分の入力欄定義。[DBの列名, 表示ラベル]。
+// server.py/investment_db.pyの_JUDGMENT_COLSと1対1で対応させている。
+const JUDGMENT_FIELDS=[
+  ["entry_reason","エントリー理由"],["skip_reason","見送り理由"],["exit_judgment","利確・損切り判断"],
+  ["supply_demand","需給評価（信用残・信用倍率等）"],["earnings_eval","業績評価"],["valuation_eval","バリュエーション評価"],
+  ["theme_eval","テーマ評価"],["chart_eval","チャート評価"],["chatgpt_judgment","ChatGPTの判断"],
+  ["my_judgment","自分の判断"],["actual_trade","実際に行った売買"],["trade_result","その後の結果"],
+];
+const JUDGMENT_CATEGORIES=["監視","保有","買い候補","見送り"];
+
+// 投資判断ログタブ（2026-09-02新規）：日次の相場観＋銘柄ごとの評価をサーバーDB（Neon）に保存する。
+// 「記録」タブでのDB移行が済んでいなくても閲覧・作成はできる（journal/myRulesの移行有無とは
+// 独立した機能）が、DB自体（DATABASE_URL）が未設定のサーバーでは保存も一覧取得もできない。
+function InvestmentLogPanel({marketEnvAuto,usMarketAuto,interestRateAuto,fxAuto,oilAuto,sectorStrengthAuto,watchTargetItems}){
+  const emptyDraft=()=>({date:todayISO(),market_env:marketEnvAuto,us_market:usMarketAuto,interest_rate:interestRateAuto,
+    fx:fxAuto,oil:oilAuto,sector_strength:sectorStrengthAuto,chatgpt_view:"",my_view:"",reflection:""});
+  const [draft,setDraft]=useState(emptyDraft);
+  const [judgments,setJudgments]=useState([]);
+  const [saving,setSaving]=useState(false);
+  const [msg,setMsg]=useState("");
+  const [logs,setLogs]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [expanded,setExpanded]=useState(()=>new Set());
+  const [filterCode,setFilterCode]=useState("");
+
+  const loadLogs=async(code)=>{
+    setLoading(true);
+    try{
+      const qs=code?("?code="+encodeURIComponent(code)):"";
+      const r=await fetch("/api/investment-log"+qs);
+      if(r.ok){const d=await r.json();setLogs(Array.isArray(d.logs)?d.logs:[]);}
+      else{setLogs([]);}
+    }catch(e){setLogs([]);}
+    setLoading(false);
+  };
+  useEffect(()=>{loadLogs(filterCode);},[filterCode]);
+
+  const addJudgmentRow=(code,name)=>{
+    if(judgments.some(j=>j.code===code))return;
+    setJudgments(js=>[...js,{code:code||"",name:name||"",category:"監視"}]);
+  };
+  const updateJudgmentRow=(idx,patch)=>setJudgments(js=>js.map((j,i)=>i===idx?{...j,...patch}:j));
+  const removeJudgmentRow=(idx)=>setJudgments(js=>js.filter((_,i)=>i!==idx));
+
+  const save=async()=>{
+    setSaving(true);setMsg("");
+    try{
+      const r=await fetch("/api/investment-log/create",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({dailyLog:draft,judgments})});
+      if(r.ok){
+        const d=await r.json();
+        if(d.error){setMsg("保存失敗："+d.error);}
+        else{setMsg("保存しました（ID "+d.id+"）");setDraft(emptyDraft());setJudgments([]);loadLogs(filterCode);}
+      }else{setMsg("保存に失敗しました。サーバーが起動しているか確認してください。");}
+    }catch(e){setMsg("保存に失敗しました。サーバーが起動しているか確認してください。");}
+    setSaving(false);
+  };
+
+  const deleteLog=async(id)=>{
+    if(!confirm("このログを削除しますか？"))return;
+    try{
+      await fetch("/api/investment-log/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});
+      loadLogs(filterCode);
+    }catch(e){}
+  };
+
+  const toggleExpand=(id)=>setExpanded(prev=>{const n=new Set(prev);n.has(id)?n.delete(id):n.add(id);return n;});
+  const fieldStyle={width:"100%",fontSize:12.5,padding:"5px 7px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",boxSizing:"border-box"};
+  const labelStyle={fontSize:11,color:"var(--inkSoft)",display:"block",marginBottom:2};
+
+  return <div style={{marginTop:18}}>
+    <div className="sec-head">投資判断ログ</div>
+    <div className="sec-note">
+      毎日の相場観・監視銘柄ごとの評価・ChatGPTとのやり取りをサーバーDB（Neon）に記録し、後から振り返り・分析できるようにします。
+      地合い・金利・為替・原油・セクター強弱は日次モニターの直近取得値から自動で下書きに入ります（内容は自由に編集できます）。
+    </div>
+
+    <div className="card" style={{padding:"14px 16px",marginBottom:16}}>
+      <div style={{fontWeight:700,marginBottom:10}}>新規ログ</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:10,marginBottom:10}}>
+        <label><span style={labelStyle}>日付</span><input type="date" value={draft.date} onChange={e=>setDraft({...draft,date:e.target.value})} style={fieldStyle}/></label>
+        <label><span style={labelStyle}>金利</span><input value={draft.interest_rate||""} onChange={e=>setDraft({...draft,interest_rate:e.target.value})} style={fieldStyle}/></label>
+        <label><span style={labelStyle}>為替</span><input value={draft.fx||""} onChange={e=>setDraft({...draft,fx:e.target.value})} style={fieldStyle}/></label>
+        <label><span style={labelStyle}>原油</span><input value={draft.oil||""} onChange={e=>setDraft({...draft,oil:e.target.value})} style={fieldStyle}/></label>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(260px,1fr))",gap:10,marginBottom:10}}>
+        <label><span style={labelStyle}>市場全体の地合い</span><textarea rows={2} value={draft.market_env||""} onChange={e=>setDraft({...draft,market_env:e.target.value})} style={fieldStyle}/></label>
+        <label><span style={labelStyle}>米国市場の状況</span><textarea rows={2} value={draft.us_market||""} onChange={e=>setDraft({...draft,us_market:e.target.value})} style={fieldStyle}/></label>
+        <label><span style={labelStyle}>セクター強弱</span><textarea rows={2} value={draft.sector_strength||""} onChange={e=>setDraft({...draft,sector_strength:e.target.value})} style={fieldStyle}/></label>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(260px,1fr))",gap:10,marginBottom:10}}>
+        <label><span style={labelStyle}>ChatGPTの判断（全体観）</span><textarea rows={3} value={draft.chatgpt_view||""} onChange={e=>setDraft({...draft,chatgpt_view:e.target.value})} style={fieldStyle}/></label>
+        <label><span style={labelStyle}>自分の判断（全体観）</span><textarea rows={3} value={draft.my_view||""} onChange={e=>setDraft({...draft,my_view:e.target.value})} style={fieldStyle}/></label>
+        <label><span style={labelStyle}>反省点</span><textarea rows={3} value={draft.reflection||""} onChange={e=>setDraft({...draft,reflection:e.target.value})} style={fieldStyle}/></label>
+      </div>
+
+      <div style={{borderTop:"1px solid var(--ruleSoft)",paddingTop:10,marginTop:4}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8,marginBottom:8}}>
+          <div style={{fontWeight:700,fontSize:13}}>銘柄評価（{judgments.length}件）</div>
+          <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+            {watchTargetItems.slice(0,12).map(w=>
+              <button key={w.code} className="action-btn" onClick={()=>addJudgmentRow(w.code,w.name)}>＋{w.name}</button>)}
+            <button className="action-btn" onClick={()=>setJudgments(js=>[...js,{code:"",name:"",category:"監視"}])}>＋銘柄を手動追加</button>
+          </div>
+        </div>
+        {judgments.length===0 && <div style={{fontSize:12,color:"var(--inkFaint)"}}>上のボタン（監視銘柄）から追加するか、下のコード欄に直接入力してください。</div>}
+        {judgments.map((j,idx)=>
+          <div key={idx} style={{border:"1px solid var(--rule)",borderRadius:4,padding:"10px 12px",marginBottom:8,background:"var(--band)"}}>
+            <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:8}}>
+              <input value={j.code} onChange={e=>updateJudgmentRow(idx,{code:e.target.value})} placeholder="コード" style={{...fieldStyle,width:90}}/>
+              <input value={j.name} onChange={e=>updateJudgmentRow(idx,{name:e.target.value})} placeholder="銘柄名" style={{...fieldStyle,width:140}}/>
+              <select value={j.category} onChange={e=>updateJudgmentRow(idx,{category:e.target.value})} style={{...fieldStyle,width:100}}>
+                {JUDGMENT_CATEGORIES.map(c=><option key={c} value={c}>{c}</option>)}
+              </select>
+              <button className="iconbtn" style={{marginLeft:"auto"}} onClick={()=>removeJudgmentRow(idx)}>×</button>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))",gap:8}}>
+              {JUDGMENT_FIELDS.map(([col,label])=>
+                <label key={col}><span style={labelStyle}>{label}</span>
+                  <textarea rows={2} value={j[col]||""} onChange={e=>updateJudgmentRow(idx,{[col]:e.target.value})} style={fieldStyle}/>
+                </label>)}
+            </div>
+          </div>)}
+      </div>
+
+      <div style={{display:"flex",alignItems:"center",gap:10,marginTop:10}}>
+        <button className="btn primary" onClick={save} disabled={saving}>{saving?"保存中…":"ログを保存"}</button>
+        {msg && <span style={{fontSize:12,color:"var(--inkSoft)"}}>{msg}</span>}
+      </div>
+    </div>
+
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8,marginBottom:8}}>
+      <div style={{fontWeight:700}}>過去のログ</div>
+      <input value={filterCode} onChange={e=>setFilterCode(e.target.value)} placeholder="銘柄コードで絞り込み（例：6981）"
+        style={{...fieldStyle,width:220}}/>
+    </div>
+    {loading
+      ? <div style={{fontSize:12.5,color:"var(--inkSoft)"}}>読み込み中…</div>
+      : logs.length===0
+        ? <div style={{padding:22,textAlign:"center",color:"var(--inkSoft)",fontSize:13,border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)"}}>
+            まだログがありません（DATABASE_URL未設定の場合はこの機能は使えません）。
+          </div>
+        : <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {logs.map(log=>{
+              const isOpen=expanded.has(log.id);
+              return <div key={log.id} className="card" style={{padding:"10px 14px"}}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8,cursor:"pointer"}} onClick={()=>toggleExpand(log.id)}>
+                  <div><b className="mono">{log.date}</b> <span style={{fontSize:12,color:"var(--inkSoft)"}}>{(log.market_env||"").slice(0,40)}</span></div>
+                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                    <span style={{fontSize:11,color:"var(--inkFaint)"}}>{(log.judgments||[]).length}銘柄</span>
+                    <button className="iconbtn" onClick={e=>{e.stopPropagation();deleteLog(log.id);}}>×</button>
+                  </div>
+                </div>
+                {isOpen && <div style={{marginTop:10,fontSize:12.5,lineHeight:1.7}}>
+                  {log.us_market && <div>米国市場：{log.us_market}</div>}
+                  {log.interest_rate && <div>金利：{log.interest_rate}</div>}
+                  {log.fx && <div>為替：{log.fx}</div>}
+                  {log.oil && <div>原油：{log.oil}</div>}
+                  {log.sector_strength && <div>セクター強弱：{log.sector_strength}</div>}
+                  {log.chatgpt_view && <div>ChatGPTの判断：{log.chatgpt_view}</div>}
+                  {log.my_view && <div>自分の判断：{log.my_view}</div>}
+                  {log.reflection && <div>反省点：{log.reflection}</div>}
+                  {(log.judgments||[]).map(j=>
+                    <div key={j.id} style={{marginTop:8,paddingTop:8,borderTop:"1px solid var(--ruleSoft)"}}>
+                      <b>{j.name}（{j.code}）</b> <span className="chip" style={{fontSize:10.5}}>{j.category}</span>
+                      {JUDGMENT_FIELDS.map(([col,label])=>j[col]?<div key={col} style={{fontSize:11.5,color:"var(--inkSoft)"}}>{label}：{j[col]}</div>:null)}
+                    </div>)}
+                </div>}
+              </div>;
+            })}
+          </div>}
+  </div>;
+}
+
 // テーマ・セクター強弱の可視化：SectorWatchlist内のsectorGroups集計（平均騰落率・合計売買代金）と
 // 同じ考え方を、JP+US統合した銘柄リストに対して汎用的に適用する。keyFnがnull/""を返す銘柄は
 // 対象外にする（テーマ未設定銘柄をテーマ別ランキングから除外するため）。
@@ -1221,6 +1402,19 @@ function App(){
   // 2026-08-21 ユーザー要望：監視銘柄は日本市場に限定（アメリカ市場タブの「監視銘柄」ボタンは
   // 撤去済みだが、念のためここでも日本株以外は除外しておく）。
   const watchTargetItems=useMemo(()=>s.watchTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean).filter(w=>w.market==="JP"),[s.watchTargets,allWatch]);
+  // 投資判断ログの「新規ログ」下書きに自動で入れる値。金利・為替・原油は日次モニターの直近取得値
+  // （s.metrics）、市場全体の地合い・米国市場は直近の銘柄分析結果（analyze_stock共通の_market_environment）
+  // から、セクター強弱はgroupStocks()の売買代金上位から組み立てる。いずれも編集可能な「下書き」であり、
+  // ユーザーが保存前に自由に書き換えられる（2026-09-02新規）。
+  const marketEnvAuto=useMemo(()=>Object.values(s.analysisData)[0]?.marketEnv||"",[s.analysisData]);
+  const usMarketAuto=useMemo(()=>{const m=marketEnvAuto.split("／");return m.length>1?m.slice(1).join("／"):"";},[marketEnvAuto]);
+  const interestRateAuto=useMemo(()=>s.metrics?.us10y?.t?`米10年債利回り ${s.metrics.us10y.t}%`:"",[s.metrics]);
+  const fxAuto=useMemo(()=>s.metrics?.usdjpy?.t?`ドル円 ${s.metrics.usdjpy.t}円`:"",[s.metrics]);
+  const oilAuto=useMemo(()=>s.metrics?.wti?.t?`WTI原油 ${s.metrics.wti.t}ドル`:"",[s.metrics]);
+  const sectorStrengthAuto=useMemo(()=>{
+    const top=groupStocks(watchlistAll,s.stockQuotes,w=>w.sector).slice(0,3);
+    return top.map(g=>`${g.key}${g.avgPct!=null?(g.avgPct>0?"+":"")+g.avgPct.toFixed(2)+"%":""}`).join("、");
+  },[watchlistAll,s.stockQuotes]);
   const [analyzing,setAnalyzing]=useState(false);
   const fetchAnalysisFor=async(items)=>{
     if(!items||!items.length)return;
@@ -1446,14 +1640,61 @@ function App(){
     });
     setTab("journal");
   };
+  // 2026-09-02 ユーザー要望「投資判断ログ」：journal・myRulesをサーバーDB（Neon）へ移行後は、
+  // 画面上の操作はこれまで通りs（ローカル状態）を即時更新しつつ、ベストエフォートでサーバーにも
+  // 同期する（失敗しても画面操作は止めない＝他の外部API連携と同じ方針）。sRef.currentで最新の
+  // 移行済みフラグを見るのは、setS呼び出し直後でもクロージャが古いsを見てしまわないようにするため。
+  const syncJournalSave=(entry)=>{if(sRef.current.investmentLogMigrated)fetch("/api/journal/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(entry)}).catch(()=>{});};
+  const syncJournalDelete=(id)=>{if(sRef.current.investmentLogMigrated)fetch("/api/journal/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})}).catch(()=>{});};
+  const syncRuleSave=(rule)=>{if(sRef.current.investmentLogMigrated)fetch("/api/rules/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(rule)}).catch(()=>{});};
+  const syncRuleDelete=(id)=>{if(sRef.current.investmentLogMigrated)fetch("/api/rules/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})}).catch(()=>{});};
+
+  // 「記録」タブの「サーバーDBへ移行」ボタン。現在のjournal・myRulesをまとめてDBへ送り、
+  // 以降はsyncJournalSave等が実際にサーバーへも書き込むようにフラグを立てる。IDが同じものは
+  // 上書きになるため、何度押しても壊れない（investment_db.migrate_legacy参照）。
+  const [migratingLog,setMigratingLog]=useState(false);
+  const [migrateLogMsg,setMigrateLogMsg]=useState("");
+  const migrateToInvestmentDb=async()=>{
+    setMigratingLog(true);setMigrateLogMsg("");
+    try{
+      const r=await fetch("/api/migrate-legacy",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({journal:sRef.current.journal,rules:sRef.current.myRules})});
+      if(r.ok){
+        const d=await r.json();
+        if(d.error){setMigrateLogMsg("移行失敗："+d.error);}
+        else{setS(p=>({...p,investmentLogMigrated:true}));setMigrateLogMsg(`移行完了（記録${d.journal}件・マイルール${d.rules}件）`);}
+      }else{setMigrateLogMsg("移行に失敗しました。サーバーが起動しているか確認してください。");}
+    }catch(e){setMigrateLogMsg("移行に失敗しました。サーバーが起動しているか確認してください。");}
+    setMigratingLog(false);
+  };
+
+  // 移行済みなら起動時にサーバーDBのjournal・myRulesを取得して上書きする（MCP/ChatGPT経由で
+  // サーバー側だけが更新されているケースを反映するため）。取得失敗時は今のローカル状態のまま
+  // （他の外部API連携と同じ、失敗を許容する方針）。
+  useEffect(()=>{
+    if(!s.investmentLogMigrated)return;
+    (async()=>{
+      try{
+        const [jr,rr]=await Promise.all([fetch("/api/journal"),fetch("/api/rules")]);
+        if(jr.ok){const jd=await jr.json();if(Array.isArray(jd.journal))setS(p=>({...p,journal:jd.journal}));}
+        if(rr.ok){const rd=await rr.json();if(Array.isArray(rd.rules))setS(p=>({...p,myRules:rd.rules}));}
+      }catch(e){}
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[s.investmentLogMigrated]);
+
   const saveJournalEntry=()=>{
     if(!journalDraft)return;
     const entry={...journalDraft,id:Date.now()+Math.random(),createdAt:new Date().toISOString(),result:"未定",lessonNote:""};
     setS(p=>({...p,journal:[entry,...p.journal]}));
+    syncJournalSave(entry);
     setJournalDraft(null);
   };
-  const updateJournalEntry=(id,patch)=>setS(p=>({...p,journal:p.journal.map(j=>j.id===id?{...j,...patch}:j)}));
-  const deleteJournalEntry=(id)=>{if(!confirm("この記録を削除しますか？"))return;setS(p=>({...p,journal:p.journal.filter(j=>j.id!==id)}));};
+  const updateJournalEntry=(id,patch)=>setS(p=>{
+    const next=p.journal.map(j=>j.id===id?{...j,...patch}:j);
+    syncJournalSave(next.find(j=>j.id===id));
+    return {...p,journal:next};
+  });
+  const deleteJournalEntry=(id)=>{if(!confirm("この記録を削除しますか？"))return;setS(p=>({...p,journal:p.journal.filter(j=>j.id!==id)}));syncJournalDelete(id);};
 
   // マイルール：追加・オンオフ・削除。良いトレード・気づきの都度アップデートできるようにする
   // （2026-08-20 ユーザー要望）。トグルで一時的に無効化もできる（削除せず参照だけ残したい場合）。
@@ -1461,10 +1702,16 @@ function App(){
   const addMyRule=(text)=>{
     const t=(text||"").trim();
     if(!t)return;
-    setS(p=>({...p,myRules:[{id:Date.now()+Math.random(),text:t,active:true,createdAt:new Date().toISOString()},...p.myRules]}));
+    const rule={id:Date.now()+Math.random(),text:t,active:true,createdAt:new Date().toISOString()};
+    setS(p=>({...p,myRules:[rule,...p.myRules]}));
+    syncRuleSave(rule);
   };
-  const toggleMyRule=(id)=>setS(p=>({...p,myRules:p.myRules.map(r=>r.id===id?{...r,active:!r.active}:r)}));
-  const deleteMyRule=(id)=>setS(p=>({...p,myRules:p.myRules.filter(r=>r.id!==id)}));
+  const toggleMyRule=(id)=>setS(p=>{
+    const next=p.myRules.map(r=>r.id===id?{...r,active:!r.active}:r);
+    syncRuleSave(next.find(r=>r.id===id));
+    return {...p,myRules:next};
+  });
+  const deleteMyRule=(id)=>{setS(p=>({...p,myRules:p.myRules.filter(r=>r.id!==id)}));syncRuleDelete(id);};
 
   const rollToNextDay=()=>{if(!confirm("今日の値を前日値へ繰り越し、新しい一日にします（登録銘柄・分析対象銘柄は保持）。よろしいですか？"))return;
     setS(p=>({...emptyState(),date:todayISO(),watchlist:p.watchlist,watchlistUS:p.watchlistUS,analysisTargets:p.analysisTargets,
@@ -1586,6 +1833,7 @@ function App(){
         <button className={"tab"+(tab==="earnings"?" on":"")} onClick={()=>setTab("earnings")}>決算分析</button>
         <button className={"tab"+(tab==="analysis"?" on":"")} onClick={()=>setTab("analysis")}>銘柄分析</button>
         <button className={"tab"+(tab==="journal"?" on":"")} onClick={()=>setTab("journal")}>記録</button>
+        <button className={"tab"+(tab==="investlog"?" on":"")} onClick={()=>setTab("investlog")}>投資判断ログ</button>
       </div>
 
       {/* ===== 日次モニター（独立タブ） ===== */}
@@ -1991,7 +2239,24 @@ function App(){
       {/* ===== 記録（17章：売買記録・トレードジャーナル） ===== */}
       {tab==="journal" && <div style={{marginTop:18}}>
         <div className="sec-head">記録</div>
-        <div className="sec-note">エントリー理由・相場環境・撤退条件を記録し、後から結果と学びを追記します。データはこの端末のブラウザにのみ保存されます（サーバーには送信されません）。</div>
+        <div className="sec-note">
+          エントリー理由・相場環境・撤退条件を記録し、後から結果と学びを追記します。
+          {s.investmentLogMigrated
+            ? "サーバーDB（Neon）に保存され、投資判断ログと合わせて後から分析・MCP連携で利用できます。"
+            : "現在はこの端末のブラウザにのみ保存されています（サーバーには送信されません）。"}
+        </div>
+        {/* 2026-09-02 ユーザー要望「投資判断ログ」：既存の記録・マイルールをサーバーDBへ移行する
+            ボタン。移行後はsyncJournalSave等が自動でサーバーにも同期するため、この操作は
+            1回だけでよい（IDが同じものは上書きになるため、誤って複数回押しても壊れない）。 */}
+        <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 14px",marginBottom:14,display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+          {s.investmentLogMigrated
+            ? <span style={{fontSize:12.5,color:"var(--up)",fontWeight:700}}>✓ サーバーDBへ移行済み（記録・マイルールはNeon Postgresに保存されています）</span>
+            : <>
+                <span style={{fontSize:12.5,color:"var(--inkSoft)"}}>記録・マイルールはまだこの端末のブラウザだけに保存されています。「投資判断ログ」タブと合わせて分析・MCP連携するには、サーバーDBへの移行が必要です。</span>
+                <button className="btn" onClick={migrateToInvestmentDb} disabled={migratingLog}>{migratingLog?"移行中…":"サーバーDBへ移行"}</button>
+              </>}
+          {migrateLogMsg && <span style={{fontSize:11.5,color:"var(--inkSoft)"}}>{migrateLogMsg}</span>}
+        </div>
 
         {/* マイルール：追加・オンオフ・削除できる自分のトレードルール一覧。2026-08-20：
             固定リマインド文をやめ、良いトレード・気づきの都度育てられる形にした。
@@ -2130,6 +2395,11 @@ function App(){
               </div>
             </>}
       </div>}
+
+      {/* ===== 投資判断ログ（2026-09-02新規） ===== */}
+      {tab==="investlog" && <InvestmentLogPanel
+        marketEnvAuto={marketEnvAuto} usMarketAuto={usMarketAuto} interestRateAuto={interestRateAuto}
+        fxAuto={fxAuto} oilAuto={oilAuto} sectorStrengthAuto={sectorStrengthAuto} watchTargetItems={watchTargetItems}/>}
 
       {/* ===== NEWS（9章・9-1章・9-2章） ===== */}
       {tab==="news" && (()=>{

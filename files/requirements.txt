@@ -2,3 +2,4 @@ yfinance
 feedparser
 pypdf
 pycryptodome
+psycopg[binary]

@@ -70,6 +70,12 @@ def _load_secrets():
 _SECRETS = _load_secrets()
 JQUANTS_API_KEY = _SECRETS.get("jquants_refresh_token", "")  # V2はAPIキー方式（x-api-keyヘッダー）
 EDINET_API_KEY = _SECRETS.get("edinet_api_key", "")
+# 2026-09-02 ユーザー要望「投資判断ログ」機能：日次の相場観・銘柄評価・売買記録・マイルールを
+# サーバー側DBに永続化し、将来MCP/API経由でChatGPT/Claudeから読み書きできるようにする。
+# DBはNeon（無料枠のPostgreSQL、スリープはしても削除されない方式）を使用。PC・Render両方から
+# 同じDBに接続することでデータを一本化する。接続先はローカルはsecrets.jsonの"database_url"、
+# Renderは環境変数DATABASE_URL（Renderの規約に合わせた名前）のどちらでも読めるようにする。
+DATABASE_URL = os.environ.get("DATABASE_URL") or _SECRETS.get("database_url", "")
 
 try:
     import yfinance as yf
@@ -86,6 +92,13 @@ try:
     import tachibana_api
 except ImportError:
     tachibana_api = None
+try:
+    # 投資判断ログ用DBアクセス（2026-09-02新規）。psycopg未インストール・DATABASE_URL未設定の
+    # 環境でも他機能に影響しないよう、未導入時はimportだけ通してinvestment_db側の各関数が
+    # 空データ/Noneを返す（investment_db.py参照）。
+    import investment_db
+except ImportError:
+    investment_db = None
 
 INDEX = {
     "usdjpy": "JPY=X", "nikkei": "^N225", "dow": "^DJI",
@@ -2556,6 +2569,16 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _read_json_body(self):
+        """POST本文をJSONとして読む（投資判断ログAPI群で使用。既存の各APIは個別に読んでいるが、
+        新設分はここに揃える）。パース失敗時は{}を返す。"""
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            return json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            return {}
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -2606,6 +2629,22 @@ class Handler(SimpleHTTPRequestHandler):
         elif self.path.startswith("/api/jp-issue-master"):
             items = get_jp_issue_master()
             self._send_json({"items": items})
+        elif self.path.startswith("/api/investment-log"):
+            qs = urllib.parse.urlparse(self.path).query
+            q = urllib.parse.parse_qs(qs)
+            logs = investment_db.list_daily_logs(
+                DATABASE_URL,
+                date_from=q.get("from", [None])[0],
+                date_to=q.get("to", [None])[0],
+                code=q.get("code", [None])[0],
+            ) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"logs": logs})
+        elif self.path.startswith("/api/journal"):
+            entries = investment_db.list_journal(DATABASE_URL) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"journal": entries})
+        elif self.path.startswith("/api/rules"):
+            rules = investment_db.list_rules(DATABASE_URL) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"rules": rules})
         elif self.path == "/" or self.path == "":
             self.send_response(302)
             self.send_header("Location", "/trade-cockpit.html")
@@ -2686,10 +2725,85 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(pdf)
 
+    def _investment_db_ready(self):
+        if investment_db is None or not DATABASE_URL:
+            self._send_json({"error": "投資判断ログDB未設定（DATABASE_URLが未設定、またはpsycopg未インストール）"})
+            return False
+        return True
+
     def do_POST(self):
         if not self._authorized():
             return
-        if self.path.startswith("/api/news"):
+        # ---- 投資判断ログ（2026-09-02新規）：daily_log・stock_judgments ----
+        if self.path == "/api/investment-log/create":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            log_id = investment_db.create_daily_log(DATABASE_URL, body.get("dailyLog", {}), body.get("judgments", []))
+            self._send_json({"id": log_id})
+        elif self.path == "/api/investment-log/update":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            investment_db.update_daily_log(DATABASE_URL, body.get("id"), body.get("dailyLog", {}))
+            self._send_json({"ok": True})
+        elif self.path == "/api/investment-log/delete":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            investment_db.delete_daily_log(DATABASE_URL, body.get("id"))
+            self._send_json({"ok": True})
+        elif self.path == "/api/investment-log/judgment/add":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            jid = investment_db.add_stock_judgment(DATABASE_URL, body.get("dailyLogId"), body.get("judgment", {}))
+            self._send_json({"id": jid})
+        elif self.path == "/api/investment-log/judgment/update":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            investment_db.update_stock_judgment(DATABASE_URL, body.get("id"), body.get("judgment", {}))
+            self._send_json({"ok": True})
+        elif self.path == "/api/investment-log/judgment/delete":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            investment_db.delete_stock_judgment(DATABASE_URL, body.get("id"))
+            self._send_json({"ok": True})
+        # ---- 売買記録（journal）・マイルール（rules）：旧localStorageからDBへ移行済みの保存先 ----
+        elif self.path == "/api/journal/save":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            investment_db.upsert_journal_entry(DATABASE_URL, body)
+            self._send_json({"ok": True})
+        elif self.path == "/api/journal/delete":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            investment_db.delete_journal_entry(DATABASE_URL, body.get("id"))
+            self._send_json({"ok": True})
+        elif self.path == "/api/rules/save":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            investment_db.upsert_rule(DATABASE_URL, body)
+            self._send_json({"ok": True})
+        elif self.path == "/api/rules/delete":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            investment_db.delete_rule(DATABASE_URL, body.get("id"))
+            self._send_json({"ok": True})
+        elif self.path == "/api/migrate-legacy":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            print(f"[投資判断ログ] 旧データ移行（journal {len(body.get('journal', []))}件・rules {len(body.get('rules', []))}件）…")
+            result = investment_db.migrate_legacy(DATABASE_URL, body.get("journal", []), body.get("rules", []))
+            self._send_json(result)
+        elif self.path.startswith("/api/news"):
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length) if length else b"[]"
             try:
@@ -2783,6 +2897,12 @@ def main():
         if not IS_CLOUD:
             input("Enterで終了します。")
         return
+    if investment_db is not None and DATABASE_URL:
+        try:
+            investment_db.init_schema(DATABASE_URL)
+            print("[投資判断ログ] DBスキーマ確認OK")
+        except Exception as e:
+            print("[投資判断ログ] DB接続・スキーマ作成に失敗（この機能のみ利用不可。他機能には影響しません）", e)
     try:
         httpd = ThreadingTCPServer((HOST, PORT), Handler)
     except OSError:
