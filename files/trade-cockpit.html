@@ -141,6 +141,22 @@ td{padding:7px 10px;vertical-align:middle}
 const { useState, useEffect, useRef, useMemo } = React;
 
 const num = (v) => (v === "" || v == null || isNaN(+v) ? null : +v);
+// Trade Cockpit v2 Phase6（ChatGPT双方向連携）：相談用テキストのクリップボードコピー共通処理。
+// 有料AI APIは使わず、テキストを生成してコピーするだけ（貼り付け先はChatGPT側で人間が操作）。
+// Clipboard APIが使えない環境（http接続・古いブラウザ等）向けにexecCommandへのフォールバックを用意。
+const copyText = async (text) => {
+  try { await navigator.clipboard.writeText(text); return true; }
+  catch (e) {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return ok;
+    } catch (e2) { return false; }
+  }
+};
 // 2026-08-21 ユーザー要望：銘柄分析カードの「PTSの注記」〜「利確/損切シグナルチップ」の区間
 // （エントリーチェックリスト・決算期待値の★・タイミングチェック・資金管理の株数目安等）を
 // 一時的に非表示にする。コードは削除せず残しているため、復活させたい場合はtrueに戻すだけでよい。
@@ -615,7 +631,9 @@ function SourceThumb({source,style}){
 
 // 10-5章：announcements(運営からの新着情報)を渡すと、ニュース一覧の間に自然に挟み込んで表示する。
 // interval件ごとに1件挟む（末尾到達で先頭に戻る簡易ローテーション）。
-function NewsList({items,showName,emptyText}){
+// Trade Cockpit v2 Phase4（設計案30番）：ニュースの関連度優先順位ラベル（0=最優先）。
+const NEWS_PRIORITY_LABELS=["保有","候補","監視","テーマ","その他"];
+function NewsList({items,showName,emptyText,priorityOf}){
   if(!items||!items.length) return <div className="news-empty">{emptyText||"まだ取得していません。自動更新（起動直後・1時間おき）をお待ちください。"}</div>;
   return <div className="news-list">
     {items.map((it,i)=>{
@@ -624,8 +642,12 @@ function NewsList({items,showName,emptyText}){
       // NQN等の速報見出し（立花証券API）は元記事URLが無いため、リンクにせずカード表示にする
       const Tag=it.url?"a":"div";
       const linkProps=it.url?{href:it.url,target:"_blank",rel:"noopener noreferrer"}:{};
+      // Trade Cockpit v2 Phase4（設計案30番）：保有／候補／監視／テーマ一致に該当するニュースには
+      // バッジを付ける（優先度4=その他は表示しない）。
+      const prio=priorityOf&&it.code?priorityOf(it.code):4;
       return <Tag key={i} className={"news-item"+(important?" important":"")} {...linkProps}>
         {important&&<span className="news-alert-badge">⚠ 重要</span>}
+        {prio<4&&<span className="chip" style={{fontSize:10,marginRight:4}}>{NEWS_PRIORITY_LABELS[prio]}</span>}
         {showName&&it.code&&<span className="news-tag">{it.code}</span>}
         <span className="news-body">
           <span className="news-title" style={important?{color:"var(--accent)",fontWeight:700}:undefined}>{it.title}</span>
@@ -961,7 +983,7 @@ function AssessmentCard({assessment:a}){
   </div>;
 }
 
-function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels}){
+function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules}){
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
 
@@ -1041,12 +1063,79 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
     }catch(e){}
   };
 
+  // 仮想IN（Trade Cockpit v2 Phase7・設計案12・40番）：見送り銘柄も含めて「今エントリーしたら」を
+  // 記録し、後から結果を追跡できるようにする。実際の売買ではなく記録のみ（実売買は「記録」ボタン→
+  // 投資判断ログ／記録タブで別途行う）。
+  const virtualEntry=async(w)=>{
+    const status=candidateStatusPick[w.code]||"WATCH";
+    const price=num(stockQuotes[w.code]?.t);
+    try{
+      await fetch("/api/trade-candidates/save",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({code:w.code,name:w.name,status,
+          rs_score:w.rsScore,market_rs:w.marketRS,sector_rs:w.sectorRS,
+          virtual_entry_price:price,virtual_entry_time:new Date().toISOString()})});
+      loadCandidates();
+    }catch(e){}
+  };
+  const [recordMsg,setRecordMsg]=useState("");
+  // 「記録」（Trade Cockpit v2 Phase5・設計案39番）：監視銘柄の行から直接、当日の投資判断ログへ
+  // 銘柄評価を1件追加する（投資判断ログタブでの手動入力を省略できるショートカット）。
+  const recordToLog=async(w)=>{
+    const qt=stockQuotes[w.code]||{};
+    try{
+      const r=await fetch("/api/investment-log/quick-judgment",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({judgment:{
+          code:w.code,name:w.name,category:"監視",
+          execution_status:candidateStatusPick[w.code]||"WATCH",
+          entry_reason:`監視銘柄タブから記録（RS Score ${w.rsScore??"—"}・現在値${num(qt.t)??"—"}）`,
+        }})});
+      const d=await r.json();
+      setRecordMsg(d.judgmentId?`${w.code} を投資判断ログに記録しました`:"記録に失敗しました");
+    }catch(e){setRecordMsg("記録に失敗しました");}
+    setTimeout(()=>setRecordMsg(""),2500);
+  };
+
+  // 仮想IN済み銘柄のチェックポイント記録（Trade Cockpit v2 Phase7・設計案40番）
+  const CHECKPOINT_LABELS=[["30m","30分後"],["1h","1時間後"],["close","大引け"],["next_day","翌営業日"],["3d","3営業日後"],["5d","5営業日後"]];
+  const recordCheckpoint=async(candidate,label)=>{
+    const price=num(stockQuotes[candidate.code]?.t);
+    if(price==null){alert("現在値が取得できていません（自動更新をお待ちください）");return;}
+    try{
+      await fetch("/api/trade-candidates/checkpoint",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({id:candidate.id,label,price})});
+      loadCandidates();
+    }catch(e){}
+  };
+
   const fmtPt=(v)=>v==null?"—":(v>0?"+":"")+v.toFixed(1);
+
+  // ChatGPT連携（Phase6・設計案44-45番）：銘柄相談用にコピー。有料AI APIは呼ばず、テキストを
+  // 生成してクリップボードにコピーするだけ。
+  const [consultMsg,setConsultMsg]=useState("");
+  const copyConsult=async(w)=>{
+    const qt=stockQuotes[w.code]||{};
+    const t=num(qt.t),p=num(qt.p);
+    const meta=WATCH_STATUS_META[w.status];
+    const lines=[
+      `【Trade Cockpit 場中相談】${new Date().toLocaleString("ja-JP")}`,"",
+      `銘柄: ${w.code} ${w.name}（${w.sector||"—"}）`,
+      `現在値: ${t!=null?t.toLocaleString():"—"}　前日比: ${w.pct!=null?(w.pct>0?"+":"")+w.pct.toFixed(2)+"%":"—"}`,
+      `Market RS: ${fmtPt(w.marketRS)}pt　Sector RS: ${fmtPt(w.sectorRS)}pt　RS Score: ${w.rsScore??"—"}`,
+      `Status: ${meta.icon} ${meta.label}`,"",
+    ];
+    if(activeRules?.length){lines.push("投資ルール：");activeRules.forEach(t=>lines.push(`・${t}`));lines.push("");}
+    lines.push("質問：この銘柄、今入るのどう？");
+    const ok=await copyText(lines.join("\n"));
+    setConsultMsg(ok?`${w.code} をコピーしました`:"コピーに失敗しました");
+    setTimeout(()=>setConsultMsg(""),2500);
+  };
 
   return <div style={{marginTop:18}}>
     <div className="sec-head">監視銘柄　{items.length}件</div>
     <div className="sec-note">「日本市場」タブの「監視銘柄」ボタン、または出来高ブレイクアウト条件（直近3か月高値を出来高1.5倍以上で上抜け）への自動該当で追加されます（日本市場のみ対象）。
-      Status・RS Scoreは日経平均・所属セクター平均との当日騰落率の差から簡易算出（詳しい分析は「分析」ボタンから）。</div>
+      Status・RS Scoreは日経平均・所属セクター平均との当日騰落率の差から簡易算出（詳しい分析は「分析」ボタンから）。
+      {consultMsg && <span style={{marginLeft:8,color:"var(--accent)",fontWeight:700}}>{consultMsg}</span>}
+      {recordMsg && <span style={{marginLeft:8,color:"var(--accent)",fontWeight:700}}>{recordMsg}</span>}</div>
     <div style={{marginTop:10,display:"flex",alignItems:"center",gap:8}}>
       <label style={{fontSize:12,color:"var(--inkSoft)"}}>並び順：</label>
       <select value={sortKey} onChange={e=>setSortKey(e.target.value)} style={{fontSize:12,padding:"3px 6px"}}>
@@ -1098,6 +1187,9 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
                     {TRADE_CANDIDATE_STATUS_OPTIONS.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}
                   </select>
                   <button className="action-btn" onClick={()=>saveCandidate(w)}>候補に追加</button>
+                  <button className="action-btn" onClick={()=>virtualEntry(w)}>仮想IN</button>
+                  <button className="action-btn" onClick={()=>recordToLog(w)}>記録</button>
+                  <button className="action-btn" onClick={()=>copyConsult(w)}>🤖 相談用コピー</button>
                   <button className="action-btn" onClick={()=>onRemove(w.code)}>削除</button>
                 </div>
               </td>
@@ -1112,13 +1204,26 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
         : candidates.length===0
           ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>まだありません。上の一覧から「候補に追加」で保存できます。</div>
           : <div style={{display:"flex",flexDirection:"column",gap:4,marginTop:6}}>
-              {candidates.map(c=><div key={c.id} style={{display:"flex",alignItems:"center",gap:8,fontSize:12.5,
-                padding:"5px 8px",border:"1px solid var(--ruleSoft)",borderRadius:3}}>
-                <span className="chip" style={{fontSize:10.5}}>{TRADE_CANDIDATE_STATUS_OPTIONS.find(o=>o.value===c.status)?.label||c.status}</span>
-                <span className="mono">{c.code}</span><span style={{fontWeight:600}}>{c.name}</span>
-                {c.rs_score!=null && <span style={{color:"var(--inkSoft)"}}>RS Score {c.rs_score}</span>}
-                <span style={{marginLeft:"auto",color:"var(--inkFaint)",fontSize:11}}>{(c.created_at||"").slice(11,16)}</span>
-                <button className="iconbtn" onClick={()=>removeCandidate(c.id)}>×</button>
+              {candidates.map(c=><div key={c.id} style={{fontSize:12.5,padding:"5px 8px",border:"1px solid var(--ruleSoft)",borderRadius:3}}>
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <span className="chip" style={{fontSize:10.5}}>{TRADE_CANDIDATE_STATUS_OPTIONS.find(o=>o.value===c.status)?.label||c.status}</span>
+                  <span className="mono">{c.code}</span><span style={{fontWeight:600}}>{c.name}</span>
+                  {c.rs_score!=null && <span style={{color:"var(--inkSoft)"}}>RS Score {c.rs_score}</span>}
+                  {c.virtual_entry_price!=null && <span style={{color:"var(--inkSoft)"}}>仮想IN {num(c.virtual_entry_price).toLocaleString()}</span>}
+                  <span style={{marginLeft:"auto",color:"var(--inkFaint)",fontSize:11}}>{(c.created_at||"").slice(11,16)}</span>
+                  <button className="iconbtn" onClick={()=>removeCandidate(c.id)}>×</button>
+                </div>
+                {/* 仮想トレード追跡（Phase7）：仮想IN済みの候補にだけチェックポイント記録UIを出す */}
+                {c.virtual_entry_price!=null && <div style={{display:"flex",gap:4,flexWrap:"wrap",marginTop:4,paddingTop:4,borderTop:"1px solid var(--ruleSoft)"}}>
+                  {CHECKPOINT_LABELS.map(([key,label])=>{
+                    const cp=c.checkpoints?.[key];
+                    if(cp){
+                      const chgPct=c.virtual_entry_price?((cp.price-c.virtual_entry_price)/c.virtual_entry_price*100):null;
+                      return <span key={key} className="chip" style={{fontSize:10}}>{label} {num(cp.price).toLocaleString()}{chgPct!=null?`(${chgPct>0?"+":""}${chgPct.toFixed(1)}%)`:""}</span>;
+                    }
+                    return <button key={key} className="action-btn" style={{fontSize:10,padding:"2px 5px"}} onClick={()=>recordCheckpoint(c,key)}>{label}を記録</button>;
+                  })}
+                </div>}
               </div>)}
             </div>}
     </div>
@@ -1349,7 +1454,7 @@ function validateChatGptPayload(obj){
   return errs;
 }
 
-function ChatGptImportPanel(){
+function ChatGptImportPanel({journal,activeRules}){
   const [rawText,setRawText]=useState("");
   const [parsed,setParsed]=useState(null);
   const [parseErrors,setParseErrors]=useState([]);
@@ -1368,6 +1473,35 @@ function ChatGptImportPanel(){
     setLoadingImports(false);
   };
   useEffect(()=>{loadImports();},[]);
+
+  // ChatGPT連携（Phase6・設計案47番）：大引け振り返り用にコピー。有料AI APIは使わず、
+  // 今日のtrade_candidates・journal（本日分）・投資ルールをテキストにまとめてコピーするだけ。
+  const [closingMsg,setClosingMsg]=useState("");
+  const copyClosingReport=async()=>{
+    const today=todayISO();
+    const lines=[`【Trade Cockpit 大引け振り返り】${new Date().toLocaleString("ja-JP")}`,""];
+    try{
+      const r=await fetch("/api/trade-candidates");
+      if(r.ok){
+        const d=await r.json();const cs=d.candidates||[];
+        if(cs.length){lines.push(`■ 今日の候補（${cs.length}件）`);
+          cs.forEach(c=>lines.push(`${c.code} ${c.name}（${c.status}）RS Score${c.rs_score??"—"}`));lines.push("");}
+      }
+    }catch(e){}
+    const todayJournal=(journal||[]).filter(j=>(j.createdAt||"").slice(0,10)===today);
+    if(todayJournal.length){
+      lines.push(`■ 本日の売買記録（${todayJournal.length}件）`);
+      todayJournal.forEach(j=>lines.push(`${j.code} ${j.name}　${j.action}　${j.price}円×${j.shares}株　結果:${j.result}${j.reason?`　理由:${j.reason}`:""}`));
+      lines.push("");
+    }else{
+      lines.push("■ 本日の売買記録：なし（見送り・様子見の日）");lines.push("");
+    }
+    if(activeRules?.length){lines.push("■ 投資ルール");activeRules.forEach(t=>lines.push(`・${t}`));lines.push("");}
+    lines.push("上記の内容を踏まえ、今日の投資判断ログ用JSON（date/market/watchlist/decisions/review/rule_updates）を作成してください。");
+    const ok=await copyText(lines.join("\n"));
+    setClosingMsg(ok?"コピーしました":"コピーに失敗しました");
+    setTimeout(()=>setClosingMsg(""),2500);
+  };
 
   const parse=()=>{
     setSaveMsg("");setDupInfo(null);
@@ -1414,7 +1548,12 @@ function ChatGptImportPanel(){
       （ChatGPTとのやり取りは従来どおりChatGPT側で行い、その結果のJSONだけをコピー＆ペーストします）。
     </div>
 
-    <div style={{marginTop:10}}>
+    <div style={{marginTop:10,display:"flex",alignItems:"center",gap:8}}>
+      <button className="action-btn" onClick={copyClosingReport}>📋 ChatGPT大引け振り返り用にコピー</button>
+      {closingMsg && <span style={{fontSize:11,color:"var(--inkSoft)"}}>{closingMsg}</span>}
+    </div>
+
+    <div style={{marginTop:16}}>
       <label style={labelStyle}>ChatGPTが出力したJSON
         <button className="action-btn" style={{marginLeft:8,fontSize:11}} onClick={()=>setRawText(CHATGPT_SAMPLE_JSON)}>サンプルを入力</button>
       </label>
@@ -1540,7 +1679,7 @@ const groupStocks=(items,stockQuotes,keyFn)=>{
 // 重い処理（3か月分の日足取得×4指数）のため1日1回だけ自動取得し、以降は手動更新ボタンに委ねる
 // （breakoutLevelsと同じキャッシュパターン）。日経/NASDAQ/SOX/US10Yの数値自体は既存のmetrics
 // （30秒おきに自動更新済み）をそのまま使うため追加リクエストは発生しない。
-function TodaysMarketCard({metrics,watchlistAll,stockQuotes,marketRisk,onRefresh,refreshing}){
+function TodaysMarketCard({metrics,watchlistAll,stockQuotes,marketRisk,onRefresh,refreshing,activeRules,importantNews}){
   const pctOfMetric=(key)=>{const m=metrics[key];if(!m)return null;const t=num(m.t),p=num(m.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
   const marketPct=pctOfMetric("nikkei");
@@ -1550,26 +1689,64 @@ function TodaysMarketCard({metrics,watchlistAll,stockQuotes,marketRisk,onRefresh
   const weakSectors=useMemo(()=>[...sectorGroups].filter(g=>g.avgPct!=null).sort((a,b)=>a.avgPct-b.avgPct).slice(0,3),[sectorGroups]);
   const sectorAvgMap=useMemo(()=>Object.fromEntries(sectorGroups.map(g=>[g.key,g.avgPct])),[sectorGroups]);
 
-  const rsStrongCount=useMemo(()=>{
-    if(marketPct==null)return null;
-    let n=0;
+  const rsStrongList=useMemo(()=>{
+    if(marketPct==null)return [];
+    const out=[];
     (watchlistAll||[]).forEach(w=>{
       const qt=stockQuotes[w.code]||{};const t=num(qt.t),p=num(qt.p);
       const pct=(t!=null&&p!=null&&p)?(t-p)/p*100:null;
       const {rsScore}=calcRsScore(pct,marketPct,sectorAvgMap[w.sector]);
-      if(rsScore!=null&&rsScore>=75)n++;
+      if(rsScore!=null&&rsScore>=75)out.push({code:w.code,name:w.name,rsScore,pct});
     });
-    return n;
+    return out.sort((a,b)=>b.rsScore-a.rsScore);
   },[watchlistAll,stockQuotes,marketPct,sectorAvgMap]);
+  const rsStrongCount=rsStrongList.length;
 
   const riskMeta=marketRisk?.marketRiskLabel;
   const riskColor=riskMeta==="RISK OFF"?"var(--down)":riskMeta==="HIGH RISK"?"var(--accent)":riskMeta==="LOW RISK"?"var(--up)":"var(--inkSoft)";
   const quickIdx=[["日経","nikkei",0],["NASDAQ","nasdaq",0],["SOX","sox",0],["US10Y","us10y",2]];
 
+  // ChatGPT連携（Phase6・設計案46番）：朝一チェック用にコピー。有料AI APIは使わず、テキストを
+  // 生成してクリップボードにコピーするだけ（貼り付け先はChatGPT側で人間が操作）。
+  const [copyMsg,setCopyMsg]=useState("");
+  const copyMorningReport=async()=>{
+    const lines=[`【Trade Cockpit 朝一チェック】${new Date().toLocaleString("ja-JP")}`,""];
+    lines.push(`■ Market Risk: ${marketRisk?.marketRiskLabel||"—"}（${marketRisk?.marketRiskScore??"—"}/100）`);
+    if(marketRisk?.text)lines.push(marketRisk.text);
+    lines.push("");
+    lines.push("■ 指数");
+    quickIdx.forEach(([label,key,dp])=>{
+      const m=metrics[key]||{};const t=num(m.t);const pct=pctOfMetric(key);
+      lines.push(`${label}: ${t!=null?t.toFixed(dp):"—"}${pct!=null?`（${pct>0?"+":""}${pct.toFixed(2)}%）`:""}`);
+    });
+    lines.push("");
+    if(strongSectors.length){lines.push("■ 強いセクター");strongSectors.forEach(g=>lines.push(`${g.key} ${g.avgPct>0?"+":""}${g.avgPct.toFixed(1)}%`));lines.push("");}
+    if(weakSectors.length){lines.push("■ 弱いセクター");weakSectors.forEach(g=>lines.push(`${g.key} ${g.avgPct>0?"+":""}${g.avgPct.toFixed(1)}%`));lines.push("");}
+    if(rsStrongList.length){lines.push(`■ Relative Strength銘柄（${rsStrongList.length}件）`);
+      rsStrongList.slice(0,10).forEach(x=>lines.push(`${x.code} ${x.name} RS Score${x.rsScore} (${x.pct>0?"+":""}${x.pct.toFixed(2)}%)`));lines.push("");}
+    try{
+      const r=await fetch("/api/trade-candidates");
+      if(r.ok){const d=await r.json();const cs=d.candidates||[];
+        if(cs.length){lines.push(`■ 今日の候補（${cs.length}件）`);
+          cs.forEach(c=>lines.push(`${c.code} ${c.name}（${c.status}）`));lines.push("");}}
+    }catch(e){}
+    if(activeRules?.length){lines.push("■ 投資ルール");activeRules.forEach(t=>lines.push(`・${t}`));lines.push("");}
+    if(importantNews?.length){lines.push(`■ 重要ニュース（${importantNews.length}件）`);
+      importantNews.slice(0,8).forEach(n=>lines.push(`・${n.title}`));lines.push("");}
+    lines.push("上記を踏まえて、今日の注目セクター・銘柄について相談したいです。");
+    const ok=await copyText(lines.join("\n"));
+    setCopyMsg(ok?"コピーしました":"コピーに失敗しました");
+    setTimeout(()=>setCopyMsg(""),2500);
+  };
+
   return <div className="card" style={{padding:"12px 16px",marginBottom:16}}>
     <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
       <div style={{fontWeight:800,fontSize:14}}>TODAY'S MARKET</div>
-      <button className="action-btn" onClick={onRefresh} disabled={refreshing}>{refreshing?"更新中…":"更新"}</button>
+      <div style={{display:"flex",alignItems:"center",gap:8}}>
+        {copyMsg && <span style={{fontSize:11,color:"var(--inkSoft)"}}>{copyMsg}</span>}
+        <button className="action-btn" onClick={copyMorningReport}>🌅 ChatGPT朝一チェック用にコピー</button>
+        <button className="action-btn" onClick={onRefresh} disabled={refreshing}>{refreshing?"更新中…":"更新"}</button>
+      </div>
     </div>
     {marketRisk==null
       ? <div style={{fontSize:12,color:"var(--inkFaint)",marginTop:6}}>{refreshing?"取得中…":"未取得（「更新」で取得できます）"}</div>
@@ -1826,6 +2003,25 @@ function App(){
     if(s.marketRiskFetchedDate!==todayISO())fetchMarketRisk();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
+
+  // ニュース優先順位付け（Trade Cockpit v2 Phase4・設計案30-33番）：保有＞今日の候補＞監視銘柄＞
+  // テーマ一致＞その他 の順で関連度の高いニュースを上に出す。「今日の候補」だけはNeon保存のため
+  // 起動時に1回取得する（他の3つはすでにローカルstateにある）。
+  const [candidateCodes,setCandidateCodes]=useState(new Set());
+  useEffect(()=>{
+    fetch("/api/trade-candidates").then(r=>r.ok?r.json():null).then(d=>{
+      if(d&&Array.isArray(d.candidates))setCandidateCodes(new Set(d.candidates.map(c=>c.code)));
+    }).catch(()=>{});
+  },[]);
+  const newsPriorityRank=(code)=>{
+    if(!code)return 4;
+    const heldCodes=new Set(s.journal.filter(j=>j.result==="未定").map(j=>j.code));
+    if(heldCodes.has(code))return 0;
+    if(candidateCodes.has(code))return 1;
+    if(s.watchTargets.includes(code))return 2;
+    if(watchlistAll.some(w=>w.code===code&&w.theme))return 3;
+    return 4;
+  };
 
   useEffect(()=>{
     fetchNewsOnly();
@@ -2324,7 +2520,8 @@ function App(){
         <div className="sec-note">30秒おきに自動更新します。ドル円・日経平均・ダウ・ナスダック・SOX・米10年債・S&P500・KOSPI・日経225先物・NYダウ先物・WTI原油・金・銅 を今日値／前日値ともに取得します（数値は遅延あり）。</div>
         <div className="sec-note" style={{marginTop:-4,marginBottom:14}}>項目をクリックするとリアルタイムチャートが下に開きます。</div>
         <TodaysMarketCard metrics={s.metrics} watchlistAll={watchlistAll} stockQuotes={s.stockQuotes}
-          marketRisk={s.marketRisk} onRefresh={fetchMarketRisk} refreshing={marketRiskFetching}/>
+          marketRisk={s.marketRisk} onRefresh={fetchMarketRisk} refreshing={marketRiskFetching}
+          activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)} importantNews={importantNewsAll}/>
         <ThemeSectorRanking watchlistAll={watchlistAll} stockQuotes={s.stockQuotes}/>
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:1,background:"var(--rule)",border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden"}}>
           {METRICS.map(m=>{const v=s.metrics[m.key];const t=num(v.t),p=num(v.p);
@@ -2366,6 +2563,7 @@ function App(){
         analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
         earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
         onRemove={removeWatchTarget} metrics={s.metrics} watchlistAll={watchlistAll} breakoutLevels={s.breakoutLevels}
+        activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)}
         onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}/>}
 
       {/* ===== BRIEFING（日本市場） ===== */}
@@ -2883,7 +3081,7 @@ function App(){
         fxAuto={fxAuto} oilAuto={oilAuto} sectorStrengthAuto={sectorStrengthAuto} watchTargetItems={watchTargetItems}/>}
 
       {/* ===== ChatGPT連携（2026-09-02新規） ===== */}
-      {tab==="chatgptimport" && <ChatGptImportPanel/>}
+      {tab==="chatgptimport" && <ChatGptImportPanel journal={s.journal} activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)}/>}
 
       {/* ===== NEWS（9章・9-1章・9-2章） ===== */}
       {tab==="news" && (()=>{
@@ -2894,8 +3092,12 @@ function App(){
           {key:"registered",label:"登録銘柄"},
           {key:"disclosure",label:"適時開示"},
         ];
-        const listFor={summary:newsSummary,domestic:s.macroNewsDomestic,overseas:overseasAll,registered:stockNameNewsAll,disclosure:disclosureAll}[newsSubTab];
+        let listFor={summary:newsSummary,domestic:s.macroNewsDomestic,overseas:overseasAll,registered:stockNameNewsAll,disclosure:disclosureAll}[newsSubTab];
         const showCode=newsSubTab==="summary"||newsSubTab==="disclosure"||newsSubTab==="registered";
+        // Trade Cockpit v2 Phase4（設計案30番）：銘柄コードを持つニュース一覧は、保有＞今日の候補＞
+        // 監視銘柄＞テーマ一致＞その他 の順に並べ替える（Array.sortは安定ソートのため、同じ優先度内
+        // では元の並び＝取得順を保つ）。
+        if(showCode)listFor=[...listFor].sort((a,b)=>newsPriorityRank(a.code)-newsPriorityRank(b.code));
         const hasImportant=listFor.some(it=>isImportantNews(it.title));
         return <div style={{marginTop:18}}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
@@ -2911,7 +3113,7 @@ function App(){
             <span style={{fontSize:12,color:"var(--inkSoft)"}}>サプライズ決算・戦争紛争・パンデミック・大規模災害・株価暴落に関連する見出しに印を付けています。</span>
           </div>}
           <div className="card" style={{padding:"14px 16px 6px"}}>
-            <NewsList items={listFor.slice(0,newsShowCount)} showName={showCode}/>
+            <NewsList items={listFor.slice(0,newsShowCount)} showName={showCode} priorityOf={showCode?newsPriorityRank:null}/>
           </div>
           {listFor.length>newsShowCount && <div style={{textAlign:"center",marginTop:10}}>
             <button className="btn" onClick={()=>setNewsShowCount(c=>c+NEWS_PAGE_SIZE)}>もっと見る（残り{listFor.length-newsShowCount}件）</button>

@@ -2981,6 +2981,25 @@ class Handler(SimpleHTTPRequestHandler):
             body = self._read_json_body()
             investment_db.delete_trade_candidate(DATABASE_URL, self.current_user, body.get("id"))
             self._send_json({"ok": True})
+        elif self.path == "/api/trade-candidates/checkpoint":
+            # 仮想トレード追跡（2026-09-02新規、Trade Cockpit v2 Phase7）
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            ok = investment_db.add_trade_candidate_checkpoint(
+                DATABASE_URL, self.current_user, body.get("id"), body.get("label"), body.get("price"))
+            self._send_json({"ok": ok})
+        elif self.path == "/api/investment-log/quick-judgment":
+            # 監視銘柄タブからのワンクリック記録（2026-09-02新規、Trade Cockpit v2 Phase5・設計案39番）。
+            # 当日のdaily_logが無ければ自動作成し、stock_judgmentを1件追加する。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            jst = datetime.timezone(datetime.timedelta(hours=9))
+            date = body.get("date") or datetime.datetime.now(jst).strftime("%Y-%m-%d")
+            log_id = investment_db.get_or_create_daily_log(DATABASE_URL, self.current_user, date)
+            jid = investment_db.add_stock_judgment(DATABASE_URL, self.current_user, log_id, body.get("judgment", {}))
+            self._send_json({"dailyLogId": log_id, "judgmentId": jid})
         elif self.path == "/api/migrate-legacy":
             if not self._investment_db_ready():
                 return

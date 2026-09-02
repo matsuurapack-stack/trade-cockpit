@@ -757,8 +757,10 @@ TRADE_CANDIDATE_STATUSES = ["WATCH", "WAIT", "BUY_CANDIDATE", "SKIP"]
 
 
 def create_trade_candidate(database_url, user_id, data):
-    """dataは{code,name,status,rs_score,market_rs,sector_rs,note}のいずれかを含むdict
-    （code・statusは必須）。戻り値: 作成したidまたはNone。"""
+    """dataは{code,name,status,rs_score,market_rs,sector_rs,note,virtual_entry_price,
+    virtual_entry_time}のいずれかを含むdict（code・statusは必須）。virtual_entry_price/
+    virtual_entry_timeは「仮想IN」（v2 Phase7・設計案12・40番：監視銘柄一覧から見送り銘柄を
+    仮想的にエントリーしたことにして後から結果を追跡する）で使う。戻り値: 作成したidまたはNone。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
@@ -767,11 +769,62 @@ def create_trade_candidate(database_url, user_id, data):
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO trade_candidates (user_id, code, name, status, rs_score, market_rs, sector_rs, note) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                "INSERT INTO trade_candidates (user_id, code, name, status, rs_score, market_rs, sector_rs, note, "
+                "virtual_entry_price, virtual_entry_time) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
                 [user_id, data.get("code"), data.get("name"), data.get("status"),
-                 data.get("rs_score"), data.get("market_rs"), data.get("sector_rs"), data.get("note")],
+                 data.get("rs_score"), data.get("market_rs"), data.get("sector_rs"), data.get("note"),
+                 data.get("virtual_entry_price"), data.get("virtual_entry_time")],
             )
+            new_id = cur.fetchone()[0]
+        conn.commit()
+    return new_id
+
+
+# ---- 仮想トレード追跡（trade_candidates.checkpoints。2026-09-02新規、Trade Cockpit v2 Phase7） ----
+# 見送り銘柄の「仮想IN」後、30分後/1時間後/大引け/翌営業日/3営業日後/5営業日後の価格を手動で
+# 記録できるようにする（自動追跡には定期実行の仕組みが必要になり複雑化するため、Phase7は
+# ユーザーが見た時に記録する手動方式にとどめる。設計案21番「システムを複雑にしない」に沿う）。
+TRADE_CANDIDATE_CHECKPOINT_LABELS = ["30m", "1h", "close", "next_day", "3d", "5d"]
+
+
+def add_trade_candidate_checkpoint(database_url, user_id, candidate_id, label, price):
+    """checkpoints(JSONB)に{label: {"price":.., "at":ISO8601}}を1件マージする。既存の同じlabelは
+    上書きする（記録し直したい場合のため）。呼び出しユーザーの候補であることを確認してから更新する。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return False
+    if label not in TRADE_CANDIDATE_CHECKPOINT_LABELS:
+        return False
+    entry = json.dumps({label: {"price": price, "at": datetime.datetime.now(datetime.timezone.utc).isoformat()}})
+    with pool.connection() as conn:
+        cur = conn.execute(
+            "UPDATE trade_candidates SET checkpoints = COALESCE(checkpoints, '{}'::jsonb) || %s::jsonb "
+            "WHERE id = %s AND user_id = %s",
+            [entry, candidate_id, user_id],
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+# ---- 監視銘柄→投資判断ログへのワンクリック記録（2026-09-02新規、Trade Cockpit v2 Phase5） ----
+# 「監視→分析→判断→記録」の導線接続（設計案5・26・39番）。監視銘柄タブの行から直接、
+# 当日のdaily_log（無ければ自動作成）にstock_judgmentを1件追加する。
+
+def get_or_create_daily_log(database_url, user_id, date):
+    """(user_id, date)のdaily_logがあればそのidを返し、無ければ空のdaily_logを作成して返す。
+    「記録」ボタン用：投資判断ログタブで手動作成済みの当日ログがあればそれに相乗りし、
+    無ければ自動で作る（ユーザーに「新規ログ」フォームへの入力を強制しない）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM daily_log WHERE user_id = %s AND date = %s ORDER BY id LIMIT 1", [user_id, date])
+            row = cur.fetchone()
+            if row:
+                return row[0]
+            cur.execute("INSERT INTO daily_log (user_id, date) VALUES (%s, %s) RETURNING id", [user_id, date])
             new_id = cur.fetchone()[0]
         conn.commit()
     return new_id
