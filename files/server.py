@@ -33,14 +33,13 @@ IS_CLOUD = bool(os.environ.get("RENDER") or os.environ.get("PORT"))
 PORT = int(os.environ.get("PORT", 8765))
 # スマホ・他PCから同じWi-Fiで開けるように、ローカル実行時も0.0.0.0（全ネットワークIF）で
 # 待ち受ける（127.0.0.1固定だとPC自身からしかアクセスできなかった）。
-# 自宅Wi-Fi内での利用はパスワード等のアクセス制限を付けない方針（ユーザー承認済み・
-# [[trade-cockpit-multi-pc-access]]）。同じWi-Fi内の他端末からは誰でも見えるため、
+# 自宅Wi-Fi内での利用はパスワード等のアクセス制限を付けない方針だったが、2026-09-02の
+# マルチユーザー化以降はUSERS（下記）が1件でも設定されていれば常にログインが必要になる
+# （[[trade-cockpit-multi-pc-access]]）。同じWi-Fi内の他端末からは誰でも見えるため、
 # 公衆Wi-Fi等では使わないこと。
-# インターネット公開（Render等のクラウド）時は、下記APP_PASSWORD環境変数を設定すると
-# Basic認証がかかる（立花証券API連携後は気配値等の実データが漏れるため、クラウド公開時は
-# 設定必須の運用。ローカル/LAN利用時は未設定のままでよい）。
+# 旧APP_PASSWORD（単一共有パスワード）は廃止し、USERSベースの認証に統一した
+# （_authorized()参照）。
 HOST = "0.0.0.0"
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 
 def _lan_ip():
@@ -76,6 +75,15 @@ EDINET_API_KEY = _SECRETS.get("edinet_api_key", "")
 # 同じDBに接続することでデータを一本化する。接続先はローカルはsecrets.jsonの"database_url"、
 # Renderは環境変数DATABASE_URL（Renderの規約に合わせた名前）のどちらでも読めるようにする。
 DATABASE_URL = os.environ.get("DATABASE_URL") or _SECRETS.get("database_url", "")
+# 2026-09-02 ユーザー要望「マルチユーザー化」：従来の単一共有パスワード(APP_PASSWORD)から、
+# ユーザー名ごとの個別パスワードに切り替える。{"ユーザー名": "パスワード"} の形。ローカルは
+# secrets.jsonの"users"、Renderは環境変数APP_USERS（JSON文字列）のどちらでも読める。
+# 空のままなら（ローカル/LAN利用時と同じく）認証なしで動作する＝後方互換。認証成功時は
+# ログイン名がそのままNeon側の各テーブルのuser_id（TEXT列）になる。
+try:
+    USERS = json.loads(os.environ.get("APP_USERS", "")) or _SECRETS.get("users", {})
+except Exception:
+    USERS = _SECRETS.get("users", {})
 
 try:
     import yfinance as yf
@@ -2587,17 +2595,23 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
 
     def _authorized(self):
-        """APP_PASSWORD環境変数が設定されている場合のみBasic認証を要求する（クラウド公開用。
-        ローカル/LAN利用時は未設定のままでよく、その場合は常にTrueを返す＝従来通り無認証）。
-        ユーザー名は何でもよく、パスワードだけ照合する。"""
-        if not APP_PASSWORD:
+        """複数ユーザー対応のBasic認証（2026-09-02 マルチユーザー化）。USERS
+        （{"ユーザー名":"パスワード"}、secrets.jsonの"users"またはRenderの環境変数APP_USERS）が
+        空なら、従来通り認証なしで動作する（ローカル/LAN限定利用向け。この場合self.current_userは
+        "local"固定＝Neon側のuser_id）。USERSが1件でも設定されていれば、必ずユーザー名・
+        パスワードでのログインが必要になる（マルチユーザー化以降は「誰が使っているか」を
+        user_idとしてNeon側の各テーブルに記録するため、ローカル/LANかどうかを問わず必須）。"""
+        if not USERS:
+            self.current_user = "local"
             return True
         header = self.headers.get("Authorization", "")
         if header.startswith("Basic "):
             try:
                 decoded = base64.b64decode(header[6:]).decode("utf-8", errors="replace")
-                _, _, pw = decoded.partition(":")
-                if secrets.compare_digest(pw, APP_PASSWORD):
+                username, _, pw = decoded.partition(":")
+                expected = USERS.get(username)
+                if expected is not None and secrets.compare_digest(pw, expected):
+                    self.current_user = username
                     return True
             except Exception:
                 pass
@@ -2605,7 +2619,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("WWW-Authenticate", 'Basic realm="Trade Cockpit"')
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write("パスワードが必要です。".encode("utf-8"))
+        self.wfile.write("ユーザー名とパスワードが必要です。".encode("utf-8"))
         return False
 
     def end_headers(self):
@@ -2633,17 +2647,17 @@ class Handler(SimpleHTTPRequestHandler):
             qs = urllib.parse.urlparse(self.path).query
             q = urllib.parse.parse_qs(qs)
             logs = investment_db.list_daily_logs(
-                DATABASE_URL,
+                DATABASE_URL, self.current_user,
                 date_from=q.get("from", [None])[0],
                 date_to=q.get("to", [None])[0],
                 code=q.get("code", [None])[0],
             ) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"logs": logs})
         elif self.path.startswith("/api/journal"):
-            entries = investment_db.list_journal(DATABASE_URL) if (investment_db is not None and DATABASE_URL) else []
+            entries = investment_db.list_journal(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"journal": entries})
         elif self.path.startswith("/api/rules"):
-            rules = investment_db.list_rules(DATABASE_URL) if (investment_db is not None and DATABASE_URL) else []
+            rules = investment_db.list_rules(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"rules": rules})
         elif self.path == "/" or self.path == "":
             self.send_response(302)
@@ -2734,74 +2748,76 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         if not self._authorized():
             return
-        # ---- 投資判断ログ（2026-09-02新規）：daily_log・stock_judgments ----
+        # ---- 投資判断ログ（2026-09-02新規、同日中にマルチユーザー化）：daily_log・stock_judgments ----
+        # 全てself.current_user（_authorized()がBasic認証のユーザー名から設定。USERS未設定時は
+        # "local"固定）をuser_idとして渡し、他ユーザーのデータに触れないようDB側でもスコープする。
         if self.path == "/api/investment-log/create":
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
-            log_id = investment_db.create_daily_log(DATABASE_URL, body.get("dailyLog", {}), body.get("judgments", []))
+            log_id = investment_db.create_daily_log(DATABASE_URL, self.current_user, body.get("dailyLog", {}), body.get("judgments", []))
             self._send_json({"id": log_id})
         elif self.path == "/api/investment-log/update":
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
-            investment_db.update_daily_log(DATABASE_URL, body.get("id"), body.get("dailyLog", {}))
+            investment_db.update_daily_log(DATABASE_URL, self.current_user, body.get("id"), body.get("dailyLog", {}))
             self._send_json({"ok": True})
         elif self.path == "/api/investment-log/delete":
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
-            investment_db.delete_daily_log(DATABASE_URL, body.get("id"))
+            investment_db.delete_daily_log(DATABASE_URL, self.current_user, body.get("id"))
             self._send_json({"ok": True})
         elif self.path == "/api/investment-log/judgment/add":
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
-            jid = investment_db.add_stock_judgment(DATABASE_URL, body.get("dailyLogId"), body.get("judgment", {}))
+            jid = investment_db.add_stock_judgment(DATABASE_URL, self.current_user, body.get("dailyLogId"), body.get("judgment", {}))
             self._send_json({"id": jid})
         elif self.path == "/api/investment-log/judgment/update":
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
-            investment_db.update_stock_judgment(DATABASE_URL, body.get("id"), body.get("judgment", {}))
+            investment_db.update_stock_judgment(DATABASE_URL, self.current_user, body.get("id"), body.get("judgment", {}))
             self._send_json({"ok": True})
         elif self.path == "/api/investment-log/judgment/delete":
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
-            investment_db.delete_stock_judgment(DATABASE_URL, body.get("id"))
+            investment_db.delete_stock_judgment(DATABASE_URL, self.current_user, body.get("id"))
             self._send_json({"ok": True})
         # ---- 売買記録（journal）・マイルール（rules）：旧localStorageからDBへ移行済みの保存先 ----
         elif self.path == "/api/journal/save":
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
-            investment_db.upsert_journal_entry(DATABASE_URL, body)
+            investment_db.upsert_journal_entry(DATABASE_URL, self.current_user, body)
             self._send_json({"ok": True})
         elif self.path == "/api/journal/delete":
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
-            investment_db.delete_journal_entry(DATABASE_URL, body.get("id"))
+            investment_db.delete_journal_entry(DATABASE_URL, self.current_user, body.get("id"))
             self._send_json({"ok": True})
         elif self.path == "/api/rules/save":
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
-            investment_db.upsert_rule(DATABASE_URL, body)
+            investment_db.upsert_rule(DATABASE_URL, self.current_user, body)
             self._send_json({"ok": True})
         elif self.path == "/api/rules/delete":
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
-            investment_db.delete_rule(DATABASE_URL, body.get("id"))
+            investment_db.delete_rule(DATABASE_URL, self.current_user, body.get("id"))
             self._send_json({"ok": True})
         elif self.path == "/api/migrate-legacy":
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
-            print(f"[投資判断ログ] 旧データ移行（journal {len(body.get('journal', []))}件・rules {len(body.get('rules', []))}件）…")
-            result = investment_db.migrate_legacy(DATABASE_URL, body.get("journal", []), body.get("rules", []))
+            print(f"[投資判断ログ] 旧データ移行（{self.current_user}・journal {len(body.get('journal', []))}件・rules {len(body.get('rules', []))}件）…")
+            result = investment_db.migrate_legacy(DATABASE_URL, self.current_user, body.get("journal", []), body.get("rules", []))
             self._send_json(result)
         elif self.path.startswith("/api/news"):
             length = int(self.headers.get("Content-Length", 0))
