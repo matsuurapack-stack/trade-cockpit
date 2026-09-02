@@ -858,48 +858,49 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
         <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13}}>{`上の検索から銘柄を登録してください（最大${max}社）。`}</div> :
         sectorGroups.map(({sector,avgPct,items},i)=>{
           const isOpen=openSectors.has(sector);
-          const avgC=changeColor(avgPct);
+          // v3 Phase1（設計案4・11・90番）：セクター見出し行のベタ塗りを廃止。騰落率は文字色のみで表現。
+          const avgFg=avgPct==null||avgPct===0?"var(--ink)":(avgPct>0?"var(--up)":"var(--down)");
           return <div key={sector} style={{borderTop:i===0?"none":"1px solid var(--ruleSoft)"}}>
-            <button onClick={()=>toggleSector(sector)} style={{display:"flex",alignItems:"center",width:"100%",gap:10,padding:"11px 14px",
-              background:avgC.level>0?avgC.bg:(isOpen?"var(--band)":"transparent"),border:"none",cursor:"pointer",textAlign:"left",font:"inherit",
-              color:avgC.level>0?avgC.fg:"var(--ink)"}}>
-              <span className="mono" style={{fontSize:12,color:avgC.level>0?avgC.fgSoft:"var(--inkSoft)",width:14}}>{isOpen?"▾":"▸"}</span>
-              <span style={{flex:1,fontSize:18,fontWeight:700}}>{sector}</span>
-              <span className="mono" style={{fontSize:19,fontWeight:800,color:avgC.fg,minWidth:70,textAlign:"right"}}>
+            <button onClick={()=>toggleSector(sector)} style={{display:"flex",alignItems:"center",width:"100%",gap:10,padding:"8px 14px",
+              background:isOpen?"var(--band)":"transparent",border:"none",cursor:"pointer",textAlign:"left",font:"inherit",color:"var(--ink)"}}>
+              <span className="mono" style={{fontSize:12,color:"var(--inkSoft)",width:14}}>{isOpen?"▾":"▸"}</span>
+              <span style={{flex:1,fontSize:14.5,fontWeight:700}}>{sector}</span>
+              <span className="mono" style={{fontSize:15,fontWeight:800,color:avgFg,minWidth:64,textAlign:"right"}}>
                 {avgPct!=null?(avgPct>0?"+":"")+avgPct.toFixed(2)+"%":"—"}
               </span>
-              <span style={{fontSize:13,color:avgC.level>0?avgC.fgSoft:"var(--inkSoft)"}}>{items.length}銘柄</span>
+              <span style={{fontSize:11.5,color:"var(--inkSoft)"}}>{items.length}銘柄</span>
             </button>
             {isOpen && <div style={{overflowX:"auto",padding:"0 0 0 28px",background:"var(--card)"}}><table style={{minWidth:860}}>
               <thead><tr style={{background:"var(--band)"}}><th>コード</th><th>銘柄</th><th>テーマ</th><th>現在値</th><th>前日比</th><th>高値</th><th>安値</th><th></th></tr></thead>
-              <tbody>{items.map(w=>{
+              <tbody>{items.map((w,ri)=>{
                 const qt=stockQuotes[w.code]||{};
                 const ct=num(qt.t),cp=num(qt.p),chi=num(qt.high),clo=num(qt.low);
                 const delta=ct!=null&&cp!=null?ct-cp:null;
                 const pct=pctOf(w.code);
-                const c=changeColor(pct);
+                const fg=pct==null||pct===0?"var(--ink)":(pct>0?"var(--up)":"var(--down)");
                 const inAnalysis=analysisTargets.includes(w.code);
                 const inEarnings=earningsTargets.includes(w.code);
                 const inWatch=watchTargets.includes(w.code);
                 const isJumpTarget=jumpHighlight===w.code;
                 return <tr key={w.id} ref={el=>{rowRefs.current[w.code]=el;}}
-                  style={{borderTop:"1px solid var(--ruleSoft)",background:isJumpTarget?"var(--accent)":c.bg,color:isJumpTarget?"var(--card)":(c.level>0?c.fg:"var(--ink)"),transition:"background 0.4s, color 0.4s"}}>
-                  <td className="mono" style={{fontWeight:700,fontSize:14}}>{w.code}</td>
-                  <td style={{fontSize:16,fontWeight:600}}>{w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
+                  style={{borderTop:"1px solid var(--ruleSoft)",background:isJumpTarget?"var(--accent)":(ri%2?"var(--band)":"transparent"),
+                    color:isJumpTarget?"var(--card)":"var(--ink)",transition:"background 0.4s, color 0.4s"}}>
+                  <td className="mono" style={{fontWeight:700,fontSize:12.5}}>{w.code}</td>
+                  <td style={{fontSize:13,fontWeight:600,maxWidth:160,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.name}>{w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
                   <td>
-                    <button className="iconbtn" style={{fontSize:11.5,color:w.theme?"var(--accent)":"var(--inkFaint)",whiteSpace:"nowrap"}}
+                    <button className="iconbtn" style={{fontSize:11,color:w.theme?"var(--accent)":"var(--inkFaint)",whiteSpace:"nowrap"}}
                       onClick={()=>editTheme(w)} title="クリックしてテーマを編集">{w.theme||"＋テーマ"}</button>
                   </td>
-                  <td className="mono" style={{fontWeight:800,fontSize:17,color:c.fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
-                  <td className="mono" style={{fontWeight:700,fontSize:16,color:c.fg,whiteSpace:"nowrap"}}>{delta!=null?(delta>0?"+":"")+delta.toLocaleString(undefined,{maximumFractionDigits:2})+(pct!=null?` (${pct>0?"+":""}${pct.toFixed(2)}%)`:""):"—"}</td>
-                  <td className="mono" style={{color:c.level>0?c.fgSoft:"var(--inkSoft)",whiteSpace:"nowrap"}}>{chi!=null?chi.toLocaleString():"—"}</td>
-                  <td className="mono" style={{color:c.level>0?c.fgSoft:"var(--inkSoft)",whiteSpace:"nowrap"}}>{clo!=null?clo.toLocaleString():"—"}</td>
+                  <td className="mono" style={{fontWeight:700,fontSize:14,color:isJumpTarget?"var(--card)":fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
+                  <td className="mono" style={{fontWeight:600,fontSize:12.5,color:isJumpTarget?"var(--card)":fg,whiteSpace:"nowrap"}}>{delta!=null?(delta>0?"+":"")+delta.toLocaleString(undefined,{maximumFractionDigits:2})+(pct!=null?` (${pct>0?"+":""}${pct.toFixed(2)}%)`:""):"—"}</td>
+                  <td className="mono" style={{color:isJumpTarget?"var(--card)":"var(--inkSoft)",fontSize:12,whiteSpace:"nowrap"}}>{chi!=null?chi.toLocaleString():"—"}</td>
+                  <td className="mono" style={{color:isJumpTarget?"var(--card)":"var(--inkSoft)",fontSize:12,whiteSpace:"nowrap"}}>{clo!=null?clo.toLocaleString():"—"}</td>
                   <td style={{textAlign:"center",whiteSpace:"nowrap"}}>
                     <button className="action-btn" style={{marginRight:5}} onClick={()=>onOpenChart(w)}>チャート</button>
                     <button className={"action-btn"+(inAnalysis?" on":"")} style={{marginRight:5}} onClick={()=>onToggleAnalysis(w.code)}>{inAnalysis?"✓ 分析中":"分析"}</button>
                     {market==="JP" && <button className={"action-btn"+(inWatch?" on":"")} style={{marginRight:5}} onClick={()=>onToggleWatch(w.code)} title="「監視銘柄」タブでまとめて確認する対象にする（日本市場のみ）">{inWatch?"✓ 監視銘柄":"監視銘柄"}</button>}
                     {market==="JP" && <button className={"action-btn"+(inEarnings?" on":"")} style={{marginRight:5}} onClick={()=>onToggleEarnings(w.code)}>{inEarnings?"✓ 決算":"決算"}</button>}
-                    <button className="iconbtn" style={{color:c.level>0?c.fg:"var(--inkSoft)"}} onClick={()=>delStock(w.id)}>×</button>
+                    <button className="iconbtn" style={{color:"var(--inkSoft)"}} onClick={()=>delStock(w.id)}>×</button>
                   </td>
                 </tr>;})}</tbody>
             </table></div>}
@@ -1034,6 +1035,32 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
     }
   },[enriched,sortKey]);
 
+  // Trade Cockpit v3 Phase1（設計案19-21番）：46銘柄・279銘柄を最初から全部読ませない。
+  // サマリー件数→フィルタ→上位10件デフォルト表示、の順で絞り込む。
+  const summary=useMemo(()=>{
+    const c={HOT:0,BREAK:0,WATCH:0,WEAK:0,rs70:0};
+    enriched.forEach(w=>{c[w.status]=(c[w.status]||0)+1;if(w.rsScore!=null&&w.rsScore>=70)c.rs70++;});
+    return c;
+  },[enriched]);
+  const [statusFilters,setStatusFilters]=useState(new Set()); // 空集合＝フィルタなし（全Status表示）
+  const [rsFilter,setRsFilter]=useState(false); // RS Score 70以上のみ
+  const [marketRsFilter,setMarketRsFilter]=useState(false); // Market RS +2pt以上のみ
+  const [pctFilter,setPctFilter]=useState(""); // "up" | "down" | ""
+  const [sectorFilter,setSectorFilter]=useState("");
+  const [showAll,setShowAll]=useState(false);
+  const toggleStatusFilter=(st)=>setStatusFilters(prev=>{const n=new Set(prev);n.has(st)?n.delete(st):n.add(st);return n;});
+  const sectorOptions=useMemo(()=>[...new Set(enriched.map(w=>w.sector).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'ja')),[enriched]);
+  const filtered=useMemo(()=>sorted.filter(w=>
+    (statusFilters.size===0||statusFilters.has(w.status))
+    &&(!rsFilter||(w.rsScore!=null&&w.rsScore>=70))
+    &&(!marketRsFilter||(w.marketRS!=null&&w.marketRS>=2))
+    &&(!pctFilter||(pctFilter==="up"?(w.pct!=null&&w.pct>0):(w.pct!=null&&w.pct<0)))
+    &&(!sectorFilter||w.sector===sectorFilter)
+  ),[sorted,statusFilters,rsFilter,marketRsFilter,pctFilter,sectorFilter]);
+  const TOP_N=10;
+  const displayed=showAll?filtered:filtered.slice(0,TOP_N);
+  const hasFilter=statusFilters.size>0||rsFilter||marketRsFilter||!!pctFilter||!!sectorFilter;
+
   // 今日の候補（trade_candidates。8番）
   const [candidates,setCandidates]=useState([]);
   const [loadingCandidates,setLoadingCandidates]=useState(true);
@@ -1130,53 +1157,85 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
     setTimeout(()=>setConsultMsg(""),2500);
   };
 
+  const FILTER_STATUS_CHIPS=["HOT","BREAK","WATCH","WEAK"];
+
   return <div style={{marginTop:18}}>
     <div className="sec-head">監視銘柄　{items.length}件</div>
     <div className="sec-note">「日本市場」タブの「監視銘柄」ボタン、または出来高ブレイクアウト条件（直近3か月高値を出来高1.5倍以上で上抜け）への自動該当で追加されます（日本市場のみ対象）。
       Status・RS Scoreは日経平均・所属セクター平均との当日騰落率の差から簡易算出（詳しい分析は「分析」ボタンから）。
       {consultMsg && <span style={{marginLeft:8,color:"var(--accent)",fontWeight:700}}>{consultMsg}</span>}
       {recordMsg && <span style={{marginLeft:8,color:"var(--accent)",fontWeight:700}}>{recordMsg}</span>}</div>
-    <div style={{marginTop:10,display:"flex",alignItems:"center",gap:8}}>
-      <label style={{fontSize:12,color:"var(--inkSoft)"}}>並び順：</label>
-      <select value={sortKey} onChange={e=>setSortKey(e.target.value)} style={{fontSize:12,padding:"3px 6px"}}>
-        <option value="priority">今日注目すべき順（既定）</option>
-        <option value="rsScore">RS Score</option>
-        <option value="pct">前日比</option>
-        <option value="sector">セクター</option>
-        <option value="current">現在値</option>
-        <option value="status">Status</option>
-      </select>
+
+    {/* サマリー（v3設計案19番）：46銘柄を読ませる前にまず件数だけで状況を把握できるようにする */}
+    <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:10,fontSize:12}}>
+      <span style={{fontWeight:700}}>今日の監視銘柄 {items.length}</span>
+      <span className="chip" style={{fontSize:11}}>🔥 HOT {summary.HOT||0}</span>
+      <span className="chip" style={{fontSize:11}}>⚡ BREAK {summary.BREAK||0}</span>
+      <span className="chip" style={{fontSize:11}}>👀 WATCH {summary.WATCH||0}</span>
+      <span className="chip" style={{fontSize:11}}>💤 WEAK {summary.WEAK||0}</span>
+      <span className="chip" style={{fontSize:11}}>RS70以上 {summary.rs70||0}</span>
     </div>
+
+    {/* フィルタ（v3設計案21番） */}
+    <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:8}}>
+      {FILTER_STATUS_CHIPS.map(st=>{const meta=WATCH_STATUS_META[st];return <button key={st}
+        className={"chip"+(statusFilters.has(st)?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+        onClick={()=>toggleStatusFilter(st)}>{meta.icon} {meta.label}</button>;})}
+      <button className={"chip"+(rsFilter?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>setRsFilter(v=>!v)}>RS 70以上</button>
+      <button className={"chip"+(marketRsFilter?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>setMarketRsFilter(v=>!v)}>Market RS +2以上</button>
+      <button className={"chip"+(pctFilter==="up"?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>setPctFilter(v=>v==="up"?"":"up")}>前日比+</button>
+      <button className={"chip"+(pctFilter==="down"?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>setPctFilter(v=>v==="down"?"":"down")}>前日比-</button>
+      <select value={sectorFilter} onChange={e=>setSectorFilter(e.target.value)} style={{fontSize:11,padding:"2px 4px"}}>
+        <option value="">セクター（すべて）</option>
+        {sectorOptions.map(s=><option key={s} value={s}>{s}</option>)}
+      </select>
+      {hasFilter && <button className="iconbtn" style={{fontSize:11}} onClick={()=>{setStatusFilters(new Set());setRsFilter(false);setMarketRsFilter(false);setPctFilter("");setSectorFilter("");}}>フィルタ解除</button>}
+      <label style={{fontSize:12,color:"var(--inkSoft)",marginLeft:"auto"}}>並び順：
+        <select value={sortKey} onChange={e=>setSortKey(e.target.value)} style={{fontSize:12,padding:"3px 6px",marginLeft:4}}>
+          <option value="priority">今日注目すべき順（既定）</option>
+          <option value="rsScore">RS Score</option>
+          <option value="pct">前日比</option>
+          <option value="sector">セクター</option>
+          <option value="current">現在値</option>
+          <option value="status">Status</option>
+        </select>
+      </label>
+    </div>
+
     <div style={{marginTop:10,border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,overflow:"hidden"}}>
-      {sorted.length===0 ?
-        <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13}}>監視銘柄はまだありません。「日本市場」タブの一覧で「監視銘柄」ボタンを押すと、ここに追加されます。</div> :
+      {filtered.length===0 ?
+        <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13}}>
+          {items.length===0?"監視銘柄はまだありません。「日本市場」タブの一覧で「監視銘柄」ボタンを押すと、ここに追加されます。":"条件に一致する銘柄はありません。"}
+        </div> :
         <div style={{overflowX:"auto"}}><table style={{minWidth:1180}}>
           <thead><tr style={{background:"var(--band)"}}>
             <th>Status</th><th>コード</th><th>銘柄</th><th>セクター</th><th>テーマ</th><th>現在値</th><th>前日比</th>
             <th>Market RS</th><th>Sector RS</th><th>RS Score</th><th>高値</th><th>安値</th><th></th></tr></thead>
-          <tbody>{sorted.map(w=>{
+          <tbody>{displayed.map((w,i)=>{
             const qt=stockQuotes[w.code]||{};
             const ct=num(qt.t),cp=num(qt.p),chi=num(qt.high),clo=num(qt.low);
             const delta=ct!=null&&cp!=null?ct-cp:null;
             const pct=w.pct;
-            const c=changeColor(pct);
+            // v3 Phase1（設計案4・90番）：行全体のベタ塗りを廃止。背景は白／薄いストライプのみ、
+            // 騰落率は文字色（changeColor().fg）だけで表現する。
+            const fg=pct==null||pct===0?"var(--ink)":(pct>0?"var(--up)":"var(--down)");
             const inAnalysis=analysisTargets.includes(w.code);
             const inEarnings=earningsTargets.includes(w.code);
             const meta=WATCH_STATUS_META[w.status];
-            return <tr key={w.code} style={{borderTop:"1px solid var(--ruleSoft)",background:c.bg,color:c.level>0?c.fg:"var(--ink)"}}>
-              <td style={{textAlign:"center",whiteSpace:"nowrap"}}>
-                <span style={{fontWeight:700,fontSize:11,color:meta.color}}>{meta.icon} {meta.label}</span></td>
-              <td className="mono" style={{fontWeight:700,fontSize:14}}>{w.code}</td>
-              <td style={{fontSize:16,fontWeight:600}}>{w.name}</td>
-              <td style={{fontSize:11.5,color:"var(--inkSoft)",whiteSpace:"nowrap"}}>{w.sector||"—"}</td>
-              <td style={{fontSize:12,color:w.theme?"var(--accent)":"var(--inkFaint)"}}>{w.theme||"—"}</td>
-              <td className="mono" style={{fontWeight:800,fontSize:17,color:c.fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
-              <td className="mono" style={{fontWeight:700,fontSize:16,color:c.fg,whiteSpace:"nowrap"}}>{delta!=null?(delta>0?"+":"")+delta.toLocaleString(undefined,{maximumFractionDigits:2})+(pct!=null?` (${pct>0?"+":""}${pct.toFixed(2)}%)`:""):"—"}</td>
-              <td className="mono" style={{fontSize:12.5,whiteSpace:"nowrap"}}>{fmtPt(w.marketRS)}pt</td>
+            return <tr key={w.code} style={{borderTop:"1px solid var(--ruleSoft)",background:i%2?"var(--band)":"transparent"}}>
+              <td style={{textAlign:"center",whiteSpace:"nowrap",borderLeft:`3px solid ${meta.color}`}}>
+                <span style={{fontWeight:700,fontSize:10.5,color:meta.color}}>{meta.icon} {meta.label}</span></td>
+              <td className="mono" style={{fontWeight:700,fontSize:12.5}}>{w.code}</td>
+              <td style={{fontSize:13,fontWeight:600,maxWidth:140,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.name}>{w.name}</td>
+              <td style={{fontSize:11,color:"var(--inkSoft)",whiteSpace:"nowrap"}}>{w.sector||"—"}</td>
+              <td style={{fontSize:11.5,color:w.theme?"var(--accent)":"var(--inkFaint)"}}>{w.theme||"—"}</td>
+              <td className="mono" style={{fontWeight:700,fontSize:14,color:fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
+              <td className="mono" style={{fontWeight:600,fontSize:12.5,color:fg,whiteSpace:"nowrap"}}>{delta!=null?(delta>0?"+":"")+delta.toLocaleString(undefined,{maximumFractionDigits:2})+(pct!=null?` (${pct>0?"+":""}${pct.toFixed(2)}%)`:""):"—"}</td>
+              <td className="mono" style={{fontSize:12.5,fontWeight:700,whiteSpace:"nowrap"}}>{fmtPt(w.marketRS)}pt</td>
               <td className="mono" style={{fontSize:12.5,whiteSpace:"nowrap"}}>{fmtPt(w.sectorRS)}pt</td>
               <td className="mono" style={{fontWeight:700,fontSize:13,whiteSpace:"nowrap"}}>{w.rsScore!=null?w.rsScore:"—"}</td>
-              <td className="mono" style={{color:c.level>0?c.fgSoft:"var(--inkSoft)",whiteSpace:"nowrap"}}>{chi!=null?chi.toLocaleString():"—"}</td>
-              <td className="mono" style={{color:c.level>0?c.fgSoft:"var(--inkSoft)",whiteSpace:"nowrap"}}>{clo!=null?clo.toLocaleString():"—"}</td>
+              <td className="mono" style={{color:"var(--inkSoft)",fontSize:12,whiteSpace:"nowrap"}}>{chi!=null?chi.toLocaleString():"—"}</td>
+              <td className="mono" style={{color:"var(--inkSoft)",fontSize:12,whiteSpace:"nowrap"}}>{clo!=null?clo.toLocaleString():"—"}</td>
               <td style={{textAlign:"center",whiteSpace:"nowrap"}}>
                 <div style={{display:"flex",gap:4,alignItems:"center",flexWrap:"wrap",justifyContent:"center"}}>
                   <button className="action-btn" onClick={()=>onOpenChart(w)}>チャート</button>
@@ -1195,6 +1254,10 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
               </td>
             </tr>;})}</tbody>
         </table></div>}
+      {!showAll&&filtered.length>TOP_N && <button className="action-btn" style={{display:"block",width:"100%",padding:"8px",borderTop:"1px solid var(--ruleSoft)"}}
+        onClick={()=>setShowAll(true)}>すべて表示（残り{filtered.length-TOP_N}件）</button>}
+      {showAll&&filtered.length>TOP_N && <button className="action-btn" style={{display:"block",width:"100%",padding:"8px",borderTop:"1px solid var(--ruleSoft)"}}
+        onClick={()=>setShowAll(false)}>上位{TOP_N}件のみ表示に戻す</button>}
     </div>
 
     <div style={{marginTop:20}}>
