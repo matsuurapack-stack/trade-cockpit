@@ -2809,6 +2809,16 @@ class Handler(SimpleHTTPRequestHandler):
             # Trade Cockpit v3 Phase5：ChatGPTスクリーンショット監視銘柄取り込み履歴
             imports = investment_db.list_watchlist_imports(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"imports": imports})
+        elif self.path.startswith("/api/watchlist"):
+            # v3-2：watchlist本体（Neonが正）。?market=JP|USで絞り込み。
+            qs = urllib.parse.urlparse(self.path).query
+            market = urllib.parse.parse_qs(qs).get("market", [None])[0]
+            items = investment_db.list_watchlist(DATABASE_URL, self.current_user, market=market) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"items": items})
+        elif self.path.startswith("/api/portfolio"):
+            # v3-2新規：portfolio（保有株、localStorageに無かった新規機能）
+            items = investment_db.list_portfolio(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"items": items})
         elif self.path == "/" or self.path == "":
             self.send_response(302)
             self.send_header("Location", "/trade-cockpit.html")
@@ -3012,7 +3022,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json({"id": fid} if fid is not None else {"error": "titleが必要です"})
         elif self.path == "/api/watchlist-import/save":
             # ChatGPTスクリーンショット監視銘柄取り込み履歴（2026-09-02新規、Trade Cockpit v3 Phase5）。
-            # 実際のwatchlist本体はブラウザ側で管理するため、ここは履歴・重複防止のみ担当する。
+            # v3-2以降、watchlist本体もNeonが正になったが、ここは引き続き取り込み履歴・重複防止専用。
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
@@ -3020,6 +3030,40 @@ class Handler(SimpleHTTPRequestHandler):
                 DATABASE_URL, self.current_user, body.get("payload"),
                 body.get("mode", "add_only"), body.get("addedCount", 0), force=bool(body.get("force")))
             self._send_json(result)
+        # ---- watchlist本体（2026-09-03新規、Trade Cockpit v3-2：NeonをSingle Source of Truthに） ----
+        elif self.path == "/api/watchlist/save":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            ok = investment_db.upsert_watchlist_item(DATABASE_URL, self.current_user, body)
+            self._send_json({"ok": ok})
+        elif self.path == "/api/watchlist/delete":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            investment_db.delete_watchlist_item(DATABASE_URL, self.current_user, body.get("code"), body.get("market"))
+            self._send_json({"ok": True})
+        elif self.path == "/api/watchlist/migrate":
+            # 既存ユーザーのlocalStorage watchlistを1回だけNeonへ取り込む（investmentLogMigratedと
+            # 同じパターン）。冪等（同じcode+marketは上書きになるだけ）。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            n = investment_db.migrate_watchlist_from_client(DATABASE_URL, self.current_user, body.get("items", []))
+            self._send_json({"count": n})
+        # ---- portfolio（2026-09-03新規、Trade Cockpit v3-2） ----
+        elif self.path == "/api/portfolio/save":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            ok = investment_db.upsert_portfolio_item(DATABASE_URL, self.current_user, body)
+            self._send_json({"ok": ok})
+        elif self.path == "/api/portfolio/delete":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            investment_db.delete_portfolio_item(DATABASE_URL, self.current_user, body.get("code"), body.get("market"))
+            self._send_json({"ok": True})
         elif self.path == "/api/investment-log/quick-judgment":
             # 監視銘柄タブからのワンクリック記録（2026-09-02新規、Trade Cockpit v2 Phase5・設計案39番）。
             # 当日のdaily_logが無ければ自動作成し、stock_judgmentを1件追加する。

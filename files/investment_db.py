@@ -196,6 +196,49 @@ CREATE TABLE IF NOT EXISTS watchlist_imports (
 );
 CREATE INDEX IF NOT EXISTS idx_watchlist_imports_user ON watchlist_imports(user_id, imported_at DESC);
 
+-- 2026-09-03新規（Trade Cockpit v3-2）：watchlist本体をNeonへ移行（従来はブラウザlocalStorageが
+-- 正データだった）。stock_code（code+market）をキーに管理し、複数端末で同じ監視リストを見られる
+-- ようにする。sourceはChatGPT Watchlist Import・出来高ブレイクアウト自動追加等の由来を記録する。
+CREATE TABLE IF NOT EXISTS watchlist (
+    id            SERIAL PRIMARY KEY,
+    user_id       TEXT NOT NULL,
+    code          TEXT NOT NULL,
+    name          TEXT,
+    market        TEXT NOT NULL DEFAULT 'JP',
+    sector        TEXT,
+    kana          TEXT,
+    tv_symbol     TEXT,
+    theme         TEXT,
+    watch         TEXT DEFAULT '通常',
+    note          TEXT,
+    source        TEXT,
+    added_reason  TEXT,
+    active        BOOLEAN NOT NULL DEFAULT true,
+    added_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, code, market)
+);
+CREATE INDEX IF NOT EXISTS idx_watchlist_user ON watchlist(user_id, market);
+
+-- 2026-09-03新規（Trade Cockpit v3-2）：portfolio（保有株）。localStorageにも従来存在しなかった
+-- 新規機能のため、移行データは無い（最初からNeonが正）。
+CREATE TABLE IF NOT EXISTS portfolio (
+    id             SERIAL PRIMARY KEY,
+    user_id        TEXT NOT NULL,
+    code           TEXT NOT NULL,
+    name           TEXT,
+    market         TEXT NOT NULL DEFAULT 'JP',
+    quantity       NUMERIC,
+    average_price  NUMERIC,
+    acquired_at    TIMESTAMPTZ,
+    memo           TEXT,
+    active         BOOLEAN NOT NULL DEFAULT true,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, code, market)
+);
+CREATE INDEX IF NOT EXISTS idx_portfolio_user ON portfolio(user_id);
+
 -- 2026-09-02新規（Trade Cockpit v2 Phase1）：「今日の候補」。監視銘柄タブでStatus・RS Scoreを
 -- 見ながら手動で拾った銘柄を保存する（自動売買や自動判定ではなく、あくまでユーザーが選んだ
 -- ものを記録するテーブル）。仮想トレード追跡（v2 Phase7予定）用の列も先に用意しておく。
@@ -1098,3 +1141,154 @@ def list_watchlist_imports(database_url, user_id, limit=30):
                 "WHERE user_id = %s ORDER BY imported_at DESC LIMIT %s", [user_id, limit],
             )
             return [_row_to_json(r) for r in cur.fetchall()]
+
+
+# ---- watchlist（2026-09-03新規、Trade Cockpit v3-2：Neonをwatchlist本体のSingle Source of
+# Truthにする） ----
+# フロントのcamelCaseキー（tvSymbol）とDB列（tv_symbol）の変換のみここで吸収する。
+
+_WATCHLIST_CAMEL_TO_SNAKE = {"tvSymbol": "tv_symbol"}
+_WATCHLIST_SNAKE_TO_CAMEL = {v: k for k, v in _WATCHLIST_CAMEL_TO_SNAKE.items()}
+
+
+def _watchlist_row_to_camel(row):
+    d = _row_to_json(row)
+    d.pop("user_id", None)
+    return {_WATCHLIST_SNAKE_TO_CAMEL.get(k, k): v for k, v in d.items()}
+
+
+def list_watchlist(database_url, user_id, market=None):
+    """呼び出しユーザーのwatchlist（active=trueのみ）をadded_at昇順で返す。marketを指定すると
+    JP/USで絞り込む。フロントのwatchlist配列とほぼ同じ形（tvSymbol等camelCase）で返す。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = ["user_id = %s", "active = true"], [user_id]
+    if market:
+        where.append("market = %s")
+        params.append(market)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SELECT * FROM watchlist WHERE {' AND '.join(where)} ORDER BY added_at", params)
+            return [_watchlist_row_to_camel(r) for r in cur.fetchall()]
+
+
+_WATCHLIST_COLS = ["name", "sector", "kana", "tv_symbol", "theme", "watch", "note", "source", "added_reason"]
+
+
+def _upsert_watchlist_item_conn(conn, user_id, item):
+    """upsert_watchlist_itemの実処理。既に開いているconnを使う（migrate_watchlist_from_clientが
+    309件规模を1本の接続で処理できるようにするため、_get_pool()を介した毎回の新規接続を避ける）。
+    呼び出し側でconn.commit()すること。"""
+    if not item.get("code"):
+        return False
+    item = {_WATCHLIST_CAMEL_TO_SNAKE.get(k, k): v for k, v in item.items()}
+    market = item.get("market") or "JP"
+    cols = [c for c in _WATCHLIST_COLS if c in item]
+    conn.execute(
+        f"INSERT INTO watchlist (user_id, code, market, {', '.join(cols)}) "
+        f"VALUES (%s, %s, %s, {', '.join(['%s'] * len(cols))}) "
+        f"ON CONFLICT (user_id, code, market) DO UPDATE SET "
+        f"{', '.join(c + ' = EXCLUDED.' + c for c in cols)}, updated_at = now(), active = true",
+        [user_id, item.get("code"), market] + [item.get(c) for c in cols],
+    )
+    return True
+
+
+def upsert_watchlist_item(database_url, user_id, item):
+    """itemは{code,market,name,sector,kana,tvSymbol,theme,watch,note,source,added_reason}の
+    いずれかを含むdict（code必須、marketは省略時JP）。既存なら更新、無ければ新規作成。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return False
+    with pool.connection() as conn:
+        ok = _upsert_watchlist_item_conn(conn, user_id, item)
+        conn.commit()
+    return ok
+
+
+def delete_watchlist_item(database_url, user_id, code, market=None):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return
+    with pool.connection() as conn:
+        if market:
+            conn.execute("DELETE FROM watchlist WHERE user_id = %s AND code = %s AND market = %s", [user_id, code, market])
+        else:
+            conn.execute("DELETE FROM watchlist WHERE user_id = %s AND code = %s", [user_id, code])
+        conn.commit()
+
+
+def migrate_watchlist_from_client(database_url, user_id, items):
+    """ブラウザに残っている旧localStorage watchlistをまとめてNeonへ取り込む（1回だけ呼ばれる
+    想定。既存コードは上書きになるため、複数回押しても壊れない＝冪等）。戻り値: 件数。
+    2026-09-03判明：300件規模だと1件ごとに新規接続していては非常に遅い（Neonへの接続確立
+    コストが件数分かかる）ため、1本の接続を使い回して処理する。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    n = 0
+    with pool.connection() as conn:
+        for item in (items or []):
+            if _upsert_watchlist_item_conn(conn, user_id, {**item, "source": item.get("source") or "manual"}):
+                n += 1
+        conn.commit()
+    return n
+
+
+# ---- portfolio（2026-09-03新規、Trade Cockpit v3-2。localStorageに存在しなかった新規機能のため
+# 移行データは無く、最初からNeonが正） ----
+
+def list_portfolio(database_url, user_id):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM portfolio WHERE user_id = %s AND active = true ORDER BY created_at", [user_id])
+            rows = cur.fetchall()
+            out = []
+            for r in rows:
+                d = _row_to_json(r)
+                d.pop("user_id", None)
+                out.append(d)
+            return out
+
+
+_PORTFOLIO_COLS = ["name", "quantity", "average_price", "acquired_at", "memo"]  # marketはINSERT文で別途固定列として扱うためここには含めない
+
+
+def upsert_portfolio_item(database_url, user_id, item):
+    """itemは{code,market,name,quantity,average_price,acquired_at,memo}のいずれかを含むdict
+    （code必須、marketは省略時JP）。既存なら更新、無ければ新規作成。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return False
+    if not item.get("code"):
+        return False
+    market = item.get("market") or "JP"
+    if item.get("acquired_at") == "":
+        item = {**item, "acquired_at": None}  # 空文字はTIMESTAMPTZ列に直接入らないためnullに変換
+    cols = [c for c in _PORTFOLIO_COLS if c in item]
+    with pool.connection() as conn:
+        conn.execute(
+            f"INSERT INTO portfolio (user_id, code, market, {', '.join(cols)}) "
+            f"VALUES (%s, %s, %s, {', '.join(['%s'] * len(cols))}) "
+            f"ON CONFLICT (user_id, code, market) DO UPDATE SET "
+            f"{', '.join(c + ' = EXCLUDED.' + c for c in cols)}, updated_at = now(), active = true",
+            [user_id, item.get("code"), market] + [item.get(c) for c in cols],
+        )
+        conn.commit()
+    return True
+
+
+def delete_portfolio_item(database_url, user_id, code, market=None):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return
+    with pool.connection() as conn:
+        if market:
+            conn.execute("DELETE FROM portfolio WHERE user_id = %s AND code = %s AND market = %s", [user_id, code, market])
+        else:
+            conn.execute("DELETE FROM portfolio WHERE user_id = %s AND code = %s", [user_id, code])
+        conn.commit()

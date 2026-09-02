@@ -575,6 +575,11 @@ const emptyState=()=>({
   // （ベストエフォート＝失敗しても画面上の操作は止めない。既存の外部API連携と同じ方針）。
   investmentLogMigrated:false,
   investmentLog:[], // 投資判断ログ（日次の相場観＋銘柄評価）。サーバーDBのdaily_logをそのままキャッシュ
+  // v3-2（watchlistのNeon化）：ブラウザに残っているwatchlistをサーバーDBへ移行済みかのフラグ。
+  // journal/rulesのinvestmentLogMigratedとは別管理（片方だけ済んでいるケースがあり得るため）。
+  // true化後は起動時にNeonのwatchlistを読み込み、以後の追加・削除・編集もNeonへ即時同期する
+  // （localStorageは表示用キャッシュとしてのみ残る）。
+  watchlistMigrated:false,
 });
 // 1章：255社デフォルトを後から追加したため、既にlocalStorageに保存済みだったユーザーは
 // 保存データの登録銘柄がそのまま優先され、新しいデフォルト銘柄が反映されないケースがある。
@@ -1424,6 +1429,82 @@ const JUDGMENT_FIELDS=[
 ];
 const JUDGMENT_CATEGORIES=["監視","保有","買い候補","見送り"];
 
+// portfolio（保有株、2026-09-03新規、Trade Cockpit v3-2）：localStorageに存在しなかった新規
+// 機能のため、最初からNeonのみで完結する（移行フローは不要）。ChatGPT朝一/大引けコピーに
+// 保有銘柄として含める（TodaysMarketCard・ChatGptImportPanel側でこのAPIを叩く）。
+function PortfolioPanel(){
+  const [items,setItems]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const emptyDraft={code:"",name:"",market:"JP",quantity:"",average_price:"",acquired_at:"",memo:""};
+  const [draft,setDraft]=useState(emptyDraft);
+  const [saving,setSaving]=useState(false);
+
+  const load=async()=>{
+    setLoading(true);
+    try{
+      const r=await fetch("/api/portfolio");
+      if(r.ok){const d=await r.json();setItems(Array.isArray(d.items)?d.items:[]);}
+    }catch(e){}
+    setLoading(false);
+  };
+  useEffect(()=>{load();},[]);
+
+  const save=async()=>{
+    if(!draft.code.trim())return;
+    setSaving(true);
+    try{
+      await fetch("/api/portfolio/save",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({...draft,quantity:num(draft.quantity),average_price:num(draft.average_price),
+          acquired_at:draft.acquired_at||null})}); // 空文字はTIMESTAMPTZ列に直接入らないためnullに変換
+      setDraft(emptyDraft);
+      load();
+    }catch(e){}
+    setSaving(false);
+  };
+  const remove=async(code,market)=>{
+    if(!confirm(`${code}を保有株一覧から削除しますか？`))return;
+    try{
+      await fetch("/api/portfolio/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({code,market})});
+      load();
+    }catch(e){}
+  };
+
+  const fieldStyle={fontSize:12.5,padding:"5px 7px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",boxSizing:"border-box"};
+
+  return <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14}}>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+      <div style={{fontWeight:700,color:"var(--ink)",fontSize:13}}>保有株（portfolio）</div>
+      <span style={{fontSize:11,color:"var(--inkFaint)"}}>{items.length}銘柄</span>
+    </div>
+    <div style={{display:"grid",gridTemplateColumns:"70px 1fr 55px 70px 90px 110px 1fr auto",gap:6,marginBottom:10}}>
+      <input placeholder="コード" value={draft.code} onChange={e=>setDraft({...draft,code:e.target.value})} style={fieldStyle}/>
+      <input placeholder="銘柄名" value={draft.name} onChange={e=>setDraft({...draft,name:e.target.value})} style={fieldStyle}/>
+      <select value={draft.market} onChange={e=>setDraft({...draft,market:e.target.value})} style={fieldStyle}>
+        <option value="JP">JP</option><option value="US">US</option>
+      </select>
+      <input placeholder="株数" value={draft.quantity} onChange={e=>setDraft({...draft,quantity:e.target.value})} style={fieldStyle}/>
+      <input placeholder="平均取得単価" value={draft.average_price} onChange={e=>setDraft({...draft,average_price:e.target.value})} style={fieldStyle}/>
+      <input type="date" value={draft.acquired_at} onChange={e=>setDraft({...draft,acquired_at:e.target.value})} style={fieldStyle}/>
+      <input placeholder="メモ" value={draft.memo} onChange={e=>setDraft({...draft,memo:e.target.value})} style={fieldStyle}/>
+      <button className="btn" onClick={save} disabled={saving||!draft.code.trim()}>追加</button>
+    </div>
+    {loading
+      ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>読み込み中…</div>
+      : items.length===0
+        ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>まだ保有株の登録がありません。</div>
+        : <div style={{display:"flex",flexDirection:"column",gap:4}}>
+            {items.map(it=><div key={it.code+it.market} style={{display:"flex",alignItems:"center",gap:10,fontSize:12.5,padding:"4px 2px"}}>
+              <span className="mono" style={{fontWeight:700}}>{it.code}</span>
+              <span style={{flex:1}}>{it.name||"—"}</span>
+              <span style={{color:"var(--inkSoft)"}}>{it.quantity!=null?`${it.quantity.toLocaleString()}株`:"—"}</span>
+              <span style={{color:"var(--inkSoft)"}}>{it.average_price!=null?`@${it.average_price.toLocaleString()}`:"—"}</span>
+              {it.memo && <span style={{color:"var(--inkFaint)"}}>{it.memo}</span>}
+              <button className="iconbtn" title="削除" onClick={()=>remove(it.code,it.market)}>×</button>
+            </div>)}
+          </div>}
+  </div>;
+}
+
 // 投資判断ログタブ（2026-09-02新規）：日次の相場観＋銘柄ごとの評価をサーバーDB（Neon）に保存する。
 // 「記録」タブでのDB移行が済んでいなくても閲覧・作成はできる（journal/myRulesの移行有無とは
 // 独立した機能）が、DB自体（DATABASE_URL）が未設定のサーバーでは保存も一覧取得もできない。
@@ -1645,6 +1726,12 @@ function ChatGptImportPanel({journal,activeRules}){
   const copyClosingReport=async()=>{
     const today=todayISO();
     const lines=[`【Trade Cockpit 大引け振り返り】${new Date().toLocaleString("ja-JP")}`,""];
+    try{
+      const r=await fetch("/api/portfolio");
+      if(r.ok){const d=await r.json();const ps=d.items||[];
+        if(ps.length){lines.push(`■ 保有銘柄（${ps.length}件）`);
+          ps.forEach(p=>lines.push(`${p.code} ${p.name||""}${p.quantity!=null?` ${p.quantity}株`:""}${p.average_price!=null?` @${p.average_price}`:""}`));lines.push("");}}
+    }catch(e){}
     try{
       const r=await fetch("/api/trade-candidates");
       if(r.ok){
@@ -2141,6 +2228,12 @@ function TodaysMarketCard({metrics,watchlistAll,stockQuotes,marketRisk,onRefresh
     if(rsStrongList.length){lines.push(`■ Relative Strength銘柄（${rsStrongList.length}件）`);
       rsStrongList.slice(0,10).forEach(x=>lines.push(`${x.code} ${x.name} RS Score${x.rsScore} (${x.pct>0?"+":""}${x.pct.toFixed(2)}%)`));lines.push("");}
     try{
+      const r=await fetch("/api/portfolio");
+      if(r.ok){const d=await r.json();const ps=d.items||[];
+        if(ps.length){lines.push(`■ 保有銘柄（${ps.length}件）`);
+          ps.forEach(p=>lines.push(`${p.code} ${p.name||""}${p.quantity!=null?` ${p.quantity}株`:""}${p.average_price!=null?` @${p.average_price}`:""}`));lines.push("");}}
+    }catch(e){}
+    try{
       const r=await fetch("/api/trade-candidates");
       if(r.ok){const d=await r.json();const cs=d.candidates||[];
         if(cs.length){lines.push(`■ 今日の候補（${cs.length}件）`);
@@ -2463,8 +2556,30 @@ function App(){
 
   const set=(patch)=>setS(p=>({...p,...patch}));
   const setMetric=(k,f,v)=>setS(p=>({...p,metrics:{...p.metrics,[k]:{...p.metrics[k],[f]:v}}}));
-  const setWatchlistJP=(wl)=>set({watchlist:wl});
-  const setWatchlistUS=(wl)=>set({watchlistUS:wl});
+  // v3-2（watchlistのNeon化）：SectorWatchlist・WatchlistImportPanel等は従来通り「新しい配列
+  // 全体」をsetWatchlistJP/USへ渡す設計のままにし（呼び出し側は無改修）、ここで旧配列との差分
+  // （追加・変更・削除）を検出してNeonへ書き込む。localStorage（s.watchlist）はUI表示用の
+  // キャッシュとして引き続き使うが、正データはNeon。
+  const syncWatchlistToNeon=(prevList,nextList,market)=>{
+    if(!s.watchlistMigrated)return; // watchlistの一括移行が済むまでは個別同期もしない（移行前にNeonへ半端な状態を書き込まないため）
+    const prevByCode=new Map(prevList.map(w=>[w.code,w]));
+    const nextByCode=new Map(nextList.map(w=>[w.code,w]));
+    nextList.forEach(w=>{
+      const prev=prevByCode.get(w.code);
+      if(!prev||JSON.stringify(prev)!==JSON.stringify(w)){
+        fetch("/api/watchlist/save",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({...w,market})}).catch(()=>{});
+      }
+    });
+    prevList.forEach(w=>{
+      if(!nextByCode.has(w.code)){
+        fetch("/api/watchlist/delete",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({code:w.code,market})}).catch(()=>{});
+      }
+    });
+  };
+  const setWatchlistJP=(wl)=>{syncWatchlistToNeon(sRef.current.watchlist,wl,"JP");set({watchlist:wl});};
+  const setWatchlistUS=(wl)=>{syncWatchlistToNeon(sRef.current.watchlistUS,wl,"US");set({watchlistUS:wl});};
   // 2026-08-22 ユーザー要望：「日本市場」タブの検索候補を、日経225中心の手動キュレーション
   // リスト（MASTER、約277社）だけでなく東証上場銘柄全体（約4400社）に広げる。立花証券APIの
   // 株式銘柄マスタをサーバー側でキャッシュ済みの/api/jp-issue-masterから1回だけ取得し、
@@ -2769,6 +2884,39 @@ function App(){
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[s.investmentLogMigrated]);
+
+  // v3-2（watchlistのNeon化）：既存ユーザーのブラウザに残っているwatchlistを1回だけNeonへ
+  // 移行するボタン用。investmentLogMigratedとは別のフラグ（watchlistMigrated）で管理する
+  // （journal/rulesは移行済みでもwatchlistはまだ、というケースがあり得るため）。
+  const [migratingWatchlist,setMigratingWatchlist]=useState(false);
+  const [migrateWatchlistMsg,setMigrateWatchlistMsg]=useState("");
+  const migrateWatchlistToNeon=async()=>{
+    setMigratingWatchlist(true);setMigrateWatchlistMsg("");
+    try{
+      const items=[...sRef.current.watchlist,...sRef.current.watchlistUS];
+      const r=await fetch("/api/watchlist/migrate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})});
+      if(r.ok){
+        const d=await r.json();
+        setS(p=>({...p,watchlistMigrated:true}));
+        setMigrateWatchlistMsg(`移行完了（${d.count}件）。以後はサーバー（Neon）が正データです。`);
+      }else{setMigrateWatchlistMsg("移行に失敗しました。サーバーが起動しているか確認してください。");}
+    }catch(e){setMigrateWatchlistMsg("移行に失敗しました。サーバーが起動しているか確認してください。");}
+    setMigratingWatchlist(false);
+  };
+
+  // 移行済みなら起動時にNeonのwatchlistを取得して上書きする（他端末・ChatGPT Import等での
+  // 変更を反映するため）。取得失敗時は今のローカル状態のまま（既存の journal/rules と同じ方針）。
+  useEffect(()=>{
+    if(!s.investmentLogMigrated||!s.watchlistMigrated)return;
+    (async()=>{
+      try{
+        const [jr,ur]=await Promise.all([fetch("/api/watchlist?market=JP"),fetch("/api/watchlist?market=US")]);
+        if(jr.ok){const jd=await jr.json();if(Array.isArray(jd.items))setS(p=>({...p,watchlist:jd.items}));}
+        if(ur.ok){const ud=await ur.json();if(Array.isArray(ud.items))setS(p=>({...p,watchlistUS:ud.items}));}
+      }catch(e){}
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[s.investmentLogMigrated,s.watchlistMigrated]);
 
   const saveJournalEntry=()=>{
     if(!journalDraft)return;
@@ -3371,6 +3519,21 @@ function App(){
           {migrateLogMsg && <span style={{fontSize:11.5,color:"var(--inkSoft)"}}>{migrateLogMsg}</span>}
         </div>
 
+        {/* v3-2（watchlistのNeon化）：ブラウザ側watchlistをサーバーDBへ移行するボタン。
+            journal/rulesとは別フラグ（watchlistMigrated）で管理する。investmentLogMigrated
+            （＝DB接続そのものが有効か）が前提条件。 */}
+        <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 14px",marginBottom:14,display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+          {!s.investmentLogMigrated
+            ? <span style={{fontSize:12.5,color:"var(--inkFaint)"}}>監視銘柄一覧のサーバー移行は、上の「サーバーDBへ移行」を先に行ってください。</span>
+            : s.watchlistMigrated
+              ? <span style={{fontSize:12.5,color:"var(--up)",fontWeight:700}}>✓ 監視銘柄一覧はサーバーDBへ移行済み（複数端末で同じ一覧を共有できます）</span>
+              : <>
+                  <span style={{fontSize:12.5,color:"var(--inkSoft)"}}>監視銘柄一覧（日本市場・アメリカ市場の登録銘柄）はまだこの端末のブラウザだけに保存されています。複数端末で共有したりChatGPT連携と組み合わせるには、サーバーDBへの移行が必要です。</span>
+                  <button className="btn" onClick={migrateWatchlistToNeon} disabled={migratingWatchlist}>{migratingWatchlist?"移行中…":`監視銘柄をサーバーDBへ移行（${s.watchlist.length+s.watchlistUS.length}件）`}</button>
+                </>}
+          {migrateWatchlistMsg && <span style={{fontSize:11.5,color:"var(--inkSoft)"}}>{migrateWatchlistMsg}</span>}
+        </div>
+
         {/* マイルール：追加・オンオフ・削除できる自分のトレードルール一覧。2026-08-20：
             固定リマインド文をやめ、良いトレード・気づきの都度育てられる形にした。
             エントリー・利確・損切りの機械的な判定（押し目/高値ブレイク・出来高ブレイクアウト等）は
@@ -3408,6 +3571,10 @@ function App(){
                   </label>)}
               </div>}
         </div>
+
+        {/* v3-2新規：保有株（portfolio）。最初からNeonのみで完結（localStorage移行フローは無い）。 */}
+        <PortfolioPanel/>
+
         {/* 資金管理・分割買いツール：総資金とリスク許容%から、銘柄分析タブの各カードの損切り幅に
             応じた株数目安を計算する。値はsettingsとしてlocalStorageに自動保存される。
             2026-08-20：銘柄分析タブをすっきりさせるためこちらに移設（計算自体は銘柄分析タブの各カードで行う）。 */}
