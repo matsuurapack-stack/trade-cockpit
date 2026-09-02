@@ -2956,6 +2956,12 @@ class Handler(SimpleHTTPRequestHandler):
             body = self._read_json_body()
             investment_db.upsert_rule(DATABASE_URL, self.current_user, body)
             self._send_json({"ok": True})
+        elif self.path == "/api/rules/seed-defaults":
+            # v3 Phase6（設計案57番）：初期ルール候補をまとめて追加。ユーザーの明示操作でのみ呼ばれる。
+            if not self._investment_db_ready():
+                return
+            n = investment_db.seed_default_structured_rules(DATABASE_URL, self.current_user)
+            self._send_json({"count": n})
         elif self.path == "/api/rules/delete":
             if not self._investment_db_ready():
                 return

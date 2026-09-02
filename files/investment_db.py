@@ -255,6 +255,13 @@ ALTER TABLE daily_log ADD COLUMN IF NOT EXISTS raw_payload JSONB;
 
 ALTER TABLE stock_judgments ADD COLUMN IF NOT EXISTS user_decision TEXT;
 ALTER TABLE stock_judgments ADD COLUMN IF NOT EXISTS ai_decision TEXT;
+
+-- v3 Phase6（設計案56番）：investment_rulesの構造化。既存の自由テキスト行はrule_code等が
+-- NULLのまま残り、従来通り動作する（後方互換）。
+ALTER TABLE investment_rules ADD COLUMN IF NOT EXISTS rule_code TEXT;
+ALTER TABLE investment_rules ADD COLUMN IF NOT EXISTS value NUMERIC;
+ALTER TABLE investment_rules ADD COLUMN IF NOT EXISTS unit TEXT;
+ALTER TABLE investment_rules ADD COLUMN IF NOT EXISTS priority TEXT;
 """
 
 
@@ -527,18 +534,49 @@ def list_rules(database_url, user_id):
 
 
 def upsert_rule(database_url, user_id, rule):
-    """ruleは旧localStorage形式{id,text,active,createdAt}。既存なら更新、無ければ新規作成。"""
+    """ruleは旧localStorage形式{id,text,active,createdAt}に加え、v3 Phase6（設計案56番）で
+    rule_code/value/unit/priorityを任意で持てるようにした（無ければNULLのまま＝旧来の
+    自由テキストルールと同じ挙動）。既存なら更新、無ければ新規作成。"""
     pool = _get_pool(database_url)
     if pool is None:
         return
     rule = {**rule, "created_at": rule.get("createdAt", rule.get("created_at"))}
     with pool.connection() as conn:
         conn.execute(
-            "INSERT INTO investment_rules (user_id, id, text, active, created_at) VALUES (%s, %s, %s, %s, %s) "
-            "ON CONFLICT (user_id, id) DO UPDATE SET text = EXCLUDED.text, active = EXCLUDED.active",
-            [user_id, rule.get("id"), rule.get("text"), rule.get("active"), rule.get("created_at")],
+            "INSERT INTO investment_rules (user_id, id, text, active, created_at, rule_code, value, unit, priority) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (user_id, id) DO UPDATE SET text = EXCLUDED.text, active = EXCLUDED.active, "
+            "rule_code = EXCLUDED.rule_code, value = EXCLUDED.value, unit = EXCLUDED.unit, priority = EXCLUDED.priority",
+            [user_id, rule.get("id"), rule.get("text"), rule.get("active"), rule.get("created_at"),
+             rule.get("rule_code"), rule.get("value"), rule.get("unit"), rule.get("priority")],
         )
         conn.commit()
+
+
+# v3 Phase6（設計案57番）：初期ルール候補。有効化はユーザーの明示操作（「初期ルールを追加」
+# ボタン）のみで行い、勝手に既存のマイルールへ割り込ませない。rule_codeを固定idにしているため
+# 複数回押しても増殖しない（upsertで上書きになるだけ）。
+DEFAULT_STRUCTURED_RULES = [
+    {"rule_code": "SWING_STOP_LOSS", "text": "スイングは-10%で損切り", "value": -10, "unit": "percent", "priority": "CRITICAL"},
+    {"rule_code": "NO_FALLING_KNIFE", "text": "落ちるナイフは掴まない（下げ止まり未確認では入らない）", "value": None, "unit": "boolean", "priority": "CRITICAL"},
+    {"rule_code": "NO_FOMO_CHASE", "text": "急騰を追わない", "value": None, "unit": "boolean", "priority": "HIGH"},
+    {"rule_code": "USE_STOP_ORDER_DAYTRADE", "text": "デイトレードは逆指値を必ず入れる", "value": None, "unit": "boolean", "priority": "HIGH"},
+    {"rule_code": "AVOID_EARNINGS_CROSS", "text": "決算をまたぐポジションは避ける", "value": None, "unit": "boolean", "priority": "NORMAL"},
+    {"rule_code": "RELATIVE_STRENGTH_PRIORITY", "text": "相対的に強い銘柄を優先する", "value": None, "unit": "text", "priority": "NORMAL"},
+]
+
+
+def seed_default_structured_rules(database_url, user_id):
+    """DEFAULT_STRUCTURED_RULESをまとめてupsertする。戻り値: 追加/更新した件数。"""
+    n = 0
+    for r in DEFAULT_STRUCTURED_RULES:
+        upsert_rule(database_url, user_id, {
+            "id": "structured-" + r["rule_code"].lower(), "text": r["text"], "active": True,
+            "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "rule_code": r["rule_code"], "value": r["value"], "unit": r["unit"], "priority": r["priority"],
+        })
+        n += 1
+    return n
 
 
 def delete_rule(database_url, user_id, rule_id):

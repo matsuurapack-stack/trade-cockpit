@@ -991,7 +991,7 @@ const AXIS_LABEL_META={
   "STRONG":{color:"var(--up)"},"WEAK":{color:"var(--down)"},
   "POSITIVE":{color:"var(--up)"},"RISK":{color:"var(--down)"},
 };
-function AssessmentCard({assessment:a}){
+function AssessmentCard({assessment:a,marginBadge,marginRatio}){
   const meta=ASSESSMENT_STATUS_META[a.overallStatus]||ASSESSMENT_STATUS_META.WEAK;
   const axisRows=[
     ["Market",a.axes?.market],["Supply/Demand",a.axes?.supplyDemand],
@@ -1022,6 +1022,12 @@ function AssessmentCard({assessment:a}){
       🔪 FALLING KNIFE：{a.fallingKnifeReasons.join("・")}</div>}
     {a.chaseRisk && <div style={{fontSize:11.5,fontWeight:700,color:"var(--down)",background:"var(--downBg)",border:"1px solid var(--down)",borderRadius:4,padding:"4px 8px",marginTop:6}}>
       ⚠ CHASE RISK：{a.chaseRiskReasons.join("・")}</div>}
+    {/* v3 Phase6（設計案58番）：ルール警告。AI不使用、既存の計算結果（marginBadge・marketRiskLabel）を
+        条件判定するだけ。falling knife/chase riskと同じ見た目の警告ボックスに揃える。 */}
+    {(marginBadge==="danger"||marginBadge==="caution") && <div style={{fontSize:11.5,fontWeight:700,color:"var(--down)",background:"var(--downBg)",border:"1px solid var(--down)",borderRadius:4,padding:"4px 8px",marginTop:6}}>
+      ⚠ 信用買い残過多：信用倍率 {marginRatio}倍</div>}
+    {a.marketRiskLabel==="RISK OFF" && <div style={{fontSize:11.5,fontWeight:700,color:"var(--down)",background:"var(--downBg)",border:"1px solid var(--down)",borderRadius:4,padding:"4px 8px",marginTop:6}}>
+      ⚠ Market Risk High：{a.marketRiskScore}/100（RISK OFF）</div>}
   </div>;
 }
 
@@ -2742,6 +2748,22 @@ function App(){
     return {...p,myRules:next};
   });
   const deleteMyRule=(id)=>{setS(p=>({...p,myRules:p.myRules.filter(r=>r.id!==id)}));syncRuleDelete(id);};
+  // v3 Phase6（設計案57番）：初期ルール候補（SWING_STOP_LOSS等）をまとめて追加する。
+  // サーバーDB未移行（investmentLogMigrated=false）の環境ではrule_code等の構造化列を保存できない
+  // ため案内のみ表示する（syncRuleSaveは/api/rules/saveへPOSTするだけの薄いラッパーのため）。
+  const [seedRulesMsg,setSeedRulesMsg]=useState("");
+  const seedDefaultRules=async()=>{
+    try{
+      const r=await fetch("/api/rules/seed-defaults",{method:"POST"});
+      const d=await r.json();
+      if(d.count){
+        const rr=await fetch("/api/rules");
+        if(rr.ok){const rd=await rr.json();if(Array.isArray(rd.rules))setS(p=>({...p,myRules:rd.rules}));}
+        setSeedRulesMsg(`初期ルール${d.count}件を追加しました`);
+      }else{setSeedRulesMsg(d.error||"追加に失敗しました");}
+    }catch(e){setSeedRulesMsg("追加に失敗しました");}
+    setTimeout(()=>setSeedRulesMsg(""),3000);
+  };
 
   const rollToNextDay=()=>{if(!confirm("今日の値を前日値へ繰り越し、新しい一日にします（登録銘柄・分析対象銘柄は保持）。よろしいですか？"))return;
     setS(p=>({...emptyState(),date:todayISO(),watchlist:p.watchlist,watchlistUS:p.watchlistUS,analysisTargets:p.analysisTargets,
@@ -3115,7 +3137,7 @@ function App(){
                             </div>}
                           {a.marketEnv && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>{a.marketEnv}</div>}
                           {/* ===== Trade Cockpit v2 Phase2：総合判断・8軸・Entry Conditions・Falling Knife/Chase Risk ===== */}
-                          {a.assessment && <AssessmentCard assessment={a.assessment}/>}
+                          {a.assessment && <AssessmentCard assessment={a.assessment} marginBadge={a.tradeRules?.marginBadge} marginRatio={a.tradeRules?.marginRatio}/>}
                           {a.tradeRules?.watchStatus && <div style={{fontSize:11.5,fontWeight:700,color:"var(--accent)",background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>⏳ {a.tradeRules.watchStatus}</div>}
                           {/* エントリーのタイミングルール（最新版）：初押し／高値ブレイクに該当する最有力タイミング(★5)を強調表示 */}
                           {a.tradeRules?.entryPattern && <div style={{fontSize:11.5,fontWeight:700,color:"var(--up)",background:"var(--upBg)",border:"1px solid var(--up)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>★★★★★ {a.tradeRules.entryPattern.label}</div>}
@@ -3314,6 +3336,13 @@ function App(){
               style={{flex:1,fontSize:12.5,padding:"6px 8px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}/>
             <button className="btn" onClick={()=>{addMyRule(newRuleText);setNewRuleText("");}}>追加</button>
           </div>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+            <button className="action-btn" onClick={seedDefaultRules} disabled={!s.investmentLogMigrated}
+              title={s.investmentLogMigrated?"":"サーバーDBへの移行後に使えます（このタブ下部の「サーバーDBへ移行」ボタン）"}>
+              ＋ 初期ルールを追加（損切り-10%・落ちるナイフ禁止など6件）
+            </button>
+            {seedRulesMsg && <span style={{fontSize:11,color:"var(--inkSoft)"}}>{seedRulesMsg}</span>}
+          </div>
           {s.myRules.length===0
             ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>まだルールがありません。上の欄から追加するか、下の記録の「学び」から追加できます。</div>
             : <div style={{display:"flex",flexDirection:"column",gap:4}}>
@@ -3321,6 +3350,7 @@ function App(){
                   <label key={r.id} style={{display:"flex",alignItems:"center",gap:8,fontSize:12.5,padding:"4px 2px",
                       color:r.active?"var(--ink)":"var(--inkFaint)",textDecoration:r.active?"none":"line-through"}}>
                     <input type="checkbox" checked={r.active} onChange={()=>toggleMyRule(r.id)}/>
+                    {r.priority && <span className="chip" style={{fontSize:9.5}}>{r.priority}</span>}
                     <span style={{flex:1}}>{r.text}</span>
                     <button className="iconbtn" title="削除" onClick={()=>deleteMyRule(r.id)}>×</button>
                   </label>)}
