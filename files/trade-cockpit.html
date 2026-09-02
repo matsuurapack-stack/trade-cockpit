@@ -87,6 +87,23 @@ table{width:100%;border-collapse:collapse;font-size:14px}
 th{padding:8px 10px;font-size:12px;font-weight:600;text-align:left;white-space:nowrap;color:var(--inkSoft)}
 td{padding:7px 10px;vertical-align:middle}
 .lbl{font-size:12px;color:var(--inkSoft);margin:8px 0 4px}
+/* 監視銘柄テーブル専用（2026-09-03改善）：行高縮小・横スクロール廃止・行hover・sticky header用 */
+.watch-table{table-layout:fixed;font-size:14px}
+.watch-table th{padding:6px 8px;font-size:13px}
+.watch-table td{padding:7px 8px}
+.watch-table thead th{position:sticky;top:0;background:var(--band);z-index:1}
+.watch-table tbody tr:nth-child(even){background:var(--band)}
+.watch-row{transition:background-color .1s}
+.watch-row:hover{background:var(--band) !important}
+.watch-menu-btn{background:transparent;border:1px solid var(--rule);border-radius:4px;color:var(--inkSoft);
+  cursor:pointer;font-size:15px;line-height:1;padding:3px 8px}
+.watch-menu-btn:hover{background:var(--band)}
+.watch-menu{position:absolute;right:0;top:100%;z-index:20;background:var(--card);border:1px solid var(--rule);
+  border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,.18);min-width:160px;overflow:hidden}
+.watch-menu button{display:block;width:100%;text-align:left;padding:7px 12px;font-size:12.5px;background:transparent;
+  border:none;color:var(--ink);cursor:pointer;white-space:nowrap}
+.watch-menu button:hover{background:var(--band)}
+.watch-menu button.on{color:var(--accent);font-weight:700}
 .chip{font-size:13px;padding:4px 10px;border-radius:16px;cursor:pointer;border:1px solid var(--rule);
   background:var(--paperAlt);color:var(--inkSoft);transition:background-color .15s,color .15s}
 .chip:hover{background:var(--band)}
@@ -1223,12 +1240,23 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
 
   const FILTER_STATUS_CHIPS=["HOT","BREAK","WATCH","WEAK"];
 
+  // 2026-09-03改善：Actionボタン群（9個）を「⋮」メニューに集約し、横幅・行高を大幅に節約する。
+  const [openMenuFor,setOpenMenuFor]=useState(null);
+  useEffect(()=>{
+    if(!openMenuFor)return;
+    const close=()=>setOpenMenuFor(null);
+    window.addEventListener("click",close);
+    return ()=>window.removeEventListener("click",close);
+  },[openMenuFor]);
+
   return <div style={{marginTop:18}}>
-    <div className="sec-head">監視銘柄　{items.length}件</div>
-    <div className="sec-note">「日本市場」タブの「監視銘柄」ボタン、または出来高ブレイクアウト条件（直近3か月高値を出来高1.5倍以上で上抜け）への自動該当で追加されます（日本市場のみ対象）。
-      Status・RS Scoreは日経平均・所属セクター平均との当日騰落率の差から簡易算出（詳しい分析は「分析」ボタンから）。
-      {consultMsg && <span style={{marginLeft:8,color:"var(--accent)",fontWeight:700}}>{consultMsg}</span>}
-      {recordMsg && <span style={{marginLeft:8,color:"var(--accent)",fontWeight:700}}>{recordMsg}</span>}</div>
+    <div style={{display:"flex",alignItems:"center",gap:6}}>
+      <div className="sec-head" style={{marginBottom:0}}>監視銘柄　{items.length}件</div>
+      <span style={{fontSize:12,color:"var(--inkFaint)",cursor:"help",border:"1px solid var(--rule)",borderRadius:"50%",width:16,height:16,display:"inline-flex",alignItems:"center",justifyContent:"center"}}
+        title="「日本市場」タブの「監視銘柄」ボタン、または出来高ブレイクアウト条件（直近3か月高値を出来高1.5倍以上で上抜け）への自動該当で追加されます（日本市場のみ対象）。Status・RS Scoreは日経平均・所属セクター平均との当日騰落率の差から簡易算出（詳しい分析は「分析」ボタンから）。">？</span>
+      {consultMsg && <span style={{fontSize:12,color:"var(--accent)",fontWeight:700}}>{consultMsg}</span>}
+      {recordMsg && <span style={{fontSize:12,color:"var(--accent)",fontWeight:700}}>{recordMsg}</span>}
+    </div>
 
     {/* サマリー（v3設計案19番）：46銘柄を読ませる前にまず件数だけで状況を把握できるようにする */}
     <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:10,fontSize:12}}>
@@ -1271,14 +1299,21 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
         <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13}}>
           {items.length===0?"監視銘柄はまだありません。「日本市場」タブの一覧で「監視銘柄」ボタンを押すと、ここに追加されます。":"条件に一致する銘柄はありません。"}
         </div> :
-        <div style={{overflowX:"auto"}}><table style={{minWidth:1180}}>
-          <thead><tr style={{background:"var(--band)"}}>
-            <th>Status</th><th>コード</th><th>銘柄</th><th>セクター</th><th>テーマ</th><th>現在値</th><th>前日比</th>
-            <th>Market RS</th><th>Sector RS</th><th>RS Score</th><th>高値</th><th>安値</th><th></th></tr></thead>
-          <tbody>{displayed.map((w,i)=>{
+        <div style={{overflowX:"auto",maxHeight:620,overflowY:"auto"}}>
+        <table className="watch-table" style={{width:"100%"}}>
+          <colgroup>
+            <col style={{width:76}}/><col style={{width:40}}/><col style={{width:56}}/><col/>
+            <col style={{width:92}}/><col style={{width:80}}/><col style={{width:80}}/>
+            <col style={{width:52}}/><col style={{width:52}}/><col style={{width:36}}/>
+          </colgroup>
+          <thead><tr>
+            <th>Status</th><th title="RS Score（0-100）">RS</th><th>コード</th><th>銘柄</th><th>セクター</th>
+            <th style={{textAlign:"right"}}>現在値</th><th style={{textAlign:"right"}}>前日比</th>
+            <th style={{textAlign:"right"}} title="Market RS（対 日経平均、pt）">M.RS</th>
+            <th style={{textAlign:"right"}} title="Sector RS（対 所属セクター平均、pt）">S.RS</th><th></th></tr></thead>
+          <tbody>{displayed.map((w)=>{
             const qt=stockQuotes[w.code]||{};
-            const ct=num(qt.t),cp=num(qt.p),chi=num(qt.high),clo=num(qt.low);
-            const delta=ct!=null&&cp!=null?ct-cp:null;
+            const ct=num(qt.t),cp=num(qt.p);
             const pct=w.pct;
             // v3 Phase1（設計案4・90番）：行全体のベタ塗りを廃止。背景は白／薄いストライプのみ、
             // 騰落率は文字色（changeColor().fg）だけで表現する。
@@ -1286,35 +1321,38 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
             const inAnalysis=analysisTargets.includes(w.code);
             const inEarnings=earningsTargets.includes(w.code);
             const meta=WATCH_STATUS_META[w.status];
-            return <tr key={w.code} style={{borderTop:"1px solid var(--ruleSoft)",background:i%2?"var(--band)":"transparent"}}>
-              <td style={{textAlign:"center",whiteSpace:"nowrap",borderLeft:`3px solid ${meta.color}`}}>
-                <span style={{fontWeight:700,fontSize:10.5,color:meta.color}}>{meta.icon} {w.breakType?"BREAK_"+w.breakType:meta.label}</span></td>
-              <td className="mono" style={{fontWeight:700,fontSize:12.5}}>{w.code}</td>
-              <td style={{fontSize:13,fontWeight:600,maxWidth:140,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.name}>{w.name}</td>
-              <td style={{fontSize:11,color:"var(--inkSoft)",whiteSpace:"nowrap"}}>{w.sector||"—"}</td>
-              <td style={{fontSize:11.5,color:w.theme?"var(--accent)":"var(--inkFaint)"}}>{w.theme||"—"}</td>
-              <td className="mono" style={{fontWeight:700,fontSize:14,color:fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
-              <td className="mono" style={{fontWeight:600,fontSize:12.5,color:fg,whiteSpace:"nowrap"}}>{delta!=null?(delta>0?"+":"")+delta.toLocaleString(undefined,{maximumFractionDigits:2})+(pct!=null?` (${pct>0?"+":""}${pct.toFixed(2)}%)`:""):"—"}</td>
-              <td className="mono" style={{fontSize:12.5,fontWeight:700,whiteSpace:"nowrap"}}>{fmtPt(w.marketRS)}pt</td>
-              <td className="mono" style={{fontSize:12.5,whiteSpace:"nowrap"}}>{fmtPt(w.sectorRS)}pt</td>
-              <td className="mono" style={{fontWeight:700,fontSize:13,whiteSpace:"nowrap"}}>{w.rsScore!=null?w.rsScore:"—"}</td>
-              <td className="mono" style={{color:"var(--inkSoft)",fontSize:12,whiteSpace:"nowrap"}}>{chi!=null?chi.toLocaleString():"—"}</td>
-              <td className="mono" style={{color:"var(--inkSoft)",fontSize:12,whiteSpace:"nowrap"}}>{clo!=null?clo.toLocaleString():"—"}</td>
-              <td style={{textAlign:"center",whiteSpace:"nowrap"}}>
-                <div style={{display:"flex",gap:4,alignItems:"center",flexWrap:"wrap",justifyContent:"center"}}>
-                  <button className="action-btn" onClick={()=>onOpenChart(w)}>チャート</button>
-                  <button className={"action-btn"+(inAnalysis?" on":"")} onClick={()=>onToggleAnalysis(w.code)}>{inAnalysis?"✓ 分析中":"分析"}</button>
-                  {w.market==="JP" && <button className={"action-btn"+(inEarnings?" on":"")} onClick={()=>onToggleEarnings(w.code)}>{inEarnings?"✓ 決算":"決算"}</button>}
-                  <select value={candidateStatusPick[w.code]||"WATCH"} onChange={e=>setCandidateStatusPick(p=>({...p,[w.code]:e.target.value}))}
-                    style={{fontSize:11,padding:"2px 3px"}}>
-                    {TRADE_CANDIDATE_STATUS_OPTIONS.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}
-                  </select>
-                  <button className="action-btn" onClick={()=>saveCandidate(w)}>候補に追加</button>
-                  <button className="action-btn" onClick={()=>virtualEntry(w)}>仮想IN</button>
-                  <button className="action-btn" onClick={()=>recordToLog(w)}>記録</button>
-                  <button className="action-btn" onClick={()=>copyConsult(w)}>🤖 相談用コピー</button>
-                  <button className="action-btn" onClick={()=>onRemove(w.code)}>削除</button>
-                </div>
+            const rsFg=w.rsScore==null?"var(--ink)":w.rsScore>=75?"var(--up)":w.rsScore<25?"var(--down)":"var(--ink)";
+            return <tr key={w.code} className="watch-row" style={{borderTop:"1px solid var(--ruleSoft)"}}>
+              <td style={{whiteSpace:"nowrap",borderLeft:`3px solid ${meta.color}`}} title={w.breakType?`BREAK_${w.breakType}`:meta.label}>
+                <span style={{fontWeight:700,fontSize:12.5,color:meta.color}}>{meta.icon} {w.breakType||meta.label}</span></td>
+              <td className="mono" style={{fontWeight:800,fontSize:15,color:rsFg}}>{w.rsScore!=null?w.rsScore:"—"}</td>
+              <td className="mono" style={{fontWeight:700,fontSize:13}}>{w.code}</td>
+              <td style={{fontSize:15,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.name}>{w.name}</td>
+              <td style={{fontSize:13,color:"var(--inkSoft)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.sector||""}>{w.sector||"—"}</td>
+              <td className="mono" style={{textAlign:"right",fontWeight:700,fontSize:14.5,color:fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
+              <td className="mono" style={{textAlign:"right",fontWeight:600,fontSize:14,color:fg,whiteSpace:"nowrap"}}
+                title={cp!=null&&ct!=null?`${ct-cp>0?"+":""}${(ct-cp).toLocaleString(undefined,{maximumFractionDigits:2})}`:""}>
+                {pct!=null?(pct>0?"+":"")+pct.toFixed(2)+"%":"—"}</td>
+              <td className="mono" style={{textAlign:"right",fontSize:13,fontWeight:700,whiteSpace:"nowrap"}}>{fmtPt(w.marketRS)}</td>
+              <td className="mono" style={{textAlign:"right",fontSize:13,whiteSpace:"nowrap"}}>{fmtPt(w.sectorRS)}</td>
+              <td style={{textAlign:"center",position:"relative"}}>
+                <button className="watch-menu-btn" onClick={e=>{e.stopPropagation();setOpenMenuFor(v=>v===w.code?null:w.code);}}>⋮</button>
+                {openMenuFor===w.code && <div className="watch-menu" onClick={e=>e.stopPropagation()}>
+                  <button onClick={()=>{onOpenChart(w);setOpenMenuFor(null);}}>チャート</button>
+                  <button className={inAnalysis?"on":""} onClick={()=>{onToggleAnalysis(w.code);setOpenMenuFor(null);}}>{inAnalysis?"✓ 分析中":"分析"}</button>
+                  {w.market==="JP" && <button className={inEarnings?"on":""} onClick={()=>{onToggleEarnings(w.code);setOpenMenuFor(null);}}>{inEarnings?"✓ 決算":"決算"}</button>}
+                  <div style={{padding:"6px 12px",display:"flex",gap:4,alignItems:"center"}}>
+                    <select value={candidateStatusPick[w.code]||"WATCH"} onChange={e=>setCandidateStatusPick(p=>({...p,[w.code]:e.target.value}))}
+                      style={{fontSize:11,padding:"2px 3px",flex:1}}>
+                      {TRADE_CANDIDATE_STATUS_OPTIONS.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}
+                    </select>
+                  </div>
+                  <button onClick={()=>{saveCandidate(w);setOpenMenuFor(null);}}>候補に追加</button>
+                  <button onClick={()=>{virtualEntry(w);setOpenMenuFor(null);}}>仮想IN</button>
+                  <button onClick={()=>{recordToLog(w);setOpenMenuFor(null);}}>記録</button>
+                  <button onClick={()=>{copyConsult(w);setOpenMenuFor(null);}}>🤖 相談用コピー</button>
+                  <button onClick={()=>{onRemove(w.code);setOpenMenuFor(null);}}>監視解除</button>
+                </div>}
               </td>
             </tr>;})}</tbody>
         </table></div>}
