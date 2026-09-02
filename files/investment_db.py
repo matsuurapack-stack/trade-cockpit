@@ -166,6 +166,36 @@ CREATE TABLE IF NOT EXISTS chatgpt_imports (
 );
 CREATE INDEX IF NOT EXISTS idx_chatgpt_imports_user ON chatgpt_imports(user_id, imported_at DESC);
 
+-- 2026-09-02新規（Trade Cockpit v3 Phase4）：「不要」判定したニュースのログ。AIは使わず、
+-- 将来ニュースフィルタのキーワード辞書を人間が見直す際の材料として蓄積するだけ（設計案48番）。
+CREATE TABLE IF NOT EXISTS news_feedback (
+    id                  SERIAL PRIMARY KEY,
+    user_id             TEXT NOT NULL,
+    title               TEXT NOT NULL,
+    source              TEXT,
+    matched_stock_code  TEXT,
+    matched_keyword     TEXT,
+    category            TEXT,
+    feedback            TEXT NOT NULL DEFAULT 'not_needed',
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_news_feedback_user ON news_feedback(user_id, created_at DESC);
+
+-- 2026-09-02新規（Trade Cockpit v3 Phase5）：ChatGPTスクリーンショット認識結果の監視銘柄一括
+-- 取り込み履歴。実際のwatchlist本体はこれまで通りブラウザlocalStorageが正（Neonへは移していない）
+-- ため、ここは「いつ・何件・どのモードで取り込んだか」の履歴と重複防止（payload_hash）専用。
+CREATE TABLE IF NOT EXISTS watchlist_imports (
+    id             SERIAL PRIMARY KEY,
+    user_id        TEXT NOT NULL,
+    payload_hash   TEXT NOT NULL,
+    raw_payload    JSONB NOT NULL,
+    applied_mode   TEXT NOT NULL,  -- add_only|diff|full_sync
+    added_count    INTEGER,
+    imported_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, payload_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_watchlist_imports_user ON watchlist_imports(user_id, imported_at DESC);
+
 -- 2026-09-02新規（Trade Cockpit v2 Phase1）：「今日の候補」。監視銘柄タブでStatus・RS Scoreを
 -- 見ながら手動で拾った銘柄を保存する（自動売買や自動判定ではなく、あくまでユーザーが選んだ
 -- ものを記録するテーブル）。仮想トレード追跡（v2 Phase7予定）用の列も先に用意しておく。
@@ -929,3 +959,78 @@ def get_stats(database_url, user_id):
                         "avgRsScore": round(avg_rs, 1) if avg_rs is not None else None},
         "note": "平均利益・平均損失・Profit Factorはjournalに金額の損益列が無いため未対応です。",
     }
+
+
+# ---- news_feedback（2026-09-02新規、Trade Cockpit v3 Phase4） ----
+
+def create_news_feedback(database_url, user_id, data):
+    """dataは{title,source,matched_stock_code,matched_keyword,category}のいずれかを含むdict
+    （titleは必須）。戻り値: 作成したidまたはNone。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    if not data.get("title"):
+        return None
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO news_feedback (user_id, title, source, matched_stock_code, matched_keyword, category) "
+                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                [user_id, data.get("title"), data.get("source"), data.get("matched_stock_code"),
+                 data.get("matched_keyword"), data.get("category")],
+            )
+            new_id = cur.fetchone()[0]
+        conn.commit()
+    return new_id
+
+
+# ---- watchlist_imports（2026-09-02新規、Trade Cockpit v3 Phase5） ----
+# ChatGPTスクリーンショット認識結果の監視銘柄一括取り込み履歴。実watchlistはブラウザ側で
+# 管理するため（71-76番：既存アーキテクチャを維持）、ここは履歴・重複防止専用。
+
+def find_watchlist_import_duplicate(database_url, user_id, raw_payload):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    h = _payload_hash(raw_payload)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id, imported_at, applied_mode, added_count FROM watchlist_imports "
+                "WHERE user_id = %s AND payload_hash = %s", [user_id, h],
+            )
+            row = cur.fetchone()
+            return _row_to_json(row) if row else None
+
+
+def save_watchlist_import(database_url, user_id, raw_payload, applied_mode, added_count, force=False):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return {"error": "DB未設定"}
+    dup = find_watchlist_import_duplicate(database_url, user_id, raw_payload)
+    if dup and not force:
+        return {"error": f"同じ内容は既に取り込み済みです（{dup['imported_at']}）"}
+    h = _payload_hash(raw_payload)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO watchlist_imports (user_id, payload_hash, raw_payload, applied_mode, added_count) "
+                "VALUES (%s, %s, %s::jsonb, %s, %s) RETURNING id",
+                [user_id, h, json.dumps(raw_payload, ensure_ascii=False), applied_mode, added_count],
+            )
+            new_id = cur.fetchone()[0]
+        conn.commit()
+    return {"id": new_id}
+
+
+def list_watchlist_imports(database_url, user_id, limit=30):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id, imported_at, applied_mode, added_count FROM watchlist_imports "
+                "WHERE user_id = %s ORDER BY imported_at DESC LIMIT %s", [user_id, limit],
+            )
+            return [_row_to_json(r) for r in cur.fetchall()]

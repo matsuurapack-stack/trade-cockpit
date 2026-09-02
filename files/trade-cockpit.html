@@ -633,6 +633,26 @@ function SourceThumb({source,style}){
 // interval件ごとに1件挟む（末尾到達で先頭に戻る簡易ローテーション）。
 // Trade Cockpit v2 Phase4（設計案30番）：ニュースの関連度優先順位ラベル（0=最優先）。
 const NEWS_PRIORITY_LABELS=["保有","候補","監視","テーマ","その他"];
+
+// Trade Cockpit v3 Phase4（設計案43番）：ニュースのカテゴリ分類。有料AI APIは使わずキーワード
+// 辞書のみ（既存のIMPORTANT_KEYWORDS・STOCK_NAME_NEWS_EXCLUDE_KEYWORDSと同じ方式）。
+// 上から順に判定し、最初にヒットしたカテゴリを採用する。
+const NEWS_CATEGORY_KEYWORDS=[
+  ["EARNINGS",["決算","上方修正","下方修正","増益","減益","最終利益","純利益","営業利益"]],
+  ["IR",["IR","適時開示","自己株式取得","株式分割","新株予約権","業務提携","M&A","公開買付","TOB","大量保有"]],
+  ["FX",["ドル円","為替","円安","円高","USDJPY"]],
+  ["COMMODITY",["原油","WTI","金価格","商品先物","天然ガス"]],
+  ["POLITICS",["選挙","政権","大統領","首相","国会","規制強化","制裁"]],
+  ["MACRO",["日銀","FRB","利上げ","利下げ","金利","GDP","インフレ","雇用統計","中央銀行"]],
+  ["MARKET",["日経平均","NYダウ","NASDAQ","S&P","市場","株式市場","続落","続伸","急落","急騰"]],
+  ["SECTOR",["セクター","業種","関連株"]],
+];
+const classifyNewsCategory=(title)=>{
+  const t=title||"";
+  for(const [cat,kws] of NEWS_CATEGORY_KEYWORDS){if(kws.some(k=>t.includes(k)))return cat;}
+  return "COMPANY"; // 企業名一致で拾われた記事のデフォルト（OTHERはスポーツ等の除外漏れ検知用に予約）
+};
+
 function NewsList({items,showName,emptyText,priorityOf}){
   if(!items||!items.length) return <div className="news-empty">{emptyText||"まだ取得していません。自動更新（起動直後・1時間おき）をお待ちください。"}</div>;
   return <div className="news-list">
@@ -645,9 +665,19 @@ function NewsList({items,showName,emptyText,priorityOf}){
       // Trade Cockpit v2 Phase4（設計案30番）：保有／候補／監視／テーマ一致に該当するニュースには
       // バッジを付ける（優先度4=その他は表示しない）。
       const prio=priorityOf&&it.code?priorityOf(it.code):4;
+      const category=classifyNewsCategory(it.title);
+      // v3 Phase4（設計案48番）：「不要」フィードバック。AI不使用、ログ化するだけ（将来のキーワード
+      // 辞書見直し用）。<a>タグ内のボタンのためクリック伝播でページ遷移しないようstopPropagation。
+      const sendFeedback=(e)=>{
+        e.preventDefault();e.stopPropagation();
+        fetch("/api/news-feedback/save",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({title:it.title,source:it.source,matched_stock_code:it.code||null,category})}).catch(()=>{});
+        e.currentTarget.textContent="✓";
+      };
       return <Tag key={i} className={"news-item"+(important?" important":"")} {...linkProps}>
         {important&&<span className="news-alert-badge">⚠ 重要</span>}
         {prio<4&&<span className="chip" style={{fontSize:10,marginRight:4}}>{NEWS_PRIORITY_LABELS[prio]}</span>}
+        <span className="chip" style={{fontSize:9.5,marginRight:4,color:"var(--inkFaint)"}}>{category}</span>
         {showName&&it.code&&<span className="news-tag">{it.code}</span>}
         <span className="news-body">
           <span className="news-title" style={important?{color:"var(--accent)",fontWeight:700}:undefined}>{it.title}</span>
@@ -655,6 +685,7 @@ function NewsList({items,showName,emptyText,priorityOf}){
           {meta&&<span className="news-meta">{meta}</span>}
         </span>
         <SourceThumb source={it.source}/>
+        <button className="iconbtn" title="このニュースは不要（フィードバックとして記録します）" style={{fontSize:11,marginLeft:4}} onClick={sendFeedback}>不要</button>
       </Tag>;
     })}
   </div>;
@@ -966,9 +997,19 @@ function AssessmentCard({assessment:a}){
     ["Market",a.axes?.market],["Supply/Demand",a.axes?.supplyDemand],
     ["Technical",a.axes?.technical],["Catalyst",a.axes?.catalyst],
   ].filter(([,v])=>v!=null);
+  // v3 Phase3（設計案37番）：Day Trade／Swingを分けて表示。新規のサーバー計算は追加せず、
+  // 既存assessmentの値（Falling Knife/Chase Risk・Entry Conditions・Market/RS）から
+  // クライアント側で導出するだけ（Day Tradeは短期シグナル寄り、Swingは地合い・RS寄りを重視）。
+  const dayTradeLabel = (a.fallingKnife||a.chaseRisk) ? "WAIT"
+    : (a.entryConditionsTotal>0 && a.entryConditionsMet===a.entryConditionsTotal) ? "STRONG WATCH"
+    : (a.entryConditionsMet>0) ? "WATCH" : "NEUTRAL";
+  const swingLabel = a.marketRiskLabel==="RISK OFF" ? "CAUTION"
+    : (a.marketRS!=null && a.marketRS>=2) ? "STRONG" : "NEUTRAL";
   return <div style={{border:"1px solid var(--rule)",borderRadius:4,padding:"8px 10px",marginBottom:8,background:"var(--card)"}}>
     <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
       <span style={{fontWeight:800,fontSize:13,color:meta.color}}>{meta.icon} {meta.label}</span>
+      <span className="chip" style={{fontSize:10.5}}>Day Trade: {dayTradeLabel}</span>
+      <span className="chip" style={{fontSize:10.5}}>Swing: {swingLabel}</span>
       {a.marketRiskScore!=null && <span className="chip" style={{fontSize:10.5}}>Market Risk {a.marketRiskScore}（{a.marketRiskLabel}）</span>}
       {a.marketRS!=null && <span className="chip" style={{fontSize:10.5}}>Market RS {a.marketRS>0?"+":""}{a.marketRS}pt</span>}
       <span className="chip" style={{fontSize:10.5}}>Entry Conditions {a.entryConditionsMet}/{a.entryConditionsTotal}</span>
@@ -984,7 +1025,7 @@ function AssessmentCard({assessment:a}){
   </div>;
 }
 
-function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules}){
+function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData}){
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
 
@@ -1008,14 +1049,29 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
     const vol=num(qt.volume);
     const volRatio=(levels?.volAvg5&&vol!=null)?vol/levels.volAvg5:null;
     const ct=num(qt.t);
-    const isBreak=!!(levels&&ct!=null&&volRatio!=null&&ct>levels.highLookback&&volRatio>=1.5);
+    const highBreak=!!(levels&&ct!=null&&ct>levels.highLookback);
+    const volSurge=volRatio!=null&&volRatio>=1.5;
+    // v3 Phase2（設計案23番）：BREAKの細分化。出来高ブレイクアウト（直近3か月高値＋出来高1.5倍）は
+    // 既存ロジックのままBREAK_VOLUMEとし、高値のみ突破（出来高伴わず）はBREAK_HIGHとする。
+    // VWAP奪回・抵抗線突破は分足・resistance計算が必要で全銘柄には重すぎるため、「分析」ボタンで
+    // 既に分析済み（s.analysisData）の銘柄に限り、そのvwap/resistanceを再利用して判定する
+    // （新規の重い計算は追加しない）。
+    const ind=analysisData?.[w.code]?.indicators;
+    const vwapReclaim=!!(ind?.vwap!=null&&ct!=null&&ct>ind.vwap);
+    const resistBreak=!!(ind?.resistance!=null&&ct!=null&&ct>ind.resistance);
+    let breakType=null;
+    if(highBreak&&volSurge)breakType="VOLUME";
+    else if(highBreak)breakType="HIGH";
+    else if(resistBreak)breakType="RESIST";
+    else if(vwapReclaim)breakType="VWAP";
+    const isBreak=breakType!=null;
     let status;
     if(isBreak)status="BREAK";
     else if(rsScore!=null&&rsScore>=75)status="HOT";
     else if(rsScore!=null&&rsScore>=50)status="WATCH";
     else status="WEAK";
-    return {...w,pct,marketRS,sectorRS,rsScore,volRatio,status};
-  }),[items,stockQuotes,marketPct,sectorAvgMap,breakoutLevels]);
+    return {...w,pct,marketRS,sectorRS,rsScore,volRatio,status,breakType};
+  }),[items,stockQuotes,marketPct,sectorAvgMap,breakoutLevels,analysisData]);
 
   const [sortKey,setSortKey]=useState("priority");
   const sorted=useMemo(()=>{
@@ -1224,7 +1280,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
             const meta=WATCH_STATUS_META[w.status];
             return <tr key={w.code} style={{borderTop:"1px solid var(--ruleSoft)",background:i%2?"var(--band)":"transparent"}}>
               <td style={{textAlign:"center",whiteSpace:"nowrap",borderLeft:`3px solid ${meta.color}`}}>
-                <span style={{fontWeight:700,fontSize:10.5,color:meta.color}}>{meta.icon} {meta.label}</span></td>
+                <span style={{fontWeight:700,fontSize:10.5,color:meta.color}}>{meta.icon} {w.breakType?"BREAK_"+w.breakType:meta.label}</span></td>
               <td className="mono" style={{fontWeight:700,fontSize:12.5}}>{w.code}</td>
               <td style={{fontSize:13,fontWeight:600,maxWidth:140,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.name}>{w.name}</td>
               <td style={{fontSize:11,color:"var(--inkSoft)",whiteSpace:"nowrap"}}>{w.sector||"—"}</td>
@@ -1713,6 +1769,169 @@ function ChatGptImportPanel({journal,activeRules}){
               </div>)}
             </div>}
     </div>
+  </div>;
+}
+
+// 監視銘柄インポート（Trade Cockpit v3 Phase5・設計案66-76番）：普段ChatGPTへ証券アプリの
+// スクリーンショットを共有しているユーザー向けに、ChatGPTが認識した銘柄一覧のJSONを貼り付けて
+// 一括登録できるようにする。画像解析はTrade Cockpit側では一切行わない（AI不使用の原則を維持）。
+// 実watchlist本体は既存アーキテクチャ通りブラウザ側（s.watchlist）が正、Neon側は
+// 取り込み履歴・重複防止（watchlist_imports）専用。stock_codeをキーにmasterJPと照合して
+// 正規化し、不明コードは勝手に登録せずUNKNOWN表示にする（設計案72番）。
+const WATCHLIST_IMPORT_SAMPLE=`{
+  "type": "watchlist_import",
+  "date": "${(()=>{const d=new Date();return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");})()}",
+  "source": "chatgpt_screenshot",
+  "stocks": [
+    {"code":"9107","name":"川崎汽船"},
+    {"code":"1605","name":"INPEX"},
+    {"code":"7203","name":"トヨタ自動車"}
+  ]
+}`;
+function WatchlistImportPanel({watchlist,setWatchlist,masterJP}){
+  const [rawText,setRawText]=useState("");
+  const [parsed,setParsed]=useState(null);
+  const [parseErrors,setParseErrors]=useState([]);
+  const [mode,setMode]=useState("add_only");
+  const [applyMsg,setApplyMsg]=useState("");
+  const [dupInfo,setDupInfo]=useState(null);
+
+  const parse=()=>{
+    setApplyMsg("");setDupInfo(null);
+    let obj;
+    try{ obj=JSON.parse(rawText); }
+    catch(e){ setParsed(null);setParseErrors(["JSONとして正しくありません: "+e.message]);return; }
+    const errs=[];
+    if(typeof obj!=="object"||obj===null||!Array.isArray(obj.stocks))errs.push("stocks配列が必要です");
+    (obj.stocks||[]).forEach((s,i)=>{if(!s||!s.code)errs.push(`stocks[${i}]にcodeがありません`);});
+    if(obj.remove!=null&&!Array.isArray(obj.remove))errs.push("removeは配列である必要があります");
+    setParseErrors(errs);
+    setParsed(errs.length===0?obj:null);
+  };
+
+  // stock_codeでmasterJPと照合して名称・セクターを正規化。不明コードはUNKNOWN扱い（勝手に登録しない）。
+  const normalized=useMemo(()=>{
+    if(!parsed)return [];
+    return parsed.stocks.map(s=>{
+      const m=masterJP.find(x=>x.code===s.code);
+      return m?{code:s.code,name:m.name,sector:m.sector,kana:m.kana,tvSymbol:m.tvSymbol,known:true}
+        :{code:s.code,name:s.name||"UNKNOWN",sector:null,known:false};
+    });
+  },[parsed,masterJP]);
+
+  const currentCodes=useMemo(()=>new Set(watchlist.map(w=>w.code)),[watchlist]);
+  const newOnes=useMemo(()=>normalized.filter(s=>!currentCodes.has(s.code)),[normalized,currentCodes]);
+  const alreadyIn=useMemo(()=>normalized.filter(s=>currentCodes.has(s.code)),[normalized,currentCodes]);
+  const importedCodes=useMemo(()=>new Set(normalized.map(s=>s.code)),[normalized]);
+  const missingFromJson=useMemo(()=>watchlist.filter(w=>!importedCodes.has(w.code)),[watchlist,importedCodes]);
+  const removeCodes=useMemo(()=>new Set(parsed?.remove||[]),[parsed]);
+
+  const apply=async()=>{
+    if(mode==="full_sync"&&missingFromJson.length>0){
+      if(!confirm(`完全同期を実行すると、今回のJSONに含まれない${missingFromJson.length}銘柄が監視リストから削除されます。よろしいですか？`))return;
+    }
+    let next=[...watchlist];
+    // 新規追加分（不明コードUNKNOWNも、ユーザーが後でテーマ等を編集できるようそのまま追加はする。
+    // ただしセクターが不明なため33業種フィルタには乗らない旨をプレビューで案内済み）
+    newOnes.forEach(s=>{
+      next.push({id:s.code,code:s.code,name:s.name,sector:s.sector||SECTOR_CHOICES[0],market:"JP",
+        tvSymbol:s.tvSymbol||("TSE:"+s.code),watch:"通常",note:"",theme:""});
+    });
+    if(mode==="diff"){
+      next=next.filter(w=>!removeCodes.has(w.code));
+    }else if(mode==="full_sync"){
+      next=next.filter(w=>importedCodes.has(w.code));
+    }
+    setWatchlist(next);
+    const addedCount=newOnes.length;
+    try{
+      const r=await fetch("/api/watchlist-import/save",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({payload:parsed,mode,addedCount})});
+      const d=await r.json();
+      if(d.error){setDupInfo(d);}
+      else{setApplyMsg(`適用しました（新規${addedCount}件${mode==="full_sync"?`・削除${missingFromJson.length}件`:""}）`);setRawText("");setParsed(null);}
+    }catch(e){setApplyMsg("履歴の保存に失敗しましたが、監視銘柄への反映は完了しています。");}
+  };
+  const applyForce=async()=>{
+    setDupInfo(null);
+    try{
+      await fetch("/api/watchlist-import/save",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({payload:parsed,mode,addedCount:newOnes.length,force:true})});
+    }catch(e){}
+    setApplyMsg("（重複を許可して）履歴を保存しました。監視銘柄は既に反映済みです。");
+  };
+
+  const fieldStyle={width:"100%",fontSize:12.5,padding:"5px 7px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",boxSizing:"border-box"};
+
+  // v3 Phase5（設計案74番）：逆方向のコピー。現在の監視銘柄一覧をChatGPTへ簡単に共有できるようにする。
+  const [copyMsg,setCopyMsg]=useState("");
+  const copyCurrentWatchlist=async()=>{
+    const lines=[`【Trade Cockpit 監視銘柄】${new Date().toLocaleString("ja-JP")}（${watchlist.length}件）`,""];
+    watchlist.forEach(w=>lines.push(`${w.code} ${w.name}（${w.sector||"—"}）`));
+    const ok=await copyText(lines.join("\n"));
+    setCopyMsg(ok?"コピーしました":"コピーに失敗しました");
+    setTimeout(()=>setCopyMsg(""),2500);
+  };
+
+  return <div style={{marginTop:24,paddingTop:20,borderTop:"1px solid var(--rule)"}}>
+    <div className="sec-head">監視銘柄インポート（ChatGPTスクリーンショット認識結果）</div>
+    <div className="sec-note">
+      普段ChatGPTへ証券アプリの監視銘柄スクリーンショットを共有している場合、ChatGPTに認識結果をJSONで出力してもらい、ここへ貼り付けると一括登録できます。
+      画像認識はChatGPT側で行い、Trade Cockpitでは行いません（有料AI APIは呼び出しません）。銘柄コードはmasterJPと照合し、不明な場合はUNKNOWNのまま登録します。
+    </div>
+    <div style={{marginTop:8,display:"flex",alignItems:"center",gap:8}}>
+      <button className="action-btn" onClick={copyCurrentWatchlist}>現在の監視銘柄をChatGPT用にコピー（{watchlist.length}件）</button>
+      {copyMsg && <span style={{fontSize:11,color:"var(--inkSoft)"}}>{copyMsg}</span>}
+    </div>
+    <div style={{marginTop:10}}>
+      <label style={{fontSize:11,color:"var(--inkSoft)",display:"block",marginBottom:2}}>ChatGPTが出力したJSON
+        <button className="action-btn" style={{marginLeft:8,fontSize:11}} onClick={()=>setRawText(WATCHLIST_IMPORT_SAMPLE)}>サンプルを入力</button>
+      </label>
+      <textarea value={rawText} onChange={e=>setRawText(e.target.value)} rows={8} placeholder='{"type":"watchlist_import","stocks":[{"code":"9107","name":"川崎汽船"}]}'
+        style={{...fieldStyle,fontFamily:"monospace",fontSize:12}}/>
+      <button className="action-btn" style={{marginTop:8}} onClick={parse} disabled={!rawText.trim()}>解析</button>
+    </div>
+
+    {parseErrors.length>0 && <div className="card" style={{marginTop:12,padding:"10px 14px",border:"1px solid var(--down)"}}>
+      <b style={{color:"var(--down)"}}>入力内容にエラーがあります：</b>
+      <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:12.5,color:"var(--down)"}}>{parseErrors.map((e,i)=><li key={i}>{e}</li>)}</ul>
+    </div>}
+
+    {parsed && <div className="card" style={{marginTop:12,padding:"12px 14px"}}>
+      <b>差分プレビュー</b>
+      <div style={{marginTop:10}}>
+        {newOnes.length>0 && <div style={{marginBottom:8}}>
+          <div style={{fontSize:11.5,color:"var(--inkSoft)",marginBottom:4}}>新規追加（{newOnes.length}件）</div>
+          {newOnes.map(s=><div key={s.code} style={{fontSize:12.5}}>+ {s.code} {s.name}{!s.known&&<span style={{color:"var(--down)",marginLeft:6}}>（UNKNOWN：銘柄マスタに一致なし）</span>}</div>)}
+        </div>}
+        {alreadyIn.length>0 && <div style={{marginBottom:8}}>
+          <div style={{fontSize:11.5,color:"var(--inkSoft)",marginBottom:4}}>登録済み（{alreadyIn.length}件、変更なし）</div>
+          {alreadyIn.map(s=><div key={s.code} style={{fontSize:12.5,color:"var(--inkFaint)"}}>= {s.code} {s.name}</div>)}
+        </div>}
+        {missingFromJson.length>0 && <div>
+          <div style={{fontSize:11.5,color:"var(--inkSoft)",marginBottom:4}}>現在アプリにあるが今回JSONにない（{missingFromJson.length}件）</div>
+          {missingFromJson.slice(0,20).map(w=><div key={w.code} style={{fontSize:12.5,color:"var(--inkFaint)"}}>{w.code} {w.name}</div>)}
+          {missingFromJson.length>20 && <div style={{fontSize:11.5,color:"var(--inkFaint)"}}>…他{missingFromJson.length-20}件</div>}
+        </div>}
+      </div>
+
+      <div style={{marginTop:12,display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+        <label style={{fontSize:12}}>同期モード：
+          <select value={mode} onChange={e=>setMode(e.target.value)} style={{fontSize:12,marginLeft:6}}>
+            <option value="add_only">追加のみ（既定・既存銘柄は削除しない）</option>
+            <option value="diff">差分更新（JSONのremove配列で明示された銘柄のみ削除）</option>
+            <option value="full_sync">完全同期（JSONに無い銘柄はすべて削除・要確認）</option>
+          </select>
+        </label>
+      </div>
+      <button className="action-btn" style={{marginTop:10}} onClick={apply}>この内容を監視銘柄に適用</button>
+      {applyMsg && <span style={{marginLeft:8,fontSize:12,color:"var(--inkSoft)"}}>{applyMsg}</span>}
+    </div>}
+
+    {dupInfo && <div className="card" style={{marginTop:12,padding:"10px 14px",border:"1px solid var(--rule)"}}>
+      <div style={{fontSize:12.5}}>{dupInfo.error}（監視銘柄への反映自体は完了しています。履歴だけ重複登録するかの確認です）</div>
+      <button className="action-btn" style={{marginTop:8}} onClick={applyForce}>履歴だけ重複を許可して保存する</button>
+    </div>}
   </div>;
 }
 
@@ -2703,6 +2922,7 @@ function App(){
         analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
         earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
         onRemove={removeWatchTarget} metrics={s.metrics} watchlistAll={watchlistAll} breakoutLevels={s.breakoutLevels}
+        analysisData={s.analysisData}
         activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)}
         onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}/>}
 
@@ -3221,7 +3441,10 @@ function App(){
         fxAuto={fxAuto} oilAuto={oilAuto} sectorStrengthAuto={sectorStrengthAuto} watchTargetItems={watchTargetItems}/>}
 
       {/* ===== ChatGPT連携（2026-09-02新規） ===== */}
-      {tab==="chatgptimport" && <ChatGptImportPanel journal={s.journal} activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)}/>}
+      {tab==="chatgptimport" && <>
+        <ChatGptImportPanel journal={s.journal} activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)}/>
+        <WatchlistImportPanel watchlist={s.watchlist} setWatchlist={setWatchlistJP} masterJP={masterJP}/>
+      </>}
 
       {/* ===== 統計ダッシュボード（2026-09-02新規） ===== */}
       {tab==="stats" && <StatsPanel/>}

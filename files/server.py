@@ -2805,6 +2805,10 @@ class Handler(SimpleHTTPRequestHandler):
             # 統計ダッシュボード（2026-09-02新規、Trade Cockpit v2 Phase8）
             stats = investment_db.get_stats(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else None
             self._send_json(stats or {"error": "投資判断ログDB未設定"})
+        elif self.path.startswith("/api/watchlist-import/list"):
+            # Trade Cockpit v3 Phase5：ChatGPTスクリーンショット監視銘柄取り込み履歴
+            imports = investment_db.list_watchlist_imports(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"imports": imports})
         elif self.path == "/" or self.path == "":
             self.send_response(302)
             self.send_header("Location", "/trade-cockpit.html")
@@ -2993,6 +2997,23 @@ class Handler(SimpleHTTPRequestHandler):
             ok = investment_db.add_trade_candidate_checkpoint(
                 DATABASE_URL, self.current_user, body.get("id"), body.get("label"), body.get("price"))
             self._send_json({"ok": ok})
+        elif self.path == "/api/news-feedback/save":
+            # 「不要」ニュースのフィードバックログ（2026-09-02新規、Trade Cockpit v3 Phase4）
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            fid = investment_db.create_news_feedback(DATABASE_URL, self.current_user, body)
+            self._send_json({"id": fid} if fid is not None else {"error": "titleが必要です"})
+        elif self.path == "/api/watchlist-import/save":
+            # ChatGPTスクリーンショット監視銘柄取り込み履歴（2026-09-02新規、Trade Cockpit v3 Phase5）。
+            # 実際のwatchlist本体はブラウザ側で管理するため、ここは履歴・重複防止のみ担当する。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            result = investment_db.save_watchlist_import(
+                DATABASE_URL, self.current_user, body.get("payload"),
+                body.get("mode", "add_only"), body.get("addedCount", 0), force=bool(body.get("force")))
+            self._send_json(result)
         elif self.path == "/api/investment-log/quick-judgment":
             # 監視銘柄タブからのワンクリック記録（2026-09-02新規、Trade Cockpit v2 Phase5・設計案39番）。
             # 当日のdaily_logが無ければ自動作成し、stock_judgmentを1件追加する。
