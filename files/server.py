@@ -2662,6 +2662,9 @@ class Handler(SimpleHTTPRequestHandler):
         elif self.path.startswith("/api/chatgpt-import/list"):
             imports = investment_db.list_chatgpt_imports(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"imports": imports})
+        elif self.path.startswith("/api/trade-candidates"):
+            candidates = investment_db.list_trade_candidates(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"candidates": candidates})
         elif self.path == "/" or self.path == "":
             self.send_response(302)
             self.send_header("Location", "/trade-cockpit.html")
@@ -2829,6 +2832,19 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             result = investment_db.save_chatgpt_import(DATABASE_URL, self.current_user, payload, force=force)
             self._send_json(result)
+        # ---- 今日の候補（trade_candidates。2026-09-02新規、Trade Cockpit v2 Phase1） ----
+        elif self.path == "/api/trade-candidates/save":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            cid = investment_db.create_trade_candidate(DATABASE_URL, self.current_user, body)
+            self._send_json({"id": cid} if cid is not None else {"error": "codeまたはstatusが不正です"})
+        elif self.path == "/api/trade-candidates/delete":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            investment_db.delete_trade_candidate(DATABASE_URL, self.current_user, body.get("id"))
+            self._send_json({"ok": True})
         elif self.path == "/api/migrate-legacy":
             if not self._investment_db_ready():
                 return

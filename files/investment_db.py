@@ -26,6 +26,7 @@ import re
 import json
 import uuid
 import hashlib
+import decimal
 import datetime
 import contextlib
 
@@ -164,6 +165,26 @@ CREATE TABLE IF NOT EXISTS chatgpt_imports (
     UNIQUE (user_id, payload_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_chatgpt_imports_user ON chatgpt_imports(user_id, imported_at DESC);
+
+-- 2026-09-02新規（Trade Cockpit v2 Phase1）：「今日の候補」。監視銘柄タブでStatus・RS Scoreを
+-- 見ながら手動で拾った銘柄を保存する（自動売買や自動判定ではなく、あくまでユーザーが選んだ
+-- ものを記録するテーブル）。仮想トレード追跡（v2 Phase7予定）用の列も先に用意しておく。
+CREATE TABLE IF NOT EXISTS trade_candidates (
+    id                   SERIAL PRIMARY KEY,
+    user_id              TEXT NOT NULL,
+    code                 TEXT NOT NULL,
+    name                 TEXT,
+    status               TEXT NOT NULL,  -- WATCH|WAIT|BUY_CANDIDATE|SKIP
+    rs_score             NUMERIC,
+    market_rs            NUMERIC,
+    sector_rs            NUMERIC,
+    note                 TEXT,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    virtual_entry_price  NUMERIC,
+    virtual_entry_time   TIMESTAMPTZ,
+    checkpoints          JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_trade_candidates_user_date ON trade_candidates(user_id, created_at DESC);
 """
 
 # 2026-09-02 マルチユーザー化の移行SQL。新規インストール（上のCREATE TABLEで最初から
@@ -376,11 +397,16 @@ def list_daily_logs(database_url, user_id, date_from=None, date_to=None, code=No
 
 
 def _row_to_json(row):
-    """psycopgのdict_rowはdatetime等をそのまま返すため、JSON化できる形に変換する。"""
+    """psycopgのdict_rowはdatetime・Decimal等をそのまま返すため、JSON化できる形に変換する。
+    2026-09-02判明：NUMERIC列（trade_candidatesのrs_score等）はDecimalで返り、標準の
+    json.dumpsではシリアライズできず例外→レスポンス未送信のままクラッシュしていた
+    （curlからは空レスポンスに見える）。float変換で対処する。"""
     out = {}
     for k, v in row.items():
         if hasattr(v, "isoformat"):
             out[k] = v.isoformat()
+        elif isinstance(v, decimal.Decimal):
+            out[k] = float(v)
         else:
             out[k] = v
     return out
@@ -721,3 +747,58 @@ def migrate_legacy(database_url, user_id, journal_list, rules_list):
         upsert_rule(database_url, user_id, rule)
         n_r += 1
     return {"journal": n_j, "rules": n_r}
+
+
+# ---- trade_candidates（「今日の候補」。2026-09-02新規、Trade Cockpit v2 Phase1） ----
+# 監視銘柄タブでStatus・RS Scoreを見ながらユーザーが手動で拾った銘柄を保存する。
+# 自動判定結果ではなく「ユーザーがその時点でその状態だと判断した」記録として扱う。
+
+TRADE_CANDIDATE_STATUSES = ["WATCH", "WAIT", "BUY_CANDIDATE", "SKIP"]
+
+
+def create_trade_candidate(database_url, user_id, data):
+    """dataは{code,name,status,rs_score,market_rs,sector_rs,note}のいずれかを含むdict
+    （code・statusは必須）。戻り値: 作成したidまたはNone。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    if not data.get("code") or data.get("status") not in TRADE_CANDIDATE_STATUSES:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO trade_candidates (user_id, code, name, status, rs_score, market_rs, sector_rs, note) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                [user_id, data.get("code"), data.get("name"), data.get("status"),
+                 data.get("rs_score"), data.get("market_rs"), data.get("sector_rs"), data.get("note")],
+            )
+            new_id = cur.fetchone()[0]
+        conn.commit()
+    return new_id
+
+
+def list_trade_candidates(database_url, user_id, since_date=None):
+    """呼び出しユーザーの「今日の候補」を新しい順に返す。since_dateを指定すると
+    その日付（YYYY-MM-DD、JST想定はフロント側で計算）以降に絞り込む（未指定時は当日分のみ）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    if since_date is None:
+        since_date = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).strftime("%Y-%m-%d")
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM trade_candidates WHERE user_id = %s AND created_at >= %s::date "
+                "ORDER BY created_at DESC",
+                [user_id, since_date],
+            )
+            return [_row_to_json(r) for r in cur.fetchall()]
+
+
+def delete_trade_candidate(database_url, user_id, candidate_id):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return
+    with pool.connection() as conn:
+        conn.execute("DELETE FROM trade_candidates WHERE id = %s AND user_id = %s", [candidate_id, user_id])
+        conn.commit()

@@ -891,46 +891,186 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
 // 少数精鋭になる想定のためセクター別アコーディオンにはせず前日比の大きい順にフラット表示する。
 // 「本日優先」に相当するボタンは無く、末尾の「削除」はwatchTargetsから外すだけ（実際の登録
 // 銘柄一覧からは削除しない。完全な登録解除は「日本市場」「アメリカ市場」タブの×で行う）。
-function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart}){
+// Status判定（Trade Cockpit v2 Phase1）。ルールベース・軽量計算のみ（サーバー側analyze_stock()は
+// 呼ばない＝279銘柄規模でも重くならないよう、既に画面上にある値〈stockQuotes・sector平均・
+// breakoutLevels〉だけから算出する）。RS Scoreの重み付けは初期値。運用しながら調整する想定。
+const WATCH_STATUS_META = {
+  BREAK: {icon:"⚡",label:"BREAK",order:0,color:"var(--down)"},
+  HOT:   {icon:"🔥",label:"HOT",  order:1,color:"var(--down)"},
+  WATCH: {icon:"👀",label:"WATCH",order:2,color:"var(--accent)"},
+  WEAK:  {icon:"💤",label:"WEAK", order:3,color:"var(--inkFaint)"},
+};
+const TRADE_CANDIDATE_STATUS_OPTIONS=[
+  {value:"WATCH",label:"監視"},{value:"WAIT",label:"待機"},
+  {value:"BUY_CANDIDATE",label:"買い候補"},{value:"SKIP",label:"見送り"},
+];
+
+function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels}){
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
-  const sorted=useMemo(()=>[...items].sort((a,b)=>{
-    const pa=pctOf(a.code),pb=pctOf(b.code);
-    if(pa==null&&pb==null)return 0; if(pa==null)return 1; if(pb==null)return -1;
-    return pb-pa;
-  }),[items,stockQuotes]);
+
+  // 市場（日経平均）に対する当日騰落率の差分（8番：Relative Strength計算方法）
+  const marketPct=useMemo(()=>{
+    const m=metrics?.nikkei;if(!m)return null;
+    const t=num(m.t),p=num(m.p);return (t!=null&&p!=null&&p)?(t-p)/p*100:null;
+  },[metrics]);
+  // セクター平均に対する差分（既存groupStocks()を再利用。ThemeSectorRanking等と同じ計算式）
+  const sectorAvgMap=useMemo(()=>{
+    const groups=groupStocks(watchlistAll||[],stockQuotes,w=>w.sector);
+    return Object.fromEntries(groups.map(g=>[g.key,g.avgPct]));
+  },[watchlistAll,stockQuotes]);
+
+  const enriched=useMemo(()=>items.map(w=>{
+    const pct=pctOf(w.code);
+    const marketRS=(pct!=null&&marketPct!=null)?pct-marketPct:null;
+    const sectorAvg=sectorAvgMap[w.sector];
+    const sectorRS=(pct!=null&&sectorAvg!=null)?pct-sectorAvg:null;
+    let rsScore=null;
+    if(marketRS!=null||sectorRS!=null){
+      const raw=(marketRS||0)*3+(sectorRS||0)*3;
+      rsScore=Math.max(0,Math.min(100,Math.round(50+raw)));
+    }
+    const levels=breakoutLevels?.[w.code];
+    const qt=stockQuotes[w.code]||{};
+    const vol=num(qt.volume);
+    const volRatio=(levels?.volAvg5&&vol!=null)?vol/levels.volAvg5:null;
+    const ct=num(qt.t);
+    const isBreak=!!(levels&&ct!=null&&volRatio!=null&&ct>levels.highLookback&&volRatio>=1.5);
+    let status;
+    if(isBreak)status="BREAK";
+    else if(rsScore!=null&&rsScore>=75)status="HOT";
+    else if(rsScore!=null&&rsScore>=50)status="WATCH";
+    else status="WEAK";
+    return {...w,pct,marketRS,sectorRS,rsScore,volRatio,status};
+  }),[items,stockQuotes,marketPct,sectorAvgMap,breakoutLevels]);
+
+  const [sortKey,setSortKey]=useState("priority");
+  const sorted=useMemo(()=>{
+    const arr=[...enriched];
+    const byNullLast=(va,vb,desc)=>{
+      if(va==null&&vb==null)return 0;if(va==null)return 1;if(vb==null)return -1;
+      return desc?vb-va:va-vb;
+    };
+    switch(sortKey){
+      case "rsScore": return arr.sort((a,b)=>byNullLast(a.rsScore,b.rsScore,true));
+      case "pct": return arr.sort((a,b)=>byNullLast(a.pct,b.pct,true));
+      case "sector": return arr.sort((a,b)=>(a.sector||"").localeCompare(b.sector||"",'ja'));
+      case "current": return arr.sort((a,b)=>byNullLast(num(stockQuotes[a.code]?.t),num(stockQuotes[b.code]?.t),true));
+      case "status": return arr.sort((a,b)=>WATCH_STATUS_META[a.status].order-WATCH_STATUS_META[b.status].order||byNullLast(a.rsScore,b.rsScore,true));
+      default: // priority：今日注目すべき順（Status優先度→RS Score）
+        return arr.sort((a,b)=>WATCH_STATUS_META[a.status].order-WATCH_STATUS_META[b.status].order||byNullLast(a.rsScore,b.rsScore,true));
+    }
+  },[enriched,sortKey]);
+
+  // 今日の候補（trade_candidates。8番）
+  const [candidates,setCandidates]=useState([]);
+  const [loadingCandidates,setLoadingCandidates]=useState(true);
+  const [candidateStatusPick,setCandidateStatusPick]=useState({}); // code -> 選択中のstatus
+  const loadCandidates=async()=>{
+    setLoadingCandidates(true);
+    try{
+      const r=await fetch("/api/trade-candidates");
+      if(r.ok){const d=await r.json();setCandidates(Array.isArray(d.candidates)?d.candidates:[]);}
+    }catch(e){}
+    setLoadingCandidates(false);
+  };
+  useEffect(()=>{loadCandidates();},[]);
+  const saveCandidate=async(w)=>{
+    const status=candidateStatusPick[w.code]||"WATCH";
+    try{
+      await fetch("/api/trade-candidates/save",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({code:w.code,name:w.name,status,
+          rs_score:w.rsScore,market_rs:w.marketRS,sector_rs:w.sectorRS})});
+      loadCandidates();
+    }catch(e){}
+  };
+  const removeCandidate=async(id)=>{
+    try{
+      await fetch("/api/trade-candidates/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});
+      loadCandidates();
+    }catch(e){}
+  };
+
+  const fmtPt=(v)=>v==null?"—":(v>0?"+":"")+v.toFixed(1);
+
   return <div style={{marginTop:18}}>
     <div className="sec-head">監視銘柄　{items.length}件</div>
-    <div className="sec-note">「日本市場」タブの「監視銘柄」ボタン、または出来高ブレイクアウト条件（直近3か月高値を出来高1.5倍以上で上抜け）への自動該当で追加されます（日本市場のみ対象）。</div>
-    <div style={{marginTop:12,border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,overflow:"hidden"}}>
+    <div className="sec-note">「日本市場」タブの「監視銘柄」ボタン、または出来高ブレイクアウト条件（直近3か月高値を出来高1.5倍以上で上抜け）への自動該当で追加されます（日本市場のみ対象）。
+      Status・RS Scoreは日経平均・所属セクター平均との当日騰落率の差から簡易算出（詳しい分析は「分析」ボタンから）。</div>
+    <div style={{marginTop:10,display:"flex",alignItems:"center",gap:8}}>
+      <label style={{fontSize:12,color:"var(--inkSoft)"}}>並び順：</label>
+      <select value={sortKey} onChange={e=>setSortKey(e.target.value)} style={{fontSize:12,padding:"3px 6px"}}>
+        <option value="priority">今日注目すべき順（既定）</option>
+        <option value="rsScore">RS Score</option>
+        <option value="pct">前日比</option>
+        <option value="sector">セクター</option>
+        <option value="current">現在値</option>
+        <option value="status">Status</option>
+      </select>
+    </div>
+    <div style={{marginTop:10,border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,overflow:"hidden"}}>
       {sorted.length===0 ?
         <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13}}>監視銘柄はまだありません。「日本市場」タブの一覧で「監視銘柄」ボタンを押すと、ここに追加されます。</div> :
-        <div style={{overflowX:"auto"}}><table style={{minWidth:860}}>
-          <thead><tr style={{background:"var(--band)"}}><th>コード</th><th>銘柄</th><th>テーマ</th><th>現在値</th><th>前日比</th><th>高値</th><th>安値</th><th></th></tr></thead>
+        <div style={{overflowX:"auto"}}><table style={{minWidth:1180}}>
+          <thead><tr style={{background:"var(--band)"}}>
+            <th>Status</th><th>コード</th><th>銘柄</th><th>セクター</th><th>テーマ</th><th>現在値</th><th>前日比</th>
+            <th>Market RS</th><th>Sector RS</th><th>RS Score</th><th>高値</th><th>安値</th><th></th></tr></thead>
           <tbody>{sorted.map(w=>{
             const qt=stockQuotes[w.code]||{};
             const ct=num(qt.t),cp=num(qt.p),chi=num(qt.high),clo=num(qt.low);
             const delta=ct!=null&&cp!=null?ct-cp:null;
-            const pct=pctOf(w.code);
+            const pct=w.pct;
             const c=changeColor(pct);
             const inAnalysis=analysisTargets.includes(w.code);
             const inEarnings=earningsTargets.includes(w.code);
+            const meta=WATCH_STATUS_META[w.status];
             return <tr key={w.code} style={{borderTop:"1px solid var(--ruleSoft)",background:c.bg,color:c.level>0?c.fg:"var(--ink)"}}>
+              <td style={{textAlign:"center",whiteSpace:"nowrap"}}>
+                <span style={{fontWeight:700,fontSize:11,color:meta.color}}>{meta.icon} {meta.label}</span></td>
               <td className="mono" style={{fontWeight:700,fontSize:14}}>{w.code}</td>
               <td style={{fontSize:16,fontWeight:600}}>{w.name}</td>
+              <td style={{fontSize:11.5,color:"var(--inkSoft)",whiteSpace:"nowrap"}}>{w.sector||"—"}</td>
               <td style={{fontSize:12,color:w.theme?"var(--accent)":"var(--inkFaint)"}}>{w.theme||"—"}</td>
               <td className="mono" style={{fontWeight:800,fontSize:17,color:c.fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
               <td className="mono" style={{fontWeight:700,fontSize:16,color:c.fg,whiteSpace:"nowrap"}}>{delta!=null?(delta>0?"+":"")+delta.toLocaleString(undefined,{maximumFractionDigits:2})+(pct!=null?` (${pct>0?"+":""}${pct.toFixed(2)}%)`:""):"—"}</td>
+              <td className="mono" style={{fontSize:12.5,whiteSpace:"nowrap"}}>{fmtPt(w.marketRS)}pt</td>
+              <td className="mono" style={{fontSize:12.5,whiteSpace:"nowrap"}}>{fmtPt(w.sectorRS)}pt</td>
+              <td className="mono" style={{fontWeight:700,fontSize:13,whiteSpace:"nowrap"}}>{w.rsScore!=null?w.rsScore:"—"}</td>
               <td className="mono" style={{color:c.level>0?c.fgSoft:"var(--inkSoft)",whiteSpace:"nowrap"}}>{chi!=null?chi.toLocaleString():"—"}</td>
               <td className="mono" style={{color:c.level>0?c.fgSoft:"var(--inkSoft)",whiteSpace:"nowrap"}}>{clo!=null?clo.toLocaleString():"—"}</td>
               <td style={{textAlign:"center",whiteSpace:"nowrap"}}>
-                <button className="action-btn" style={{marginRight:5}} onClick={()=>onOpenChart(w)}>チャート</button>
-                <button className={"action-btn"+(inAnalysis?" on":"")} style={{marginRight:5}} onClick={()=>onToggleAnalysis(w.code)}>{inAnalysis?"✓ 分析中":"分析"}</button>
-                {w.market==="JP" && <button className={"action-btn"+(inEarnings?" on":"")} style={{marginRight:5}} onClick={()=>onToggleEarnings(w.code)}>{inEarnings?"✓ 決算":"決算"}</button>}
-                <button className="action-btn" onClick={()=>onRemove(w.code)}>削除</button>
+                <div style={{display:"flex",gap:4,alignItems:"center",flexWrap:"wrap",justifyContent:"center"}}>
+                  <button className="action-btn" onClick={()=>onOpenChart(w)}>チャート</button>
+                  <button className={"action-btn"+(inAnalysis?" on":"")} onClick={()=>onToggleAnalysis(w.code)}>{inAnalysis?"✓ 分析中":"分析"}</button>
+                  {w.market==="JP" && <button className={"action-btn"+(inEarnings?" on":"")} onClick={()=>onToggleEarnings(w.code)}>{inEarnings?"✓ 決算":"決算"}</button>}
+                  <select value={candidateStatusPick[w.code]||"WATCH"} onChange={e=>setCandidateStatusPick(p=>({...p,[w.code]:e.target.value}))}
+                    style={{fontSize:11,padding:"2px 3px"}}>
+                    {TRADE_CANDIDATE_STATUS_OPTIONS.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                  <button className="action-btn" onClick={()=>saveCandidate(w)}>候補に追加</button>
+                  <button className="action-btn" onClick={()=>onRemove(w.code)}>削除</button>
+                </div>
               </td>
             </tr>;})}</tbody>
         </table></div>}
+    </div>
+
+    <div style={{marginTop:20}}>
+      <div className="sec-head" style={{fontSize:13}}>今日の候補　{candidates.length}件</div>
+      {loadingCandidates
+        ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>読み込み中…</div>
+        : candidates.length===0
+          ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>まだありません。上の一覧から「候補に追加」で保存できます。</div>
+          : <div style={{display:"flex",flexDirection:"column",gap:4,marginTop:6}}>
+              {candidates.map(c=><div key={c.id} style={{display:"flex",alignItems:"center",gap:8,fontSize:12.5,
+                padding:"5px 8px",border:"1px solid var(--ruleSoft)",borderRadius:3}}>
+                <span className="chip" style={{fontSize:10.5}}>{TRADE_CANDIDATE_STATUS_OPTIONS.find(o=>o.value===c.status)?.label||c.status}</span>
+                <span className="mono">{c.code}</span><span style={{fontWeight:600}}>{c.name}</span>
+                {c.rs_score!=null && <span style={{color:"var(--inkSoft)"}}>RS Score {c.rs_score}</span>}
+                <span style={{marginLeft:"auto",color:"var(--inkFaint)",fontSize:11}}>{(c.created_at||"").slice(11,16)}</span>
+                <button className="iconbtn" onClick={()=>removeCandidate(c.id)}>×</button>
+              </div>)}
+            </div>}
     </div>
   </div>;
 }
@@ -2083,7 +2223,7 @@ function App(){
       {tab==="watch" && <WatchTargetsPanel items={watchTargetItems} stockQuotes={s.stockQuotes}
         analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
         earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
-        onRemove={removeWatchTarget}
+        onRemove={removeWatchTarget} metrics={s.metrics} watchlistAll={watchlistAll} breakoutLevels={s.breakoutLevels}
         onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}/>}
 
       {/* ===== BRIEFING（日本市場） ===== */}
