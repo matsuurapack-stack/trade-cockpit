@@ -3,12 +3,16 @@
 
 - 保存先はNeon（無料枠のPostgreSQL）。PC・Renderクラウドの両方から同じDBに接続することで
   データを一本化する（接続先の切り替えはserver.py側のDATABASE_URL定数で行う）。
-- 5テーブル構成：
+- テーブル構成：
   - daily_log          … 日次の相場観（地合い・米国市場・金利・為替・原油・セクター強弱等）
   - stock_judgments    … 銘柄ごとの評価（daily_logに従属。監視/保有/買い候補/見送りの評価一式）
   - journal            … 売買記録（旧localStorage "journal" の移行先。列構成はほぼ同じ）
   - investment_rules   … マイルール（旧localStorage "myRules" の移行先）
-  - investment_profile … 投資プロフィール（AI相談機能Phase1で使う自己紹介的な情報。1ユーザー1行）
+  - investment_profile … 投資プロフィール（自己紹介的な情報。1ユーザー1行。将来の機能拡張向けに
+    列だけ用意、現状読み書きするAPIは無い）
+  - chatgpt_imports    … ChatGPTで作成した投資ログJSONの取り込み履歴（2026-09-02新規。
+    「有料AI APIは使わず、ChatGPT⇄手動貼り付けで連携する」方針のため、アプリからAIを
+    直接呼び出すことはしない）
 - 2026-09-02 マルチユーザー化：daily_log・journal・investment_rules・investment_profileは
   すべてuser_id（ログインユーザー名、server.pyの_authorized()参照）で分離する。journal・
   investment_rulesは既存の主キーがidだけだった（マルチユーザー化前は暗黙的に単一ユーザー
@@ -18,7 +22,11 @@
 - psycopg（PostgreSQL用ドライバ）が未インストール・DATABASE_URL未設定の環境でも他機能に
   影響しないよう、未導入時は全関数が空データ/Noneを返すだけにする（他のAPI連携と同じ方針）。
 """
+import re
 import json
+import uuid
+import hashlib
+import datetime
 import contextlib
 
 try:
@@ -72,7 +80,11 @@ CREATE TABLE IF NOT EXISTS daily_log (
     sector_strength  TEXT,
     chatgpt_view     TEXT,
     my_view          TEXT,
-    reflection       TEXT
+    reflection       TEXT,
+    strong_sectors   JSONB,  -- 2026-09-02追加（ChatGPT連携）：その日の強かったセクター（文字列配列）
+    weak_sectors     JSONB,  -- 2026-09-02追加（ChatGPT連携）：その日の弱かったセクター（文字列配列）
+    raw_payload      JSONB   -- 2026-09-02追加（ChatGPT連携）：取り込み元のJSONをそのまま保存（後日の再解析・救済用）。
+                             -- どのchatgpt_importsから来たかはchatgpt_imports.daily_log_id側から辿る
 );
 
 CREATE TABLE IF NOT EXISTS stock_judgments (
@@ -95,7 +107,9 @@ CREATE TABLE IF NOT EXISTS stock_judgments (
     trade_result      TEXT,
     journal_id        TEXT,
     execution_status  TEXT,  -- 2026-09-02追加：BUY|WATCH|SKIP|MISSED|CANCELLED等（取引しなかった判断も記録）
-    mental_state      TEXT   -- 2026-09-02追加：fear|fomo|confident|uncertain|frustrated|revenge_trade|calm等
+    mental_state      TEXT,  -- 2026-09-02追加：fear|fomo|confident|uncertain|frustrated|revenge_trade|calm等
+    user_decision     TEXT,  -- 2026-09-02追加（ChatGPT連携）：自分の判断（例: BUY|WAIT|SKIP）
+    ai_decision       TEXT   -- 2026-09-02追加（ChatGPT連携）：ChatGPTの判断。user_decisionとの食い違いを後から分析できるようにするため分離
 );
 CREATE INDEX IF NOT EXISTS idx_stock_judgments_daily ON stock_judgments(daily_log_id);
 CREATE INDEX IF NOT EXISTS idx_stock_judgments_code ON stock_judgments(code);
@@ -126,14 +140,30 @@ CREATE TABLE IF NOT EXISTS investment_rules (
     PRIMARY KEY (user_id, id)
 );
 
--- 2026-09-02新規：AI相談機能Phase1で使う投資プロフィール（投資スタイル・リスク許容度等の
--- 自由記述サマリ。1ユーザー1行）。まだ読み書きするAPIは無いが、schemaだけ先に用意しておく。
+-- 2026-09-02新規：投資プロフィール（投資スタイル・リスク許容度等の自由記述サマリ。1ユーザー1行）。
+-- まだ読み書きするAPIは無いが、schemaだけ先に用意しておく。
 CREATE TABLE IF NOT EXISTS investment_profile (
     user_id         TEXT PRIMARY KEY,
     style_summary   TEXT,
     risk_tolerance  TEXT,
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 2026-09-02新規（ChatGPT連携 Phase1）：ChatGPTで作成した投資ログJSONの取り込み履歴。
+-- 同じ内容を誤って何度も貼り付け保存しないよう、payload_hash（生JSON文字列のSHA256）に
+-- UNIQUE制約を付ける（9番：重複防止）。raw_payloadは取り込んだJSONをそのまま保存し、
+-- 将来スキーマが変わっても再解析できるようにする（8番）。
+CREATE TABLE IF NOT EXISTS chatgpt_imports (
+    id            SERIAL PRIMARY KEY,
+    user_id       TEXT NOT NULL,
+    import_date   TEXT NOT NULL,
+    payload_hash  TEXT NOT NULL,
+    raw_payload   JSONB NOT NULL,
+    imported_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    daily_log_id  INTEGER REFERENCES daily_log(id) ON DELETE SET NULL,
+    UNIQUE (user_id, payload_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_chatgpt_imports_user ON chatgpt_imports(user_id, imported_at DESC);
 """
 
 # 2026-09-02 マルチユーザー化の移行SQL。新規インストール（上のCREATE TABLEで最初から
@@ -165,17 +195,29 @@ ALTER TABLE investment_rules DROP CONSTRAINT IF EXISTS investment_rules_pkey;
 ALTER TABLE investment_rules ADD CONSTRAINT investment_rules_pkey PRIMARY KEY (user_id, id);
 """
 
+# 2026-09-02新規（ChatGPT連携 Phase1）：既存インストール向けの列追加。chatgpt_importsを
+# 参照するimport_id列があるため、_SCHEMA_SQL（chatgpt_imports作成）より後に実行する必要がある。
+_MIGRATE_CHATGPT_IMPORT_SQL = """
+ALTER TABLE daily_log ADD COLUMN IF NOT EXISTS strong_sectors JSONB;
+ALTER TABLE daily_log ADD COLUMN IF NOT EXISTS weak_sectors JSONB;
+ALTER TABLE daily_log ADD COLUMN IF NOT EXISTS raw_payload JSONB;
+
+ALTER TABLE stock_judgments ADD COLUMN IF NOT EXISTS user_decision TEXT;
+ALTER TABLE stock_judgments ADD COLUMN IF NOT EXISTS ai_decision TEXT;
+"""
+
 
 def init_schema(database_url):
-    """テーブルを（無ければ）作成し、マルチユーザー化の移行SQLも実行する。サーバー起動時に
-    1回呼ぶ想定。失敗時は例外を投げる（起動時ログで気づけるようにするため、ここでは
-    握りつぶさない）。"""
+    """テーブルを（無ければ）作成し、マルチユーザー化・ChatGPT連携の移行SQLも実行する。
+    サーバー起動時に1回呼ぶ想定。失敗時は例外を投げる（起動時ログで気づけるようにするため、
+    ここでは握りつぶさない）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return
     with pool.connection() as conn:
         conn.execute(_SCHEMA_SQL)
         conn.execute(_MIGRATE_MULTIUSER_SQL)
+        conn.execute(_MIGRATE_CHATGPT_IMPORT_SQL)
         conn.commit()
 
 
@@ -186,7 +228,7 @@ _DAILY_LOG_COLS = ["date", "market_env", "us_market", "interest_rate", "fx", "oi
 _JUDGMENT_COLS = ["code", "name", "category", "entry_reason", "skip_reason", "exit_judgment",
                    "supply_demand", "earnings_eval", "valuation_eval", "theme_eval", "chart_eval",
                    "chatgpt_judgment", "my_judgment", "actual_trade", "trade_result", "journal_id",
-                   "execution_status", "mental_state"]
+                   "execution_status", "mental_state", "user_decision", "ai_decision"]
 
 
 def create_daily_log(database_url, user_id, data, judgments=None):
@@ -452,7 +494,7 @@ def delete_rule(database_url, user_id, rule_id):
         conn.commit()
 
 
-# ---- investment_profile（投資プロフィール。AI相談機能Phase1向け。2026-09-02新規） ----
+# ---- investment_profile（投資プロフィール。2026-09-02新規） ----
 
 def get_profile(database_url, user_id):
     pool = _get_pool(database_url)
@@ -481,6 +523,184 @@ def upsert_profile(database_url, user_id, data):
             [user_id, data.get("style_summary"), data.get("risk_tolerance")],
         )
         conn.commit()
+
+
+# ---- ChatGPT連携（2026-09-02新規、Phase1）：ChatGPTが出力した投資ログJSONを取り込む ----
+# 有料AI APIは使わず、「ChatGPTで相談→JSON出力→ここへ手動貼り付け」という半自動フローの
+# 保存先。JSONのwatchlist/decisionsはcodeで突き合わせてstock_judgments 1行にマージする
+# （どちらか片方にしか無い項目も許容する）。
+
+ALLOWED_EXECUTION = ["BUY", "SELL", "WAIT", "WATCH", "NO_TRADE", "MISSED", "CANCELLED",
+                      "STOP_LOSS", "TAKE_PROFIT"]
+_CODE_RE_LOOSE = re.compile(r"^[0-9A-Za-z.\-]{1,12}$")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def validate_chatgpt_payload(payload):
+    """貼り付けJSONを解析したdictを検証し、エラーメッセージのリストを返す（空なら合格）。
+    フロント側でも同じ内容の検証をJSで行うが（即時フィードバック用）、ここでのサーバー側検証が
+    最終防衛線（フロントを経由しない直接APIコールや改変に備える）。"""
+    errors = []
+    if not isinstance(payload, dict):
+        return ["JSONのトップレベルはオブジェクトである必要があります"]
+    date = payload.get("date")
+    if not date or not isinstance(date, str) or not _DATE_RE.match(date):
+        errors.append("date は YYYY-MM-DD 形式の文字列で必須です")
+    watchlist = payload.get("watchlist")
+    if watchlist is not None and not isinstance(watchlist, list):
+        errors.append("watchlist は配列である必要があります")
+    for i, w in enumerate(watchlist or []):
+        if not isinstance(w, dict) or not w.get("code"):
+            errors.append(f"watchlist[{i}] に code がありません")
+        elif not _CODE_RE_LOOSE.match(str(w.get("code"))):
+            errors.append(f"watchlist[{i}].code の形式が不正です: {w.get('code')}")
+    decisions = payload.get("decisions")
+    if decisions is not None and not isinstance(decisions, list):
+        errors.append("decisions は配列である必要があります")
+    for i, d in enumerate(decisions or []):
+        if not isinstance(d, dict) or not d.get("code"):
+            errors.append(f"decisions[{i}] に code がありません")
+            continue
+        if not _CODE_RE_LOOSE.match(str(d.get("code"))):
+            errors.append(f"decisions[{i}].code の形式が不正です: {d.get('code')}")
+        execution = d.get("execution")
+        if execution and execution not in ALLOWED_EXECUTION:
+            errors.append(f"decisions[{i}].execution \"{execution}\" は許可された値ではありません"
+                           f"（許可: {', '.join(ALLOWED_EXECUTION)}）")
+    rule_updates = payload.get("rule_updates")
+    if rule_updates is not None and not isinstance(rule_updates, list):
+        errors.append("rule_updates は配列である必要があります")
+    return errors
+
+
+def _payload_hash(raw_payload):
+    raw_str = json.dumps(raw_payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw_str.encode("utf-8")).hexdigest()
+
+
+def find_chatgpt_import_duplicate(database_url, user_id, raw_payload):
+    """同一内容（payload_hash一致）の取り込み済みレコードがあれば返す（無ければNone）。
+    保存前のプレビュー段階で警告表示するために使う（10番の重複防止のプレビュー版）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    h = _payload_hash(raw_payload)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id, import_date, imported_at FROM chatgpt_imports WHERE user_id = %s AND payload_hash = %s",
+                [user_id, h],
+            )
+            row = cur.fetchone()
+            return _row_to_json(row) if row else None
+
+
+def list_chatgpt_imports(database_url, user_id, limit=30):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id, import_date, imported_at, daily_log_id FROM chatgpt_imports "
+                "WHERE user_id = %s ORDER BY imported_at DESC LIMIT %s",
+                [user_id, limit],
+            )
+            return [_row_to_json(r) for r in cur.fetchall()]
+
+
+def save_chatgpt_import(database_url, user_id, payload, force=False):
+    """検証済み（validate_chatgpt_payloadでエラー0件確認済み）のpayloadをNeonへ保存する。
+    - daily_log 1行（市場環境・強弱セクター・raw_payload）
+    - stock_judgments N行（watchlist・decisionsをcodeで突き合わせてマージ）
+    - investment_rules（rule_updatesがあれば追加。既存ルールの上書きはしない＝新規追加のみ）
+    - chatgpt_imports 1行（取り込み履歴。payload_hashで重複検出）
+    同一内容が取り込み済みならforce=Trueでない限り保存せずエラーを返す。
+    戻り値: {"error": ...} または {"dailyLogId":.., "importId":.., "judgments":N, "rulesAdded":N}。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return {"error": "DB未設定（DATABASE_URLが未設定、またはpsycopg未インストール）"}
+
+    dup = find_chatgpt_import_duplicate(database_url, user_id, payload)
+    if dup and not force:
+        return {"error": f"同じ内容のログは既に取り込み済みです（{dup['import_date']}に取り込み、import_id {dup['id']}）"}
+
+    market = payload.get("market") or {}
+    h = _payload_hash(payload)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO daily_log (user_id, date, market_env, chatgpt_view, reflection, "
+                "strong_sectors, weak_sectors, raw_payload) "
+                "VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb) RETURNING id",
+                [
+                    user_id, payload.get("date"), market.get("condition"), market.get("summary"),
+                    payload.get("review"),
+                    json.dumps(market.get("strong_sectors") or [], ensure_ascii=False),
+                    json.dumps(market.get("weak_sectors") or [], ensure_ascii=False),
+                    json.dumps(payload, ensure_ascii=False),
+                ],
+            )
+            log_id = cur.fetchone()[0]
+            cur.execute(
+                "INSERT INTO chatgpt_imports (user_id, import_date, payload_hash, raw_payload, daily_log_id) "
+                "VALUES (%s, %s, %s, %s::jsonb, %s) RETURNING id",
+                [user_id, payload.get("date"), h, json.dumps(payload, ensure_ascii=False), log_id],
+            )
+            import_id = cur.fetchone()[0]
+        conn.commit()
+
+    # watchlist・decisionsをcodeで突き合わせてstock_judgments 1行にマージ
+    by_code = {}
+    for w in payload.get("watchlist") or []:
+        code = w.get("code")
+        if not code:
+            continue
+        row = by_code.setdefault(code, {"code": code})
+        if w.get("name"):
+            row["name"] = w["name"]
+        if w.get("status"):
+            row["category"] = w["status"]
+        if w.get("reason"):
+            row["entry_reason"] = w["reason"]
+    for d in payload.get("decisions") or []:
+        code = d.get("code")
+        if not code:
+            continue
+        row = by_code.setdefault(code, {"code": code})
+        if d.get("user_decision"):
+            row["user_decision"] = d["user_decision"]
+        if d.get("ai_decision"):
+            row["ai_decision"] = d["ai_decision"]
+        if d.get("execution"):
+            row["execution_status"] = d["execution"]
+        if d.get("mental_state"):
+            row["mental_state"] = d["mental_state"]
+        if d.get("reason"):
+            # watchlist由来のentry_reasonが既にあれば上書きしない（見送り理由はskip_reasonへ）
+            key = "skip_reason" if d.get("execution") == "NO_TRADE" else "entry_reason"
+            row.setdefault(key, d["reason"])
+
+    n_judgments = 0
+    for fields in by_code.values():
+        jid = add_stock_judgment(database_url, user_id, log_id, fields)
+        if jid is not None:
+            n_judgments += 1
+
+    n_rules = 0
+    for ru in payload.get("rule_updates") or []:
+        text = ru if isinstance(ru, str) else (ru or {}).get("text")
+        if not text:
+            continue
+        upsert_rule(database_url, user_id, {
+            "id": "chatgpt-" + uuid.uuid4().hex[:8],
+            "text": text,
+            "active": True,
+            "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        })
+        n_rules += 1
+
+    return {"dailyLogId": log_id, "importId": import_id, "judgments": n_judgments, "rulesAdded": n_rules}
 
 
 # ---- 一括移行（旧localStorageのjournal・myRulesをまとめて取り込む） ----

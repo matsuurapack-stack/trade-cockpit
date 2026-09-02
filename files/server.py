@@ -2659,6 +2659,9 @@ class Handler(SimpleHTTPRequestHandler):
         elif self.path.startswith("/api/rules"):
             rules = investment_db.list_rules(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"rules": rules})
+        elif self.path.startswith("/api/chatgpt-import/list"):
+            imports = investment_db.list_chatgpt_imports(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"imports": imports})
         elif self.path == "/" or self.path == "":
             self.send_response(302)
             self.send_header("Location", "/trade-cockpit.html")
@@ -2812,6 +2815,20 @@ class Handler(SimpleHTTPRequestHandler):
             body = self._read_json_body()
             investment_db.delete_rule(DATABASE_URL, self.current_user, body.get("id"))
             self._send_json({"ok": True})
+        # ---- ChatGPT連携（2026-09-02新規、Phase1）：有料AI APIは使わず、ChatGPTが出力した
+        # 投資ログJSONを手動貼り付けで取り込む。 ----
+        elif self.path == "/api/chatgpt-import/save":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            payload = body.get("payload")
+            force = bool(body.get("force"))
+            errors = investment_db.validate_chatgpt_payload(payload)
+            if errors:
+                self._send_json({"errors": errors})
+                return
+            result = investment_db.save_chatgpt_import(DATABASE_URL, self.current_user, payload, force=force)
+            self._send_json(result)
         elif self.path == "/api/migrate-legacy":
             if not self._investment_db_ready():
                 return

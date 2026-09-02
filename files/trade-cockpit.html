@@ -1128,6 +1128,202 @@ function InvestmentLogPanel({marketEnvAuto,usMarketAuto,interestRateAuto,fxAuto,
   </div>;
 }
 
+// ChatGPT連携（2026-09-02新規、Phase1）：有料AI APIは使わず、「ChatGPTで相談→JSON出力→
+// ここへ手動貼り付け」の半自動フローで投資ログをNeonへ蓄積する。JSONの構造検証はまずここ
+// （フロント）で即時に行い、保存はサーバー側（server.py）でも同じ検証をやり直す（二重防御）。
+const CHATGPT_ALLOWED_EXECUTION=["BUY","SELL","WAIT","WATCH","NO_TRADE","MISSED","CANCELLED","STOP_LOSS","TAKE_PROFIT"];
+const CHATGPT_SAMPLE_JSON=`{
+  "date": "${(()=>{const d=new Date();return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");})()}",
+  "market": { "condition": "bearish", "summary": "全面安",
+    "strong_sectors": ["shipping"], "weak_sectors": ["banks","semiconductors"] },
+  "watchlist": [ {"code":"9107","name":"川崎汽船","status":"WATCH","reason":"全面安の中で相対的に強い"} ],
+  "decisions": [ {"code":"9107","user_decision":"WAIT","ai_decision":"WAIT","execution":"NO_TRADE",
+    "reason":"地合いが悪いため","mental_state":"calm"} ],
+  "review": "無理に入らず待った",
+  "rule_updates": []
+}`;
+
+function validateChatGptPayload(obj){
+  const errs=[];
+  if(typeof obj!=="object"||obj===null||Array.isArray(obj)){errs.push("JSONのトップレベルはオブジェクトである必要があります");return errs;}
+  if(!obj.date||!/^\d{4}-\d{2}-\d{2}$/.test(obj.date))errs.push("date は YYYY-MM-DD 形式の文字列で必須です");
+  if(obj.watchlist!=null&&!Array.isArray(obj.watchlist))errs.push("watchlist は配列である必要があります");
+  (obj.watchlist||[]).forEach((w,i)=>{ if(!w||!w.code)errs.push(`watchlist[${i}] に code がありません`); });
+  if(obj.decisions!=null&&!Array.isArray(obj.decisions))errs.push("decisions は配列である必要があります");
+  (obj.decisions||[]).forEach((d,i)=>{
+    if(!d||!d.code){errs.push(`decisions[${i}] に code がありません`);return;}
+    if(d.execution&&!CHATGPT_ALLOWED_EXECUTION.includes(d.execution))
+      errs.push(`decisions[${i}].execution "${d.execution}" は許可された値ではありません（許可: ${CHATGPT_ALLOWED_EXECUTION.join(", ")}）`);
+  });
+  if(obj.rule_updates!=null&&!Array.isArray(obj.rule_updates))errs.push("rule_updates は配列である必要があります");
+  return errs;
+}
+
+function ChatGptImportPanel(){
+  const [rawText,setRawText]=useState("");
+  const [parsed,setParsed]=useState(null);
+  const [parseErrors,setParseErrors]=useState([]);
+  const [saving,setSaving]=useState(false);
+  const [saveMsg,setSaveMsg]=useState("");
+  const [dupInfo,setDupInfo]=useState(null); // {error} が重複だった場合、再送信（force）を促す
+  const [imports,setImports]=useState([]);
+  const [loadingImports,setLoadingImports]=useState(true);
+
+  const loadImports=async()=>{
+    setLoadingImports(true);
+    try{
+      const r=await fetch("/api/chatgpt-import/list");
+      if(r.ok){const d=await r.json();setImports(Array.isArray(d.imports)?d.imports:[]);}
+    }catch(e){}
+    setLoadingImports(false);
+  };
+  useEffect(()=>{loadImports();},[]);
+
+  const parse=()=>{
+    setSaveMsg("");setDupInfo(null);
+    let obj;
+    try{ obj=JSON.parse(rawText); }
+    catch(e){ setParsed(null);setParseErrors(["JSONとして正しくありません: "+e.message]);return; }
+    const errs=validateChatGptPayload(obj);
+    setParseErrors(errs);
+    setParsed(errs.length===0?obj:null);
+  };
+
+  const updateMarket=(field,value)=>setParsed(p=>({...p,market:{...(p.market||{}),[field]:value}}));
+  const updateSectorList=(field,text)=>updateMarket(field,text.split(",").map(s=>s.trim()).filter(Boolean));
+  const updateWatchItem=(idx,field,value)=>setParsed(p=>({...p,watchlist:(p.watchlist||[]).map((w,i)=>i===idx?{...w,[field]:value}:w)}));
+  const removeWatchItem=(idx)=>setParsed(p=>({...p,watchlist:(p.watchlist||[]).filter((_,i)=>i!==idx)}));
+  const updateDecisionItem=(idx,field,value)=>setParsed(p=>({...p,decisions:(p.decisions||[]).map((d,i)=>i===idx?{...d,[field]:value}:d)}));
+  const removeDecisionItem=(idx)=>setParsed(p=>({...p,decisions:(p.decisions||[]).filter((_,i)=>i!==idx)}));
+  const updateRuleUpdate=(idx,value)=>setParsed(p=>({...p,rule_updates:(p.rule_updates||[]).map((r,i)=>i===idx?value:r)}));
+  const removeRuleUpdate=(idx)=>setParsed(p=>({...p,rule_updates:(p.rule_updates||[]).filter((_,i)=>i!==idx)}));
+
+  const save=async(force)=>{
+    setSaving(true);setSaveMsg("");setDupInfo(null);
+    try{
+      const r=await fetch("/api/chatgpt-import/save",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({payload:parsed,force:!!force})});
+      const d=await r.json();
+      if(d.errors){setSaveMsg("保存失敗：\n・"+d.errors.join("\n・"));}
+      else if(d.error){setDupInfo(d);}
+      else{
+        setSaveMsg(`保存しました（daily_log ID ${d.dailyLogId}・銘柄評価 ${d.judgments}件・追加ルール ${d.rulesAdded}件）`);
+        setRawText("");setParsed(null);setParseErrors([]);loadImports();
+      }
+    }catch(e){setSaveMsg("保存に失敗しました。サーバーが起動しているか確認してください。");}
+    setSaving(false);
+  };
+
+  const fieldStyle={width:"100%",fontSize:12.5,padding:"5px 7px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",boxSizing:"border-box"};
+  const labelStyle={fontSize:11,color:"var(--inkSoft)",display:"block",marginBottom:2};
+
+  return <div style={{marginTop:18}}>
+    <div className="sec-head">ChatGPT連携（投資ログ取り込み）</div>
+    <div className="sec-note">
+      ChatGPTで相談して作成した投資ログJSONをここへ貼り付けます。有料AI APIはこのアプリからは呼び出しません
+      （ChatGPTとのやり取りは従来どおりChatGPT側で行い、その結果のJSONだけをコピー＆ペーストします）。
+    </div>
+
+    <div style={{marginTop:10}}>
+      <label style={labelStyle}>ChatGPTが出力したJSON
+        <button className="action-btn" style={{marginLeft:8,fontSize:11}} onClick={()=>setRawText(CHATGPT_SAMPLE_JSON)}>サンプルを入力</button>
+      </label>
+      <textarea value={rawText} onChange={e=>setRawText(e.target.value)} rows={10} placeholder='{"date":"2026-09-02", ...}'
+        style={{...fieldStyle,fontFamily:"monospace",fontSize:12}}/>
+      <button className="action-btn" style={{marginTop:8}} onClick={parse} disabled={!rawText.trim()}>解析</button>
+    </div>
+
+    {parseErrors.length>0 && <div className="card" style={{marginTop:12,padding:"10px 14px",border:"1px solid var(--down)"}}>
+      <b style={{color:"var(--down)"}}>入力内容にエラーがあります：</b>
+      <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:12.5,color:"var(--down)"}}>
+        {parseErrors.map((e,i)=><li key={i}>{e}</li>)}
+      </ul>
+    </div>}
+
+    {parsed && <div className="card" style={{marginTop:12,padding:"12px 14px"}}>
+      <b>プレビュー（保存前に内容を確認・修正できます）</b>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginTop:10}}>
+        <div><label style={labelStyle}>日付</label>
+          <input style={fieldStyle} value={parsed.date||""} onChange={e=>setParsed(p=>({...p,date:e.target.value}))}/></div>
+        <div><label style={labelStyle}>地合い（condition）</label>
+          <input style={fieldStyle} value={parsed.market?.condition||""} onChange={e=>updateMarket("condition",e.target.value)}/></div>
+        <div style={{gridColumn:"1 / -1"}}><label style={labelStyle}>市況サマリー</label>
+          <input style={fieldStyle} value={parsed.market?.summary||""} onChange={e=>updateMarket("summary",e.target.value)}/></div>
+        <div><label style={labelStyle}>強いセクター（カンマ区切り）</label>
+          <input style={fieldStyle} value={(parsed.market?.strong_sectors||[]).join(", ")} onChange={e=>updateSectorList("strong_sectors",e.target.value)}/></div>
+        <div><label style={labelStyle}>弱いセクター（カンマ区切り）</label>
+          <input style={fieldStyle} value={(parsed.market?.weak_sectors||[]).join(", ")} onChange={e=>updateSectorList("weak_sectors",e.target.value)}/></div>
+        <div style={{gridColumn:"1 / -1"}}><label style={labelStyle}>振り返り（review）</label>
+          <textarea style={fieldStyle} rows={2} value={parsed.review||""} onChange={e=>setParsed(p=>({...p,review:e.target.value}))}/></div>
+      </div>
+
+      {(parsed.watchlist||[]).length>0 && <div style={{marginTop:14}}>
+        <b style={{fontSize:12.5}}>ウォッチリスト</b>
+        {(parsed.watchlist||[]).map((w,i)=><div key={i} style={{display:"grid",gridTemplateColumns:"70px 1fr 90px 1fr 24px",gap:6,marginTop:6,alignItems:"center"}}>
+          <input style={fieldStyle} placeholder="コード" value={w.code||""} onChange={e=>updateWatchItem(i,"code",e.target.value)}/>
+          <input style={fieldStyle} placeholder="銘柄名" value={w.name||""} onChange={e=>updateWatchItem(i,"name",e.target.value)}/>
+          <input style={fieldStyle} placeholder="状態" value={w.status||""} onChange={e=>updateWatchItem(i,"status",e.target.value)}/>
+          <input style={fieldStyle} placeholder="理由" value={w.reason||""} onChange={e=>updateWatchItem(i,"reason",e.target.value)}/>
+          <button className="iconbtn" onClick={()=>removeWatchItem(i)}>×</button>
+        </div>)}
+      </div>}
+
+      {(parsed.decisions||[]).length>0 && <div style={{marginTop:14}}>
+        <b style={{fontSize:12.5}}>判断（decisions）</b>
+        {(parsed.decisions||[]).map((d,i)=><div key={i} style={{border:"1px solid var(--ruleSoft)",borderRadius:4,padding:8,marginTop:6}}>
+          <div style={{display:"grid",gridTemplateColumns:"70px 1fr 1fr 24px",gap:6,alignItems:"center"}}>
+            <input style={fieldStyle} placeholder="コード" value={d.code||""} onChange={e=>updateDecisionItem(i,"code",e.target.value)}/>
+            <input style={fieldStyle} placeholder="自分の判断" value={d.user_decision||""} onChange={e=>updateDecisionItem(i,"user_decision",e.target.value)}/>
+            <input style={fieldStyle} placeholder="ChatGPTの判断" value={d.ai_decision||""} onChange={e=>updateDecisionItem(i,"ai_decision",e.target.value)}/>
+            <button className="iconbtn" onClick={()=>removeDecisionItem(i)}>×</button>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,marginTop:6}}>
+            <select style={fieldStyle} value={d.execution||""} onChange={e=>updateDecisionItem(i,"execution",e.target.value)}>
+              <option value="">実行結果を選択</option>
+              {CHATGPT_ALLOWED_EXECUTION.map(v=><option key={v} value={v}>{v}</option>)}
+            </select>
+            <input style={fieldStyle} placeholder="理由" value={d.reason||""} onChange={e=>updateDecisionItem(i,"reason",e.target.value)}/>
+            <input style={fieldStyle} placeholder="心理状態" value={d.mental_state||""} onChange={e=>updateDecisionItem(i,"mental_state",e.target.value)}/>
+          </div>
+        </div>)}
+      </div>}
+
+      {(parsed.rule_updates||[]).length>0 && <div style={{marginTop:14}}>
+        <b style={{fontSize:12.5}}>ルール更新（新規追加のみ・既存ルールの上書きはしません）</b>
+        {(parsed.rule_updates||[]).map((r,i)=><div key={i} style={{display:"flex",gap:6,marginTop:6}}>
+          <input style={fieldStyle} value={typeof r==="string"?r:(r.text||"")} onChange={e=>updateRuleUpdate(i,e.target.value)}/>
+          <button className="iconbtn" onClick={()=>removeRuleUpdate(i)}>×</button>
+        </div>)}
+      </div>}
+
+      <div style={{marginTop:14,display:"flex",gap:8,alignItems:"center"}}>
+        <button className="action-btn" disabled={saving} onClick={()=>save(false)}>NEONへ保存</button>
+        {saving && <span style={{fontSize:12,color:"var(--inkFaint)"}}>保存中…</span>}
+      </div>
+    </div>}
+
+    {dupInfo && <div className="card" style={{marginTop:12,padding:"10px 14px",border:"1px solid var(--rule)"}}>
+      <div style={{fontSize:12.5}}>{dupInfo.error}</div>
+      <button className="action-btn" style={{marginTop:8}} disabled={saving} onClick={()=>save(true)}>それでも保存する（重複を許可）</button>
+    </div>}
+
+    {saveMsg && <div style={{marginTop:10,fontSize:12.5,whiteSpace:"pre-wrap"}}>{saveMsg}</div>}
+
+    <div style={{marginTop:20}}>
+      <div className="sec-head" style={{fontSize:13}}>取り込み履歴</div>
+      {loadingImports
+        ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>読み込み中…</div>
+        : imports.length===0
+          ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>まだ取り込みはありません</div>
+          : <div style={{display:"flex",flexDirection:"column",gap:4,marginTop:6}}>
+              {imports.map(im=><div key={im.id} style={{fontSize:12,padding:"4px 8px",border:"1px solid var(--ruleSoft)",borderRadius:3}}>
+                <span className="mono">{im.import_date}</span> に取り込み（daily_log ID {im.daily_log_id}）
+              </div>)}
+            </div>}
+    </div>
+  </div>;
+}
+
 // テーマ・セクター強弱の可視化：SectorWatchlist内のsectorGroups集計（平均騰落率・合計売買代金）と
 // 同じ考え方を、JP+US統合した銘柄リストに対して汎用的に適用する。keyFnがnull/""を返す銘柄は
 // 対象外にする（テーマ未設定銘柄をテーマ別ランキングから除外するため）。
@@ -1834,6 +2030,7 @@ function App(){
         <button className={"tab"+(tab==="analysis"?" on":"")} onClick={()=>setTab("analysis")}>銘柄分析</button>
         <button className={"tab"+(tab==="journal"?" on":"")} onClick={()=>setTab("journal")}>記録</button>
         <button className={"tab"+(tab==="investlog"?" on":"")} onClick={()=>setTab("investlog")}>投資判断ログ</button>
+        <button className={"tab"+(tab==="chatgptimport"?" on":"")} onClick={()=>setTab("chatgptimport")}>ChatGPT連携</button>
       </div>
 
       {/* ===== 日次モニター（独立タブ） ===== */}
@@ -2400,6 +2597,9 @@ function App(){
       {tab==="investlog" && <InvestmentLogPanel
         marketEnvAuto={marketEnvAuto} usMarketAuto={usMarketAuto} interestRateAuto={interestRateAuto}
         fxAuto={fxAuto} oilAuto={oilAuto} sectorStrengthAuto={sectorStrengthAuto} watchTargetItems={watchTargetItems}/>}
+
+      {/* ===== ChatGPT連携（2026-09-02新規） ===== */}
+      {tab==="chatgptimport" && <ChatGptImportPanel/>}
 
       {/* ===== NEWS（9章・9-1章・9-2章） ===== */}
       {tab==="news" && (()=>{
