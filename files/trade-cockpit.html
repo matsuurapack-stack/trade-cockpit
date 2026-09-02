@@ -787,7 +787,7 @@ function EarningsProgressChart({trend,latestDetail}){
 
 // 6-1章：銘柄検索・登録＋セクター別アコーディオン表示（2〜5章の仕様）を市場ごとに再利用するための共通コンポーネント。
 // 日本市場・アメリカ市場タブの両方で、このコンポーネントをそのまま使い回すことで「全く同じ仕様・UI」を担保する。
-function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,watchTargets,onToggleWatch,onOpenChart}){
+function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,watchTargets,onToggleWatch,onOpenChart,metrics,breakoutLevels,analysisData}){
   const [q,setQ]=useState("");
   const [manualSector,setManualSector]=useState(SECTOR_CHOICES[0]);
   const [openSectors,setOpenSectors]=useState(()=>new Set());
@@ -860,6 +860,24 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
   },[watchlist,stockQuotes,sectorOrder]);
   const toggleSector=(sec)=>setOpenSectors(prev=>{const n=new Set(prev);n.has(sec)?n.delete(sec):n.add(sec);return n;});
 
+  // v3-3 Step4（UI統一）：監視銘柄タブと同じRS/Status判定をこのテーブルにも適用する。
+  // 市場全体の当日騰落率は日本株=日経平均、米国株=NASDAQ（既存metricsから、追加リクエスト無し）。
+  // セクター平均は上のsectorGroupsで既に集計済みの値をそのまま再利用する。
+  const marketPct=useMemo(()=>{
+    const m=metrics?.[market==="US"?"nasdaq":"nikkei"];if(!m)return null;
+    const t=num(m.t),p=num(m.p);return (t!=null&&p!=null&&p)?(t-p)/p*100:null;
+  },[metrics,market]);
+  const sectorAvgMap=useMemo(()=>Object.fromEntries(sectorGroups.map(g=>[g.sector,g.avgPct])),[sectorGroups]);
+
+  // Actionメニュー（監視銘柄タブと共通のCSSクラスを使う「⋮」ドロップダウン）
+  const [openMenuFor,setOpenMenuFor]=useState(null);
+  useEffect(()=>{
+    if(!openMenuFor)return;
+    const close=()=>setOpenMenuFor(null);
+    window.addEventListener("click",close);
+    return ()=>window.removeEventListener("click",close);
+  },[openMenuFor]);
+
   // 2026-08-21 ユーザー要望：検索した銘柄が既に登録済みだった場合、そのセクターを開いて実際の行まで
   // スクロールする（メッセージを出すだけで終わらせない）。アコーディオンの開閉は次の描画を経てから
   // でないとDOMに行が無くscrollIntoViewできないため、setTimeoutで1フレーム分待つ。
@@ -923,37 +941,50 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
               </span>
               <span style={{fontSize:11.5,color:"var(--inkSoft)"}}>{items.length}銘柄</span>
             </button>
-            {isOpen && <div style={{overflowX:"auto",padding:"0 0 0 28px",background:"var(--card)"}}><table style={{minWidth:860}}>
-              <thead><tr style={{background:"var(--band)"}}><th>コード</th><th>銘柄</th><th>テーマ</th><th>現在値</th><th>前日比</th><th>高値</th><th>安値</th><th></th></tr></thead>
-              <tbody>{items.map((w,ri)=>{
-                const qt=stockQuotes[w.code]||{};
-                const ct=num(qt.t),cp=num(qt.p),chi=num(qt.high),clo=num(qt.low);
-                const delta=ct!=null&&cp!=null?ct-cp:null;
-                const pct=pctOf(w.code);
-                const fg=pct==null||pct===0?"var(--ink)":(pct>0?"var(--up)":"var(--down)");
+            {isOpen && <div style={{overflowX:"auto",overflowY:"auto",maxHeight:520}}>
+              <table className="watch-table" style={{width:"100%"}}>
+              <colgroup>
+                <col style={{width:76}}/><col style={{width:40}}/><col style={{width:56}}/><col/>
+                <col style={{width:80}}/><col style={{width:80}}/>
+                <col style={{width:52}}/><col style={{width:52}}/><col style={{width:36}}/>
+              </colgroup>
+              <thead><tr>
+                <th>Status</th><th title="RS Score（0-100）">RS</th><th>コード</th><th>銘柄</th>
+                <th style={{textAlign:"right"}}>現在値</th><th style={{textAlign:"right"}}>前日比</th>
+                <th style={{textAlign:"right"}} title={`Market RS（対 ${market==="US"?"NASDAQ":"日経平均"}、pt）`}>M.RS</th>
+                <th style={{textAlign:"right"}} title="Sector RS（対 所属セクター平均、pt）">S.RS</th><th></th></tr></thead>
+              <tbody>{items.map(w=>{
+                const enr=enrichWatchRow(w,stockQuotes,marketPct,sectorAvgMap[w.sector],breakoutLevels,analysisData);
+                const ct=num(stockQuotes[w.code]?.t);
+                const fg=enr.pct==null||enr.pct===0?"var(--ink)":(enr.pct>0?"var(--up)":"var(--down)");
                 const inAnalysis=analysisTargets.includes(w.code);
                 const inEarnings=earningsTargets.includes(w.code);
                 const inWatch=watchTargets.includes(w.code);
                 const isJumpTarget=jumpHighlight===w.code;
-                return <tr key={w.id} ref={el=>{rowRefs.current[w.code]=el;}}
-                  style={{borderTop:"1px solid var(--ruleSoft)",background:isJumpTarget?"var(--accent)":(ri%2?"var(--band)":"transparent"),
+                const meta=WATCH_STATUS_META[enr.status];
+                return <tr key={w.id} ref={el=>{rowRefs.current[w.code]=el;}} className="watch-row"
+                  style={{borderTop:"1px solid var(--ruleSoft)",background:isJumpTarget?"var(--accent)":"transparent",
                     color:isJumpTarget?"var(--card)":"var(--ink)",transition:"background 0.4s, color 0.4s"}}>
-                  <td className="mono" style={{fontWeight:700,fontSize:12.5}}>{w.code}</td>
-                  <td style={{fontSize:13,fontWeight:600,maxWidth:160,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.name}>{w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
-                  <td>
-                    <button className="iconbtn" style={{fontSize:11,color:w.theme?"var(--accent)":"var(--inkFaint)",whiteSpace:"nowrap"}}
-                      onClick={()=>editTheme(w)} title="クリックしてテーマを編集">{w.theme||"＋テーマ"}</button>
-                  </td>
-                  <td className="mono" style={{fontWeight:700,fontSize:14,color:isJumpTarget?"var(--card)":fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
-                  <td className="mono" style={{fontWeight:600,fontSize:12.5,color:isJumpTarget?"var(--card)":fg,whiteSpace:"nowrap"}}>{delta!=null?(delta>0?"+":"")+delta.toLocaleString(undefined,{maximumFractionDigits:2})+(pct!=null?` (${pct>0?"+":""}${pct.toFixed(2)}%)`:""):"—"}</td>
-                  <td className="mono" style={{color:isJumpTarget?"var(--card)":"var(--inkSoft)",fontSize:12,whiteSpace:"nowrap"}}>{chi!=null?chi.toLocaleString():"—"}</td>
-                  <td className="mono" style={{color:isJumpTarget?"var(--card)":"var(--inkSoft)",fontSize:12,whiteSpace:"nowrap"}}>{clo!=null?clo.toLocaleString():"—"}</td>
-                  <td style={{textAlign:"center",whiteSpace:"nowrap"}}>
-                    <button className="action-btn" style={{marginRight:5}} onClick={()=>onOpenChart(w)}>チャート</button>
-                    <button className={"action-btn"+(inAnalysis?" on":"")} style={{marginRight:5}} onClick={()=>onToggleAnalysis(w.code)}>{inAnalysis?"✓ 分析中":"分析"}</button>
-                    {market==="JP" && <button className={"action-btn"+(inWatch?" on":"")} style={{marginRight:5}} onClick={()=>onToggleWatch(w.code)} title="「監視銘柄」タブでまとめて確認する対象にする（日本市場のみ）">{inWatch?"✓ 監視銘柄":"監視銘柄"}</button>}
-                    {market==="JP" && <button className={"action-btn"+(inEarnings?" on":"")} style={{marginRight:5}} onClick={()=>onToggleEarnings(w.code)}>{inEarnings?"✓ 決算":"決算"}</button>}
-                    <button className="iconbtn" style={{color:"var(--inkSoft)"}} onClick={()=>delStock(w.id)}>×</button>
+                  <td style={{whiteSpace:"nowrap",borderLeft:`3px solid ${meta.color}`}} title={enr.breakType?`BREAK_${enr.breakType}`:meta.label}>
+                    <span style={{fontWeight:700,fontSize:12.5,color:isJumpTarget?"var(--card)":meta.color}}>{meta.icon} {enr.breakType||meta.label}</span></td>
+                  <td className="mono" style={{fontWeight:800,fontSize:15,color:isJumpTarget?"var(--card)":(enr.rsScore==null?"var(--ink)":enr.rsScore>=75?"var(--up)":enr.rsScore<25?"var(--down)":"var(--ink)")}}>{enr.rsScore!=null?enr.rsScore:"—"}</td>
+                  <td className="mono" style={{fontWeight:700,fontSize:13}}>{w.code}</td>
+                  <td style={{fontSize:15,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.name}>
+                    {w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
+                  <td className="mono" style={{textAlign:"right",fontWeight:700,fontSize:14.5,color:isJumpTarget?"var(--card)":fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
+                  <td className="mono" style={{textAlign:"right",fontWeight:600,fontSize:14,color:isJumpTarget?"var(--card)":fg,whiteSpace:"nowrap"}}>{enr.pct!=null?(enr.pct>0?"+":"")+enr.pct.toFixed(2)+"%":"—"}</td>
+                  <td className="mono" style={{textAlign:"right",fontSize:13,fontWeight:700,whiteSpace:"nowrap"}}>{enr.marketRS!=null?(enr.marketRS>0?"+":"")+enr.marketRS.toFixed(1):"—"}</td>
+                  <td className="mono" style={{textAlign:"right",fontSize:13,whiteSpace:"nowrap"}}>{enr.sectorRS!=null?(enr.sectorRS>0?"+":"")+enr.sectorRS.toFixed(1):"—"}</td>
+                  <td style={{textAlign:"center",position:"relative"}}>
+                    <button className="watch-menu-btn" onClick={e=>{e.stopPropagation();setOpenMenuFor(v=>v===w.code?null:w.code);}}>⋮</button>
+                    {openMenuFor===w.code && <div className="watch-menu" onClick={e=>e.stopPropagation()}>
+                      <button onClick={()=>{onOpenChart(w);setOpenMenuFor(null);}}>チャート</button>
+                      <button className={inAnalysis?"on":""} onClick={()=>{onToggleAnalysis(w.code);setOpenMenuFor(null);}}>{inAnalysis?"✓ 分析中":"分析"}</button>
+                      {market==="JP" && <button className={inWatch?"on":""} onClick={()=>{onToggleWatch(w.code);setOpenMenuFor(null);}}>{inWatch?"✓ 監視銘柄":"監視銘柄に追加"}</button>}
+                      {market==="JP" && <button className={inEarnings?"on":""} onClick={()=>{onToggleEarnings(w.code);setOpenMenuFor(null);}}>{inEarnings?"✓ 決算":"決算"}</button>}
+                      <button onClick={()=>{editTheme(w);setOpenMenuFor(null);}}>{w.theme?`テーマ編集（${w.theme}）`:"＋テーマ"}</button>
+                      <button onClick={()=>{delStock(w.id);setOpenMenuFor(null);}}>登録解除</button>
+                    </div>}
                   </td>
                 </tr>;})}</tbody>
             </table></div>}
@@ -981,6 +1012,36 @@ function calcRsScore(pct,marketPct,sectorAvg){
   const raw=(marketRS||0)*3+(sectorRS||0)*3;
   const rsScore=Math.max(0,Math.min(100,Math.round(50+raw)));
   return {marketRS,sectorRS,rsScore};
+}
+
+// Trade Cockpit v3-3 Step4（UI統一）：Status/BREAK判定ロジックを共通関数化。元はWatchTargetsPanel
+// 内のuseMemoに閉じていたが、日本市場/アメリカ市場タブ（SectorWatchlist）でも同じ判定を使う
+// ために切り出した。軽量計算のみ（サーバー側analyze_stock()は呼ばない）。
+function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysisData){
+  const qt=stockQuotes[w.code]||{};
+  const ct=num(qt.t),p=num(qt.p);
+  const pct=(ct!=null&&p!=null&&p)?(ct-p)/p*100:null;
+  const {marketRS,sectorRS,rsScore}=calcRsScore(pct,marketPct,sectorAvg);
+  const levels=breakoutLevels?.[w.code];
+  const vol=num(qt.volume);
+  const volRatio=(levels?.volAvg5&&vol!=null)?vol/levels.volAvg5:null;
+  const highBreak=!!(levels&&ct!=null&&ct>levels.highLookback);
+  const volSurge=volRatio!=null&&volRatio>=1.5;
+  const ind=analysisData?.[w.code]?.indicators;
+  const vwapReclaim=!!(ind?.vwap!=null&&ct!=null&&ct>ind.vwap);
+  const resistBreak=!!(ind?.resistance!=null&&ct!=null&&ct>ind.resistance);
+  let breakType=null;
+  if(highBreak&&volSurge)breakType="VOLUME";
+  else if(highBreak)breakType="HIGH";
+  else if(resistBreak)breakType="RESIST";
+  else if(vwapReclaim)breakType="VWAP";
+  const isBreak=breakType!=null;
+  let status;
+  if(isBreak)status="BREAK";
+  else if(rsScore!=null&&rsScore>=75)status="HOT";
+  else if(rsScore!=null&&rsScore>=50)status="WATCH";
+  else status="WEAK";
+  return {...w,pct,marketRS,sectorRS,rsScore,volRatio,status,breakType};
 }
 
 // Status判定（Trade Cockpit v2 Phase1）。ルールベース・軽量計算のみ（サーバー側analyze_stock()は
@@ -1068,38 +1129,9 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
     return Object.fromEntries(groups.map(g=>[g.key,g.avgPct]));
   },[watchlistAll,stockQuotes]);
 
-  const enriched=useMemo(()=>items.map(w=>{
-    const pct=pctOf(w.code);
-    const sectorAvg=sectorAvgMap[w.sector];
-    const {marketRS,sectorRS,rsScore}=calcRsScore(pct,marketPct,sectorAvg);
-    const levels=breakoutLevels?.[w.code];
-    const qt=stockQuotes[w.code]||{};
-    const vol=num(qt.volume);
-    const volRatio=(levels?.volAvg5&&vol!=null)?vol/levels.volAvg5:null;
-    const ct=num(qt.t);
-    const highBreak=!!(levels&&ct!=null&&ct>levels.highLookback);
-    const volSurge=volRatio!=null&&volRatio>=1.5;
-    // v3 Phase2（設計案23番）：BREAKの細分化。出来高ブレイクアウト（直近3か月高値＋出来高1.5倍）は
-    // 既存ロジックのままBREAK_VOLUMEとし、高値のみ突破（出来高伴わず）はBREAK_HIGHとする。
-    // VWAP奪回・抵抗線突破は分足・resistance計算が必要で全銘柄には重すぎるため、「分析」ボタンで
-    // 既に分析済み（s.analysisData）の銘柄に限り、そのvwap/resistanceを再利用して判定する
-    // （新規の重い計算は追加しない）。
-    const ind=analysisData?.[w.code]?.indicators;
-    const vwapReclaim=!!(ind?.vwap!=null&&ct!=null&&ct>ind.vwap);
-    const resistBreak=!!(ind?.resistance!=null&&ct!=null&&ct>ind.resistance);
-    let breakType=null;
-    if(highBreak&&volSurge)breakType="VOLUME";
-    else if(highBreak)breakType="HIGH";
-    else if(resistBreak)breakType="RESIST";
-    else if(vwapReclaim)breakType="VWAP";
-    const isBreak=breakType!=null;
-    let status;
-    if(isBreak)status="BREAK";
-    else if(rsScore!=null&&rsScore>=75)status="HOT";
-    else if(rsScore!=null&&rsScore>=50)status="WATCH";
-    else status="WEAK";
-    return {...w,pct,marketRS,sectorRS,rsScore,volRatio,status,breakType};
-  }),[items,stockQuotes,marketPct,sectorAvgMap,breakoutLevels,analysisData]);
+  const enriched=useMemo(()=>items.map(w=>
+    enrichWatchRow(w,stockQuotes,marketPct,sectorAvgMap[w.sector],breakoutLevels,analysisData)
+  ),[items,stockQuotes,marketPct,sectorAvgMap,breakoutLevels,analysisData]);
 
   const [sortKey,setSortKey]=useState("priority");
   const sorted=useMemo(()=>{
@@ -3160,6 +3192,7 @@ function App(){
           stockQuotes={s.stockQuotes} analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
           earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
           watchTargets={s.watchTargets} onToggleWatch={toggleWatchTarget}
+          metrics={s.metrics} breakoutLevels={s.breakoutLevels} analysisData={s.analysisData}
           onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}/>
         <p className="foot">※ ニュースはGoogleニュースRSSを利用しています。売買を推奨するものではなく、最終判断はご自身で。</p>
       </div>}
@@ -3176,6 +3209,7 @@ function App(){
           stockQuotes={s.stockQuotes} analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
           earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
           watchTargets={s.watchTargets} onToggleWatch={toggleWatchTarget}
+          metrics={s.metrics} breakoutLevels={s.breakoutLevels} analysisData={s.analysisData}
           onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}/>
         <p className="foot" style={{marginTop:16}}>※ 対象は現行のダウ工業株30種平均構成銘柄。業種分類は日本市場と同じ東証33業種の枠組みで統一しています（GICSセクターではありません）。アメリカ市場銘柄のニュース・決算・IRは「ニュース」タブのサマリー・海外市況・適時開示に統合表示しています。</p>
       </div>}
