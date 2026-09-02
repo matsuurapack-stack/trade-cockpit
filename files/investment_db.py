@@ -212,7 +212,9 @@ CREATE TABLE IF NOT EXISTS trade_candidates (
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     virtual_entry_price  NUMERIC,
     virtual_entry_time   TIMESTAMPTZ,
-    checkpoints          JSONB
+    checkpoints          JSONB,
+    sector               TEXT,     -- v3 Phase8（設計案83番）：セクター別統計用。保存時にフロントが持っている値をそのまま渡す
+    margin_ratio         NUMERIC   -- v3 Phase8（設計案82番）：信用倍率別統計用。「分析」済み銘柄のみ取得できるため多くはNULL
 );
 CREATE INDEX IF NOT EXISTS idx_trade_candidates_user_date ON trade_candidates(user_id, created_at DESC);
 """
@@ -262,6 +264,10 @@ ALTER TABLE investment_rules ADD COLUMN IF NOT EXISTS rule_code TEXT;
 ALTER TABLE investment_rules ADD COLUMN IF NOT EXISTS value NUMERIC;
 ALTER TABLE investment_rules ADD COLUMN IF NOT EXISTS unit TEXT;
 ALTER TABLE investment_rules ADD COLUMN IF NOT EXISTS priority TEXT;
+
+-- v3 Phase8（設計案82-83番）：既存インストール向け列追加
+ALTER TABLE trade_candidates ADD COLUMN IF NOT EXISTS sector TEXT;
+ALTER TABLE trade_candidates ADD COLUMN IF NOT EXISTS margin_ratio NUMERIC;
 """
 
 
@@ -838,11 +844,12 @@ def create_trade_candidate(database_url, user_id, data):
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO trade_candidates (user_id, code, name, status, rs_score, market_rs, sector_rs, note, "
-                "virtual_entry_price, virtual_entry_time) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                "virtual_entry_price, virtual_entry_time, sector, margin_ratio) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
                 [user_id, data.get("code"), data.get("name"), data.get("status"),
                  data.get("rs_score"), data.get("market_rs"), data.get("sector_rs"), data.get("note"),
-                 data.get("virtual_entry_price"), data.get("virtual_entry_time")],
+                 data.get("virtual_entry_price"), data.get("virtual_entry_time"),
+                 data.get("sector"), data.get("margin_ratio")],
             )
             new_id = cur.fetchone()[0]
         conn.commit()
@@ -938,7 +945,7 @@ def get_stats(database_url, user_id):
         "journal": {"total": 0, "byResult": {}, "winRate": None},
         "judgments": {"total": 0, "byExecutionStatus": {}, "byMentalState": {},
                        "decisionAgreement": {"agree": 0, "disagree": 0, "rate": None}},
-        "candidates": {"total": 0, "byStatus": {}, "avgRsScore": None},
+        "candidates": {"total": 0, "byStatus": {}, "avgRsScore": None, "byRsBucket": {}, "bySector": {}},
         "note": "平均利益・平均損失・Profit Factorはjournalに金額の損益列が無いため未対応です。",
     }
     if pool is None:
@@ -989,12 +996,31 @@ def get_stats(database_url, user_id):
             avg_rs_row = cur.fetchone()
             avg_rs = float(avg_rs_row["avg_rs"]) if avg_rs_row and avg_rs_row["avg_rs"] is not None else None
 
+            # v3 Phase8（設計案81番）：RS Score帯別の件数。「全面安で強い銘柄を狙う」戦略が
+            # 実際に機能しているかを後から検証できるようにする（AI不使用、SQL集計のみ）。
+            cur.execute("SELECT rs_score FROM trade_candidates WHERE user_id = %s AND rs_score IS NOT NULL", [user_id])
+            rs_bucket_defs = [("90+", 90, 999), ("75-89", 75, 90), ("50-74", 50, 75), ("25-49", 25, 50), ("<25", -999, 25)]
+            by_rs_bucket = {label: 0 for label, _, _ in rs_bucket_defs}
+            for r in cur.fetchall():
+                v = float(r["rs_score"])
+                for label, lo, hi in rs_bucket_defs:
+                    if lo <= v < hi:
+                        by_rs_bucket[label] += 1
+                        break
+
+            # v3 Phase8（設計案83番）：セクター別件数。sector列は2026-09-02以降に保存された
+            # candidatesのみ持つため、それ以前のデータはUNKNOWNとして扱う（0として誤魔化さない）。
+            cur.execute("SELECT COALESCE(sector, 'UNKNOWN') AS sector, COUNT(*) AS n FROM trade_candidates "
+                        "WHERE user_id = %s GROUP BY sector", [user_id])
+            by_sector = {r["sector"]: r["n"] for r in cur.fetchall()}
+
     return {
         "journal": {"total": j_total, "byResult": by_result, "winRate": win_rate},
         "judgments": {"total": j_judg_total, "byExecutionStatus": by_exec, "byMentalState": by_mental,
                        "decisionAgreement": {"agree": agree, "disagree": disagree, "rate": agree_rate}},
         "candidates": {"total": cand_total, "byStatus": by_status,
-                        "avgRsScore": round(avg_rs, 1) if avg_rs is not None else None},
+                        "avgRsScore": round(avg_rs, 1) if avg_rs is not None else None,
+                        "byRsBucket": by_rs_bucket, "bySector": by_sector},
         "note": "平均利益・平均損失・Profit Factorはjournalに金額の損益列が無いため未対応です。",
     }
 

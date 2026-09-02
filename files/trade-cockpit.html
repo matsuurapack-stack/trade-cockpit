@@ -1141,7 +1141,8 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
     try{
       await fetch("/api/trade-candidates/save",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({code:w.code,name:w.name,status,
-          rs_score:w.rsScore,market_rs:w.marketRS,sector_rs:w.sectorRS})});
+          rs_score:w.rsScore,market_rs:w.marketRS,sector_rs:w.sectorRS,
+          sector:w.sector||null,margin_ratio:analysisData?.[w.code]?.tradeRules?.marginRatio??null})});
       loadCandidates();
     }catch(e){}
   };
@@ -1162,6 +1163,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
       await fetch("/api/trade-candidates/save",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({code:w.code,name:w.name,status,
           rs_score:w.rsScore,market_rs:w.marketRS,sector_rs:w.sectorRS,
+          sector:w.sector||null,margin_ratio:analysisData?.[w.code]?.tradeRules?.marginRatio??null,
           virtual_entry_price:price,virtual_entry_time:new Date().toISOString()})});
       loadCandidates();
     }catch(e){}
@@ -2008,6 +2010,18 @@ function StatsPanel(){
               <div style={{marginTop:8,display:"flex",flexWrap:"wrap",gap:4}}>
                 {rowsFromDict(stats.candidates.byStatus).map(([k,v])=><span key={k} className="chip" style={{fontSize:11}}>{TRADE_CANDIDATE_STATUS_OPTIONS.find(o=>o.value===k)?.label||k} {v}</span>)}
               </div>
+              {Object.values(stats.candidates.byRsBucket||{}).some(v=>v>0) && <div style={{marginTop:8}}>
+                <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:2}}>RS Score帯別（v3設計案81番：全面安で強い銘柄を狙う戦略の検証用）</div>
+                <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
+                  {["90+","75-89","50-74","25-49","<25"].map(k=><span key={k} className="chip" style={{fontSize:11}}>{k} {stats.candidates.byRsBucket[k]||0}</span>)}
+                </div>
+              </div>}
+              {Object.keys(stats.candidates.bySector||{}).length>0 && <div style={{marginTop:8}}>
+                <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:2}}>セクター別（2026-09-02以降に保存した候補のみ集計。それ以前はUNKNOWN）</div>
+                <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
+                  {rowsFromDict(stats.candidates.bySector).map(([k,v])=><span key={k} className="chip" style={{fontSize:11}}>{k} {v}</span>)}
+                </div>
+              </div>}
             </div>
 
             <div style={{...card,gridColumn:"1 / -1"}}>
