@@ -2801,6 +2801,10 @@ class Handler(SimpleHTTPRequestHandler):
         elif self.path.startswith("/api/trade-candidates"):
             candidates = investment_db.list_trade_candidates(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"candidates": candidates})
+        elif self.path.startswith("/api/stats"):
+            # 統計ダッシュボード（2026-09-02新規、Trade Cockpit v2 Phase8）
+            stats = investment_db.get_stats(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else None
+            self._send_json(stats or {"error": "投資判断ログDB未設定"})
         elif self.path == "/" or self.path == "":
             self.send_response(302)
             self.send_header("Location", "/trade-cockpit.html")

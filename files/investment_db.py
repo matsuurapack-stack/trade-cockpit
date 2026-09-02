@@ -855,3 +855,77 @@ def delete_trade_candidate(database_url, user_id, candidate_id):
     with pool.connection() as conn:
         conn.execute("DELETE FROM trade_candidates WHERE id = %s AND user_id = %s", [candidate_id, user_id])
         conn.commit()
+
+
+# ---- 統計ダッシュボード（2026-09-02新規、Trade Cockpit v2 Phase8） ----
+# AI APIは使わずSQLの集計のみ（設計案52-60番）。journal.resultは{"成功","失敗","引分","未定"}の
+# 固定値のため勝率は計算できるが、金額の損益（平均利益・平均損失・Profit Factor）は journal に
+# 数値P/L列が無く計算できない。無理に推測せず、「未対応（journalに金額列が無いため）」を
+# 明記して返す（83番：データ欠損はUNKNOWNとして扱う方針）。
+
+def get_stats(database_url, user_id):
+    """統計ダッシュボード用の集計をまとめて返す。DB未設定時は全項目0/空で返す。"""
+    pool = _get_pool(database_url)
+    empty = {
+        "journal": {"total": 0, "byResult": {}, "winRate": None},
+        "judgments": {"total": 0, "byExecutionStatus": {}, "byMentalState": {},
+                       "decisionAgreement": {"agree": 0, "disagree": 0, "rate": None}},
+        "candidates": {"total": 0, "byStatus": {}, "avgRsScore": None},
+        "note": "平均利益・平均損失・Profit Factorはjournalに金額の損益列が無いため未対応です。",
+    }
+    if pool is None:
+        return empty
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT result, COUNT(*) AS n FROM journal WHERE user_id = %s GROUP BY result", [user_id])
+            by_result = {r["result"] or "未定": r["n"] for r in cur.fetchall()}
+            j_total = sum(by_result.values())
+            wins, losses, draws = by_result.get("成功", 0), by_result.get("失敗", 0), by_result.get("引分", 0)
+            decided = wins + losses + draws
+            win_rate = round(wins / decided * 100, 1) if decided else None
+
+            cur.execute(
+                "SELECT sj.execution_status, COUNT(*) AS n FROM stock_judgments sj "
+                "JOIN daily_log dl ON dl.id = sj.daily_log_id WHERE dl.user_id = %s "
+                "GROUP BY sj.execution_status", [user_id],
+            )
+            by_exec = {(r["execution_status"] or "未設定"): r["n"] for r in cur.fetchall()}
+            j_judg_total = sum(by_exec.values())
+
+            cur.execute(
+                "SELECT sj.mental_state, COUNT(*) AS n FROM stock_judgments sj "
+                "JOIN daily_log dl ON dl.id = sj.daily_log_id WHERE dl.user_id = %s AND sj.mental_state IS NOT NULL "
+                "GROUP BY sj.mental_state", [user_id],
+            )
+            by_mental = {r["mental_state"]: r["n"] for r in cur.fetchall()}
+
+            cur.execute(
+                "SELECT COUNT(*) FILTER (WHERE sj.user_decision = sj.ai_decision) AS agree, "
+                "COUNT(*) FILTER (WHERE sj.user_decision IS NOT NULL AND sj.ai_decision IS NOT NULL "
+                "AND sj.user_decision != sj.ai_decision) AS disagree "
+                "FROM stock_judgments sj JOIN daily_log dl ON dl.id = sj.daily_log_id "
+                "WHERE dl.user_id = %s AND sj.user_decision IS NOT NULL AND sj.ai_decision IS NOT NULL",
+                [user_id],
+            )
+            agree_row = cur.fetchone() or {"agree": 0, "disagree": 0}
+            agree, disagree = agree_row["agree"] or 0, agree_row["disagree"] or 0
+            agree_total = agree + disagree
+            agree_rate = round(agree / agree_total * 100, 1) if agree_total else None
+
+            cur.execute("SELECT status, COUNT(*) AS n, AVG(rs_score) AS avg_rs FROM trade_candidates "
+                        "WHERE user_id = %s GROUP BY status", [user_id])
+            cand_rows = cur.fetchall()
+            by_status = {r["status"]: r["n"] for r in cand_rows}
+            cand_total = sum(by_status.values())
+            cur.execute("SELECT AVG(rs_score) AS avg_rs FROM trade_candidates WHERE user_id = %s", [user_id])
+            avg_rs_row = cur.fetchone()
+            avg_rs = float(avg_rs_row["avg_rs"]) if avg_rs_row and avg_rs_row["avg_rs"] is not None else None
+
+    return {
+        "journal": {"total": j_total, "byResult": by_result, "winRate": win_rate},
+        "judgments": {"total": j_judg_total, "byExecutionStatus": by_exec, "byMentalState": by_mental,
+                       "decisionAgreement": {"agree": agree, "disagree": disagree, "rate": agree_rate}},
+        "candidates": {"total": cand_total, "byStatus": by_status,
+                        "avgRsScore": round(avg_rs, 1) if avg_rs is not None else None},
+        "note": "平均利益・平均損失・Profit Factorはjournalに金額の損益列が無いため未対応です。",
+    }
