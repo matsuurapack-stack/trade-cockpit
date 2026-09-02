@@ -905,6 +905,46 @@ const TRADE_CANDIDATE_STATUS_OPTIONS=[
   {value:"BUY_CANDIDATE",label:"買い候補"},{value:"SKIP",label:"見送り"},
 ];
 
+// 銘柄分析カード用の総合判断表示（Trade Cockpit v2 Phase2・24番）。server.py analyze_stock()の
+// assessmentをそのまま表示するだけ（AI不使用・ルールベースの結果を可視化するのみ）。
+// 色は既存entryChecklist/avoidChecklistの慣習に合わせる（--up=赤=好材料寄り、--down=緑=警告寄り。
+// CLAUDE.md記載の「上昇=赤・下落=緑」の株価配色とは別に、このアプリでは買いシグナル=赤／
+// 見送り警告=緑の対比として使われている。混同しないよう既存チップと同じ配色に揃える）。
+const ASSESSMENT_STATUS_META={
+  HOT:{icon:"🔥",label:"HOT",color:"var(--up)"},
+  WATCH:{icon:"👀",label:"WATCH",color:"var(--accent)"},
+  WAIT:{icon:"⏳",label:"WAIT",color:"var(--inkSoft)"},
+  WEAK:{icon:"💤",label:"WEAK",color:"var(--inkFaint)"},
+};
+const AXIS_LABEL_META={
+  "RISK ON":{color:"var(--up)"},"NEUTRAL":{color:"var(--inkSoft)"},"RISK OFF":{color:"var(--down)"},
+  "STRONG":{color:"var(--up)"},"WEAK":{color:"var(--down)"},
+  "POSITIVE":{color:"var(--up)"},"RISK":{color:"var(--down)"},
+};
+function AssessmentCard({assessment:a}){
+  const meta=ASSESSMENT_STATUS_META[a.overallStatus]||ASSESSMENT_STATUS_META.WEAK;
+  const axisRows=[
+    ["Market",a.axes?.market],["Supply/Demand",a.axes?.supplyDemand],
+    ["Technical",a.axes?.technical],["Catalyst",a.axes?.catalyst],
+  ].filter(([,v])=>v!=null);
+  return <div style={{border:"1px solid var(--rule)",borderRadius:4,padding:"8px 10px",marginBottom:8,background:"var(--card)"}}>
+    <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+      <span style={{fontWeight:800,fontSize:13,color:meta.color}}>{meta.icon} {meta.label}</span>
+      {a.marketRiskScore!=null && <span className="chip" style={{fontSize:10.5}}>Market Risk {a.marketRiskScore}（{a.marketRiskLabel}）</span>}
+      {a.marketRS!=null && <span className="chip" style={{fontSize:10.5}}>Market RS {a.marketRS>0?"+":""}{a.marketRS}pt</span>}
+      <span className="chip" style={{fontSize:10.5}}>Entry Conditions {a.entryConditionsMet}/{a.entryConditionsTotal}</span>
+    </div>
+    {a.judgmentText && <div style={{fontSize:12,color:"var(--ink)",marginTop:6,lineHeight:1.6}}>{a.judgmentText}</div>}
+    {axisRows.length>0 && <div style={{display:"flex",flexWrap:"wrap",gap:4,marginTop:6}}>
+      {axisRows.map(([label,val])=><span key={label} className="chip" style={{fontSize:10.5,color:AXIS_LABEL_META[val]?.color}}>{label}: {val}</span>)}
+    </div>}
+    {a.fallingKnife && <div style={{fontSize:11.5,fontWeight:700,color:"var(--down)",background:"var(--downBg)",border:"1px solid var(--down)",borderRadius:4,padding:"4px 8px",marginTop:6}}>
+      🔪 FALLING KNIFE：{a.fallingKnifeReasons.join("・")}</div>}
+    {a.chaseRisk && <div style={{fontSize:11.5,fontWeight:700,color:"var(--down)",background:"var(--downBg)",border:"1px solid var(--down)",borderRadius:4,padding:"4px 8px",marginTop:6}}>
+      ⚠ CHASE RISK：{a.chaseRiskReasons.join("・")}</div>}
+  </div>;
+}
+
 function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels}){
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
@@ -2414,6 +2454,8 @@ function App(){
                               　/　売 {s.stockQuotes[w.code]?.ask!=null?num(s.stockQuotes[w.code].ask).toLocaleString():"—"}
                             </div>}
                           {a.marketEnv && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>{a.marketEnv}</div>}
+                          {/* ===== Trade Cockpit v2 Phase2：総合判断・8軸・Entry Conditions・Falling Knife/Chase Risk ===== */}
+                          {a.assessment && <AssessmentCard assessment={a.assessment}/>}
                           {a.tradeRules?.watchStatus && <div style={{fontSize:11.5,fontWeight:700,color:"var(--accent)",background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>⏳ {a.tradeRules.watchStatus}</div>}
                           {/* エントリーのタイミングルール（最新版）：初押し／高値ブレイクに該当する最有力タイミング(★5)を強調表示 */}
                           {a.tradeRules?.entryPattern && <div style={{fontSize:11.5,fontWeight:700,color:"var(--up)",background:"var(--upBg)",border:"1px solid var(--up)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>★★★★★ {a.tradeRules.entryPattern.label}</div>}

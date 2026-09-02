@@ -1306,15 +1306,54 @@ def _index_trend(symbol):
 _TREND_LABEL = {"up": "上昇", "down": "下落", "flat": "横ばい"}
 
 
+def _market_risk_score(n225, nasdaq, sox, us10y, usdjpy):
+    """Trade Cockpit v2 Phase2（設計案10番）：0〜100のMarket Risk Score。日経・NASDAQ/SOX・
+    US10Y・USDJPYの各トレンドに加点していく単純なルールベース（AI不使用）。0-25=LOW RISK,
+    26-50=NORMAL, 51-75=HIGH RISK, 76-100=RISK OFF。取得できなかった指数は加点対象外にする
+    （データ欠損を0点＝安全側に丸めない。83番：欠損はUNKNOWNとして扱う設計方針に合わせ、
+    scoreはあくまで取得できた指数のみで計算する旨をnoteに残す）。"""
+    score = 25
+    missing = []
+    if n225:
+        if n225["trend"] == "down":
+            score += 20
+    else:
+        missing.append("日経平均")
+    if (nasdaq and nasdaq["trend"] == "down") or (sox and sox["trend"] == "down"):
+        score += 20
+    if not nasdaq and not sox:
+        missing.append("NASDAQ/SOX")
+    if us10y:
+        if us10y["trend"] == "up":
+            score += 15
+    else:
+        missing.append("米10年債")
+    if usdjpy and usdjpy["changePct"] is not None and abs(usdjpy["changePct"]) >= 1:
+        score += 10
+    score = max(0, min(100, score))
+    if score <= 25:
+        label = "LOW RISK"
+    elif score <= 50:
+        label = "NORMAL"
+    elif score <= 75:
+        label = "HIGH RISK"
+    else:
+        label = "RISK OFF"
+    return {"score": score, "label": label, "missing": missing}
+
+
 def _market_environment():
     """動画「スマホで2億円を稼いだ天才ママ」の教え①②：個別株より先に日経平均・NASDAQ・SOX指数の
     方向を確認する。日経平均のトレンドで地合い良好/不安定/中立を判定し、NASDAQ・SOXの状況も
     一言添える。日経平均の前日比（nikkeiChangePct）は、個別銘柄との相対的な強さ（ルール⑪：
     市場全体が下がっても下がらない銘柄は強い銘柄）の判定にも使う。分析対象銘柄ごとに毎回
-    取得すると重いため、build_analysis() 内で1回だけ計算して全銘柄で使い回す。"""
+    取得すると重いため、build_analysis() 内で1回だけ計算して全銘柄で使い回す。
+    2026-09-02（Trade Cockpit v2 Phase2）：Market Risk Score（0〜100）とMarket Condition
+    （RISK ON/NEUTRAL/RISK OFF）も同じタイミングでまとめて計算する（設計案11・12番）。"""
     n225 = _index_trend("^N225")
     if not n225:
-        return {"text": "相場環境：データ不足のため判定できません", "nikkeiChangePct": None, "bad": False}
+        return {"text": "相場環境：データ不足のため判定できません", "nikkeiChangePct": None, "bad": False,
+                "marketRiskScore": None, "marketRiskLabel": None, "marketCondition": None}
 
     if n225["trend"] == "up":
         text = "地合い良好（日経平均が25日線より上で上昇トレンド）"
@@ -1323,15 +1362,23 @@ def _market_environment():
     else:
         text = "地合い中立（日経平均は25日線付近で横ばい）"
 
+    nasdaq = _index_trend("^IXIC")
+    sox = _index_trend("^SOX")
+    us10y = _index_trend("^TNX")
+    usdjpy = _index_trend("JPY=X")
+
     support_bits = []
-    for label, sym in (("NASDAQ", "^IXIC"), ("SOX", "^SOX")):
-        idx = _index_trend(sym)
+    for label, idx in (("NASDAQ", nasdaq), ("SOX", sox)):
         if idx:
             support_bits.append(f"{label} {_TREND_LABEL[idx['trend']]}")
     if support_bits:
         text += "／" + "・".join(support_bits)
 
-    return {"text": text, "nikkeiChangePct": n225["changePct"], "bad": n225["trend"] == "down"}
+    risk = _market_risk_score(n225, nasdaq, sox, us10y, usdjpy)
+    market_condition = "RISK OFF" if risk["score"] >= 76 else ("RISK ON" if risk["score"] <= 25 else "NEUTRAL")
+
+    return {"text": text, "nikkeiChangePct": n225["changePct"], "bad": n225["trend"] == "down",
+            "marketRiskScore": risk["score"], "marketRiskLabel": risk["label"], "marketCondition": market_condition}
 
 
 def _fetch_intraday(tk, interval):
@@ -2409,6 +2456,83 @@ def analyze_stock(w, market_env=None):
         dev = (fwd - trl) / abs(trl) * 100
         fund_notes.append(f"予想EPSは実績比{dev:+.1f}%")
 
+    # ---- Trade Cockpit v2 Phase2（設計案12〜14・21・24・25番）：Falling Knife判定・Chase Risk判定・
+    # Entry Condition集計・8軸評価もどきの総合判断・ルールベースの判断文。新規の重い計算は増やさず、
+    # ここまでに既に計算済みの値（catastrophic_volume_crash・chasing_gu_high・rsi_only_high・
+    # away_from_5m_ma・near_resistance_now・entry_checklist等）を組み合わせるだけにする。----
+    falling_knife_reasons = []
+    if catastrophic_volume_crash:
+        falling_knife_reasons.append("大商いを伴う急落で主要移動平均線を一気に割っている")
+    if (change_pct is not None and change_pct <= -4 and intraday_low is not None
+            and current <= intraday_low * 1.01 and not already_pulled_back):
+        falling_knife_reasons.append(f"本日{change_pct:+.1f}%の急落で、現在値がまだ当日安値付近＝下げ止まりを確認できていない")
+    falling_knife = bool(falling_knife_reasons)
+
+    chase_risk_reasons = []
+    if long_bull_top:
+        chase_risk_reasons.append("高値圏での長い陽線の天井")
+    if rsi_only_high:
+        chase_risk_reasons.append(f"RSI({rsi:.0f})だけが高く出来高等の裏付けがない")
+    if away_from_5m_ma:
+        chase_risk_reasons.append("5分足短期線から大きく乖離")
+    if near_resistance_now:
+        chase_risk_reasons.append("上値抵抗線付近＝利益確定売りが出そうな位置")
+    if chasing_gu_high:
+        chase_risk_reasons.append("GU日の寄り付き高値を追いかけている")
+    chase_risk = bool(chase_risk_reasons)
+
+    entry_met = sum(1 for c in entry_checklist if c.get("pass") is True)
+    entry_total = len(entry_checklist)
+
+    market_rs = (change_pct - nikkei_chg) if (change_pct is not None and nikkei_chg is not None) else None
+
+    # ---- 8軸評価もどき（設計案24番）。有料AI APIは使わずルールベースのラベルのみ。----
+    axis_market = market_env.get("marketCondition")
+    axis_supplyDemand = "RISK" if margin_badge in ("caution", "danger") else ("NEUTRAL" if margin_badge else None)
+    if entry_total:
+        axis_technical = "STRONG" if entry_met / entry_total >= 0.6 else ("NEUTRAL" if entry_met / entry_total >= 0.4 else "WEAK")
+    else:
+        axis_technical = None
+    axis_catalyst = None
+    if days_to_earnings is not None and 0 <= days_to_earnings <= 10:
+        axis_catalyst = "POSITIVE" if (auto_earnings_stars or 0) >= 4 else "NEUTRAL"
+
+    # ---- 総合判断・ルールベースの判断文（設計案25番）。テンプレート＋条件判定のみ、AI不使用。----
+    judgment_parts = []
+    if falling_knife:
+        overall_status = "WAIT"
+        judgment_parts.append("急落中で下げ止まりが未確認のため、現時点では様子見（Falling Knife）")
+    elif chase_risk:
+        overall_status = "WAIT"
+        judgment_parts.append("勢いは強いが現在位置からの追いかけはリスクが高い（Chase Risk）。押し目を待つ")
+    elif entry_total and entry_met == entry_total:
+        overall_status = "HOT"
+        judgment_parts.append(f"エントリー条件が{entry_total}/{entry_total}すべて成立")
+    elif entry_total and entry_met > 0:
+        overall_status = "WATCH"
+        judgment_parts.append(f"エントリー条件{entry_met}/{entry_total}成立、残りの条件待ち")
+    else:
+        overall_status = "WEAK"
+        judgment_parts.append("明確な優位性は確認できず、様子見が妥当")
+    if relative_strength_note:
+        judgment_parts.append(relative_strength_note)
+    judgment_text = "。".join(judgment_parts) + "。"
+
+    assessment = {
+        "overallStatus": overall_status,
+        "judgmentText": judgment_text,
+        "entryConditionsMet": entry_met, "entryConditionsTotal": entry_total,
+        "fallingKnife": falling_knife, "fallingKnifeReasons": falling_knife_reasons,
+        "chaseRisk": chase_risk, "chaseRiskReasons": chase_risk_reasons,
+        "marketRS": round(market_rs, 2) if market_rs is not None else None,
+        "marketRiskScore": market_env.get("marketRiskScore"),
+        "marketRiskLabel": market_env.get("marketRiskLabel"),
+        "axes": {
+            "market": axis_market, "supplyDemand": axis_supplyDemand,
+            "technical": axis_technical, "catalyst": axis_catalyst,
+        },
+    }
+
     return {
         "current": round(current, 2),
         "entry": round(entry, 2), "entryReason": "・".join(entry_reasons),
@@ -2446,6 +2570,7 @@ def analyze_stock(w, market_env=None):
         "fundamentalNote": "・".join(fund_notes) if fund_notes else "取得できるファンダメンタルデータがありません",
         "daysToEarnings": days_to_earnings,  # 決算またぎ期待値機能：10日前からのカウントダウン表示に使う
         "autoEarningsStars": auto_earnings_stars,  # 決算期待値の星（過去の上方/下方修正比率・直近決算・過熱度から自動算出）
+        "assessment": assessment,  # Trade Cockpit v2 Phase2：Falling Knife/Chase Risk・Entry Conditions集計・8軸ラベル・ルールベース判断文
         "tradeRules": {
             "entryChecklist": entry_checklist,
             "avoidChecklist": avoid_checklist,
