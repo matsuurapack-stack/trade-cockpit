@@ -1095,22 +1095,29 @@ function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysi
   else if(resistBreak)breakType="RESIST";
   else if(vwapReclaim)breakType="VWAP";
 
-  // v3-3 Step5（BREAK判定の再検討）：「一度ブレイクした」だけでなく「今もブレイクが有効か」を
-  // 見る。既に取得済みの当日高値（stockQuotes[].high）からの押し（pullback）・当日騰落率・
+  // v3-3 Step5（BREAK判定の再検討・2026-09-03改訂）：「一度ブレイクした」だけでなく「今もブレイクが
+  // 有効か」を見る。既に取得済みの当日高値（stockQuotes[].high）からの押し（pullback）・当日騰落率・
   // Market RS/Sector RSを使い、ACTIVE/WEAK/FAILEDの3段階に分ける（新規の重い計算は追加しない）。
-  // 「大幅下落中なのにBREAK_HIGH」対策として、当日-1%以上の下落、または当日高値から5%以上
-  // 押した銘柄はFAILED（ブレイク水準を割った＝一度ブレイクしたが今は無効）として明示する
-  // （WEAK/HOTへ紛れ込ませて見えなくするのではなく、「失敗したブレイク」として区別する）。
+  // なお「ブレイク水準を割っている」銘柄はbreakType自体が現在値とのライブ比較（highBreak等）で
+  // 判定されるため、そもそもここに来る時点でbreakTypeが付かず自動的に除外される。
+  // 改訂点（大幅下落中・Market RSが大きくマイナスの銘柄が強いBREAKに見えないよう厳格化）：
+  // ・FAILEDの下落閾値を-1%→-2%に引き上げ（「大幅」に見合う基準に）、-1%〜-2%の軽い下落は
+  //   新たにWEAK側に拾うようにして粒度を細かくした。
+  // ・Market RSが-6pt以下（＝地合いに対し極端に弱い＝「大きくマイナス」）は、それ単独でFAILEDへ
+  //   格上げする（従来は-3ptでWEAK止まりだったが、-3pt程度の弱さでACTIVE落選＝WEAK扱いは妥当な
+  //   一方、-6pt級の極端な弱さは「失敗したブレイク」として明示すべきと判断）。
   let breakQuality=null;
   if(breakType){
     const todayHigh=num(qt.high);
     const pullbackPct=(todayHigh!=null&&ct!=null&&todayHigh>0)?(todayHigh-ct)/todayHigh*100:null;
-    const declining=pct!=null&&pct<=-1;
+    const decliningHard=pct!=null&&pct<=-2;
+    const decliningMild=pct!=null&&pct<=-1;
     const fadedFromHigh=pullbackPct!=null&&pullbackPct>=5;
+    const veryWeakRS=(marketRS!=null&&marketRS<=-6)||(sectorRS!=null&&sectorRS<=-6);
     const weakRS=(marketRS!=null&&marketRS<=-3)||(sectorRS!=null&&sectorRS<=-3);
     const mildPullback=pullbackPct!=null&&pullbackPct>=2;
-    if(declining||fadedFromHigh)breakQuality="FAILED";
-    else if(weakRS||mildPullback)breakQuality="WEAK";
+    if(decliningHard||fadedFromHigh||veryWeakRS)breakQuality="FAILED";
+    else if(decliningMild||weakRS||mildPullback)breakQuality="WEAK";
     else breakQuality="ACTIVE";
   }
   const isBreak=breakType!=null;
@@ -1240,9 +1247,10 @@ const WATCH_STATUS_META = {
   WAIT:  {icon:"⏳",label:"WAIT", order:4,color:"var(--inkSoft)"},
   WEAK:  {icon:"💤",label:"WEAK", order:5,color:"var(--inkFaint)"},
 };
-// v3-3 Step5：BREAKの「今も有効か」による色分け。ACTIVE=まだ勢いがある（既存のBREAK色を継承）、
-// WEAK=ブレイクはしたが勢いが弱い（要注意）、FAILED=一度ブレイクしたが現在値がブレイク水準を
-// 割った（実質的に失敗）。ACTIVE_BREAK/WEAK_BREAK/FAILED_BREAKとしてバッジ表示する。
+// v3-3 Step5（2026-09-03改訂）：BREAKの「今も有効か」による色分け。ACTIVE=まだ勢いがある
+// （既存のBREAK色を継承）、WEAK=ブレイクはしたが勢いが弱い・地合いに対しやや劣後（要注意）、
+// FAILED=大幅下落中／高値からの押しが大きい／Market RSが極端に弱い＝実質的に失敗したブレイク。
+// ACTIVE_BREAK/WEAK_BREAK/FAILED_BREAKとしてバッジ表示する。
 const BREAK_QUALITY_META = {
   ACTIVE: {color:"var(--down)"},
   WEAK:   {color:"var(--accent)"},
