@@ -548,16 +548,25 @@ const changeColor=(pct)=>{
 // tvEmbed=trueのものだけ無料埋め込みで表示（CLAUDE.mdの検証済みルールに合わせ、指数は連動ETF/CFDで代用）。
 // falseのものは埋め込み表示できないシンボル（KOSPI・米10年債・銅・NYダウ先物など）のため
 // 「TradingViewで開く」のみ提供。
-// v3-5（日次モニター改修）：intradayOk=falseは「埋め込みはできるが無料枠では日足しか出ない」
-// シンボル（実測確認済み。2026-09-03：INDEX:NKYはトレードビュー純正ツールバーで1分/5分等を
-// クリックしても日足のまま変化しないことを確認した＝Nikkei225指数そのものはTradingView無料の
-// データベンダーからは分足データが提供されていないため）。省略時はtrue。
-// nikkei_futは同じ調査で「OSE:先物シンボルは無料埋め込みに対応していない」という従来の想定が
-// 誤りだったと判明（実際は埋め込み可能・分足も日本時間の取引時間帯でそのまま表示された）ため
-// tvEmbed:trueへ変更し、日経平均の分足代替として使えるようにした。
+// v3-5（日次モニター改修・2026-09-03実測確認、その後さらに検証を追加）：
+// 当初はINDEX:NKYのままintervalだけ変えれば分足化できると考えたが、widget URLのinterval値が
+// 反映されているかだけを確認しており、実際にローソク足が描画されるかまでは見ていなかった。
+// その後、TradingViewの純正埋め込み（tradingview-widget.com）に直接アクセスし、
+// interval="5"を初期値として渡した状態でスクリーンショット確認したところ、INDEX:NKYは
+// 「このシンボルではD, W, Mのみ利用できます」という無データ画面になり、ローソク足が
+// 一切描画されないことを確認した（＝Nikkei225指数そのものはTradingView無料のデータベンダー
+// からintradayデータが提供されていない。ツールバーでの分足クリックが効かないのと同じ制約）。
+// 対策として、日経平均カードのチャートには最初から日経225先物（OSE:NK225M1!）を使う。
+// こちらは同じ手順でinterval="5"指定時に実際に5分足ローソクが描画されることを確認済み
+// （日本時間の取引時間帯のデータが表示される）。有料プラン・有料データは使用していない。
+// chartLabel/chartNoteは、チャートに表示している銘柄が現物指数と異なることをUIで
+// 明示するための追加フィールド（カード自体の見出し・現在値は引き続き日経平均＝^N225の
+// 現物値のまま、チャート部分だけ先物に差し替える）。
 const METRICS = [
   {key:"usdjpy",label:"ドル円",dp:2,stq:"usdjpy",tv:"FX:USDJPY",tvEmbed:true},
-  {key:"nikkei",label:"日経平均",dp:0,stq:"^nkx",tv:"INDEX:NKY",tvEmbed:true,intradayOk:false},
+  {key:"nikkei",label:"日経平均",dp:0,stq:"^nkx",tv:"OSE:NK225M1!",tvEmbed:true,
+    chartLabel:"日経225先物（5分足）",
+    chartNote:"このチャートは日経平均（現物指数）ではなく日経225先物（OSE:NK225M1!）です。現物指数はTradingView無料枠でintradayデータが提供されていないため、分足で場中の値動きを見る代替として先物を表示しています。先物のため現物指数とは価格差があります（上のカードの現在値・前日比は現物の日経平均です）。"},
   {key:"dow",label:"NYダウ",dp:0,stq:"^dji",tv:"AMEX:DIA",tvEmbed:true},
   {key:"nasdaq",label:"ナスダック",dp:0,stq:"^ndq",tv:"NASDAQ:QQQ",tvEmbed:true},
   {key:"sox",label:"SOX半導体",dp:0,stq:"^sox",tv:"NASDAQ:SOXX",tvEmbed:true},
@@ -3753,11 +3762,12 @@ function App(){
               {isOpen && <div style={{gridColumn:"1 / -1",background:"var(--card)",padding:12}}>
                 {m.tvEmbed
                   ? <>
-                      <div style={{marginBottom:8}}><IntervalSwitcher value={monitorInterval} onChange={setMonitorInterval}/></div>
-                      {m.intradayOk===false && monitorInterval!=="D" &&
-                        <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8,lineHeight:1.5}}>
-                          ℹ️ {m.label}（{m.tv}）はTradingView無料枠にintraday（分足）データが提供されていないため、分足を選んでも日足のまま表示されます（実測確認済み）。分足で日本株の地合いを見たい場合は「日経225先物」をお使いください（先物のため現物指数とは多少乖離します）。
-                        </div>}
+                      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8,marginBottom:8}}>
+                        <IntervalSwitcher value={monitorInterval} onChange={setMonitorInterval}/>
+                        {m.chartLabel && <span style={{fontSize:11.5,fontWeight:700,color:"var(--accent)"}}>{m.chartLabel}</span>}
+                      </div>
+                      {m.chartNote &&
+                        <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8,lineHeight:1.5}}>ℹ️ {m.chartNote}</div>}
                       <div ref={el=>metricRefs.current[m.key]=el} style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",background:"var(--card)",minHeight:444}}></div>
                     </>
                   : <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10,padding:"8px 4px"}}>
