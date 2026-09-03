@@ -1086,6 +1086,42 @@ function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysi
   return {...w,pct,marketRS,sectorRS,rsScore,volRatio,status,breakType,breakQuality};
 }
 
+// v3-4（監視銘柄タブ「今日の注目TOP5」用）：enrichWatchRow()の軽量出力（rsScore/status/
+// breakQuality）だけからA+/A/B+/B/Cとアクション（NOW/PULLBACK/BREAKOUT/WAIT/AVOID）を導出する。
+// analyze_stock()が必要な厳密なgradeFromAnalysis/classifyEntryStrategy（トレード分析タブ用・
+// 個別に「分析」した銘柄のみ）とは別物。全銘柄（数十〜数百件）に重い計算を追加しないための
+// 簡易版で、"分析対象外の銘柄でもTOP5に出せる"ことを優先している。
+function lightweightGrade(enr){
+  if(enr.rsScore==null)return null;
+  const order=["A+","A","B+","B","C"];
+  let idx;
+  if(enr.rsScore>=80)idx=0;
+  else if(enr.rsScore>=70)idx=1;
+  else if(enr.rsScore>=60)idx=2;
+  else if(enr.rsScore>=50)idx=3;
+  else idx=4;
+  if(enr.status==="RISK"||enr.status==="WEAK"||enr.breakQuality==="FAILED")idx=Math.min(order.length-1,idx+1);
+  return order[idx];
+}
+function lightweightAction(enr){
+  if(enr.status==null)return null;
+  if(enr.status==="RISK")return "AVOID";
+  if(enr.status==="BREAK")return enr.breakQuality==="FAILED"?"WAIT":"BREAKOUT";
+  if(enr.status==="HOT")return "NOW";
+  if(enr.status==="WATCH")return "PULLBACK";
+  if(enr.status==="WAIT")return "WAIT";
+  return "AVOID"; // WEAK
+}
+// TOP5の短い選定理由：既に画面に出しているRS Score・Status・前日比だけで組み立てる（新規計算なし）。
+function lightweightReason(enr){
+  const meta=WATCH_STATUS_META[enr.status];
+  const pctTxt=enr.pct!=null?(enr.pct>0?"+":"")+enr.pct.toFixed(2)+"%":"—";
+  const rsTxt=enr.rsScore!=null?`RS ${enr.rsScore}`:"RS —";
+  const breakTxt=enr.breakType==="VOLUME"?"出来高急増ブレイク":enr.breakType==="HIGH"?"直近高値ブレイク":
+    enr.breakType==="RESIST"?"レジスタンス上抜け":enr.breakType==="VWAP"?"VWAP回復":null;
+  return [meta?.label,breakTxt,rsTxt,`前日比${pctTxt}`].filter(Boolean).join("・");
+}
+
 // Status判定（Trade Cockpit v2 Phase1）。ルールベース・軽量計算のみ（サーバー側analyze_stock()は
 // 呼ばない＝279銘柄規模でも重くならないよう、既に画面上にある値〈stockQuotes・sector平均・
 // breakoutLevels〉だけから算出する）。RS Scoreの重み付けは初期値。運用しながら調整する想定。
@@ -1216,7 +1252,7 @@ function AssessmentCard({assessment:a,marginBadge,marginRatio}){
   </div>;
 }
 
-function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData}){
+function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData}){
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
 
@@ -1234,6 +1270,15 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
   const enriched=useMemo(()=>items.map(w=>
     enrichWatchRow(w,stockQuotes,marketPct,sectorAvgMap[w.sector],breakoutLevels,analysisData)
   ),[items,stockQuotes,marketPct,sectorAvgMap,breakoutLevels,analysisData]);
+
+  // v3-4「今日の注目TOP5」：判定不能（rsScore/currentが未取得）な銘柄は無理に順位付けせず除外する。
+  // RISK（過熱・急落注意）とWEAK（弱い）は「デイトレ候補」としては出さない（除外）。
+  // 残りをStatus優先度（WATCH_STATUS_META.order）→RS Scoreの順で並べ、上位5件を採用する。
+  const top5=useMemo(()=>enriched
+    .filter(w=>w.rsScore!=null&&num(stockQuotes[w.code]?.t)!=null&&w.status!=="RISK"&&w.status!=="WEAK")
+    .sort((a,b)=>WATCH_STATUS_META[a.status].order-WATCH_STATUS_META[b.status].order||(b.rsScore-a.rsScore))
+    .slice(0,5)
+  ,[enriched,stockQuotes]);
 
   const [sortKey,setSortKey]=useState("priority");
   const sorted=useMemo(()=>{
@@ -1395,6 +1440,39 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
         title="「日本市場」タブの「監視銘柄」ボタン、または出来高ブレイクアウト条件（直近3か月高値を出来高1.5倍以上で上抜け）への自動該当で追加されます（日本市場のみ対象）。Status・RS Scoreは日経平均・所属セクター平均との当日騰落率の差から簡易算出（詳しい分析は「分析」ボタンから）。">？</span>
       {consultMsg && <span style={{fontSize:12,color:"var(--accent)",fontWeight:700}}>{consultMsg}</span>}
       {recordMsg && <span style={{fontSize:12,color:"var(--accent)",fontWeight:700}}>{recordMsg}</span>}
+    </div>
+
+    {/* v3-4「今日の注目TOP5」：既存のenrichWatchRow()出力のみから軽量に順位付け（新規のサーバー
+        計算・重い分析呼び出しなし）。クリックで既存のonOpenAnalysis（analysisTargetsに追加＋
+        トレード分析タブへ遷移）を再利用し、コード入力なしで直接トレード分析に飛べる。 */}
+    <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:6,padding:"12px 14px",marginTop:12}}>
+      <div style={{fontWeight:800,fontSize:13.5,marginBottom:8}}>🎯 今日の注目 TOP5</div>
+      {top5.length===0
+        ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>判定可能な銘柄がまだありません（データ取得中か、RISK/WEAKのみの状態です）。</div>
+        : <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            {top5.map((w,i)=>{
+              const grade=lightweightGrade(w);
+              const action=lightweightAction(w);
+              const actionMeta=ENTRY_STRATEGY_META[action];
+              const qt=stockQuotes[w.code]||{};
+              const cur=num(qt.t);
+              return <div key={w.code} onClick={()=>onOpenAnalysis(w.code)}
+                style={{display:"flex",alignItems:"center",gap:10,padding:"7px 8px",borderRadius:4,cursor:"pointer",
+                  background:"var(--bg)",border:"1px solid var(--rule)"}}
+                title="クリックでトレード分析へ">
+                <div style={{fontSize:13,fontWeight:800,color:"var(--inkFaint)",width:16,textAlign:"center"}}>{i+1}</div>
+                <div style={{width:56,fontSize:11.5,color:"var(--inkSoft)"}} className="mono">{w.code}</div>
+                <div style={{flex:"0 0 auto",minWidth:90,fontSize:12.5,fontWeight:700}}>{w.name}</div>
+                <div className="mono" style={{width:78,fontSize:12.5,textAlign:"right"}}>{cur!=null?cur.toLocaleString():"—"}</div>
+                <div className="mono" style={{width:60,fontSize:12,textAlign:"right",color:w.pct==null?"var(--inkFaint)":w.pct>0?"var(--up)":w.pct<0?"var(--down)":"var(--inkFaint)"}}>
+                  {w.pct!=null?(w.pct>0?"+":"")+w.pct.toFixed(2)+"%":"—"}
+                </div>
+                {grade && <span style={{fontSize:11,fontWeight:800,color:GRADE_COLOR[grade],border:`1px solid ${GRADE_COLOR[grade]}`,borderRadius:3,padding:"1px 6px"}}>{grade}</span>}
+                {actionMeta && <span style={{fontSize:10.5,fontWeight:700,color:actionMeta.color,border:`1px solid ${actionMeta.color}`,borderRadius:3,padding:"1px 6px",whiteSpace:"nowrap"}}>{actionMeta.label}</span>}
+                <div style={{flex:1,fontSize:11,color:"var(--inkSoft)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{lightweightReason(w)}</div>
+              </div>;
+            })}
+          </div>}
     </div>
 
     {/* サマリー（v3設計案19番）：46銘柄を読ませる前にまず件数だけで状況を把握できるようにする */}
@@ -2314,6 +2392,73 @@ const groupStocks=(items,stockQuotes,keyFn)=>{
   }).sort((a,b)=>(b.totalTurnover-a.totalTurnover));
 };
 
+// v3-4（市場タブ再設計）：「今日の日本株環境」バナー。米国市場・金利・為替・原油は独立した
+// 投資対象としてではなく、あくまで「日本株を判断するための外部環境」として最上部にまとめて
+// 表示する（数値自体は既存metrics＝30秒おきに自動更新済みのものをそのまま使い、追加リクエストは
+// 発生しない）。地合い（強気/中立/弱気）は日経225先物・NASDAQ・SOXの当日騰落率の平均から簡易
+// 判定する（サーバー側の重いMarket Risk Score/_market_environment()とは別物・軽量計算のみ）。
+const ENV_ROWS=[["日経先物","nikkei_fut",0],["ドル円","usdjpy",2],["米10年金利","us10y",2],["WTI原油","wti",2],["NASDAQ","nasdaq",0],["SOX","sox",0]];
+function arrowOf(pct){if(pct==null)return "→";return pct>=0.05?"↑":pct<=-0.05?"↓":"→";}
+function MarketEnvironmentBanner({metrics,watchlistAll,stockQuotes}){
+  const pctOfMetric=(key)=>{const m=metrics?.[key];if(!m)return null;const t=num(m.t),p=num(m.p);
+    return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
+  const sentiment=useMemo(()=>{
+    const vals=[pctOfMetric("nikkei_fut")??pctOfMetric("nikkei"),pctOfMetric("nasdaq"),pctOfMetric("sox")].filter(v=>v!=null);
+    if(!vals.length)return null;
+    const avg=vals.reduce((a,b)=>a+b,0)/vals.length;
+    if(avg>=0.3)return "強気";
+    if(avg<=-0.3)return "弱気";
+    return "中立";
+  },[metrics]);
+  const sentimentColor=sentiment==="強気"?"var(--up)":sentiment==="弱気"?"var(--down)":"var(--inkSoft)";
+
+  // セクター強弱：既存groupStocks()（登録銘柄の当日騰落率平均・売買代金順）を強い/中立/弱いの
+  // 3段階に区分するだけ（新規計算なし）。±1%を目安の閾値とする。
+  const sectorGroups=useMemo(()=>groupStocks(watchlistAll||[],stockQuotes,w=>w.sector).filter(g=>g.avgPct!=null),[watchlistAll,stockQuotes]);
+  const strongSectors=useMemo(()=>[...sectorGroups].filter(g=>g.avgPct>=1).sort((a,b)=>b.avgPct-a.avgPct).slice(0,5),[sectorGroups]);
+  const weakSectors=useMemo(()=>[...sectorGroups].filter(g=>g.avgPct<=-1).sort((a,b)=>a.avgPct-b.avgPct).slice(0,5),[sectorGroups]);
+  const neutralSectors=useMemo(()=>[...sectorGroups].filter(g=>g.avgPct>-1&&g.avgPct<1).sort((a,b)=>b.totalTurnover-a.totalTurnover).slice(0,5),[sectorGroups]);
+
+  return <div className="card" style={{padding:"12px 16px",marginBottom:14}}>
+    <div style={{fontWeight:800,fontSize:14,marginBottom:8}}>今日の日本株環境</div>
+    <div style={{display:"flex",alignItems:"baseline",gap:8,marginBottom:10}}>
+      <span style={{fontSize:12,color:"var(--inkSoft)"}}>今日の地合い：</span>
+      <span style={{fontWeight:800,fontSize:18,color:sentimentColor}}>{sentiment||"—"}</span>
+      <span style={{fontSize:11,color:"var(--inkFaint)"}}>（日経先物・NASDAQ・SOXの当日騰落率の平均から簡易判定／米国市場は日本株判断のための外部環境として扱います）</span>
+    </div>
+    <div style={{display:"flex",flexWrap:"wrap",gap:16,marginBottom:12}}>
+      {ENV_ROWS.map(([label,key,dp])=>{
+        const m=metrics?.[key]||{};const t=num(m.t);const pct=pctOfMetric(key);
+        return <div key={key} style={{fontSize:12.5}}>
+          <span style={{color:"var(--inkSoft)"}}>{label}：</span>
+          <span className="mono" style={{fontWeight:700,color:pct==null?"var(--inkSoft)":pct>0?"var(--up)":pct<0?"var(--down)":"var(--inkSoft)"}}>{arrowOf(pct)}</span>{" "}
+          <span className="mono">{t!=null?t.toFixed(dp):"—"}</span>{" "}
+          {pct!=null && <span className="mono" style={{fontSize:11,color:pct>0?"var(--up)":pct<0?"var(--down)":"var(--inkSoft)"}}>({pct>0?"+":""}{pct.toFixed(2)}%)</span>}
+        </div>;})}
+    </div>
+    <div style={{display:"flex",flexWrap:"wrap",gap:20}}>
+      <div style={{fontSize:12}}>
+        <span style={{color:"var(--inkSoft)"}}>強い：</span>
+        {strongSectors.length
+          ? strongSectors.map(g=><span key={g.key} className="chip" style={{fontSize:10.5,marginRight:4}}>{g.key} {g.avgPct>0?"+":""}{g.avgPct.toFixed(1)}%</span>)
+          : <span style={{color:"var(--inkFaint)"}}>該当なし</span>}
+      </div>
+      <div style={{fontSize:12}}>
+        <span style={{color:"var(--inkSoft)"}}>中立：</span>
+        {neutralSectors.length
+          ? neutralSectors.map(g=><span key={g.key} className="chip" style={{fontSize:10.5,marginRight:4}}>{g.key} {g.avgPct>0?"+":""}{g.avgPct.toFixed(1)}%</span>)
+          : <span style={{color:"var(--inkFaint)"}}>該当なし</span>}
+      </div>
+      <div style={{fontSize:12}}>
+        <span style={{color:"var(--inkSoft)"}}>弱い：</span>
+        {weakSectors.length
+          ? weakSectors.map(g=><span key={g.key} className="chip" style={{fontSize:10.5,marginRight:4}}>{g.key} {g.avgPct>0?"+":""}{g.avgPct.toFixed(1)}%</span>)
+          : <span style={{color:"var(--inkFaint)"}}>該当なし</span>}
+      </div>
+    </div>
+  </div>;
+}
+
 // TODAY'S MARKET（Trade Cockpit v2 Phase3・設計案27・68・69番）。日次モニターの最上部に置き、
 // 「今日の地合い→強い/弱いセクター→RS上位銘柄数」を1画面で把握できるようにする。Market Risk Score
 // はサーバー側_market_environment()（25日線トレンド判定）が必要なため/api/market-riskを叩くが、
@@ -2952,6 +3097,14 @@ function App(){
     setTab("analysis");
   };
 
+  // v3-4（今日の注目TOP5バナー用）：toggleAnalysisTargetは既に分析対象の銘柄を押すと
+  // 「外して」しまう（トグル）ため、TOP5バナーのクリックには使えない。追加専用＋遷移のみ行う
+  // ラッパーを別途用意する（analysisTargetsへの追加ロジック自体はtoggleAnalysisTargetと同じ）。
+  const openAnalysisFor=(code)=>{
+    setS(p=>({...p,analysisTargets:p.analysisTargets.includes(code)?p.analysisTargets:[...p.analysisTargets,code]}));
+    setTab("analysis");
+  };
+
   // 登録銘柄テーブルの「決算」ボタン。押すたびに決算分析タブの対象銘柄リストに追加/削除をトグルし、
   // 追加・削除いずれの場合も結果をすぐ確認できるよう「決算分析」タブに遷移する（分析ボタンと同様の設計）。
   const toggleEarningsTarget=(code)=>{
@@ -3227,6 +3380,7 @@ function App(){
 
       {/* ===== 日次モニター（独立タブ） ===== */}
       {tab==="monitor" && <div style={{marginTop:18}}>
+        <MarketEnvironmentBanner metrics={s.metrics} watchlistAll={watchlistAll} stockQuotes={s.stockQuotes}/>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
           <div className="sec-head">日次モニター</div>
           <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
@@ -3276,7 +3430,7 @@ function App(){
 
       {/* ===== 監視銘柄（2026-08-21 ユーザー要望） ===== */}
       {tab==="watch" && <WatchTargetsPanel items={watchTargetItems} stockQuotes={s.stockQuotes}
-        analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
+        analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget} onOpenAnalysis={openAnalysisFor}
         earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
         onRemove={removeWatchTarget} metrics={s.metrics} watchlistAll={watchlistAll} breakoutLevels={s.breakoutLevels}
         analysisData={s.analysisData}
