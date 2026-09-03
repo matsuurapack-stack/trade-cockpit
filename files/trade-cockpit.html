@@ -1057,10 +1057,31 @@ function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysi
     else breakQuality="ACTIVE";
   }
   const isBreak=breakType!=null;
+
+  // v3-3 Step6（WAIT/RISKの軽量判定）：全銘柄にanalyze_stock()相当の重い計算は追加せず、
+  // 既に取得済みのstockQuotes（当日高値・安値・出来高）とRS Scoreだけで判定する。「分析」済み
+  // 銘柄（analysisData）があればVWAP・信用倍率等でさらに精度を上げるが、無くても動く設計。
+  const todayHigh=num(qt.high),todayLow=num(qt.low);
+  const rangePullbackPct=(todayHigh!=null&&ct!=null&&todayHigh>0)?(todayHigh-ct)/todayHigh*100:null;
+  // RISK：短時間急騰からの高値急落（当日+5%以上あったのに現在は高値から3%以上押している）、
+  // または当日の値動きが±8%を超える極端な変動（out-sizeなボラティリティ＝飛び付き注意）。
+  // 「分析」済みなら信用倍率danger・RSI過熱（>=80）も加味する（無くても上記2条件だけで判定可）。
+  const spikeReversal=pct!=null&&pct>=5&&rangePullbackPct!=null&&rangePullbackPct>=3;
+  const extremeMove=pct!=null&&Math.abs(pct)>=8;
+  const marginDanger=analysisData?.[w.code]?.tradeRules?.marginBadge==="danger";
+  const rsiHot=ind?.rsi!=null&&ind.rsi>=80;
+  const isRisk=spikeReversal||extremeMove||marginDanger||rsiHot;
+  // WAIT：RSはWATCH相当（50-74）だが、当日プラスなのに値幅の下半分で推移＝強さが確認できていない。
+  // 「分析」済みならVWAP未回復も加味する。
+  const indecisive=pct!=null&&pct>0&&todayHigh!=null&&todayLow!=null&&todayHigh>todayLow&&((ct-todayLow)/(todayHigh-todayLow))<0.5;
+  const vwapNotReclaimed=!!(ind?.vwap!=null&&ct!=null&&ct<ind.vwap);
+  const isWaitCandidate=indecisive||vwapNotReclaimed;
+
   let status;
   if(isBreak)status="BREAK";
+  else if(isRisk)status="RISK";
   else if(rsScore!=null&&rsScore>=75)status="HOT";
-  else if(rsScore!=null&&rsScore>=50)status="WATCH";
+  else if(rsScore!=null&&rsScore>=50)status=isWaitCandidate?"WAIT":"WATCH";
   else status="WEAK";
   return {...w,pct,marketRS,sectorRS,rsScore,volRatio,status,breakType,breakQuality};
 }
@@ -1070,9 +1091,11 @@ function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysi
 // breakoutLevels〉だけから算出する）。RS Scoreの重み付けは初期値。運用しながら調整する想定。
 const WATCH_STATUS_META = {
   BREAK: {icon:"⚡",label:"BREAK",order:0,color:"var(--down)"},
-  HOT:   {icon:"🔥",label:"HOT",  order:1,color:"var(--down)"},
-  WATCH: {icon:"👀",label:"WATCH",order:2,color:"var(--accent)"},
-  WEAK:  {icon:"💤",label:"WEAK", order:3,color:"var(--inkFaint)"},
+  RISK:  {icon:"⚠",label:"RISK", order:1,color:"var(--up)"},
+  HOT:   {icon:"🔥",label:"HOT",  order:2,color:"var(--down)"},
+  WATCH: {icon:"👀",label:"WATCH",order:3,color:"var(--accent)"},
+  WAIT:  {icon:"⏳",label:"WAIT", order:4,color:"var(--inkSoft)"},
+  WEAK:  {icon:"💤",label:"WEAK", order:5,color:"var(--inkFaint)"},
 };
 // v3-3 Step5：BREAKの「今も有効か」による色分け。ACTIVE=まだ勢いがある（既存のBREAK色を継承）、
 // WEAK=ブレイクはしたが勢いが弱い（要注意）、FAILED=一度ブレイクしたが現在値がブレイク水準を
@@ -1183,7 +1206,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
   // Trade Cockpit v3 Phase1（設計案19-21番）：46銘柄・279銘柄を最初から全部読ませない。
   // サマリー件数→フィルタ→上位10件デフォルト表示、の順で絞り込む。
   const summary=useMemo(()=>{
-    const c={HOT:0,BREAK:0,WATCH:0,WEAK:0,rs70:0};
+    const c={HOT:0,BREAK:0,WATCH:0,WAIT:0,RISK:0,WEAK:0,rs70:0};
     enriched.forEach(w=>{c[w.status]=(c[w.status]||0)+1;if(w.rsScore!=null&&w.rsScore>=70)c.rs70++;});
     return c;
   },[enriched]);
@@ -1304,7 +1327,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
     setTimeout(()=>setConsultMsg(""),2500);
   };
 
-  const FILTER_STATUS_CHIPS=["HOT","BREAK","WATCH","WEAK"];
+  const FILTER_STATUS_CHIPS=["HOT","BREAK","WATCH","WAIT","RISK","WEAK"];
 
   // 2026-09-03改善：Actionボタン群（9個）を「⋮」メニューに集約し、横幅・行高を大幅に節約する。
   const [openMenuFor,setOpenMenuFor]=useState(null);
@@ -1330,6 +1353,8 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
       <span className="chip" style={{fontSize:11}}>🔥 HOT {summary.HOT||0}</span>
       <span className="chip" style={{fontSize:11}}>⚡ BREAK {summary.BREAK||0}</span>
       <span className="chip" style={{fontSize:11}}>👀 WATCH {summary.WATCH||0}</span>
+      <span className="chip" style={{fontSize:11}}>⏳ WAIT {summary.WAIT||0}</span>
+      <span className="chip" style={{fontSize:11}}>⚠ RISK {summary.RISK||0}</span>
       <span className="chip" style={{fontSize:11}}>💤 WEAK {summary.WEAK||0}</span>
       <span className="chip" style={{fontSize:11}}>RS70以上 {summary.rs70||0}</span>
     </div>
