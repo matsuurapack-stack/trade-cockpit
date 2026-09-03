@@ -965,12 +965,12 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
             {isOpen && <div style={{overflowX:"auto",overflowY:"auto",maxHeight:520}}>
               <table className="watch-table" style={{width:"100%"}}>
               <colgroup>
-                <col style={{width:76}}/><col style={{width:40}}/><col style={{width:56}}/><col/>
+                <col style={{width:132}}/><col style={{width:44}}/><col style={{width:56}}/><col/>
                 <col style={{width:80}}/><col style={{width:80}}/>
                 <col style={{width:52}}/><col style={{width:52}}/><col style={{width:36}}/>
               </colgroup>
               <thead><tr>
-                <th>Status</th><th title="RS Score（0-100）">RS</th><th>コード</th><th>銘柄</th>
+                <th>Status</th><th style={{textAlign:"right"}} title="RS Score（0-100）">RS</th><th>コード</th><th>銘柄</th>
                 <th style={{textAlign:"right"}}>現在値</th><th style={{textAlign:"right"}}>前日比</th>
                 <th style={{textAlign:"right"}} title={`Market RS（対 ${market==="US"?"NASDAQ":"日経平均"}、pt）`}>M.RS</th>
                 <th style={{textAlign:"right"}} title="Sector RS（対 所属セクター平均、pt）">S.RS</th><th></th></tr></thead>
@@ -984,13 +984,15 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                 const isJumpTarget=jumpHighlight===w.code;
                 const meta=WATCH_STATUS_META[enr.status];
                 const badgeColor=enr.breakQuality?BREAK_QUALITY_META[enr.breakQuality].color:meta.color;
-                const badgeLabel=enr.breakQuality?`${enr.breakQuality}_BREAK`:meta.label;
+                // Status列にはステータス文言のみ（RS値は出さない・アンダースコアではなく空白区切りにして
+                // 「ACTIVE BREAK」のように1行で読めるようにする）。RS値は隣のRS列だけに表示する。
+                const badgeLabel=enr.breakQuality?`${enr.breakQuality} BREAK`:meta.label;
                 return <tr key={w.id} ref={el=>{rowRefs.current[w.code]=el;}} className="watch-row"
                   style={{borderTop:"1px solid var(--ruleSoft)",background:isJumpTarget?"var(--accent)":"transparent",
                     color:isJumpTarget?"var(--card)":"var(--ink)",transition:"background 0.4s, color 0.4s"}}>
-                  <td style={{whiteSpace:"nowrap",borderLeft:`3px solid ${badgeColor}`}} title={enr.breakType?`ブレイク条件: BREAK_${enr.breakType}`:meta.label}>
-                    <span style={{fontWeight:700,fontSize:12.5,color:isJumpTarget?"var(--card)":badgeColor}}>{meta.icon} {badgeLabel}</span></td>
-                  <td className="mono" style={{fontWeight:800,fontSize:15,color:isJumpTarget?"var(--card)":(enr.rsScore==null?"var(--ink)":enr.rsScore>=75?"var(--up)":enr.rsScore<25?"var(--down)":"var(--ink)")}}>{enr.rsScore!=null?enr.rsScore:"—"}</td>
+                  <td style={{whiteSpace:"nowrap",overflow:"hidden",borderLeft:`3px solid ${badgeColor}`,paddingRight:10}} title={enr.breakType?`ブレイク条件: BREAK_${enr.breakType}`:meta.label}>
+                    <span style={{fontWeight:700,fontSize:11.5,color:isJumpTarget?"var(--card)":badgeColor,whiteSpace:"nowrap"}}>{meta.icon} {badgeLabel}</span></td>
+                  <td className="mono" style={{fontWeight:800,fontSize:15,textAlign:"right",paddingLeft:10,color:isJumpTarget?"var(--card)":(enr.rsScore==null?"var(--ink)":enr.rsScore>=75?"var(--up)":enr.rsScore<25?"var(--down)":"var(--ink)")}}>{enr.rsScore!=null?enr.rsScore:"—"}</td>
                   <td className="mono" style={{fontWeight:700,fontSize:13}}>{w.code}</td>
                   <td style={{fontSize:15,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.name}>
                     {w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
@@ -1563,12 +1565,12 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         <div style={{overflowX:"auto",maxHeight:620,overflowY:"auto"}}>
         <table className="watch-table" style={{width:"100%"}}>
           <colgroup>
-            <col style={{width:76}}/><col style={{width:40}}/><col style={{width:56}}/><col/>
+            <col style={{width:132}}/><col style={{width:44}}/><col style={{width:56}}/><col/>
             <col style={{width:92}}/><col style={{width:80}}/><col style={{width:80}}/>
             <col style={{width:52}}/><col style={{width:52}}/><col style={{width:36}}/>
           </colgroup>
           <thead><tr>
-            <th>Status</th><th title="RS Score（0-100）">RS</th><th>コード</th><th>銘柄</th><th>セクター</th>
+            <th>Status</th><th style={{textAlign:"right"}} title="RS Score（0-100）">RS</th><th>コード</th><th>銘柄</th><th>セクター</th>
             <th style={{textAlign:"right"}}>現在値</th><th style={{textAlign:"right"}}>前日比</th>
             <th style={{textAlign:"right"}} title="Market RS（対 日経平均、pt）">M.RS</th>
             <th style={{textAlign:"right"}} title="Sector RS（対 所属セクター平均、pt）">S.RS</th><th></th></tr></thead>
@@ -1584,11 +1586,13 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
             const meta=WATCH_STATUS_META[w.status];
             const rsFg=w.rsScore==null?"var(--ink)":w.rsScore>=75?"var(--up)":w.rsScore<25?"var(--down)":"var(--ink)";
             const badgeColor=w.breakQuality?BREAK_QUALITY_META[w.breakQuality].color:meta.color;
-            const badgeLabel=w.breakQuality?`${w.breakQuality}_BREAK`:meta.label;
+            // Status列にはステータス文言のみ（RS値は出さない・アンダースコアではなく空白区切り）。
+            // RS値は隣のRS列だけに表示する。
+            const badgeLabel=w.breakQuality?`${w.breakQuality} BREAK`:meta.label;
             return <tr key={w.code} className="watch-row" style={{borderTop:"1px solid var(--ruleSoft)"}}>
-              <td style={{whiteSpace:"nowrap",borderLeft:`3px solid ${badgeColor}`}} title={w.breakType?`ブレイク条件: BREAK_${w.breakType}`:meta.label}>
-                <span style={{fontWeight:700,fontSize:12.5,color:badgeColor}}>{meta.icon} {badgeLabel}</span></td>
-              <td className="mono" style={{fontWeight:800,fontSize:15,color:rsFg}}>{w.rsScore!=null?w.rsScore:"—"}</td>
+              <td style={{whiteSpace:"nowrap",overflow:"hidden",borderLeft:`3px solid ${badgeColor}`,paddingRight:10}} title={w.breakType?`ブレイク条件: BREAK_${w.breakType}`:meta.label}>
+                <span style={{fontWeight:700,fontSize:11.5,color:badgeColor,whiteSpace:"nowrap"}}>{meta.icon} {badgeLabel}</span></td>
+              <td className="mono" style={{fontWeight:800,fontSize:15,textAlign:"right",paddingLeft:10,color:rsFg}}>{w.rsScore!=null?w.rsScore:"—"}</td>
               <td className="mono" style={{fontWeight:700,fontSize:13}}>{w.code}</td>
               <td style={{fontSize:15,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.name}>{w.name}</td>
               <td style={{fontSize:13,color:"var(--inkSoft)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.sector||""}>{w.sector||"—"}</td>
