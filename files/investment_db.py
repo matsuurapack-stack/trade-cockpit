@@ -311,6 +311,14 @@ ALTER TABLE investment_rules ADD COLUMN IF NOT EXISTS priority TEXT;
 -- v3 Phase8（設計案82-83番）：既存インストール向け列追加
 ALTER TABLE trade_candidates ADD COLUMN IF NOT EXISTS sector TEXT;
 ALTER TABLE trade_candidates ADD COLUMN IF NOT EXISTS margin_ratio NUMERIC;
+
+-- Trade Cockpit v3-4（ポジションタブ拡張）：SL/TPをportfolioに保存できるようにする列追加。
+-- トレーリング状態（OFF/初期SL/建値/利益保護/トレーリング）は現在値・平均取得単価・
+-- initial_stop・current_stopから毎回導出できるため、専用列は追加しない（不要なスキーマ変更を避ける）。
+ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS initial_stop NUMERIC;
+ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS current_stop NUMERIC;
+ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS target_1 NUMERIC;
+ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS target_2 NUMERIC;
 """
 
 
@@ -1255,7 +1263,8 @@ def list_portfolio(database_url, user_id):
             return out
 
 
-_PORTFOLIO_COLS = ["name", "quantity", "average_price", "acquired_at", "memo"]  # marketはINSERT文で別途固定列として扱うためここには含めない
+_PORTFOLIO_COLS = ["name", "quantity", "average_price", "acquired_at", "memo",
+                   "initial_stop", "current_stop", "target_1", "target_2"]  # marketはINSERT文で別途固定列として扱うためここには含めない
 
 
 def upsert_portfolio_item(database_url, user_id, item):

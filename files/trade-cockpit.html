@@ -1645,13 +1645,61 @@ const JUDGMENT_FIELDS=[
 ];
 const JUDGMENT_CATEGORIES=["監視","保有","買い候補","見送り"];
 
+// v3-4（ポジションタブ拡張）：含み損益・RRはportfolioの保存値（quantity/average_price/
+// initial_stop/current_stop/target_1/target_2）とstockQuotesの現在値だけから毎回計算する。
+// トレーリング状態も保存せず都度導出する（DBに保存するのはinitial_stop/current_stop/
+// target_1/target_2の4値のみ。既存portfolioテーブルにこの4列だけ追加済み）。
+function calcUnrealizedPnl(avgPrice,quantity,current){
+  if(avgPrice==null||quantity==null||current==null)return {amount:null,pct:null};
+  const amount=(current-avgPrice)*quantity;
+  const pct=avgPrice>0?(current-avgPrice)/avgPrice*100:null;
+  return {amount,pct};
+}
+// RR = (TP1 - 取得値または現在値) / (取得値または現在値 - 現在SL)。ロング前提。
+// 0除算・現在SL >= 基準値などの異常ケースはnull（表示側で「--」）。
+function calcPositionRR(tp1,basisPrice,currentStop){
+  if(tp1==null||basisPrice==null||currentStop==null)return null;
+  const risk=basisPrice-currentStop;
+  if(risk<=0)return null;
+  const reward=tp1-basisPrice;
+  if(reward<=0)return null;
+  return reward/risk;
+}
+const TRAILING_STATUS_META={
+  OFF:{label:"OFF",color:"var(--inkFaint)"},
+  INITIAL:{label:"初期SL",color:"var(--inkSoft)"},
+  BREAKEVEN:{label:"建値",color:"var(--accent)"},
+  PROTECT:{label:"利益保護",color:"var(--up)"},
+  TRAILING:{label:"トレーリング",color:"var(--up)"},
+};
+// current_stopが未設定ならOFF。initial_stopのままなら「初期SL」。average_priceと一致すれば
+// 「建値」。average_priceより上に上げてあれば「利益保護」、さらに現在値との乖離が小さい
+// （値幅を詰めて追随中とみなせる目安として3%以内）場合は「トレーリング」とする。完全自動売買は
+// 行わず、あくまで表示用の簡易分類（新規の重い計算・保存列は追加しない）。
+function deriveTrailingStatus(currentStop,initialStop,avgPrice,current){
+  if(currentStop==null)return "OFF";
+  const eq=(a,b)=>a!=null&&b!=null&&Math.abs(a-b)<0.01;
+  if(eq(currentStop,initialStop))return "INITIAL";
+  if(eq(currentStop,avgPrice))return "BREAKEVEN";
+  if(avgPrice!=null&&currentStop>avgPrice){
+    if(current!=null&&current>0&&(current-currentStop)/current<=0.03)return "TRAILING";
+    return "PROTECT";
+  }
+  return "INITIAL";
+}
+
 // portfolio（保有株、2026-09-03新規、Trade Cockpit v3-2）：localStorageに存在しなかった新規
 // 機能のため、最初からNeonのみで完結する（移行フローは不要）。ChatGPT朝一/大引けコピーに
 // 保有銘柄として含める（TodaysMarketCard・ChatGptImportPanel側でこのAPIを叩く）。
-function PortfolioPanel(){
+// v3-4：SL/TP（initial_stop/current_stop/target_1/target_2）を追加。current_stopは行内で
+// 直接編集・保存できる。stockQuotes（現在値）・analysisData（トレード分析タブのentry/stop/
+// target/fullExitTargetのスナップショット）を新たにpropsで受け取り、既存の取得済みデータを
+// 再利用する（新規リクエストは追加しない）。
+function PortfolioPanel({stockQuotes,analysisData}){
   const [items,setItems]=useState([]);
   const [loading,setLoading]=useState(true);
-  const emptyDraft={code:"",name:"",market:"JP",quantity:"",average_price:"",acquired_at:"",memo:""};
+  const emptyDraft={code:"",name:"",market:"JP",quantity:"",average_price:"",acquired_at:"",memo:"",
+    initial_stop:"",target_1:"",target_2:""};
   const [draft,setDraft]=useState(emptyDraft);
   const [saving,setSaving]=useState(false);
 
@@ -1665,13 +1713,28 @@ function PortfolioPanel(){
   };
   useEffect(()=>{load();},[]);
 
+  // v3-4：入力中のコードがトレード分析タブで既に「分析」済みなら、その時点のstop/target/
+  // fullExitTargetを初期SL・利確①②の下書きに流し込むショートカット（既存analysisDataの
+  // 再利用のみ、新規計算なし）。あくまで下書きへの反映で、押さない限り書き換わらない。
+  const analysisForDraft=analysisData?.[draft.code.trim()];
+  const applyAnalysisValues=()=>{
+    if(!analysisForDraft)return;
+    setDraft(d=>({...d,
+      initial_stop:analysisForDraft.stop??d.initial_stop,
+      target_1:analysisForDraft.target??d.target_1,
+      target_2:analysisForDraft.fullExitTarget??d.target_2}));
+  };
+
   const save=async()=>{
     if(!draft.code.trim())return;
     setSaving(true);
     try{
       await fetch("/api/portfolio/save",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({...draft,quantity:num(draft.quantity),average_price:num(draft.average_price),
-          acquired_at:draft.acquired_at||null})}); // 空文字はTIMESTAMPTZ列に直接入らないためnullに変換
+          acquired_at:draft.acquired_at||null,
+          initial_stop:num(draft.initial_stop),target_1:num(draft.target_1),target_2:num(draft.target_2),
+          // current_stopは新規登録時は初期SLと同じ値で開始する（トレーリング状態＝「初期SL」から始まる）
+          current_stop:num(draft.initial_stop)})}); // 空文字はTIMESTAMPTZ列に直接入らないためnullに変換
       setDraft(emptyDraft);
       load();
     }catch(e){}
@@ -1685,6 +1748,20 @@ function PortfolioPanel(){
     }catch(e){}
   };
 
+  // v3-4：現在SLだけをその場で編集・保存する（他の列は送らないので上書きされない＝
+  // upsert_portfolio_itemは送られた列だけをUPDATEする部分更新の仕組みを利用）。
+  const [stopDraftFor,setStopDraftFor]=useState(null); // 編集中のcode+market
+  const [stopDraftVal,setStopDraftVal]=useState("");
+  const saveCurrentStop=async(it)=>{
+    const v=num(stopDraftVal);
+    try{
+      await fetch("/api/portfolio/save",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({code:it.code,market:it.market,current_stop:v})});
+      setStopDraftFor(null);
+      load();
+    }catch(e){}
+  };
+
   const fieldStyle={fontSize:12.5,padding:"5px 7px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",boxSizing:"border-box"};
 
   return <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14}}>
@@ -1692,31 +1769,83 @@ function PortfolioPanel(){
       <div style={{fontWeight:700,color:"var(--ink)",fontSize:13}}>保有株（portfolio）</div>
       <span style={{fontSize:11,color:"var(--inkFaint)"}}>{items.length}銘柄</span>
     </div>
-    <div style={{display:"grid",gridTemplateColumns:"70px 1fr 55px 70px 90px 110px 1fr auto",gap:6,marginBottom:10}}>
+    <div style={{display:"grid",gridTemplateColumns:"70px 1fr 55px 70px 90px 110px",gap:6,marginBottom:6}}>
       <input placeholder="コード" value={draft.code} onChange={e=>setDraft({...draft,code:e.target.value})} style={fieldStyle}/>
       <input placeholder="銘柄名" value={draft.name} onChange={e=>setDraft({...draft,name:e.target.value})} style={fieldStyle}/>
       <select value={draft.market} onChange={e=>setDraft({...draft,market:e.target.value})} style={fieldStyle}>
         <option value="JP">JP</option><option value="US">US</option>
       </select>
       <input placeholder="株数" value={draft.quantity} onChange={e=>setDraft({...draft,quantity:e.target.value})} style={fieldStyle}/>
-      <input placeholder="平均取得単価" value={draft.average_price} onChange={e=>setDraft({...draft,average_price:e.target.value})} style={fieldStyle}/>
+      <input placeholder="平均取得単価（実際の約定単価）" value={draft.average_price} onChange={e=>setDraft({...draft,average_price:e.target.value})} style={fieldStyle}/>
       <input type="date" value={draft.acquired_at} onChange={e=>setDraft({...draft,acquired_at:e.target.value})} style={fieldStyle}/>
+    </div>
+    <div style={{display:"grid",gridTemplateColumns:"90px 90px 90px 1fr auto auto",gap:6,marginBottom:10,alignItems:"center"}}>
+      <input placeholder="初期SL" value={draft.initial_stop} onChange={e=>setDraft({...draft,initial_stop:e.target.value})} style={fieldStyle}/>
+      <input placeholder="利確①" value={draft.target_1} onChange={e=>setDraft({...draft,target_1:e.target.value})} style={fieldStyle}/>
+      <input placeholder="利確②" value={draft.target_2} onChange={e=>setDraft({...draft,target_2:e.target.value})} style={fieldStyle}/>
       <input placeholder="メモ" value={draft.memo} onChange={e=>setDraft({...draft,memo:e.target.value})} style={fieldStyle}/>
+      {analysisForDraft && <button className="action-btn" type="button" onClick={applyAnalysisValues} title="トレード分析タブでのこの銘柄のstop/利確①/利確②を下書きに反映します（参考値。実際の取得単価は上の欄に手入力してください）">分析値を使う</button>}
       <button className="btn" onClick={save} disabled={saving||!draft.code.trim()}>追加</button>
+    </div>
+    <div className="sec-note" style={{marginTop:-4,marginBottom:10}}>
+      ※ 平均取得単価は実際に約定した単価を入力してください（トレード分析タブのentryは参考値で、ポジション管理の基準にはしません）。初期SL・利確①②は任意入力で、トレード分析タブで「分析」済みの銘柄なら「分析値を使う」で反映できます。
     </div>
     {loading
       ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>読み込み中…</div>
       : items.length===0
         ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>まだ保有株の登録がありません。</div>
-        : <div style={{display:"flex",flexDirection:"column",gap:4}}>
-            {items.map(it=><div key={it.code+it.market} style={{display:"flex",alignItems:"center",gap:10,fontSize:12.5,padding:"4px 2px"}}>
-              <span className="mono" style={{fontWeight:700}}>{it.code}</span>
-              <span style={{flex:1}}>{it.name||"—"}</span>
-              <span style={{color:"var(--inkSoft)"}}>{it.quantity!=null?`${it.quantity.toLocaleString()}株`:"—"}</span>
-              <span style={{color:"var(--inkSoft)"}}>{it.average_price!=null?`@${it.average_price.toLocaleString()}`:"—"}</span>
-              {it.memo && <span style={{color:"var(--inkFaint)"}}>{it.memo}</span>}
-              <button className="iconbtn" title="削除" onClick={()=>remove(it.code,it.market)}>×</button>
-            </div>)}
+        : <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(260px,1fr))",gap:8}}>
+            {items.map(it=>{
+              const current=num(stockQuotes?.[it.code]?.t);
+              const {amount:pnlAmount,pct:pnlPct}=calcUnrealizedPnl(it.average_price,it.quantity,current);
+              const basisPrice=it.average_price??current;
+              const rr=calcPositionRR(it.target_1,basisPrice,it.current_stop);
+              const trailKey=deriveTrailingStatus(it.current_stop,it.initial_stop,it.average_price,current);
+              const trailMeta=TRAILING_STATUS_META[trailKey];
+              const editingStop=stopDraftFor===it.code+it.market;
+              return <div key={it.code+it.market} style={{border:"1px solid var(--rule)",borderRadius:5,padding:"10px 12px",background:"var(--bg)"}}>
+                <div style={{display:"flex",alignItems:"baseline",gap:8}}>
+                  <span style={{fontWeight:800,fontSize:13.5}}>{it.name||it.code}</span>
+                  <span className="mono" style={{fontSize:11,color:"var(--inkFaint)"}}>{it.code}</span>
+                  <button className="iconbtn" style={{marginLeft:"auto"}} title="削除" onClick={()=>remove(it.code,it.market)}>×</button>
+                </div>
+                <div className="mono" style={{fontSize:12,color:"var(--inkSoft)",marginTop:2}}>
+                  {it.quantity!=null?`${it.quantity.toLocaleString()}株`:"—株"} @ {it.average_price!=null?it.average_price.toLocaleString():"—"}
+                  {"　現在 "}{current!=null?current.toLocaleString():"—"}
+                </div>
+                <div className="mono" style={{fontSize:15,fontWeight:800,marginTop:2,
+                    color:pnlAmount==null?"var(--inkFaint)":pnlAmount>0?"var(--up)":pnlAmount<0?"var(--down)":"var(--inkSoft)"}}>
+                  {pnlAmount!=null?`${pnlAmount>0?"+":""}${Math.round(pnlAmount).toLocaleString()}円`:"—"}
+                  {pnlPct!=null && <span style={{fontSize:12,fontWeight:700,marginLeft:6}}>({pnlPct>0?"+":""}{pnlPct.toFixed(2)}%)</span>}
+                </div>
+                <div style={{display:"flex",flexWrap:"wrap",gap:10,marginTop:8,fontSize:12}}>
+                  <div>
+                    <span style={{color:"var(--inkSoft)"}}>SL </span>
+                    <span className="mono">{it.initial_stop!=null?it.initial_stop.toLocaleString():"—"}</span>
+                    <span style={{color:"var(--inkFaint)"}}> → 現在SL </span>
+                    {editingStop
+                      ? <span style={{display:"inline-flex",gap:4,alignItems:"center"}}>
+                          <input autoFocus value={stopDraftVal} onChange={e=>setStopDraftVal(e.target.value)}
+                            onKeyDown={e=>{if(e.key==="Enter")saveCurrentStop(it);if(e.key==="Escape")setStopDraftFor(null);}}
+                            style={{...fieldStyle,width:70,padding:"2px 5px"}}/>
+                          <button className="action-btn" style={{fontSize:10,padding:"2px 5px"}} onClick={()=>saveCurrentStop(it)}>保存</button>
+                        </span>
+                      : <span className="mono" style={{fontWeight:700,cursor:"pointer",borderBottom:"1px dashed var(--inkFaint)"}}
+                          title="クリックして現在SLを変更"
+                          onClick={()=>{setStopDraftFor(it.code+it.market);setStopDraftVal(it.current_stop??it.initial_stop??"");}}>
+                          {it.current_stop!=null?it.current_stop.toLocaleString():"未設定"}
+                        </span>}
+                  </div>
+                  <div><span style={{color:"var(--inkSoft)"}}>TP1 </span><span className="mono">{it.target_1!=null?it.target_1.toLocaleString():"—"}</span></div>
+                  <div><span style={{color:"var(--inkSoft)"}}>TP2 </span><span className="mono">{it.target_2!=null?it.target_2.toLocaleString():"—"}</span></div>
+                  <div><span style={{color:"var(--inkSoft)"}}>RR </span><span className="mono" style={{fontWeight:700}}>{rr!=null?`1 : ${rr.toFixed(2)}`:"--"}</span></div>
+                </div>
+                <div style={{marginTop:6}}>
+                  <span style={{fontSize:10.5,fontWeight:700,color:trailMeta.color,border:`1px solid ${trailMeta.color}`,borderRadius:3,padding:"1px 6px"}}>状態：{trailMeta.label}</span>
+                  {it.memo && <span style={{fontSize:11,color:"var(--inkFaint)",marginLeft:8}}>{it.memo}</span>}
+                </div>
+              </div>;
+            })}
           </div>}
   </div>;
 }
@@ -3991,7 +4120,7 @@ function App(){
       {tab==="position" && <div style={{marginTop:18}}>
         <div className="sec-head">ポジション</div>
         <div className="sec-note">保有中の建玉のみを表示します。売買記録・振り返りは「記録」タブへ。</div>
-        <PortfolioPanel/>
+        <PortfolioPanel stockQuotes={s.stockQuotes} analysisData={s.analysisData}/>
       </div>}
 
       {/* ===== 投資判断ログ（2026-09-02新規） ===== */}
