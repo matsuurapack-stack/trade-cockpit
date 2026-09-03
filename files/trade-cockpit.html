@@ -962,11 +962,13 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                 const inWatch=watchTargets.includes(w.code);
                 const isJumpTarget=jumpHighlight===w.code;
                 const meta=WATCH_STATUS_META[enr.status];
+                const badgeColor=enr.breakQuality?BREAK_QUALITY_META[enr.breakQuality].color:meta.color;
+                const badgeLabel=enr.breakQuality?`${enr.breakQuality}_BREAK`:meta.label;
                 return <tr key={w.id} ref={el=>{rowRefs.current[w.code]=el;}} className="watch-row"
                   style={{borderTop:"1px solid var(--ruleSoft)",background:isJumpTarget?"var(--accent)":"transparent",
                     color:isJumpTarget?"var(--card)":"var(--ink)",transition:"background 0.4s, color 0.4s"}}>
-                  <td style={{whiteSpace:"nowrap",borderLeft:`3px solid ${meta.color}`}} title={enr.breakType?`BREAK_${enr.breakType}`:meta.label}>
-                    <span style={{fontWeight:700,fontSize:12.5,color:isJumpTarget?"var(--card)":meta.color}}>{meta.icon} {enr.breakType||meta.label}</span></td>
+                  <td style={{whiteSpace:"nowrap",borderLeft:`3px solid ${badgeColor}`}} title={enr.breakType?`ブレイク条件: BREAK_${enr.breakType}`:meta.label}>
+                    <span style={{fontWeight:700,fontSize:12.5,color:isJumpTarget?"var(--card)":badgeColor}}>{meta.icon} {badgeLabel}</span></td>
                   <td className="mono" style={{fontWeight:800,fontSize:15,color:isJumpTarget?"var(--card)":(enr.rsScore==null?"var(--ink)":enr.rsScore>=75?"var(--up)":enr.rsScore<25?"var(--down)":"var(--ink)")}}>{enr.rsScore!=null?enr.rsScore:"—"}</td>
                   <td className="mono" style={{fontWeight:700,fontSize:13}}>{w.code}</td>
                   <td style={{fontSize:15,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.name}>
@@ -1035,13 +1037,32 @@ function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysi
   else if(highBreak)breakType="HIGH";
   else if(resistBreak)breakType="RESIST";
   else if(vwapReclaim)breakType="VWAP";
+
+  // v3-3 Step5（BREAK判定の再検討）：「一度ブレイクした」だけでなく「今もブレイクが有効か」を
+  // 見る。既に取得済みの当日高値（stockQuotes[].high）からの押し（pullback）・当日騰落率・
+  // Market RS/Sector RSを使い、ACTIVE/WEAK/FAILEDの3段階に分ける（新規の重い計算は追加しない）。
+  // 「大幅下落中なのにBREAK_HIGH」対策として、当日-1%以上の下落、または当日高値から5%以上
+  // 押した銘柄はFAILED（ブレイク水準を割った＝一度ブレイクしたが今は無効）として明示する
+  // （WEAK/HOTへ紛れ込ませて見えなくするのではなく、「失敗したブレイク」として区別する）。
+  let breakQuality=null;
+  if(breakType){
+    const todayHigh=num(qt.high);
+    const pullbackPct=(todayHigh!=null&&ct!=null&&todayHigh>0)?(todayHigh-ct)/todayHigh*100:null;
+    const declining=pct!=null&&pct<=-1;
+    const fadedFromHigh=pullbackPct!=null&&pullbackPct>=5;
+    const weakRS=(marketRS!=null&&marketRS<=-3)||(sectorRS!=null&&sectorRS<=-3);
+    const mildPullback=pullbackPct!=null&&pullbackPct>=2;
+    if(declining||fadedFromHigh)breakQuality="FAILED";
+    else if(weakRS||mildPullback)breakQuality="WEAK";
+    else breakQuality="ACTIVE";
+  }
   const isBreak=breakType!=null;
   let status;
   if(isBreak)status="BREAK";
   else if(rsScore!=null&&rsScore>=75)status="HOT";
   else if(rsScore!=null&&rsScore>=50)status="WATCH";
   else status="WEAK";
-  return {...w,pct,marketRS,sectorRS,rsScore,volRatio,status,breakType};
+  return {...w,pct,marketRS,sectorRS,rsScore,volRatio,status,breakType,breakQuality};
 }
 
 // Status判定（Trade Cockpit v2 Phase1）。ルールベース・軽量計算のみ（サーバー側analyze_stock()は
@@ -1052,6 +1073,14 @@ const WATCH_STATUS_META = {
   HOT:   {icon:"🔥",label:"HOT",  order:1,color:"var(--down)"},
   WATCH: {icon:"👀",label:"WATCH",order:2,color:"var(--accent)"},
   WEAK:  {icon:"💤",label:"WEAK", order:3,color:"var(--inkFaint)"},
+};
+// v3-3 Step5：BREAKの「今も有効か」による色分け。ACTIVE=まだ勢いがある（既存のBREAK色を継承）、
+// WEAK=ブレイクはしたが勢いが弱い（要注意）、FAILED=一度ブレイクしたが現在値がブレイク水準を
+// 割った（実質的に失敗）。ACTIVE_BREAK/WEAK_BREAK/FAILED_BREAKとしてバッジ表示する。
+const BREAK_QUALITY_META = {
+  ACTIVE: {color:"var(--down)"},
+  WEAK:   {color:"var(--accent)"},
+  FAILED: {color:"var(--inkFaint)"},
 };
 const TRADE_CANDIDATE_STATUS_OPTIONS=[
   {value:"WATCH",label:"監視"},{value:"WAIT",label:"待機"},
@@ -1359,9 +1388,11 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,e
             const inEarnings=earningsTargets.includes(w.code);
             const meta=WATCH_STATUS_META[w.status];
             const rsFg=w.rsScore==null?"var(--ink)":w.rsScore>=75?"var(--up)":w.rsScore<25?"var(--down)":"var(--ink)";
+            const badgeColor=w.breakQuality?BREAK_QUALITY_META[w.breakQuality].color:meta.color;
+            const badgeLabel=w.breakQuality?`${w.breakQuality}_BREAK`:meta.label;
             return <tr key={w.code} className="watch-row" style={{borderTop:"1px solid var(--ruleSoft)"}}>
-              <td style={{whiteSpace:"nowrap",borderLeft:`3px solid ${meta.color}`}} title={w.breakType?`BREAK_${w.breakType}`:meta.label}>
-                <span style={{fontWeight:700,fontSize:12.5,color:meta.color}}>{meta.icon} {w.breakType||meta.label}</span></td>
+              <td style={{whiteSpace:"nowrap",borderLeft:`3px solid ${badgeColor}`}} title={w.breakType?`ブレイク条件: BREAK_${w.breakType}`:meta.label}>
+                <span style={{fontWeight:700,fontSize:12.5,color:badgeColor}}>{meta.icon} {badgeLabel}</span></td>
               <td className="mono" style={{fontWeight:800,fontSize:15,color:rsFg}}>{w.rsScore!=null?w.rsScore:"—"}</td>
               <td className="mono" style={{fontWeight:700,fontSize:13}}>{w.code}</td>
               <td style={{fontSize:15,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.name}>{w.name}</td>
