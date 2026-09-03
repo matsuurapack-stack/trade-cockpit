@@ -842,7 +842,7 @@ function EarningsProgressChart({trend,latestDetail}){
 
 // 6-1章：銘柄検索・登録＋セクター別アコーディオン表示（2〜5章の仕様）を市場ごとに再利用するための共通コンポーネント。
 // 日本市場・アメリカ市場タブの両方で、このコンポーネントをそのまま使い回すことで「全く同じ仕様・UI」を担保する。
-function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,watchTargets,onToggleWatch,onOpenChart,metrics,breakoutLevels,analysisData}){
+function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,watchTargets,onToggleWatch,onOpenChart,metrics,breakoutLevels,analysisData,marketRiskLabel}){
   const [q,setQ]=useState("");
   const [manualSector,setManualSector]=useState(SECTOR_CHOICES[0]);
   const [openSectors,setOpenSectors]=useState(()=>new Set());
@@ -999,7 +999,7 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
             {isOpen && <div style={{overflowX:"auto",overflowY:"auto",maxHeight:520}}>
               <table className="watch-table" style={{width:"100%"}}>
               <colgroup>
-                <col style={{width:132}}/><col style={{width:44}}/><col style={{width:56}}/><col/>
+                <col style={{width:150}}/><col style={{width:44}}/><col style={{width:56}}/><col/>
                 <col style={{width:80}}/><col style={{width:80}}/>
                 <col style={{width:52}}/><col style={{width:52}}/><col style={{width:36}}/>
               </colgroup>
@@ -1009,23 +1009,26 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                 <th style={{textAlign:"right"}} title={`Market RS（対 ${market==="US"?"NASDAQ":"日経平均"}、pt）`}>M.RS</th>
                 <th style={{textAlign:"right"}} title="Sector RS（対 所属セクター平均、pt）">S.RS</th><th></th></tr></thead>
               <tbody>{items.map(w=>{
-                const enr=enrichWatchRow(w,stockQuotes,marketPct,sectorAvgMap[w.sector],breakoutLevels,analysisData);
+                const enr=enrichWatchRow(w,stockQuotes,marketPct,sectorAvgMap[w.sector],breakoutLevels,analysisData,marketRiskLabel);
                 const ct=num(stockQuotes[w.code]?.t);
                 const fg=enr.pct==null||enr.pct===0?"var(--ink)":(enr.pct>0?"var(--up)":"var(--down)");
                 const inAnalysis=analysisTargets.includes(w.code);
                 const inEarnings=earningsTargets.includes(w.code);
                 const inWatch=watchTargets.includes(w.code);
                 const isJumpTarget=jumpHighlight===w.code;
-                const meta=WATCH_STATUS_META[enr.status];
-                const badgeColor=enr.breakQuality?BREAK_QUALITY_META[enr.breakQuality].color:meta.color;
-                // Status列にはステータス文言のみ（RS値は出さない・アンダースコアではなく空白区切りにして
-                // 「ACTIVE BREAK」のように1行で読めるようにする）。RS値は隣のRS列だけに表示する。
-                const badgeLabel=enr.breakQuality?`${enr.breakQuality} BREAK`:meta.label;
+                const meta=PRIMARY_STATUS_META[enr.status];
+                // v3-6：Status列はPrimary Status＋Action Statusの2軸表示。詳細理由はtitleのみ。
+                const actionMeta=ACTION_STATUS_META[enr.actionStatus];
+                const reasonList=enr.actionStatus==="RISK"?enr.riskReasons.map(r=>RISK_REASON_META[r])
+                  :enr.actionStatus==="WAIT"?enr.waitReasons.map(r=>WAIT_REASON_META[r]):[];
+                const statusTitle=[meta.label,actionMeta.label,reasonList.join("・")].filter(Boolean).join(" / ");
                 return <tr key={w.id} ref={el=>{rowRefs.current[w.code]=el;}} className="watch-row"
                   style={{borderTop:"1px solid var(--ruleSoft)",background:isJumpTarget?"var(--accent)":"transparent",
                     color:isJumpTarget?"var(--card)":"var(--ink)",transition:"background 0.4s, color 0.4s"}}>
-                  <td style={{whiteSpace:"nowrap",overflow:"hidden",borderLeft:`3px solid ${badgeColor}`,paddingRight:10}} title={enr.breakType?`ブレイク条件: BREAK_${enr.breakType}`:meta.label}>
-                    <span style={{fontWeight:700,fontSize:11.5,color:isJumpTarget?"var(--card)":badgeColor,whiteSpace:"nowrap"}}>{meta.icon} {badgeLabel}</span></td>
+                  <td style={{whiteSpace:"nowrap",overflow:"hidden",borderLeft:`3px solid ${meta.color}`,paddingRight:10}} title={statusTitle}>
+                    <div style={{fontWeight:700,fontSize:11.5,color:isJumpTarget?"var(--card)":meta.color,whiteSpace:"nowrap"}}>{meta.icon} {meta.label}</div>
+                    {actionMeta.label && <div style={{fontWeight:700,fontSize:10.5,color:isJumpTarget?"var(--card)":actionMeta.color,whiteSpace:"nowrap",marginTop:1}}>{actionMeta.icon} {actionMeta.label}</div>}
+                  </td>
                   <td className="mono" style={{fontWeight:800,fontSize:15,textAlign:"right",paddingLeft:10,color:isJumpTarget?"var(--card)":(enr.rsScore==null?"var(--ink)":enr.rsScore>=75?"var(--up)":enr.rsScore<25?"var(--down)":"var(--ink)")}}>{enr.rsScore!=null?enr.rsScore:"—"}</td>
                   <td className="mono" style={{fontWeight:700,fontSize:13}}>{w.code}</td>
                   <td style={{fontSize:15,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.name}>
@@ -1076,7 +1079,7 @@ function calcRsScore(pct,marketPct,sectorAvg){
 // Trade Cockpit v3-3 Step4（UI統一）：Status/BREAK判定ロジックを共通関数化。元はWatchTargetsPanel
 // 内のuseMemoに閉じていたが、日本市場/アメリカ市場タブ（SectorWatchlist）でも同じ判定を使う
 // ために切り出した。軽量計算のみ（サーバー側analyze_stock()は呼ばない）。
-function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysisData){
+function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysisData,marketRiskLabel){
   const qt=stockQuotes[w.code]||{};
   const ct=num(qt.t),p=num(qt.p);
   const pct=(ct!=null&&p!=null&&p)?(ct-p)/p*100:null;
@@ -1087,6 +1090,7 @@ function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysi
   const highBreak=!!(levels&&ct!=null&&ct>levels.highLookback);
   const volSurge=volRatio!=null&&volRatio>=1.5;
   const ind=analysisData?.[w.code]?.indicators;
+  const assessment=analysisData?.[w.code]?.assessment;
   const vwapReclaim=!!(ind?.vwap!=null&&ct!=null&&ct>ind.vwap);
   const resistBreak=!!(ind?.resistance!=null&&ct!=null&&ct>ind.resistance);
   let breakType=null;
@@ -1100,16 +1104,10 @@ function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysi
   // Market RS/Sector RSを使い、ACTIVE/WEAK/FAILEDの3段階に分ける（新規の重い計算は追加しない）。
   // なお「ブレイク水準を割っている」銘柄はbreakType自体が現在値とのライブ比較（highBreak等）で
   // 判定されるため、そもそもここに来る時点でbreakTypeが付かず自動的に除外される。
-  // 改訂点（大幅下落中・Market RSが大きくマイナスの銘柄が強いBREAKに見えないよう厳格化）：
-  // ・FAILEDの下落閾値を-1%→-2%に引き上げ（「大幅」に見合う基準に）、-1%〜-2%の軽い下落は
-  //   新たにWEAK側に拾うようにして粒度を細かくした。
-  // ・Market RSが-6pt以下（＝地合いに対し極端に弱い＝「大きくマイナス」）は、それ単独でFAILEDへ
-  //   格上げする（従来は-3ptでWEAK止まりだったが、-3pt程度の弱さでACTIVE落選＝WEAK扱いは妥当な
-  //   一方、-6pt級の極端な弱さは「失敗したブレイク」として明示すべきと判断）。
+  const todayHigh=num(qt.high),todayLow=num(qt.low);
+  const pullbackPct=(todayHigh!=null&&ct!=null&&todayHigh>0)?(todayHigh-ct)/todayHigh*100:null;
   let breakQuality=null;
   if(breakType){
-    const todayHigh=num(qt.high);
-    const pullbackPct=(todayHigh!=null&&ct!=null&&todayHigh>0)?(todayHigh-ct)/todayHigh*100:null;
     const decliningHard=pct!=null&&pct<=-2;
     const decliningMild=pct!=null&&pct<=-1;
     const fadedFromHigh=pullbackPct!=null&&pullbackPct>=5;
@@ -1122,32 +1120,79 @@ function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysi
   }
   const isBreak=breakType!=null;
 
-  // v3-3 Step6（WAIT/RISKの軽量判定）：全銘柄にanalyze_stock()相当の重い計算は追加せず、
-  // 既に取得済みのstockQuotes（当日高値・安値・出来高）とRS Scoreだけで判定する。「分析」済み
-  // 銘柄（analysisData）があればVWAP・信用倍率等でさらに精度を上げるが、無くても動く設計。
-  const todayHigh=num(qt.high),todayLow=num(qt.low);
-  const rangePullbackPct=(todayHigh!=null&&ct!=null&&todayHigh>0)?(todayHigh-ct)/todayHigh*100:null;
-  // RISK：短時間急騰からの高値急落（当日+5%以上あったのに現在は高値から3%以上押している）、
-  // または当日の値動きが±8%を超える極端な変動（out-sizeなボラティリティ＝飛び付き注意）。
-  // 「分析」済みなら信用倍率danger・RSI過熱（>=80）も加味する（無くても上記2条件だけで判定可）。
-  const spikeReversal=pct!=null&&pct>=5&&rangePullbackPct!=null&&rangePullbackPct>=3;
-  const extremeMove=pct!=null&&Math.abs(pct)>=8;
-  const marginDanger=analysisData?.[w.code]?.tradeRules?.marginBadge==="danger";
-  const rsiHot=ind?.rsi!=null&&ind.rsi>=80;
-  const isRisk=spikeReversal||extremeMove||marginDanger||rsiHot;
-  // WAIT：RSはWATCH相当（50-74）だが、当日プラスなのに値幅の下半分で推移＝強さが確認できていない。
-  // 「分析」済みならVWAP未回復も加味する。
-  const indecisive=pct!=null&&pct>0&&todayHigh!=null&&todayLow!=null&&todayHigh>todayLow&&((ct-todayLow)/(todayHigh-todayLow))<0.5;
-  const vwapNotReclaimed=!!(ind?.vwap!=null&&ct!=null&&ct<ind.vwap);
-  const isWaitCandidate=indecisive||vwapNotReclaimed;
-
+  // v3-6（2026-09-04・Primary/Action 2軸化）：Primary Statusは「銘柄そのものの強さ」だけを表す
+  // （HOT/ACTIVE_BREAK/WEAK_BREAK/FAILED_BREAK/WATCH/WEAK）。旧status＋breakQualityを統合した形。
   let status;
-  if(isBreak)status="BREAK";
-  else if(isRisk)status="RISK";
+  if(isBreak)status=breakQuality==="ACTIVE"?"ACTIVE_BREAK":breakQuality==="WEAK"?"WEAK_BREAK":"FAILED_BREAK";
   else if(rsScore!=null&&rsScore>=75)status="HOT";
-  else if(rsScore!=null&&rsScore>=50)status=isWaitCandidate?"WAIT":"WATCH";
+  else if(rsScore!=null&&rsScore>=50)status="WATCH";
   else status="WEAK";
-  return {...w,pct,marketRS,sectorRS,rsScore,volRatio,status,breakType,breakQuality};
+
+  // Action Status：「今ここから入れるか」。全監視銘柄にanalyze_stock()相当の重い計算は追加せず、
+  // 既に取得済みのstockQuotes（当日高値・安値・出来高）・RS Score・breakoutLevelsだけで判定する。
+  // 「分析」済み銘柄（analysisData）があればVWAP・RSI・信用倍率・Falling Knife/Chase Riskで精度を
+  // 上げるが、無くても動く設計（この点は変更なし）。
+  //
+  // RISK（強く見えても今入るのは危険。isBreakかどうかを問わず評価＝BREAKと同時にRISKもあり得る）：
+  //  - CHASE_UP: 当日+8%以上、かつ高値からの押しが2%未満（＝まだ反落していない伸び切った状態＝
+  //    「飛んだ銘柄をFOMOで追わない」対象）
+  //  - VWAP_EXTENDED: 現在値がVWAPの1.03倍超（分析済みのみ）
+  //  - VOLUME_CRASH: 出来高急増を伴う当日-3%以下の急落
+  //  - FALLING_KNIFE/CHASE_RISK: サーバー側analyze_stock()が既に算出済みの判定を再利用（分析済みのみ、
+  //    新規計算なし）＝「落ちるナイフは掴まない」をこのライト判定でも機能させる
+  //  - SPIKE_REVERSAL/EXTREME_MOVE/MARGIN_DANGER/RSI_HOT：既存条件を維持
+  const riskReasons=[];
+  if(pct!=null&&pct>=8&&pullbackPct!=null&&pullbackPct<2)riskReasons.push("CHASE_UP");
+  if(ind?.vwap!=null&&ct!=null&&ct>ind.vwap*1.03)riskReasons.push("VWAP_EXTENDED");
+  if(volSurge&&pct!=null&&pct<=-3)riskReasons.push("VOLUME_CRASH");
+  if(assessment?.fallingKnife)riskReasons.push("FALLING_KNIFE");
+  if(assessment?.chaseRisk)riskReasons.push("CHASE_RISK");
+  if(pct!=null&&pct>=5&&pullbackPct!=null&&pullbackPct>=3)riskReasons.push("SPIKE_REVERSAL");
+  if(pct!=null&&Math.abs(pct)>=8)riskReasons.push("EXTREME_MOVE");
+  if(analysisData?.[w.code]?.tradeRules?.marginBadge==="danger")riskReasons.push("MARGIN_DANGER");
+  if(ind?.rsi!=null&&ind.rsi>=80)riskReasons.push("RSI_HOT");
+
+  // WAIT（「弱いから待つ」ではなく「候補としては良いがエントリー条件未達」。既にbreakType成立済み＝
+  // BREAK系は「もう入る条件が整っている」ためWAIT対象外とする）：
+  //  - VWAP_NOT_RECLAIMED: VWAP未回復（分析済みのみ）
+  //  - RANGE_UNCONFIRMED: プラス圏だが当日レンジの下半分＝押し目形成途中／下げ止まり未確認
+  //  - NEAR_BREAKOUT: highLookbackまで1.5%以内だが未突破＝ブレイク直前
+  //  - SECTOR_WEAK: Sector RS <= -2pt
+  //  - MARKET_SOFT: 地合いが明確に軟調（日経当日-1%以下、またはMarket RiskがHIGH RISK/RISK OFF）
+  //    かつ、この銘柄自身のMarket RS/Sector RSが地合いを跳ね返すほど強くはない場合のみ。
+  //    ※ 市場が少しマイナスというだけでは発火しない・Market RS/Sector RSが非常に強い（+5pt以上）
+  //    銘柄は地合いだけを理由にWAITへ落とさない（全面安の中の相対的な強さを重視する戦略のため）。
+  // WAITはPrimary StatusがWEAK（rsScore<50）の銘柄には付けない。「弱いから待つ」ではなく
+  // 「候補としては良いがエントリー条件未達」という意味を保つため、そもそも候補にすらならない
+  // 弱い銘柄（WEAK）はWAITではなくNONE（対象外）として扱う。
+  const waitReasons=[];
+  if(!isBreak&&rsScore!=null&&rsScore>=50){
+    if(ind?.vwap!=null&&ct!=null&&ct<ind.vwap)waitReasons.push("VWAP_NOT_RECLAIMED");
+    const rangePos=(todayHigh!=null&&todayLow!=null&&ct!=null&&todayHigh>todayLow)?(ct-todayLow)/(todayHigh-todayLow):null;
+    if(pct!=null&&pct>0&&rangePos!=null&&rangePos<0.5)waitReasons.push("RANGE_UNCONFIRMED");
+    if(levels?.highLookback!=null&&ct!=null&&ct<levels.highLookback&&((levels.highLookback-ct)/levels.highLookback)<=0.015)waitReasons.push("NEAR_BREAKOUT");
+    if(sectorRS!=null&&sectorRS<=-2)waitReasons.push("SECTOR_WEAK");
+    const veryStrongRS=(marketRS!=null&&marketRS>=5)||(sectorRS!=null&&sectorRS>=5);
+    if(!veryStrongRS){
+      const marketSoft=(marketPct!=null&&marketPct<=-1.0)||marketRiskLabel==="HIGH RISK"||marketRiskLabel==="RISK OFF";
+      const rsNotStrongEnough=!(marketRS!=null&&marketRS>=3);
+      const sectorSoft=sectorRS!=null&&sectorRS<=0;
+      if(marketSoft&&(rsNotStrongEnough||sectorSoft))waitReasons.push("MARKET_SOFT");
+    }
+  }
+
+  // Action Statusの排他決定：RISK > WAIT > ENTRY_READY > NONE。
+  // ENTRY_READYは「買いシグナル」ではなく「詳細分析する優先度が高い」の意味（HOT/ACTIVE_BREAK/
+  // WATCH上位＝rsScore>=65で、RISKでもWAITでもない銘柄）。
+  let actionStatus;
+  if(riskReasons.length>0)actionStatus="RISK";
+  else if(waitReasons.length>0)actionStatus="WAIT";
+  else{
+    const primaryQualifies=status==="HOT"||status==="ACTIVE_BREAK"||(status==="WATCH"&&rsScore!=null&&rsScore>=65);
+    actionStatus=primaryQualifies?"ENTRY_READY":"NONE";
+  }
+
+  return {...w,pct,marketRS,sectorRS,rsScore,volRatio,status,breakType,breakQuality,actionStatus,riskReasons,waitReasons};
 }
 
 // v3-4（監視銘柄タブ「今日の注目TOP5」用）：enrichWatchRow()の軽量出力（rsScore/status/
@@ -1164,26 +1209,29 @@ function lightweightGrade(enr){
   else if(enr.rsScore>=60)idx=2;
   else if(enr.rsScore>=50)idx=3;
   else idx=4;
-  if(enr.status==="RISK"||enr.status==="WEAK"||enr.breakQuality==="FAILED")idx=Math.min(order.length-1,idx+1);
+  if(enr.actionStatus==="RISK"||enr.status==="WEAK"||enr.status==="FAILED_BREAK")idx=Math.min(order.length-1,idx+1);
   return order[idx];
 }
 function lightweightAction(enr){
   if(enr.status==null)return null;
-  if(enr.status==="RISK")return "AVOID";
-  if(enr.status==="BREAK")return enr.breakQuality==="FAILED"?"WAIT":"BREAKOUT";
+  if(enr.actionStatus==="RISK")return "AVOID";
+  if(enr.status==="ACTIVE_BREAK")return "BREAKOUT";
+  if(enr.status==="WEAK_BREAK"||enr.status==="FAILED_BREAK")return "WAIT";
   if(enr.status==="HOT")return "NOW";
-  if(enr.status==="WATCH")return "PULLBACK";
-  if(enr.status==="WAIT")return "WAIT";
+  if(enr.status==="WATCH")return enr.actionStatus==="ENTRY_READY"?"NOW":"PULLBACK";
   return "AVOID"; // WEAK
 }
 // TOP5の短い選定理由：既に画面に出しているRS Score・Status・前日比だけで組み立てる（新規計算なし）。
+// v3-6：Action Status（RISK/WAIT）の理由があれば末尾に付け加える。
 function lightweightReason(enr){
-  const meta=WATCH_STATUS_META[enr.status];
+  const meta=PRIMARY_STATUS_META[enr.status];
   const pctTxt=enr.pct!=null?(enr.pct>0?"+":"")+enr.pct.toFixed(2)+"%":"—";
   const rsTxt=enr.rsScore!=null?`RS ${enr.rsScore}`:"RS —";
   const breakTxt=enr.breakType==="VOLUME"?"出来高急増ブレイク":enr.breakType==="HIGH"?"直近高値ブレイク":
     enr.breakType==="RESIST"?"レジスタンス上抜け":enr.breakType==="VWAP"?"VWAP回復":null;
-  return [meta?.label,breakTxt,rsTxt,`前日比${pctTxt}`].filter(Boolean).join("・");
+  const reasonTxt=enr.actionStatus==="RISK"?enr.riskReasons.map(r=>RISK_REASON_META[r]).join("/")
+    :enr.actionStatus==="WAIT"?enr.waitReasons.map(r=>WAIT_REASON_META[r]).join("/"):null;
+  return [meta?.label,breakTxt,rsTxt,`前日比${pctTxt}`,reasonTxt].filter(Boolean).join("・");
 }
 
 // Status判定（Trade Cockpit v2 Phase1）。ルールベース・軽量計算のみ（サーバー側analyze_stock()は
@@ -1239,22 +1287,44 @@ const TAB_GROUPS=[
   {key:"news",label:"ニュース",tabs:[{key:"news",label:"ニュース"}]},
 ];
 
-const WATCH_STATUS_META = {
-  BREAK: {icon:"⚡",label:"BREAK",order:0,color:"var(--down)"},
-  RISK:  {icon:"⚠",label:"RISK", order:1,color:"var(--up)"},
-  HOT:   {icon:"🔥",label:"HOT",  order:2,color:"var(--down)"},
-  WATCH: {icon:"👀",label:"WATCH",order:3,color:"var(--accent)"},
-  WAIT:  {icon:"⏳",label:"WAIT", order:4,color:"var(--inkSoft)"},
-  WEAK:  {icon:"💤",label:"WEAK", order:5,color:"var(--inkFaint)"},
+// v3-6（2026-09-04・Primary/Action 2軸化）：Primary Status＝銘柄そのものの強さ・状態。
+// 旧WATCH_STATUS_META（BREAK/RISK/HOT/WATCH/WAIT/WEAK）＋BREAK_QUALITY_METAを統合し、
+// BREAKをACTIVE_BREAK/WEAK_BREAK/FAILED_BREAKとして最初からPrimary Statusの値そのものにした。
+// RISK/WAITはPrimary Statusから独立させ、下のACTION_STATUS_METAで別軸として扱う。
+const PRIMARY_STATUS_META = {
+  ACTIVE_BREAK: {icon:"⚡",label:"ACTIVE BREAK",order:0,color:"var(--down)"},
+  HOT:          {icon:"🔥",label:"HOT",         order:1,color:"var(--down)"},
+  WEAK_BREAK:   {icon:"⚡",label:"WEAK BREAK",   order:2,color:"var(--accent)"},
+  WATCH:        {icon:"👀",label:"WATCH",        order:3,color:"var(--accent)"},
+  FAILED_BREAK: {icon:"⚡",label:"FAILED BREAK", order:4,color:"var(--inkFaint)"},
+  WEAK:         {icon:"💤",label:"WEAK",         order:5,color:"var(--inkFaint)"},
 };
-// v3-3 Step5（2026-09-03改訂）：BREAKの「今も有効か」による色分け。ACTIVE=まだ勢いがある
-// （既存のBREAK色を継承）、WEAK=ブレイクはしたが勢いが弱い・地合いに対しやや劣後（要注意）、
-// FAILED=大幅下落中／高値からの押しが大きい／Market RSが極端に弱い＝実質的に失敗したブレイク。
-// ACTIVE_BREAK/WEAK_BREAK/FAILED_BREAKとしてバッジ表示する。
-const BREAK_QUALITY_META = {
-  ACTIVE: {color:"var(--down)"},
-  WEAK:   {color:"var(--accent)"},
-  FAILED: {color:"var(--inkFaint)"},
+// Action Status＝「今ここから入れるか」。Primary Statusとは排他的な別軸（例：🔥HOT＋⚠RISK、
+// ⚡ACTIVE BREAK＋✅ENTRY READY、のように組み合わせて表示する）。
+const ACTION_STATUS_META = {
+  ENTRY_READY: {icon:"✅",label:"ENTRY READY",color:"var(--up)"},
+  WAIT:        {icon:"⏳",label:"WAIT",        color:"var(--inkSoft)"},
+  RISK:        {icon:"⚠",label:"RISK",        color:"var(--down)"},
+  NONE:        {icon:"",label:"",color:"var(--inkFaint)"},
+};
+// RISK/WAITの具体的な理由コード→短い日本語ラベル（一覧のtooltip・詳細表示用）。
+const RISK_REASON_META = {
+  CHASE_UP:      "急騰(高値圏)",
+  VWAP_EXTENDED: "VWAP乖離",
+  VOLUME_CRASH:  "出来高急増の急落",
+  FALLING_KNIFE: "落ちるナイフ",
+  CHASE_RISK:    "高値掴みリスク",
+  SPIKE_REVERSAL:"急騰後反落",
+  EXTREME_MOVE:  "急変動",
+  MARGIN_DANGER: "信用倍率警戒",
+  RSI_HOT:       "RSI過熱",
+};
+const WAIT_REASON_META = {
+  VWAP_NOT_RECLAIMED: "VWAP未回復",
+  RANGE_UNCONFIRMED:  "下げ止まり未確認",
+  NEAR_BREAKOUT:       "ブレイク直前",
+  SECTOR_WEAK:         "セクター軟調",
+  MARKET_SOFT:         "地合い軟調",
 };
 const TRADE_CANDIDATE_STATUS_OPTIONS=[
   {value:"WATCH",label:"監視"},{value:"WAIT",label:"待機"},
@@ -1320,34 +1390,35 @@ function AssessmentCard({assessment:a,marginBadge,marginRatio}){
 // v3-4（ChatGPT連携の再配置）：監視銘柄タブ（WatchTargetsPanel）専用だった「今日の注目TOP5」の
 // enrichWatchRow→選定ロジックを共通関数として切り出す。市場タブの「朝一分析」コピーにも同じ
 // TOP5をそのまま使い回すため（計算内容は完全に同一、二重実装を避ける）。
-function computeEnrichedWatch(items,stockQuotes,metrics,watchlistAll,breakoutLevels,analysisData){
+function computeEnrichedWatch(items,stockQuotes,metrics,watchlistAll,breakoutLevels,analysisData,marketRiskLabel){
   const m=metrics?.nikkei;
   const mt=m?num(m.t):null,mp=m?num(m.p):null;
   const marketPct=(mt!=null&&mp!=null&&mp)?(mt-mp)/mp*100:null;
   const groups=groupStocks(watchlistAll||[],stockQuotes,w=>w.sector);
   const sectorAvgMap=Object.fromEntries(groups.map(g=>[g.key,g.avgPct]));
-  return items.map(w=>enrichWatchRow(w,stockQuotes,marketPct,sectorAvgMap[w.sector],breakoutLevels,analysisData));
+  return items.map(w=>enrichWatchRow(w,stockQuotes,marketPct,sectorAvgMap[w.sector],breakoutLevels,analysisData,marketRiskLabel));
 }
+// v3-6：RISK（actionStatus==="RISK"）とWEAK（Primary Status）は「デイトレ候補」としては出さない。
 function rankTop5(enriched,stockQuotes){
   return [...enriched]
-    .filter(w=>w.rsScore!=null&&num(stockQuotes[w.code]?.t)!=null&&w.status!=="RISK"&&w.status!=="WEAK")
-    .sort((a,b)=>WATCH_STATUS_META[a.status].order-WATCH_STATUS_META[b.status].order||(b.rsScore-a.rsScore))
+    .filter(w=>w.rsScore!=null&&num(stockQuotes[w.code]?.t)!=null&&w.status!=="WEAK"&&w.actionStatus!=="RISK")
+    .sort((a,b)=>PRIMARY_STATUS_META[a.status].order-PRIMARY_STATUS_META[b.status].order||(b.rsScore-a.rsScore))
     .slice(0,5);
 }
 
-function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData}){
+function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel}){
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
 
   // v3-4：市場（日経平均）・セクター平均に対する差分→enrichWatchRow→TOP5選定は
   // computeEnrichedWatch/rankTop5（共通ヘルパー、本ファイル上部で定義）に切り出し済み。
   // 市場タブの「朝一分析」コピーも同じ関数で同じTOP5を算出する（二重実装を避ける）。
-  const enriched=useMemo(()=>computeEnrichedWatch(items,stockQuotes,metrics,watchlistAll,breakoutLevels,analysisData),
-    [items,stockQuotes,metrics,watchlistAll,breakoutLevels,analysisData]);
+  const enriched=useMemo(()=>computeEnrichedWatch(items,stockQuotes,metrics,watchlistAll,breakoutLevels,analysisData,marketRiskLabel),
+    [items,stockQuotes,metrics,watchlistAll,breakoutLevels,analysisData,marketRiskLabel]);
 
   // v3-4「今日の注目TOP5」：判定不能（rsScore/currentが未取得）な銘柄は無理に順位付けせず除外する。
   // RISK（過熱・急落注意）とWEAK（弱い）は「デイトレ候補」としては出さない（除外）。
-  // 残りをStatus優先度（WATCH_STATUS_META.order）→RS Scoreの順で並べ、上位5件を採用する。
+  // 残りをPrimary Status優先度→RS Scoreの順で並べ、上位5件を採用する。
   const top5=useMemo(()=>rankTop5(enriched,stockQuotes),[enriched,stockQuotes]);
 
   const [sortKey,setSortKey]=useState("priority");
@@ -1362,37 +1433,43 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
       case "pct": return arr.sort((a,b)=>byNullLast(a.pct,b.pct,true));
       case "sector": return arr.sort((a,b)=>(a.sector||"").localeCompare(b.sector||"",'ja'));
       case "current": return arr.sort((a,b)=>byNullLast(num(stockQuotes[a.code]?.t),num(stockQuotes[b.code]?.t),true));
-      case "status": return arr.sort((a,b)=>WATCH_STATUS_META[a.status].order-WATCH_STATUS_META[b.status].order||byNullLast(a.rsScore,b.rsScore,true));
+      case "status": return arr.sort((a,b)=>PRIMARY_STATUS_META[a.status].order-PRIMARY_STATUS_META[b.status].order||byNullLast(a.rsScore,b.rsScore,true));
       default: // priority：今日注目すべき順（Status優先度→RS Score）
-        return arr.sort((a,b)=>WATCH_STATUS_META[a.status].order-WATCH_STATUS_META[b.status].order||byNullLast(a.rsScore,b.rsScore,true));
+        return arr.sort((a,b)=>PRIMARY_STATUS_META[a.status].order-PRIMARY_STATUS_META[b.status].order||byNullLast(a.rsScore,b.rsScore,true));
     }
   },[enriched,sortKey]);
 
   // Trade Cockpit v3 Phase1（設計案19-21番）：46銘柄・279銘柄を最初から全部読ませない。
   // サマリー件数→フィルタ→上位10件デフォルト表示、の順で絞り込む。
+  // v3-6：Primary Status（強さ）とAction Status（今入れるか）の2軸それぞれの件数を数える。
   const summary=useMemo(()=>{
-    const c={HOT:0,BREAK:0,WATCH:0,WAIT:0,RISK:0,WEAK:0,rs70:0};
-    enriched.forEach(w=>{c[w.status]=(c[w.status]||0)+1;if(w.rsScore!=null&&w.rsScore>=70)c.rs70++;});
+    const c={HOT:0,ACTIVE_BREAK:0,WEAK_BREAK:0,FAILED_BREAK:0,WATCH:0,WEAK:0,
+      ENTRY_READY:0,WAIT:0,RISK:0,rs70:0};
+    enriched.forEach(w=>{c[w.status]=(c[w.status]||0)+1;c[w.actionStatus]=(c[w.actionStatus]||0)+1;
+      if(w.rsScore!=null&&w.rsScore>=70)c.rs70++;});
     return c;
   },[enriched]);
-  const [statusFilters,setStatusFilters]=useState(new Set()); // 空集合＝フィルタなし（全Status表示）
+  const [statusFilters,setStatusFilters]=useState(new Set()); // Primary Status。空集合＝フィルタなし
+  const [actionFilters,setActionFilters]=useState(new Set()); // Action Status。空集合＝フィルタなし
   const [rsFilter,setRsFilter]=useState(false); // RS Score 70以上のみ
   const [marketRsFilter,setMarketRsFilter]=useState(false); // Market RS +2pt以上のみ
   const [pctFilter,setPctFilter]=useState(""); // "up" | "down" | ""
   const [sectorFilter,setSectorFilter]=useState("");
   const [showAll,setShowAll]=useState(false);
   const toggleStatusFilter=(st)=>setStatusFilters(prev=>{const n=new Set(prev);n.has(st)?n.delete(st):n.add(st);return n;});
+  const toggleActionFilter=(st)=>setActionFilters(prev=>{const n=new Set(prev);n.has(st)?n.delete(st):n.add(st);return n;});
   const sectorOptions=useMemo(()=>[...new Set(enriched.map(w=>w.sector).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'ja')),[enriched]);
   const filtered=useMemo(()=>sorted.filter(w=>
     (statusFilters.size===0||statusFilters.has(w.status))
+    &&(actionFilters.size===0||actionFilters.has(w.actionStatus))
     &&(!rsFilter||(w.rsScore!=null&&w.rsScore>=70))
     &&(!marketRsFilter||(w.marketRS!=null&&w.marketRS>=2))
     &&(!pctFilter||(pctFilter==="up"?(w.pct!=null&&w.pct>0):(w.pct!=null&&w.pct<0)))
     &&(!sectorFilter||w.sector===sectorFilter)
-  ),[sorted,statusFilters,rsFilter,marketRsFilter,pctFilter,sectorFilter]);
+  ),[sorted,statusFilters,actionFilters,rsFilter,marketRsFilter,pctFilter,sectorFilter]);
   const TOP_N=10;
   const displayed=showAll?filtered:filtered.slice(0,TOP_N);
-  const hasFilter=statusFilters.size>0||rsFilter||marketRsFilter||!!pctFilter||!!sectorFilter;
+  const hasFilter=statusFilters.size>0||actionFilters.size>0||rsFilter||marketRsFilter||!!pctFilter||!!sectorFilter;
 
   // 今日の候補（trade_candidates。8番）
   const [candidates,setCandidates]=useState([]);
@@ -1477,13 +1554,16 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
   const copyConsult=async(w)=>{
     const qt=stockQuotes[w.code]||{};
     const t=num(qt.t),p=num(qt.p);
-    const meta=WATCH_STATUS_META[w.status];
+    const meta=PRIMARY_STATUS_META[w.status];
+    const actionMeta=ACTION_STATUS_META[w.actionStatus];
+    const reasonTxt=w.actionStatus==="RISK"?w.riskReasons.map(r=>RISK_REASON_META[r]).join("/")
+      :w.actionStatus==="WAIT"?w.waitReasons.map(r=>WAIT_REASON_META[r]).join("/"):null;
     const lines=[
       `【Trade Cockpit 場中相談】${new Date().toLocaleString("ja-JP")}`,"",
       `銘柄: ${w.code} ${w.name}（${w.sector||"—"}）`,
       `現在値: ${t!=null?t.toLocaleString():"—"}　前日比: ${w.pct!=null?(w.pct>0?"+":"")+w.pct.toFixed(2)+"%":"—"}`,
       `Market RS: ${fmtPt(w.marketRS)}pt　Sector RS: ${fmtPt(w.sectorRS)}pt　RS Score: ${w.rsScore??"—"}`,
-      `Status: ${meta.icon} ${meta.label}`,"",
+      `Status: ${meta.icon} ${meta.label}${actionMeta.label?`　${actionMeta.icon} ${actionMeta.label}`:""}${reasonTxt?`（${reasonTxt}）`:""}`,"",
     ];
     if(activeRules?.length){lines.push("投資ルール：");activeRules.forEach(t=>lines.push(`・${t}`));lines.push("");}
     lines.push("質問：この銘柄、今入るのどう？");
@@ -1504,8 +1584,6 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
       })),
     },setConsultMsg);
   };
-
-  const FILTER_STATUS_CHIPS=["HOT","BREAK","WATCH","WAIT","RISK","WEAK"];
 
   // 2026-09-03改善：Actionボタン群（9個）を「⋮」メニューに集約し、横幅・行高を大幅に節約する。
   const [openMenuFor,setOpenMenuFor]=useState(null);
@@ -1561,23 +1639,36 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
           </div>}
     </div>
 
-    {/* サマリー（v3設計案19番）：46銘柄を読ませる前にまず件数だけで状況を把握できるようにする */}
+    {/* サマリー（v3設計案19番）：46銘柄を読ませる前にまず件数だけで状況を把握できるようにする。
+        v3-6：Primary Status（強さ）とAction Status（今入れるか）を分けて集計する。 */}
     <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:10,fontSize:12}}>
       <span style={{fontWeight:700}}>今日の監視銘柄 {items.length}</span>
       <span className="chip" style={{fontSize:11}}>🔥 HOT {summary.HOT||0}</span>
-      <span className="chip" style={{fontSize:11}}>⚡ BREAK {summary.BREAK||0}</span>
+      <span className="chip" style={{fontSize:11}}>⚡ ACTIVE BREAK {summary.ACTIVE_BREAK||0}</span>
+      <span className="chip" style={{fontSize:11}}>⚡ WEAK BREAK {summary.WEAK_BREAK||0}</span>
+      <span className="chip" style={{fontSize:11}}>⚡ FAILED BREAK {summary.FAILED_BREAK||0}</span>
       <span className="chip" style={{fontSize:11}}>👀 WATCH {summary.WATCH||0}</span>
-      <span className="chip" style={{fontSize:11}}>⏳ WAIT {summary.WAIT||0}</span>
-      <span className="chip" style={{fontSize:11}}>⚠ RISK {summary.RISK||0}</span>
       <span className="chip" style={{fontSize:11}}>💤 WEAK {summary.WEAK||0}</span>
       <span className="chip" style={{fontSize:11}}>RS70以上 {summary.rs70||0}</span>
     </div>
+    <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:6,fontSize:12}}>
+      <span style={{color:"var(--inkSoft)"}}>今すぐ入れるか：</span>
+      <span className="chip" style={{fontSize:11}}>✅ ENTRY READY {summary.ENTRY_READY||0}</span>
+      <span className="chip" style={{fontSize:11}}>⏳ WAIT {summary.WAIT||0}</span>
+      <span className="chip" style={{fontSize:11}}>⚠ RISK {summary.RISK||0}</span>
+    </div>
 
-    {/* フィルタ（v3設計案21番） */}
+    {/* フィルタ（v3設計案21番）。v3-6：Primary Status（強さ）とAction Status（今入れるか）を
+        別々のチップ列にする（2軸を排他的に扱わないため）。 */}
     <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:8}}>
-      {FILTER_STATUS_CHIPS.map(st=>{const meta=WATCH_STATUS_META[st];return <button key={st}
+      {Object.keys(PRIMARY_STATUS_META).map(st=>{const meta=PRIMARY_STATUS_META[st];return <button key={st}
         className={"chip"+(statusFilters.has(st)?" on":"")} style={{fontSize:11,cursor:"pointer"}}
         onClick={()=>toggleStatusFilter(st)}>{meta.icon} {meta.label}</button>;})}
+    </div>
+    <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:6}}>
+      {["ENTRY_READY","WAIT","RISK"].map(st=>{const meta=ACTION_STATUS_META[st];return <button key={st}
+        className={"chip"+(actionFilters.has(st)?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+        onClick={()=>toggleActionFilter(st)}>{meta.icon} {meta.label}</button>;})}
       <button className={"chip"+(rsFilter?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>setRsFilter(v=>!v)}>RS 70以上</button>
       <button className={"chip"+(marketRsFilter?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>setMarketRsFilter(v=>!v)}>Market RS +2以上</button>
       <button className={"chip"+(pctFilter==="up"?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>setPctFilter(v=>v==="up"?"":"up")}>前日比+</button>
@@ -1586,7 +1677,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         <option value="">セクター（すべて）</option>
         {sectorOptions.map(s=><option key={s} value={s}>{s}</option>)}
       </select>
-      {hasFilter && <button className="iconbtn" style={{fontSize:11}} onClick={()=>{setStatusFilters(new Set());setRsFilter(false);setMarketRsFilter(false);setPctFilter("");setSectorFilter("");}}>フィルタ解除</button>}
+      {hasFilter && <button className="iconbtn" style={{fontSize:11}} onClick={()=>{setStatusFilters(new Set());setActionFilters(new Set());setRsFilter(false);setMarketRsFilter(false);setPctFilter("");setSectorFilter("");}}>フィルタ解除</button>}
       <label style={{fontSize:12,color:"var(--inkSoft)",marginLeft:"auto"}}>並び順：
         <select value={sortKey} onChange={e=>setSortKey(e.target.value)} style={{fontSize:12,padding:"3px 6px",marginLeft:4}}>
           <option value="priority">今日注目すべき順（既定）</option>
@@ -1607,7 +1698,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         <div style={{overflowX:"auto",maxHeight:620,overflowY:"auto"}}>
         <table className="watch-table" style={{width:"100%"}}>
           <colgroup>
-            <col style={{width:132}}/><col style={{width:44}}/><col style={{width:56}}/><col/>
+            <col style={{width:150}}/><col style={{width:44}}/><col style={{width:56}}/><col/>
             <col style={{width:92}}/><col style={{width:80}}/><col style={{width:80}}/>
             <col style={{width:52}}/><col style={{width:52}}/><col style={{width:36}}/>
           </colgroup>
@@ -1625,15 +1716,19 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
             const fg=pct==null||pct===0?"var(--ink)":(pct>0?"var(--up)":"var(--down)");
             const inAnalysis=analysisTargets.includes(w.code);
             const inEarnings=earningsTargets.includes(w.code);
-            const meta=WATCH_STATUS_META[w.status];
+            const meta=PRIMARY_STATUS_META[w.status];
             const rsFg=w.rsScore==null?"var(--ink)":w.rsScore>=75?"var(--up)":w.rsScore<25?"var(--down)":"var(--ink)";
-            const badgeColor=w.breakQuality?BREAK_QUALITY_META[w.breakQuality].color:meta.color;
-            // Status列にはステータス文言のみ（RS値は出さない・アンダースコアではなく空白区切り）。
-            // RS値は隣のRS列だけに表示する。
-            const badgeLabel=w.breakQuality?`${w.breakQuality} BREAK`:meta.label;
+            // v3-6：Status列はPrimary Status（強さ）＋Action Status（今入れるか）を2軸で表示する。
+            // 詳細理由（riskReasons/waitReasons）はtitleツールチップのみ（一覧はバッジのみに留める）。
+            const actionMeta=ACTION_STATUS_META[w.actionStatus];
+            const reasonList=w.actionStatus==="RISK"?w.riskReasons.map(r=>RISK_REASON_META[r])
+              :w.actionStatus==="WAIT"?w.waitReasons.map(r=>WAIT_REASON_META[r]):[];
+            const statusTitle=[meta.label,actionMeta.label,reasonList.join("・")].filter(Boolean).join(" / ");
             return <tr key={w.code} className="watch-row" style={{borderTop:"1px solid var(--ruleSoft)"}}>
-              <td style={{whiteSpace:"nowrap",overflow:"hidden",borderLeft:`3px solid ${badgeColor}`,paddingRight:10}} title={w.breakType?`ブレイク条件: BREAK_${w.breakType}`:meta.label}>
-                <span style={{fontWeight:700,fontSize:11.5,color:badgeColor,whiteSpace:"nowrap"}}>{meta.icon} {badgeLabel}</span></td>
+              <td style={{whiteSpace:"nowrap",overflow:"hidden",borderLeft:`3px solid ${meta.color}`,paddingRight:10}} title={statusTitle}>
+                <div style={{fontWeight:700,fontSize:11.5,color:meta.color,whiteSpace:"nowrap"}}>{meta.icon} {meta.label}</div>
+                {actionMeta.label && <div style={{fontWeight:700,fontSize:10.5,color:actionMeta.color,whiteSpace:"nowrap",marginTop:1}}>{actionMeta.icon} {actionMeta.label}</div>}
+              </td>
               <td className="mono" style={{fontWeight:800,fontSize:15,textAlign:"right",paddingLeft:10,color:rsFg}}>{w.rsScore!=null?w.rsScore:"—"}</td>
               <td className="mono" style={{fontWeight:700,fontSize:13}}>{w.code}</td>
               <td style={{fontSize:15,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.name}>{w.name}</td>
@@ -3203,9 +3298,9 @@ function App(){
   // v3-4（ChatGPT連携の再配置）：市場タブ「朝一分析」に監視銘柄TOP5を含めるため、監視銘柄タブと
   // 同じcomputeEnrichedWatch/rankTop5（共通ヘルパー）でApp側でも同じTOP5を算出しておく。
   const todayTop5=useMemo(()=>{
-    const enriched=computeEnrichedWatch(watchTargetItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData);
+    const enriched=computeEnrichedWatch(watchTargetItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData,s.marketRisk?.marketRiskLabel);
     return rankTop5(enriched,s.stockQuotes);
-  },[watchTargetItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData]);
+  },[watchTargetItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData,s.marketRisk]);
   // 投資判断ログの「新規ログ」下書きに自動で入れる値。金利・為替・原油は日次モニターの直近取得値
   // （s.metrics）、市場全体の地合い・米国市場は直近の銘柄分析結果（analyze_stock共通の_market_environment）
   // から、セクター強弱はgroupStocks()の売買代金上位から組み立てる。いずれも編集可能な「下書き」であり、
@@ -3822,7 +3917,7 @@ function App(){
         analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget} onOpenAnalysis={openAnalysisFor}
         earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
         onRemove={removeWatchTarget} metrics={s.metrics} watchlistAll={watchlistAll} breakoutLevels={s.breakoutLevels}
-        analysisData={s.analysisData}
+        analysisData={s.analysisData} marketRiskLabel={s.marketRisk?.marketRiskLabel}
         activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)}
         onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}/>}
 
@@ -3838,7 +3933,7 @@ function App(){
           stockQuotes={s.stockQuotes} analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
           earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
           watchTargets={s.watchTargets} onToggleWatch={toggleWatchTarget}
-          metrics={s.metrics} breakoutLevels={s.breakoutLevels} analysisData={s.analysisData}
+          metrics={s.metrics} breakoutLevels={s.breakoutLevels} analysisData={s.analysisData} marketRiskLabel={s.marketRisk?.marketRiskLabel}
           onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}/>
         <p className="foot">※ ニュースはGoogleニュースRSSを利用しています。売買を推奨するものではなく、最終判断はご自身で。</p>
       </div>}
@@ -3855,7 +3950,7 @@ function App(){
           stockQuotes={s.stockQuotes} analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
           earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
           watchTargets={s.watchTargets} onToggleWatch={toggleWatchTarget}
-          metrics={s.metrics} breakoutLevels={s.breakoutLevels} analysisData={s.analysisData}
+          metrics={s.metrics} breakoutLevels={s.breakoutLevels} analysisData={s.analysisData} marketRiskLabel={s.marketRisk?.marketRiskLabel}
           onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}/>
         <p className="foot" style={{marginTop:16}}>※ 対象は現行のダウ工業株30種平均構成銘柄。業種分類は日本市場と同じ東証33業種の枠組みで統一しています（GICSセクターではありません）。アメリカ市場銘柄のニュース・決算・IRは「ニュース」タブのサマリー・海外市況・適時開示に統合表示しています。</p>
       </div>}
