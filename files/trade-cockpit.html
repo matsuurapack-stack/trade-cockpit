@@ -161,6 +161,23 @@ const num = (v) => (v === "" || v == null || isNaN(+v) ? null : +v);
 // Trade Cockpit v2 Phase6（ChatGPT双方向連携）：相談用テキストのクリップボードコピー共通処理。
 // 有料AI APIは使わず、テキストを生成してコピーするだけ（貼り付け先はChatGPT側で人間が操作）。
 // Clipboard APIが使えない環境（http接続・古いブラウザ等）向けにexecCommandへのフォールバックを用意。
+// v3-5（日次モニター・TradingViewチャート改修）：時間足の選択肢と、用途ごとに独立した
+// localStorageキーでの保存・復元。「日次モニターで以前銘柄分析タブで使った日足が残ってしまう」
+// ことを避けるため、用途ごとにキーを分ける（monitorChartInterval／stockChartInterval）。
+const CHART_INTERVALS=[["1","1分"],["3","3分"],["5","5分"],["15","15分"],["30","30分"],["60","1時間"],["D","日足"]];
+function loadChartInterval(key,fallback){
+  try{const v=localStorage.getItem(key);return v||fallback;}catch(e){return fallback;}
+}
+function IntervalSwitcher({value,onChange}){
+  return <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+    {CHART_INTERVALS.map(([v,label])=>
+      <button key={v} onClick={()=>onChange(v)}
+        style={{fontSize:11,padding:"3px 8px",borderRadius:3,cursor:"pointer",
+          border:`1px solid ${value===v?"var(--accent)":"var(--rule)"}`,
+          background:value===v?"var(--accent)":"var(--card)",
+          color:value===v?"#fff":"var(--inkSoft)",fontWeight:value===v?700:400}}>{label}</button>)}
+  </div>;
+}
 const copyText = async (text) => {
   try { await navigator.clipboard.writeText(text); return true; }
   catch (e) {
@@ -529,17 +546,25 @@ const changeColor=(pct)=>{
 
 // 8章：日次モニターの各項目をクリックした時に開くリアルタイムチャート用シンボル。
 // tvEmbed=trueのものだけ無料埋め込みで表示（CLAUDE.mdの検証済みルールに合わせ、指数は連動ETF/CFDで代用）。
-// falseのものは埋め込み表示できないシンボル（先物・KOSPI・米10年債・銅など）のため「TradingViewで開く」のみ提供。
+// falseのものは埋め込み表示できないシンボル（KOSPI・米10年債・銅・NYダウ先物など）のため
+// 「TradingViewで開く」のみ提供。
+// v3-5（日次モニター改修）：intradayOk=falseは「埋め込みはできるが無料枠では日足しか出ない」
+// シンボル（実測確認済み。2026-09-03：INDEX:NKYはトレードビュー純正ツールバーで1分/5分等を
+// クリックしても日足のまま変化しないことを確認した＝Nikkei225指数そのものはTradingView無料の
+// データベンダーからは分足データが提供されていないため）。省略時はtrue。
+// nikkei_futは同じ調査で「OSE:先物シンボルは無料埋め込みに対応していない」という従来の想定が
+// 誤りだったと判明（実際は埋め込み可能・分足も日本時間の取引時間帯でそのまま表示された）ため
+// tvEmbed:trueへ変更し、日経平均の分足代替として使えるようにした。
 const METRICS = [
   {key:"usdjpy",label:"ドル円",dp:2,stq:"usdjpy",tv:"FX:USDJPY",tvEmbed:true},
-  {key:"nikkei",label:"日経平均",dp:0,stq:"^nkx",tv:"INDEX:NKY",tvEmbed:true},
+  {key:"nikkei",label:"日経平均",dp:0,stq:"^nkx",tv:"INDEX:NKY",tvEmbed:true,intradayOk:false},
   {key:"dow",label:"NYダウ",dp:0,stq:"^dji",tv:"AMEX:DIA",tvEmbed:true},
   {key:"nasdaq",label:"ナスダック",dp:0,stq:"^ndq",tv:"NASDAQ:QQQ",tvEmbed:true},
   {key:"sox",label:"SOX半導体",dp:0,stq:"^sox",tv:"NASDAQ:SOXX",tvEmbed:true},
   {key:"us10y",label:"米10年債 %",dp:2,tv:"TVC:US10Y",tvEmbed:false},
   {key:"sp500",label:"S&P500",dp:2,tv:"AMEX:SPY",tvEmbed:true},
   {key:"kospi",label:"KOSPI",dp:2,tv:"KRX:KOSPI",tvEmbed:false},
-  {key:"nikkei_fut",label:"日経225先物",dp:0,tv:"OSE:NK225M1!",tvEmbed:false},
+  {key:"nikkei_fut",label:"日経225先物",dp:0,tv:"OSE:NK225M1!",tvEmbed:true},
   {key:"dow_fut",label:"NYダウ先物",dp:0,tv:"CBOT_MINI:YM1!",tvEmbed:false},
   {key:"wti",label:"WTI原油",dp:2,tv:"OANDA:WTICOUSD",tvEmbed:true},
   {key:"gold",label:"金(Gold)",dp:1,tv:"OANDA:XAUUSD",tvEmbed:true},
@@ -2816,39 +2841,61 @@ function TodaysMarketCard({metrics,watchlistAll,stockQuotes,marketRisk,onRefresh
 // 日次モニター先頭に表示するランキングパネル。「市場→テーマ→セクター→銘柄」の確認順序を
 // タブを跨がずに把握できるようにする（4〜6章対応）。テーマは登録銘柄にユーザーが手動で
 // 付けたタグのみを対象にするため、1件も設定されていなければテーマ欄は非表示にする。
-function ThemeSectorRanking({watchlistAll,stockQuotes}){
+// v3-5（日次モニター整理）：「セクター別」「テーマ別」の2本立てをやめ、セクター別1本に絞って
+// コンパクトな表形式にする。合計売買代金だけで「強い」と誤解しないよう、騰落率とMarket RS
+// （対日経平均）を併記する（大型株の多いセクターが売買代金だけでは上位に出やすいため）。
+// テーマ別ランキングは要望により日次モニターから非表示にするが、算出ロジック自体
+// （groupStocksでのtheme集計）・watchlist側のthemeフィールド・「＋テーマ」登録UIは
+// 削除していない。将来テーマ分析を再開する場合は、下のthemeRanking行のコメントを外して
+// RankList相当の表示を復活させればよい。
+function ThemeSectorRanking({watchlistAll,stockQuotes,metrics}){
+  const marketPct=useMemo(()=>{
+    const m=metrics?.nikkei;if(!m)return null;
+    const t=num(m.t),p=num(m.p);return (t!=null&&p!=null&&p)?(t-p)/p*100:null;
+  },[metrics]);
   const sectorRanking=useMemo(()=>groupStocks(watchlistAll,stockQuotes,w=>w.sector).slice(0,5),[watchlistAll,stockQuotes]);
-  const themeRanking=useMemo(()=>groupStocks(watchlistAll,stockQuotes,w=>(w.theme||"").trim()).slice(0,5),[watchlistAll,stockQuotes]);
+  // 非表示（削除ではない）：const themeRanking=useMemo(()=>groupStocks(watchlistAll,stockQuotes,w=>(w.theme||"").trim()).slice(0,5),[watchlistAll,stockQuotes]);
 
-  const RankList=({title,rows,emptyNote})=>
-    <div style={{flex:"1 1 320px",minWidth:280}}>
-      <div style={{fontSize:13,fontWeight:700,marginBottom:6}}>{title}</div>
-      {rows.length===0
-        ? <div style={{fontSize:12,color:"var(--inkSoft)"}}>{emptyNote}</div>
-        : <div style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden"}}>
-            {rows.map((r,i)=>{const c=changeColor(r.avgPct);
-              return <div key={r.key} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 10px",
-                borderTop:i===0?"none":"1px solid var(--ruleSoft)",background:c.level>0?c.bg:"transparent"}}>
-                <span className="mono" style={{fontSize:11,color:"var(--inkSoft)",width:14}}>{i+1}</span>
-                <span style={{flex:1,fontSize:13,fontWeight:600,color:c.level>0?c.fg:"var(--ink)"}}>{r.key}</span>
-                <span style={{fontSize:11,color:"var(--inkSoft)"}}>{r.count}銘柄</span>
-                <span className="mono" style={{fontSize:13,fontWeight:800,color:c.fg,minWidth:56,textAlign:"right"}}>
-                  {r.avgPct!=null?(r.avgPct>0?"+":"")+r.avgPct.toFixed(2)+"%":"—"}
-                </span>
-                {r.leader&&<span style={{fontSize:11,color:"var(--inkSoft)",whiteSpace:"nowrap"}}>代表：{r.leader.name}
-                  <span className="mono" style={{color:changeColor(r.leader.pct).fg,fontWeight:700}}> {r.leader.pct>0?"+":""}{r.leader.pct.toFixed(1)}%</span>
-                </span>}
-              </div>;})}
-          </div>}
-    </div>;
+  const fmtOku=(v)=>v==null||v<=0?"—":v>=1e8?(v/1e8).toFixed(1)+"億":(v/1e4).toFixed(0)+"万";
 
   return <div style={{marginBottom:18}}>
-    <div className="sec-head">本日の注目セクター・テーマ</div>
-    <div className="sec-note">登録銘柄（日本・アメリカ市場）の平均騰落率・合計売買代金から自動算出。「代表銘柄」はそのグループ内で最も値動きが大きい銘柄です。</div>
-    <div style={{display:"flex",flexWrap:"wrap",gap:16,marginTop:8}}>
-      <RankList title="セクター別（上位5・合計売買代金順）" rows={sectorRanking} emptyNote="登録銘柄がありません。「日本市場」「アメリカ市場」タブで銘柄を登録してください。"/>
-      <RankList title="テーマ別（上位5・合計売買代金順）" rows={themeRanking} emptyNote="テーマが設定された銘柄がありません。「日本市場」「アメリカ市場」タブの登録銘柄一覧で、銘柄名の右の「＋テーマ」から設定できます。"/>
-    </div>
+    <div className="sec-head">本日の注目セクター</div>
+    <div className="sec-note">登録銘柄（日本・アメリカ市場）の平均騰落率・Market RS（対日経平均、pt）・合計売買代金・銘柄数から自動算出。売買代金の大きさ＝強さではないため（大型株の多いセクターが上位に出やすい）、騰落率・Market RSも併記しています。「代表銘柄」はそのグループ内で最も値動きが大きい銘柄です。</div>
+    {sectorRanking.length===0
+      ? <div style={{fontSize:12,color:"var(--inkSoft)",marginTop:8}}>登録銘柄がありません。「日本市場」「アメリカ市場」タブで銘柄を登録してください。</div>
+      : <div style={{overflowX:"auto",marginTop:8}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:12.5}}>
+            <thead><tr>
+              <th style={{textAlign:"left",padding:"4px 8px",color:"var(--inkSoft)",fontWeight:600,borderBottom:"1px solid var(--rule)"}}>Rank</th>
+              <th style={{textAlign:"left",padding:"4px 8px",color:"var(--inkSoft)",fontWeight:600,borderBottom:"1px solid var(--rule)"}}>Sector</th>
+              <th style={{textAlign:"right",padding:"4px 8px",color:"var(--inkSoft)",fontWeight:600,borderBottom:"1px solid var(--rule)"}}>騰落率</th>
+              <th style={{textAlign:"right",padding:"4px 8px",color:"var(--inkSoft)",fontWeight:600,borderBottom:"1px solid var(--rule)"}} title="対日経平均（pt）">Market RS</th>
+              <th style={{textAlign:"right",padding:"4px 8px",color:"var(--inkSoft)",fontWeight:600,borderBottom:"1px solid var(--rule)"}}>売買代金</th>
+              <th style={{textAlign:"left",padding:"4px 8px",color:"var(--inkSoft)",fontWeight:600,borderBottom:"1px solid var(--rule)"}}>代表銘柄</th>
+            </tr></thead>
+            <tbody>
+              {sectorRanking.map((r,i)=>{
+                const rs=(r.avgPct!=null&&marketPct!=null)?r.avgPct-marketPct:null;
+                const pctColor=r.avgPct==null?"var(--inkFaint)":r.avgPct>0?"var(--up)":r.avgPct<0?"var(--down)":"var(--inkSoft)";
+                const rsColor=rs==null?"var(--inkFaint)":rs>0?"var(--up)":rs<0?"var(--down)":"var(--inkSoft)";
+                return <tr key={r.key}>
+                  <td className="mono" style={{padding:"6px 8px",color:"var(--inkSoft)",borderBottom:"1px solid var(--ruleSoft)"}}>{i+1}</td>
+                  <td style={{padding:"6px 8px",fontWeight:700,borderBottom:"1px solid var(--ruleSoft)"}}>{r.key}
+                    <span style={{fontSize:10.5,color:"var(--inkFaint)",fontWeight:400}}>（{r.count}銘柄）</span></td>
+                  <td className="mono" style={{padding:"6px 8px",textAlign:"right",fontWeight:700,color:pctColor,borderBottom:"1px solid var(--ruleSoft)"}}>
+                    {r.avgPct!=null?(r.avgPct>0?"+":"")+r.avgPct.toFixed(2)+"%":"—"}</td>
+                  <td className="mono" style={{padding:"6px 8px",textAlign:"right",color:rsColor,borderBottom:"1px solid var(--ruleSoft)"}}>
+                    {rs!=null?(rs>0?"+":"")+rs.toFixed(1):"—"}</td>
+                  <td className="mono" style={{padding:"6px 8px",textAlign:"right",color:"var(--inkSoft)",borderBottom:"1px solid var(--ruleSoft)"}}>{fmtOku(r.totalTurnover)}</td>
+                  <td style={{padding:"6px 8px",whiteSpace:"nowrap",fontSize:11.5,color:"var(--inkSoft)",borderBottom:"1px solid var(--ruleSoft)"}}>
+                    {r.leader
+                      ? <>{r.leader.name} <span className="mono" style={{color:changeColor(r.leader.pct).fg,fontWeight:700}}>{r.leader.pct>0?"+":""}{r.leader.pct.toFixed(1)}%</span></>
+                      : "—"}
+                  </td>
+                </tr>;})}
+            </tbody>
+          </table>
+        </div>}
   </div>;
 }
 
@@ -2875,6 +2922,14 @@ function App(){
   const [newsShowCount,setNewsShowCount]=useState(NEWS_PAGE_SIZE); // サブタブごとにリセットする表示件数
   const [chartModal,setChartModal]=useState(null); // {symbol,name,code,market} 5章：登録銘柄行の「チャート」ボタン用モーダル
   const [cBB,setCBB]=useState(true),[cRSI,setCRSI]=useState(true),[cMA,setCMA]=useState(false);
+  // v3-5：TradingViewチャートの時間足。用途ごとに独立管理し、片方の変更がもう片方の初期表示に
+  // 影響しないようにする（日次モニター＝寄り付き〜大引けの当日の動き重視、個別銘柄チャート＝
+  // 場中に開くモーダル、どちらもデフォルト5分足）。最後に選んだ値はlocalStorageに保存し、
+  // 次回そのタブ/モーダルを開いた時に復元する。
+  const [monitorInterval,setMonitorIntervalRaw]=useState(()=>loadChartInterval("monitorChartInterval","5"));
+  const setMonitorInterval=(v)=>{setMonitorIntervalRaw(v);try{localStorage.setItem("monitorChartInterval",v);}catch(e){}};
+  const [stockChartInterval,setStockChartIntervalRaw]=useState(()=>loadChartInterval("stockChartInterval","5"));
+  const setStockChartInterval=(v)=>{setStockChartIntervalRaw(v);try{localStorage.setItem("stockChartInterval",v);}catch(e){}};
   const [openMetrics,setOpenMetrics]=useState(()=>new Set()); // 8章：日次モニターでチャートを開いている項目
   const [jpHistoryMsg,setJpHistoryMsg]=useState(""); // 立花証券API日足チャートの読み込み状態
   const fileRef=useRef();
@@ -3540,13 +3595,17 @@ function App(){
   // 日本の個別株（TSE:xxxx）は無料の埋め込みウィジェットでは表示不可（東証データの再配信制限）。
   const embeddable=(sym)=>!/^TSE:/i.test(sym||"");
 
-  // 5章：登録銘柄行の「チャート」ボタンから開くモーダル用チャート（6章でタブ内チャートは廃止、モーダルのみ）
+  // 5章：登録銘柄行の「チャート」ボタンから開くモーダル用チャート（6章でタブ内チャートは廃止、モーダルのみ）。
+  // v3-5：時間足はstockChartInterval（用途別・デフォルト5分足）を使う。TradingViewの無料埋め込みは
+  // JS APIでの動的な時間足変更に対応していないため（postMessageでの制御は不可）、時間足が変わる
+  // たびにwidget自体（scriptタグ）を作り直す＝このuseEffectの依存配列にstockChartIntervalを
+  // 含めて再実行させる、という方式で確実に切り替える。
   useEffect(()=>{if(!chartModal||!embeddable(chartModal.symbol))return;const c=modalChartRef.current;if(!c)return;
     c.innerHTML='<div class="tradingview-widget-container__widget"></div>';
     const studies=[];if(cBB)studies.push("BB@tv-basicstudies");if(cRSI)studies.push("RSI@tv-basicstudies");if(cMA)studies.push("MASimple@tv-basicstudies");
     const sc=document.createElement("script");sc.src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js";sc.async=true;
-    sc.innerHTML=JSON.stringify({symbol:chartModal.symbol,interval:"D",timezone:"Asia/Tokyo",theme:"light",style:"1",locale:"ja",studies,width:"100%",height:480,allow_symbol_change:false});
-    c.appendChild(sc);},[chartModal,cBB,cRSI,cMA]);
+    sc.innerHTML=JSON.stringify({symbol:chartModal.symbol,interval:stockChartInterval,timezone:"Asia/Tokyo",theme:"light",style:"1",locale:"ja",studies,width:"100%",height:480,allow_symbol_change:false});
+    c.appendChild(sc);},[chartModal,cBB,cRSI,cMA,stockChartInterval]);
 
   // 5-2章：JP個別株（TradingView無料埋め込み不可）は立花証券APIの日足データで自前描画する。
   useEffect(()=>{
@@ -3593,16 +3652,23 @@ function App(){
   // 8章：日次モニターの項目クリックでチャートをトグル開閉
   const toggleMetric=(key)=>setOpenMetrics(prev=>{const n=new Set(prev);n.has(key)?n.delete(key):n.add(key);return n;});
   const openMetricsKey=useMemo(()=>[...openMetrics].sort().join(","),[openMetrics]);
+  // v3-5：時間足はmonitorInterval（日次モニター用・デフォルト5分足）を使う。TradingView無料埋め込みは
+  // JS APIでの動的な時間足変更に対応していないため、時間足が変わるたびにwidgetを作り直す
+  // （依存配列にmonitorIntervalを含めて開いている全チャートを再生成する）。
+  // なおINDEX:NKY（日経平均）はTradingView無料枠でintraday（分足）データが提供されていないため
+  // （2026-09-03実測確認：純正ツールバーで1分/5分等をクリックしても日足のまま変化しない）、
+  // monitorIntervalを渡しても日足のまま表示される。intradayOk:falseのメトリクスにはUI側で
+  // その旨の注記を出す（下のJSX参照）。
   useEffect(()=>{
     METRICS.forEach(m=>{
       if(!openMetrics.has(m.key)||!m.tvEmbed)return;
       const c=metricRefs.current[m.key];if(!c)return;
       c.innerHTML='<div class="tradingview-widget-container__widget"></div>';
       const sc=document.createElement("script");sc.src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js";sc.async=true;
-      sc.innerHTML=JSON.stringify({symbol:m.tv,interval:"D",timezone:"Asia/Tokyo",theme:"light",style:"1",locale:"ja",studies:[],width:"100%",height:320,allow_symbol_change:false});
+      sc.innerHTML=JSON.stringify({symbol:m.tv,interval:monitorInterval,timezone:"Asia/Tokyo",theme:"light",style:"1",locale:"ja",studies:[],width:"100%",height:440,allow_symbol_change:false});
       c.appendChild(sc);
     });
-  },[openMetricsKey]);
+  },[openMetricsKey,monitorInterval]);
 
   return (
     <div className="wrap">
@@ -3661,7 +3727,7 @@ function App(){
         <TodaysMarketCard metrics={s.metrics} watchlistAll={watchlistAll} stockQuotes={s.stockQuotes}
           marketRisk={s.marketRisk} onRefresh={fetchMarketRisk} refreshing={marketRiskFetching}
           activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)} importantNews={importantNewsAll}/>
-        <ThemeSectorRanking watchlistAll={watchlistAll} stockQuotes={s.stockQuotes}/>
+        <ThemeSectorRanking watchlistAll={watchlistAll} stockQuotes={s.stockQuotes} metrics={s.metrics}/>
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:1,background:"var(--rule)",border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden"}}>
           {METRICS.map(m=>{const v=s.metrics[m.key];const t=num(v.t),p=num(v.p);
             const delta=t!=null&&p!=null?t-p:null;
@@ -3686,7 +3752,14 @@ function App(){
               </button>
               {isOpen && <div style={{gridColumn:"1 / -1",background:"var(--card)",padding:12}}>
                 {m.tvEmbed
-                  ? <div ref={el=>metricRefs.current[m.key]=el} style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",background:"var(--card)",minHeight:324}}></div>
+                  ? <>
+                      <div style={{marginBottom:8}}><IntervalSwitcher value={monitorInterval} onChange={setMonitorInterval}/></div>
+                      {m.intradayOk===false && monitorInterval!=="D" &&
+                        <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8,lineHeight:1.5}}>
+                          ℹ️ {m.label}（{m.tv}）はTradingView無料枠にintraday（分足）データが提供されていないため、分足を選んでも日足のまま表示されます（実測確認済み）。分足で日本株の地合いを見たい場合は「日経225先物」をお使いください（先物のため現物指数とは多少乖離します）。
+                        </div>}
+                      <div ref={el=>metricRefs.current[m.key]=el} style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",background:"var(--card)",minHeight:444}}></div>
+                    </>
                   : <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10,padding:"8px 4px"}}>
                       <span style={{fontSize:12.5,color:"var(--inkSoft)"}}>{m.label}は無料埋め込みでは表示できないシンボルです。</span>
                       <button className="btn primary" onClick={()=>openTV(m.tv)}>↗ TradingViewで開く</button>
@@ -3694,7 +3767,36 @@ function App(){
               </div>}
             </React.Fragment>;})}
         </div>
-        <p className="foot">※ 30秒おきに自動更新されます（start.bat で起動したローカルサーバー経由）。数値は遅延あり（前営業日終値〜数十分遅れ）でリアルタイムの板ではありません。</p>
+
+        {/* v3-5（日次モニター情報優先順位）：Market→Sector→Stockの最後、「RS上位監視銘柄」を
+            日次モニター末尾に置く。監視銘柄タブの「今日の注目TOP5」と同じtodayTop5（App側で
+            computeEnrichedWatch/rankTop5により算出済み）をそのまま再利用し、新規計算はしない。
+            クリックで既存のopenAnalysisFor（analysisTargetsに追加＋トレード分析タブへ遷移）を使う。 */}
+        <div style={{marginTop:18}}>
+          <div className="sec-head" style={{fontSize:14}}>RS上位 監視銘柄</div>
+          <div className="sec-note">監視銘柄タブの「今日の注目TOP5」と同じ算出結果です。クリックでトレード分析へ移動します。</div>
+          {todayTop5.length===0
+            ? <div style={{fontSize:12,color:"var(--inkFaint)",marginTop:6}}>判定可能な監視銘柄がまだありません。</div>
+            : <div style={{display:"flex",flexDirection:"column",gap:4,marginTop:8}}>
+                {todayTop5.map(w=>{
+                  const grade=lightweightGrade(w);
+                  const cur=num(s.stockQuotes[w.code]?.t);
+                  return <div key={w.code} onClick={()=>openAnalysisFor(w.code)}
+                    style={{display:"flex",alignItems:"center",gap:10,padding:"6px 10px",borderRadius:4,cursor:"pointer",
+                      border:"1px solid var(--rule)",background:"var(--card)"}}>
+                    <span className="mono" style={{fontSize:11,color:"var(--inkSoft)",width:44}}>{w.code}</span>
+                    <span style={{fontSize:12.5,fontWeight:700,minWidth:100}}>{w.name}</span>
+                    <span className="mono" style={{fontSize:12,marginLeft:"auto"}}>{cur!=null?cur.toLocaleString():"—"}</span>
+                    <span className="mono" style={{fontSize:11.5,width:60,textAlign:"right",
+                      color:w.pct==null?"var(--inkFaint)":w.pct>0?"var(--up)":w.pct<0?"var(--down)":"var(--inkFaint)"}}>
+                      {w.pct!=null?(w.pct>0?"+":"")+w.pct.toFixed(2)+"%":"—"}</span>
+                    <span style={{fontSize:11,color:"var(--inkSoft)",width:36,textAlign:"right"}}>RS{w.rsScore??"—"}</span>
+                    {grade && <span style={{fontSize:10.5,fontWeight:800,color:GRADE_COLOR[grade],border:`1px solid ${GRADE_COLOR[grade]}`,borderRadius:3,padding:"1px 6px"}}>{grade}</span>}
+                  </div>;})}
+              </div>}
+        </div>
+
+        <p className="foot" style={{marginTop:14}}>※ 30秒おきに自動更新されます（start.bat で起動したローカルサーバー経由）。数値は遅延あり（前営業日終値〜数十分遅れ）でリアルタイムの板ではありません。</p>
       </div>}
 
       {/* ===== 監視銘柄（2026-08-21 ユーザー要望） ===== */}
@@ -4327,10 +4429,13 @@ function App(){
               <div className="mono" style={{fontSize:11.5,color:"var(--inkSoft)"}}>{chartModal.symbol}</div></div>
             <button className="iconbtn" style={{fontSize:20}} onClick={()=>setChartModal(null)}>×</button>
           </div>
-          {embeddable(chartModal.symbol) && <div style={{display:"flex",gap:14,flexWrap:"wrap",marginBottom:10}}>
-            <label style={{fontSize:12.5,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cBB} onChange={e=>setCBB(e.target.checked)}/>ボリンジャー</label>
-            <label style={{fontSize:12.5,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cRSI} onChange={e=>setCRSI(e.target.checked)}/>RSI</label>
-            <label style={{fontSize:12.5,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cMA} onChange={e=>setCMA(e.target.checked)}/>移動平均</label>
+          {embeddable(chartModal.symbol) && <div style={{marginBottom:10}}>
+            <IntervalSwitcher value={stockChartInterval} onChange={setStockChartInterval}/>
+            <div style={{display:"flex",gap:14,flexWrap:"wrap",marginTop:8}}>
+              <label style={{fontSize:12.5,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cBB} onChange={e=>setCBB(e.target.checked)}/>ボリンジャー</label>
+              <label style={{fontSize:12.5,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cRSI} onChange={e=>setCRSI(e.target.checked)}/>RSI</label>
+              <label style={{fontSize:12.5,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cMA} onChange={e=>setCMA(e.target.checked)}/>移動平均</label>
+            </div>
           </div>}
           {embeddable(chartModal.symbol)
             ? <div key="modaltvchart" ref={modalChartRef} style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",background:"var(--card)",minHeight:484}}></div>
