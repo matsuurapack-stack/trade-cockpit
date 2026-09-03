@@ -999,15 +999,15 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
             {isOpen && <div style={{overflowX:"auto",overflowY:"auto",maxHeight:520}}>
               <table className="watch-table" style={{width:"100%"}}>
               <colgroup>
-                <col style={{width:150}}/><col style={{width:44}}/><col style={{width:56}}/><col/>
+                <col style={{width:150}}/><col style={{width:54}}/><col style={{width:56}}/><col/>
                 <col style={{width:80}}/><col style={{width:80}}/>
-                <col style={{width:52}}/><col style={{width:52}}/><col style={{width:36}}/>
+                <col style={{width:58}}/><col style={{width:64}}/><col style={{width:36}}/>
               </colgroup>
               <thead><tr>
-                <th>Status</th><th style={{textAlign:"right"}} title="RS Score（0-100）">RS</th><th>コード</th><th>銘柄</th>
+                <th>Status</th><th style={{textAlign:"right"}} title="総合RS：市場とセクターに対する相対的な強さを0〜100で表した総合スコア">総合RS</th><th>コード</th><th>銘柄</th>
                 <th style={{textAlign:"right"}}>現在値</th><th style={{textAlign:"right"}}>前日比</th>
-                <th style={{textAlign:"right"}} title={`Market RS（対 ${market==="US"?"NASDAQ":"日経平均"}、pt）`}>M.RS</th>
-                <th style={{textAlign:"right"}} title="Sector RS（対 所属セクター平均、pt）">S.RS</th><th></th></tr></thead>
+                <th style={{textAlign:"right"}} title={`対市場：銘柄騰落率 − ${market==="US"?"NASDAQ":"日経平均"}騰落率。プラスが大きいほど市場より強い`}>対市場</th>
+                <th style={{textAlign:"right"}} title="対セクター：銘柄騰落率 − セクター平均騰落率。プラスが大きいほど同業・同セクターより強い">対セクター</th><th></th></tr></thead>
               <tbody>{items.map(w=>{
                 const enr=enrichWatchRow(w,stockQuotes,marketPct,sectorAvgMap[w.sector],breakoutLevels,analysisData,marketRiskLabel);
                 const ct=num(stockQuotes[w.code]?.t);
@@ -1698,15 +1698,15 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         <div style={{overflowX:"auto",maxHeight:620,overflowY:"auto"}}>
         <table className="watch-table" style={{width:"100%"}}>
           <colgroup>
-            <col style={{width:150}}/><col style={{width:44}}/><col style={{width:56}}/><col/>
+            <col style={{width:150}}/><col style={{width:54}}/><col style={{width:56}}/><col/>
             <col style={{width:92}}/><col style={{width:80}}/><col style={{width:80}}/>
-            <col style={{width:52}}/><col style={{width:52}}/><col style={{width:36}}/>
+            <col style={{width:58}}/><col style={{width:64}}/><col style={{width:36}}/>
           </colgroup>
           <thead><tr>
-            <th>Status</th><th style={{textAlign:"right"}} title="RS Score（0-100）">RS</th><th>コード</th><th>銘柄</th><th>セクター</th>
+            <th>Status</th><th style={{textAlign:"right"}} title="総合RS：市場とセクターに対する相対的な強さを0〜100で表した総合スコア">総合RS</th><th>コード</th><th>銘柄</th><th>セクター</th>
             <th style={{textAlign:"right"}}>現在値</th><th style={{textAlign:"right"}}>前日比</th>
-            <th style={{textAlign:"right"}} title="Market RS（対 日経平均、pt）">M.RS</th>
-            <th style={{textAlign:"right"}} title="Sector RS（対 所属セクター平均、pt）">S.RS</th><th></th></tr></thead>
+            <th style={{textAlign:"right"}} title="対市場：銘柄騰落率 − 日経平均騰落率。プラスが大きいほど市場より強い">対市場</th>
+            <th style={{textAlign:"right"}} title="対セクター：銘柄騰落率 − セクター平均騰落率。プラスが大きいほど同業・同セクターより強い">対セクター</th><th></th></tr></thead>
           <tbody>{displayed.map((w)=>{
             const qt=stockQuotes[w.code]||{};
             const ct=num(qt.t),cp=num(qt.p);
