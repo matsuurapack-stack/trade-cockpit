@@ -174,6 +174,27 @@ const copyText = async (text) => {
     } catch (e2) { return false; }
   }
 };
+
+// v3-4（ChatGPT連携の再配置）：市場／監視銘柄／トレード分析／ポジションの各画面共通の
+// 「今見ている情報をChatGPT相談用にまとめてコピー」ヘルパー。有料AI APIは呼ばず、
+// JSON（今後Claude Code/ChatGPT双方で扱いやすい構造化データを基本）＋人間が読める見出しを
+// 1つのテキストにしてcopyText()でクリップボードにコピーするだけ。各画面はcontextとdataだけを
+// 渡せばよく、同じような整形処理を画面ごとに重複実装しない。
+function buildChatGPTPayload(context,data){
+  return {context,generated_at:new Date().toISOString(),...data};
+}
+function formatChatGPTText(title,payload){
+  return `【Trade Cockpit ${title}】${new Date().toLocaleString("ja-JP")}\n`+
+    "以下はJSON形式のデータです。内容を踏まえて相談したいです。\n\n"+
+    "```json\n"+JSON.stringify(payload,null,2)+"\n```";
+}
+async function copyChatGPTPayload(title,context,data,setMsg){
+  const payload=buildChatGPTPayload(context,data);
+  const ok=await copyText(formatChatGPTText(title,payload));
+  setMsg?.(ok?"コピーしました":"コピーに失敗しました");
+  if(setMsg)setTimeout(()=>setMsg(""),2500);
+  return ok;
+}
 // 2026-08-21 ユーザー要望：銘柄分析カードの「PTSの注記」〜「利確/損切シグナルチップ」の区間
 // （エントリーチェックリスト・決算期待値の★・タイミングチェック・資金管理の株数目安等）を
 // 一時的に非表示にする。コードは削除せず残しているため、復活させたい場合はtrueに戻すだけでよい。
@@ -1252,33 +1273,38 @@ function AssessmentCard({assessment:a,marginBadge,marginRatio}){
   </div>;
 }
 
+// v3-4（ChatGPT連携の再配置）：監視銘柄タブ（WatchTargetsPanel）専用だった「今日の注目TOP5」の
+// enrichWatchRow→選定ロジックを共通関数として切り出す。市場タブの「朝一分析」コピーにも同じ
+// TOP5をそのまま使い回すため（計算内容は完全に同一、二重実装を避ける）。
+function computeEnrichedWatch(items,stockQuotes,metrics,watchlistAll,breakoutLevels,analysisData){
+  const m=metrics?.nikkei;
+  const mt=m?num(m.t):null,mp=m?num(m.p):null;
+  const marketPct=(mt!=null&&mp!=null&&mp)?(mt-mp)/mp*100:null;
+  const groups=groupStocks(watchlistAll||[],stockQuotes,w=>w.sector);
+  const sectorAvgMap=Object.fromEntries(groups.map(g=>[g.key,g.avgPct]));
+  return items.map(w=>enrichWatchRow(w,stockQuotes,marketPct,sectorAvgMap[w.sector],breakoutLevels,analysisData));
+}
+function rankTop5(enriched,stockQuotes){
+  return [...enriched]
+    .filter(w=>w.rsScore!=null&&num(stockQuotes[w.code]?.t)!=null&&w.status!=="RISK"&&w.status!=="WEAK")
+    .sort((a,b)=>WATCH_STATUS_META[a.status].order-WATCH_STATUS_META[b.status].order||(b.rsScore-a.rsScore))
+    .slice(0,5);
+}
+
 function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData}){
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
 
-  // 市場（日経平均）に対する当日騰落率の差分（8番：Relative Strength計算方法）
-  const marketPct=useMemo(()=>{
-    const m=metrics?.nikkei;if(!m)return null;
-    const t=num(m.t),p=num(m.p);return (t!=null&&p!=null&&p)?(t-p)/p*100:null;
-  },[metrics]);
-  // セクター平均に対する差分（既存groupStocks()を再利用。ThemeSectorRanking等と同じ計算式）
-  const sectorAvgMap=useMemo(()=>{
-    const groups=groupStocks(watchlistAll||[],stockQuotes,w=>w.sector);
-    return Object.fromEntries(groups.map(g=>[g.key,g.avgPct]));
-  },[watchlistAll,stockQuotes]);
-
-  const enriched=useMemo(()=>items.map(w=>
-    enrichWatchRow(w,stockQuotes,marketPct,sectorAvgMap[w.sector],breakoutLevels,analysisData)
-  ),[items,stockQuotes,marketPct,sectorAvgMap,breakoutLevels,analysisData]);
+  // v3-4：市場（日経平均）・セクター平均に対する差分→enrichWatchRow→TOP5選定は
+  // computeEnrichedWatch/rankTop5（共通ヘルパー、本ファイル上部で定義）に切り出し済み。
+  // 市場タブの「朝一分析」コピーも同じ関数で同じTOP5を算出する（二重実装を避ける）。
+  const enriched=useMemo(()=>computeEnrichedWatch(items,stockQuotes,metrics,watchlistAll,breakoutLevels,analysisData),
+    [items,stockQuotes,metrics,watchlistAll,breakoutLevels,analysisData]);
 
   // v3-4「今日の注目TOP5」：判定不能（rsScore/currentが未取得）な銘柄は無理に順位付けせず除外する。
   // RISK（過熱・急落注意）とWEAK（弱い）は「デイトレ候補」としては出さない（除外）。
   // 残りをStatus優先度（WATCH_STATUS_META.order）→RS Scoreの順で並べ、上位5件を採用する。
-  const top5=useMemo(()=>enriched
-    .filter(w=>w.rsScore!=null&&num(stockQuotes[w.code]?.t)!=null&&w.status!=="RISK"&&w.status!=="WEAK")
-    .sort((a,b)=>WATCH_STATUS_META[a.status].order-WATCH_STATUS_META[b.status].order||(b.rsScore-a.rsScore))
-    .slice(0,5)
-  ,[enriched,stockQuotes]);
+  const top5=useMemo(()=>rankTop5(enriched,stockQuotes),[enriched,stockQuotes]);
 
   const [sortKey,setSortKey]=useState("priority");
   const sorted=useMemo(()=>{
@@ -1422,6 +1448,19 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
     setTimeout(()=>setConsultMsg(""),2500);
   };
 
+  // v3-4（ChatGPT連携の再配置）：「今日のTOP5を相談」。TOP5各銘柄の詳細に加え、
+  // 監視銘柄全体のサマリー（summary、既に画面上部に表示している件数と同じ値）も含める。
+  const copyWatchTop5Consult=async()=>{
+    await copyChatGPTPayload("今日のTOP5を相談","watchlist_top5",{
+      watchlist_summary:{total:items.length,...summary},
+      top5:top5.map(w=>({
+        code:w.code,name:w.name,current:num(stockQuotes[w.code]?.t),
+        pct_change:w.pct,rs_score:w.rsScore,status:w.status,
+        grade:lightweightGrade(w),action:lightweightAction(w),reason:lightweightReason(w),
+      })),
+    },setConsultMsg);
+  };
+
   const FILTER_STATUS_CHIPS=["HOT","BREAK","WATCH","WAIT","RISK","WEAK"];
 
   // 2026-09-03改善：Actionボタン群（9個）を「⋮」メニューに集約し、横幅・行高を大幅に節約する。
@@ -1446,7 +1485,10 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         計算・重い分析呼び出しなし）。クリックで既存のonOpenAnalysis（analysisTargetsに追加＋
         トレード分析タブへ遷移）を再利用し、コード入力なしで直接トレード分析に飛べる。 */}
     <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:6,padding:"12px 14px",marginTop:12}}>
-      <div style={{fontWeight:800,fontSize:13.5,marginBottom:8}}>🎯 今日の注目 TOP5</div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6,marginBottom:8}}>
+        <div style={{fontWeight:800,fontSize:13.5}}>🎯 今日の注目 TOP5</div>
+        <button className="action-btn" onClick={copyWatchTop5Consult} disabled={top5.length===0}>🤖 今日のTOP5を相談</button>
+      </div>
       {top5.length===0
         ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>判定可能な銘柄がまだありません（データ取得中か、RISK/WEAKのみの状態です）。</div>
         : <div style={{display:"flex",flexDirection:"column",gap:6}}>
@@ -1762,6 +1804,36 @@ function PortfolioPanel({stockQuotes,analysisData}){
     }catch(e){}
   };
 
+  // v3-4（ChatGPT連携の再配置）：「利確・損切り相談」。ポジションの実データ（実際の平均取得単価
+  // 基準）に加えて、対応するトレード分析結果（analysisData、あれば）を「参考情報」として別枠で
+  // 添える。ポジション管理の基準は実際の取得単価であり、トレード分析のentryは参考値である旨を
+  // 明示するnoteを含める。
+  const [positionConsultMsg,setPositionConsultMsg]=useState("");
+  const copyPositionConsult=async(it)=>{
+    const current=num(stockQuotes?.[it.code]?.t);
+    const {amount:pnlAmount,pct:pnlPct}=calcUnrealizedPnl(it.average_price,it.quantity,current);
+    const basisPrice=it.average_price??current;
+    const rr=calcPositionRR(it.target_1,basisPrice,it.current_stop);
+    const trailKey=deriveTrailingStatus(it.current_stop,it.initial_stop,it.average_price,current);
+    const a=analysisData?.[it.code];
+    await copyChatGPTPayload("利確・損切り相談","position_management",{
+      stock:{code:it.code,name:it.name,market:it.market},
+      position:{
+        quantity:it.quantity,average_price_actual:it.average_price,current,
+        unrealized_pnl:{amount:pnlAmount,pct:pnlPct},
+        initial_stop:it.initial_stop,current_stop:it.current_stop,
+        target_1:it.target_1,target_2:it.target_2,rr,trailing_status:TRAILING_STATUS_META[trailKey].label,
+      },
+      note:"average_price_actualは実際に約定した取得単価（ポジション管理の基準）。以下のtrade_analysis_reference.entry_theoreticalはトレード分析タブの理論値で、参考情報にすぎず取得単価とは別物。",
+      trade_analysis_reference:a?{
+        grade:gradeFromAnalysis(a),action:classifyEntryStrategy(a),
+        entry_theoretical:a.entry,initial_stop_theoretical:a.stop,
+        target_1_theoretical:a.target,target_2_theoretical:a.fullExitTarget??null,
+      }:null,
+      question:"今のSLを上げるべきか、TP1で利確すべきか、トレンド継続ならどこまで伸ばすべきか相談したいです。",
+    },setPositionConsultMsg);
+  };
+
   const fieldStyle={fontSize:12.5,padding:"5px 7px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",boxSizing:"border-box"};
 
   return <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14}}>
@@ -1808,6 +1880,10 @@ function PortfolioPanel({stockQuotes,analysisData}){
                   <span style={{fontWeight:800,fontSize:13.5}}>{it.name||it.code}</span>
                   <span className="mono" style={{fontSize:11,color:"var(--inkFaint)"}}>{it.code}</span>
                   <button className="iconbtn" style={{marginLeft:"auto"}} title="削除" onClick={()=>remove(it.code,it.market)}>×</button>
+                </div>
+                <div style={{display:"flex",alignItems:"center",gap:6,marginTop:4}}>
+                  {positionConsultMsg && <span style={{fontSize:10.5,color:"var(--accent)",fontWeight:700}}>{positionConsultMsg}</span>}
+                  <button className="action-btn" style={{fontSize:11}} onClick={()=>copyPositionConsult(it)}>🤖 利確・損切り相談</button>
                 </div>
                 <div className="mono" style={{fontSize:12,color:"var(--inkSoft)",marginTop:2}}>
                   {it.quantity!=null?`${it.quantity.toLocaleString()}株`:"—株"} @ {it.average_price!=null?it.average_price.toLocaleString():"—"}
@@ -2528,7 +2604,7 @@ const groupStocks=(items,stockQuotes,keyFn)=>{
 // 判定する（サーバー側の重いMarket Risk Score/_market_environment()とは別物・軽量計算のみ）。
 const ENV_ROWS=[["日経先物","nikkei_fut",0],["ドル円","usdjpy",2],["米10年金利","us10y",2],["WTI原油","wti",2],["NASDAQ","nasdaq",0],["SOX","sox",0]];
 function arrowOf(pct){if(pct==null)return "→";return pct>=0.05?"↑":pct<=-0.05?"↓":"→";}
-function MarketEnvironmentBanner({metrics,watchlistAll,stockQuotes}){
+function MarketEnvironmentBanner({metrics,watchlistAll,stockQuotes,top5}){
   const pctOfMetric=(key)=>{const m=metrics?.[key];if(!m)return null;const t=num(m.t),p=num(m.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
   const sentiment=useMemo(()=>{
@@ -2548,8 +2624,38 @@ function MarketEnvironmentBanner({metrics,watchlistAll,stockQuotes}){
   const weakSectors=useMemo(()=>[...sectorGroups].filter(g=>g.avgPct<=-1).sort((a,b)=>a.avgPct-b.avgPct).slice(0,5),[sectorGroups]);
   const neutralSectors=useMemo(()=>[...sectorGroups].filter(g=>g.avgPct>-1&&g.avgPct<1).sort((a,b)=>b.totalTurnover-a.totalTurnover).slice(0,5),[sectorGroups]);
 
+  // v3-4（ChatGPT連携の再配置）：「朝一分析」。この画面に表示している値（地合い・指数・
+  // セクター強弱）そのものと、監視銘柄TOP5（App側でcomputeEnrichedWatch/rankTop5により算出済み、
+  // 監視銘柄タブと同一ロジック）をJSONにまとめてコピーする。新規のサーバー計算・追加リクエストなし。
+  const [morningMsg,setMorningMsg]=useState("");
+  const copyMorningAnalysis=async()=>{
+    await copyChatGPTPayload("朝一分析","morning_market",{
+      sentiment,
+      indices:Object.fromEntries(ENV_ROWS.map(([label,key,dp])=>{
+        const m=metrics?.[key]||{};const t=num(m.t);const pct=pctOfMetric(key);
+        return [key,{label,value:t,pct_change:pct}];
+      })),
+      sectors:{
+        strong:strongSectors.map(g=>({sector:g.key,avg_pct:g.avgPct})),
+        neutral:neutralSectors.map(g=>({sector:g.key,avg_pct:g.avgPct})),
+        weak:weakSectors.map(g=>({sector:g.key,avg_pct:g.avgPct})),
+      },
+      watchlist_top5:(top5||[]).map(w=>({
+        code:w.code,name:w.name,current:num(stockQuotes[w.code]?.t),
+        pct_change:w.pct,rs_score:w.rsScore,status:w.status,
+        grade:lightweightGrade(w),action:lightweightAction(w),reason:lightweightReason(w),
+      })),
+    },setMorningMsg);
+  };
+
   return <div className="card" style={{padding:"12px 16px",marginBottom:14}}>
-    <div style={{fontWeight:800,fontSize:14,marginBottom:8}}>今日の日本株環境</div>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8,marginBottom:8}}>
+      <div style={{fontWeight:800,fontSize:14}}>今日の日本株環境</div>
+      <div style={{display:"flex",alignItems:"center",gap:8}}>
+        {morningMsg && <span style={{fontSize:11,color:"var(--inkSoft)"}}>{morningMsg}</span>}
+        <button className="action-btn" onClick={copyMorningAnalysis}>🤖 朝一分析</button>
+      </div>
+    </div>
     <div style={{display:"flex",alignItems:"baseline",gap:8,marginBottom:10}}>
       <span style={{fontSize:12,color:"var(--inkSoft)"}}>今日の地合い：</span>
       <span style={{fontWeight:800,fontSize:18,color:sentimentColor}}>{sentiment||"—"}</span>
@@ -3018,6 +3124,12 @@ function App(){
   // 2026-08-21 ユーザー要望：監視銘柄は日本市場に限定（アメリカ市場タブの「監視銘柄」ボタンは
   // 撤去済みだが、念のためここでも日本株以外は除外しておく）。
   const watchTargetItems=useMemo(()=>s.watchTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean).filter(w=>w.market==="JP"),[s.watchTargets,allWatch]);
+  // v3-4（ChatGPT連携の再配置）：市場タブ「朝一分析」に監視銘柄TOP5を含めるため、監視銘柄タブと
+  // 同じcomputeEnrichedWatch/rankTop5（共通ヘルパー）でApp側でも同じTOP5を算出しておく。
+  const todayTop5=useMemo(()=>{
+    const enriched=computeEnrichedWatch(watchTargetItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData);
+    return rankTop5(enriched,s.stockQuotes);
+  },[watchTargetItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData]);
   // 投資判断ログの「新規ログ」下書きに自動で入れる値。金利・為替・原油は日次モニターの直近取得値
   // （s.metrics）、市場全体の地合い・米国市場は直近の銘柄分析結果（analyze_stock共通の_market_environment）
   // から、セクター強弱はgroupStocks()の売買代金上位から組み立てる。いずれも編集可能な「下書き」であり、
@@ -3264,6 +3376,30 @@ function App(){
     });
     setTab("journal");
   };
+
+  // v3-4（ChatGPT連携の再配置）：トレード分析タブ「詳細分析を相談」。既存のanalyze_stock()結果
+  // （a）と現在値をそのままJSONにまとめる。current（現在値）とentry（押し目エントリー価格帯＝
+  // 理論値）を明確に別キーで分け、混同しないようnoteを添える。新規のサーバー計算は追加しない。
+  const [analysisConsultMsg,setAnalysisConsultMsg]=useState("");
+  const copyAnalysisConsult=async(w,a)=>{
+    const grade=gradeFromAnalysis(a);
+    const strategy=classifyEntryStrategy(a);
+    const rr=(a.entry!=null&&a.stop!=null&&a.target!=null&&(a.entry-a.stop)>0)?(a.target-a.entry)/(a.entry-a.stop):null;
+    await copyChatGPTPayload("詳細分析を相談","trade_analysis",{
+      stock:{code:w.code,name:w.name,market:w.market,sector:w.sector||null},
+      price:{current:a.current,note:"currentは現在値（実勢価格）。levels.entry_theoreticalはテクニカルから算出した押し目エントリー価格帯の理論値で、現在値と同じとは限らない。"},
+      evaluation:{grade,action:strategy},
+      levels:{
+        entry_theoretical:a.entry,breakout_level:a.indicators?.resistance??null,
+        initial_stop:a.stop,target_1:a.target,target_2:a.fullExitTarget??null,rr,
+      },
+      indicators:{vwap:a.indicators?.vwap??null,rsi:a.indicators?.rsi??null,atr:a.indicators?.atr14??null,
+        volume:num(s.stockQuotes[w.code]?.volume)},
+      margin:{ratio:a.tradeRules?.marginRatio??null,badge:a.tradeRules?.marginBadge??null},
+      market_environment:a.marketEnv||null,
+      comment:[a.entryReason,a.stopReason,a.targetReason].filter(Boolean),
+    },setAnalysisConsultMsg);
+  };
   // 2026-09-02 ユーザー要望「投資判断ログ」：journal・myRulesをサーバーDB（Neon）へ移行後は、
   // 画面上の操作はこれまで通りs（ローカル状態）を即時更新しつつ、ベストエフォートでサーバーにも
   // 同期する（失敗しても画面操作は止めない＝他の外部API連携と同じ方針）。sRef.currentで最新の
@@ -3509,7 +3645,7 @@ function App(){
 
       {/* ===== 日次モニター（独立タブ） ===== */}
       {tab==="monitor" && <div style={{marginTop:18}}>
-        <MarketEnvironmentBanner metrics={s.metrics} watchlistAll={watchlistAll} stockQuotes={s.stockQuotes}/>
+        <MarketEnvironmentBanner metrics={s.metrics} watchlistAll={watchlistAll} stockQuotes={s.stockQuotes} top5={todayTop5}/>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
           <div className="sec-head">日次モニター</div>
           <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
@@ -3729,6 +3865,8 @@ function App(){
                     <div className="card-hd" style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
                       <div><div className="card-t">{w.name}</div><div className="card-n mono">{w.code}</div></div>
                       <div style={{display:"flex",alignItems:"center",gap:6}}>
+                        {analysisConsultMsg && <span style={{fontSize:11,color:"var(--accent)",fontWeight:700}}>{analysisConsultMsg}</span>}
+                        {a && <button className="action-btn" onClick={()=>copyAnalysisConsult(w,a)}>🤖 詳細分析を相談</button>}
                         {a && <button className="action-btn" onClick={()=>openJournalDraft(w,a)}>記録に追加</button>}
                         <button className="iconbtn" title="分析対象から外す" onClick={()=>toggleAnalysisTarget(w.code)}>×</button>
                       </div>
