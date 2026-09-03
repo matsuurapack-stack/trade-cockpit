@@ -1089,6 +1089,56 @@ function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysi
 // Status判定（Trade Cockpit v2 Phase1）。ルールベース・軽量計算のみ（サーバー側analyze_stock()は
 // 呼ばない＝279銘柄規模でも重くならないよう、既に画面上にある値〈stockQuotes・sector平均・
 // breakoutLevels〉だけから算出する）。RS Scoreの重み付けは初期値。運用しながら調整する想定。
+// Trade Cockpit v3-4（UI/UX再設計）：星評価(1-5)を廃止し、既存のstrength値・Market RSから
+// A+/A/B+/B/Cの総合評価を導出する（新規のサーバー計算は追加しない）。
+function gradeFromAnalysis(a){
+  const s=a.strength||0;
+  const rs=a.assessment?.marketRS;
+  const strong=rs!=null&&rs>=2;
+  if(s>=5)return strong?"A+":"A";
+  if(s===4)return strong?"A":"B+";
+  if(s===3)return "B+";
+  if(s===2)return "B";
+  return "C";
+}
+const GRADE_COLOR={"A+":"var(--up)","A":"var(--up)","B+":"var(--accent)","B":"var(--accent)","C":"var(--inkFaint)"};
+
+// エントリー戦略（NOW/PULLBACK/BREAKOUT/WAIT/AVOID）。既存のentry/stop/current・resistance・
+// avoidChecklist・assessment（Falling Knife/Chase Risk）から判定するだけで、購入単価を
+// そのまま表に出す旧方式を置き換える（新規のサーバー計算は追加しない）。
+function classifyEntryStrategy(a){
+  const criticalAvoid=(a.tradeRules?.avoidChecklist||[]).some(c=>c.hit&&["catastrophicVolumeCrash","badEarnings"].includes(c.key));
+  if(a.assessment?.fallingKnife||criticalAvoid)return "AVOID";
+  if(a.assessment?.chaseRisk)return "WAIT";
+  if(a.tradeRules?.entryPattern)return "NOW";
+  const current=a.current,entry=a.entry,resistance=a.indicators?.resistance;
+  if(current!=null&&entry!=null&&current<=entry*1.005)return "NOW";
+  if(current!=null&&resistance!=null&&current>=resistance*0.995)return "BREAKOUT";
+  if(current!=null&&entry!=null&&current>entry)return "PULLBACK";
+  return "WAIT";
+}
+const ENTRY_STRATEGY_META={
+  NOW:{label:"NOW：買える",color:"var(--up)"},
+  PULLBACK:{label:"PULLBACK：押し目待ち",color:"var(--accent)"},
+  BREAKOUT:{label:"BREAKOUT：高値更新待ち",color:"var(--accent)"},
+  WAIT:{label:"WAIT：様子見",color:"var(--inkSoft)"},
+  AVOID:{label:"AVOID：見送り",color:"var(--inkFaint)"},
+};
+
+// v3-4（UI/UX再設計）：タブ構成を「市場／監視銘柄（ホーム）／トレード分析／ポジション／記録」の
+// 5グループ＋ニュース（旧構成の全機能を壊さないため独立タブとして残置）に再編する。既存の
+// tabキー（monitor/news/watch/us/briefing/earnings/analysis/journal/investlog/chatgptimport/
+// stats/position）・各パネルの内部ロジックは一切変更せず、上部ナビゲーションの見せ方だけを
+// グループ化する（第1階層＝グループボタン、第2階層＝グループ内サブタブ）。
+const TAB_GROUPS=[
+  {key:"watch",label:"監視銘柄",tabs:[{key:"watch",label:"監視銘柄"}]},
+  {key:"market",label:"市場",tabs:[{key:"monitor",label:"概況"},{key:"briefing",label:"日本株一覧"},{key:"us",label:"米国株一覧"}]},
+  {key:"tradeAnalysis",label:"トレード分析",tabs:[{key:"analysis",label:"分析"},{key:"earnings",label:"決算"}]},
+  {key:"position",label:"ポジション",tabs:[{key:"position",label:"ポジション"}]},
+  {key:"record",label:"記録",tabs:[{key:"journal",label:"記録"},{key:"investlog",label:"投資判断ログ"},{key:"chatgptimport",label:"ChatGPT取込"},{key:"stats",label:"統計"}]},
+  {key:"news",label:"ニュース",tabs:[{key:"news",label:"ニュース"}]},
+];
+
 const WATCH_STATUS_META = {
   BREAK: {icon:"⚡",label:"BREAK",order:0,color:"var(--down)"},
   RISK:  {icon:"⚠",label:"RISK", order:1,color:"var(--up)"},
@@ -2434,7 +2484,8 @@ function App(){
     try{localStorage.setItem(THEME_KEY,theme);}catch{}
   },[theme]);
   const toggleTheme=()=>setTheme(t=>t==="dark"?"light":"dark");
-  const [tab,setTab]=useState("monitor");
+  // v3-4（UI/UX再設計）：ホーム画面を「監視銘柄」に変更（旧「日次モニター」から）。
+  const [tab,setTab]=useState("watch");
   const [newsSubTab,setNewsSubTab]=useState("summary"); // 9-1章：ニュースタブのサブ切り替え
   const NEWS_PAGE_SIZE=15; // 「もっと見る」：初期表示件数・1クリックあたりの追加表示件数
   const [newsShowCount,setNewsShowCount]=useState(NEWS_PAGE_SIZE); // サブタブごとにリセットする表示件数
@@ -3159,24 +3210,20 @@ function App(){
         </label>
       </div>
 
-      {/* タブ並び順：日次モニター→ニュース→アメリカ市場(6-1)→日本市場→決算分析→銘柄分析(12章)。
-          日次モニターは6章の並びに含まれないが、要望により先頭に配置。
-          決算分析：登録銘柄テーブルの「決算」ボタンで追加した銘柄の直近決算短信を表示するタブ
-          （tabキーはearnings、内部状態はearningsTargets/earningsDetail）。「銘柄分析」は元「分析」タブ
-          （tabキーはanalysisのまま、ラベルのみ変更）で、混同を避けるため隣に並べている。 */}
+      {/* v3-4（UI/UX再設計）：タブ構成をTAB_GROUPS（本ファイル上部で定義）に基づく2階層ナビゲーション
+          に変更。第1階層＝グループ（監視銘柄／市場／トレード分析／ポジション／記録／ニュース）、
+          第2階層＝グループ内の既存タブ（グループ内が1つだけなら省略）。既存のtabキー・各パネルの
+          render条件（{tab==="xxx" && ...}）は一切変更していない。 */}
       <div className="tabs">
-        <button className={"tab"+(tab==="monitor"?" on":"")} onClick={()=>setTab("monitor")}>日次モニター</button>
-        <button className={"tab"+(tab==="news"?" on":"")} onClick={()=>setTab("news")}>ニュース</button>
-        <button className={"tab"+(tab==="watch"?" on":"")} onClick={()=>setTab("watch")}>監視銘柄</button>
-        <button className={"tab"+(tab==="us"?" on":"")} onClick={()=>setTab("us")}>アメリカ市場</button>
-        <button className={"tab"+(tab==="briefing"?" on":"")} onClick={()=>setTab("briefing")}>日本市場</button>
-        <button className={"tab"+(tab==="earnings"?" on":"")} onClick={()=>setTab("earnings")}>決算分析</button>
-        <button className={"tab"+(tab==="analysis"?" on":"")} onClick={()=>setTab("analysis")}>銘柄分析</button>
-        <button className={"tab"+(tab==="journal"?" on":"")} onClick={()=>setTab("journal")}>記録</button>
-        <button className={"tab"+(tab==="investlog"?" on":"")} onClick={()=>setTab("investlog")}>投資判断ログ</button>
-        <button className={"tab"+(tab==="chatgptimport"?" on":"")} onClick={()=>setTab("chatgptimport")}>ChatGPT連携</button>
-        <button className={"tab"+(tab==="stats"?" on":"")} onClick={()=>setTab("stats")}>統計</button>
+        {TAB_GROUPS.map(g=>
+          <button key={g.key} className={"tab"+(g.tabs.some(t=>t.key===tab)?" on":"")}
+            onClick={()=>setTab(g.tabs.some(t=>t.key===tab)?tab:g.tabs[0].key)}>{g.label}</button>)}
       </div>
+      {(()=>{const activeGroup=TAB_GROUPS.find(g=>g.tabs.some(t=>t.key===tab))||TAB_GROUPS[0];
+        return activeGroup.tabs.length>1 && <div className="tabs" style={{marginTop:4}}>
+          {activeGroup.tabs.map(t=>
+            <button key={t.key} className={"tab"+(tab===t.key?" on":"")} onClick={()=>setTab(t.key)} style={{fontSize:12}}>{t.label}</button>)}
+        </div>;})()}
 
       {/* ===== 日次モニター（独立タブ） ===== */}
       {tab==="monitor" && <div style={{marginTop:18}}>
@@ -3413,12 +3460,23 @@ function App(){
                               </>}
                         </div>
                       : <div>
-                          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
-                            <div className="mono" style={{fontSize:12,color:"var(--inkSoft)"}}>現在値 {a.current.toLocaleString()}
-                              {a._fetchedAt && <span style={{marginLeft:8,fontSize:10.5,color:"var(--inkFaint)"}} title={`この分析結果の取得時刻。サーバーへ送った現在値：${a._currentSent!=null?a._currentSent:"（未送信＝日足終値で算出）"}`}>（取得 {a._fetchedAt}）</span>}
+                          {/* v3-4（UI/UX再設計）：星評価を廃止し、現在値・総合評価(A+/A/B+/B/C)・
+                              エントリー戦略(NOW/PULLBACK/BREAKOUT/WAIT/AVOID)を最上部にまとめる。
+                              いずれも既存のstrength・entry・stop・resistance・assessmentから
+                              クライアント側で導出するのみで、サーバー側ロジックは無変更。 */}
+                          {(()=>{const grade=gradeFromAnalysis(a);const strategy=classifyEntryStrategy(a);const sm=ENTRY_STRATEGY_META[strategy];
+                          return <div style={{marginBottom:8}}>
+                            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6}}>
+                              <div className="mono" style={{fontSize:14,color:"var(--inkSoft)"}}>現在値 <span style={{fontWeight:800,fontSize:20,color:"var(--ink)"}}>{a.current.toLocaleString()}</span>
+                                {a._fetchedAt && <span style={{marginLeft:8,fontSize:10.5,color:"var(--inkFaint)"}} title={`この分析結果の取得時刻。サーバーへ送った現在値：${a._currentSent!=null?a._currentSent:"（未送信＝日足終値で算出）"}`}>（取得 {a._fetchedAt}）</span>}
+                              </div>
+                              <span title="総合評価（旧・星評価の後継。シグナル強度とMarket RSから算出）"
+                                style={{fontWeight:800,fontSize:16,color:GRADE_COLOR[grade],border:`1.5px solid ${GRADE_COLOR[grade]}`,borderRadius:4,padding:"1px 8px"}}>{grade}</span>
                             </div>
-                            <div title="シグナル強度" style={{color:"var(--star)",fontSize:13,letterSpacing:1}}>{"★".repeat(a.strength||0)}{"☆".repeat(5-(a.strength||0))}</div>
-                          </div>
+                            <div style={{marginTop:6,fontWeight:700,fontSize:13,color:sm.color,background:"var(--band)",border:`1px solid ${sm.color}`,borderRadius:4,padding:"5px 9px",display:"inline-block"}}>
+                              {sm.label}
+                            </div>
+                          </div>;})()}
                           {/* 立花証券APIの最良気配（板の全体深度ではない）。日本株のみ・未接続時は非表示 */}
                           {w.market==="JP" && (num(s.stockQuotes[w.code]?.bid)!=null || num(s.stockQuotes[w.code]?.ask)!=null) &&
                             <div className="mono" style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>
@@ -3485,27 +3543,29 @@ function App(){
                             {a.signals.sell.map(sig=><div key={sig.key} className="chip" style={{background:"var(--downBg)",borderColor:"var(--down)",color:"var(--down)",marginRight:4,marginBottom:4,display:"inline-block",fontSize:11}}>▼ {sig.label}</div>)}
                           </div>}
                           </>}
-                          <div style={{display:"flex",flexDirection:"column",gap:10}}>
-                            <div>
-                              <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>購入単価(目安)</div>
-                              <div className="mono" style={{fontSize:22,fontWeight:800,color:"var(--ink)",lineHeight:1.3}}>{a.entry.toLocaleString()}</div>
-                              <div style={{color:"var(--inkSoft)",fontSize:11,marginTop:2}}>{a.entryReason}</div>
-                            </div>
-                            <div>
-                              <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>損切り単価(目安)</div>
-                              <div className="mono" style={{fontSize:22,fontWeight:800,color:"var(--down)",lineHeight:1.3}}>{a.stop.toLocaleString()}</div>
-                              <div style={{color:"var(--inkSoft)",fontSize:11,marginTop:2}}>{a.stopReason}</div>
-                            </div>
-                            <div>
-                              <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>利確単価(目安)</div>
-                              <div className="mono" style={{fontSize:22,fontWeight:800,color:"var(--up)",lineHeight:1.3}}>{a.target.toLocaleString()}</div>
-                              <div style={{color:"var(--inkSoft)",fontSize:11,marginTop:2}}>{a.targetReason}</div>
-                              {a.fullExitTarget!=null && <div style={{color:"var(--inkSoft)",fontSize:11,marginTop:4}}>
-                                全部利確ライン（目安） <span className="mono" style={{color:"var(--up)",fontWeight:700}}>{a.fullExitTarget.toLocaleString()}</span>（+5〜8%到達で100株すべての利確を検討）
-                              </div>}
-                              {a.tradeRules?.reboundTargetNote && <div style={{color:"var(--inkSoft)",fontSize:11,marginTop:4}}>📈 {a.tradeRules.reboundTargetNote}</div>}
-                            </div>
-                          </div>
+                          {/* v3-4（UI/UX再設計）：「購入単価(目安)」の単一表示をやめ、押し目価格帯・
+                              ブレイク価格・損切り・利確①②・RRの一覧に置き換える。数値の算出元は
+                              既存のa.entry/a.stop/a.target/a.fullExitTarget/indicators.resistance
+                              のまま（サーバー側ロジックは無変更、表示の組み方だけを変更）。 */}
+                          {(()=>{
+                            const resistance=a.indicators?.resistance;
+                            const rr=(a.entry!=null&&a.stop!=null&&a.target!=null&&(a.entry-a.stop)>0)
+                              ?(a.target-a.entry)/(a.entry-a.stop):null;
+                            const Row=({label,value,color,note})=><div>
+                              <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>{label}</div>
+                              <div className="mono" style={{fontSize:20,fontWeight:800,color,lineHeight:1.3}}>{value}</div>
+                              {note && <div style={{color:"var(--inkSoft)",fontSize:11,marginTop:2}}>{note}</div>}
+                            </div>;
+                            return <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                              <Row label="押し目エントリー価格帯" value={a.entry.toLocaleString()} color="var(--ink)" note={a.entryReason}/>
+                              {resistance!=null && <Row label="ブレイク価格" value={`${resistance.toLocaleString()}超`} color="var(--ink)" note="直近レジスタンス（この水準を出来高を伴って上抜けたら高値ブレイクとして扱う）"/>}
+                              <Row label="初期損切り" value={a.stop.toLocaleString()} color="var(--down)" note={a.stopReason}/>
+                              <Row label="利確①" value={a.target.toLocaleString()} color="var(--up)" note={a.targetReason}/>
+                              {a.fullExitTarget!=null && <Row label="利確②（全部利確ライン）" value={a.fullExitTarget.toLocaleString()} color="var(--up)" note="+5〜8%到達で100株すべての利確を検討"/>}
+                              {rr!=null && <div style={{fontSize:12.5,fontWeight:700,color:"var(--ink)"}}>RR（リスクリワード）　<span className="mono">1 : {rr.toFixed(2)}</span></div>}
+                              {a.tradeRules?.reboundTargetNote && <div style={{color:"var(--inkSoft)",fontSize:11}}>📈 {a.tradeRules.reboundTargetNote}</div>}
+                            </div>;
+                          })()}
                           {a.tradeRules?.profitTakingNote && <div style={{fontSize:11,color:"var(--inkSoft)",marginTop:8}}>⚠️ {a.tradeRules.profitTakingNote}</div>}
                           {a.tradeRules?.entryBasisNote && <div style={{fontSize:10.5,color:"var(--inkFaint)",marginTop:6,lineHeight:1.6}}>ℹ️ {a.tradeRules.entryBasisNote}</div>}
                           {a.tradeRules?.timeHorizonNote && <div style={{fontSize:10.5,color:"var(--inkFaint)",marginTop:6,lineHeight:1.6}}>⏱️ {a.tradeRules.timeHorizonNote}</div>}
@@ -3662,9 +3722,6 @@ function App(){
               </div>}
         </div>
 
-        {/* v3-2新規：保有株（portfolio）。最初からNeonのみで完結（localStorage移行フローは無い）。 */}
-        <PortfolioPanel/>
-
         {/* 資金管理・分割買いツール：総資金とリスク許容%から、銘柄分析タブの各カードの損切り幅に
             応じた株数目安を計算する。値はsettingsとしてlocalStorageに自動保存される。
             2026-08-20：銘柄分析タブをすっきりさせるためこちらに移設（計算自体は銘柄分析タブの各カードで行う）。 */}
@@ -3772,6 +3829,15 @@ function App(){
                 </div>)}
               </div>
             </>}
+      </div>}
+
+      {/* ===== ポジション（v3-4新規：保有株の管理を独立タブに分離） =====
+          中身は既存のPortfolioPanel（Neonの portfolio テーブルで完結、localStorage移行フローなし）
+          をそのまま移設。SL/TP・含み損益・トレーリング状態などの拡張は本タブ新設とは別タスク。 */}
+      {tab==="position" && <div style={{marginTop:18}}>
+        <div className="sec-head">ポジション</div>
+        <div className="sec-note">保有中の建玉のみを表示します。売買記録・振り返りは「記録」タブへ。</div>
+        <PortfolioPanel/>
       </div>}
 
       {/* ===== 投資判断ログ（2026-09-02新規） ===== */}
