@@ -324,6 +324,21 @@ ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS target_2 NUMERIC;
 -- NULL（未設定）を許容し、UI側で設定を促す。HARD STOP（-10%ルール）等はSWING限定のため
 -- この列が必須の起点になる。
 ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS trade_style TEXT;
+
+-- v3-9（監視銘柄自動登録エンジン）：manual_registeredは「手動登録された監視銘柄がAUTOタグの
+-- 期限切れで誤って自動削除される事故」を絶対に起こさないための明示的な列。DEFAULT trueなので、
+-- 既存の全行（=これまでは全て手動登録）は移行なしでそのまま「手動登録」として扱われる
+-- （後方互換性）。自動登録エンジン（server.py側の専用関数のみ）が新規行を作る場合だけ
+-- 明示的にfalseを指定する。_WATCHLIST_COLS（クライアントの汎用保存エンドポイントが使う
+-- 書き込み許可列リスト）には意図的に含めない＝クライアント側の通常の保存・同期処理からは
+-- 物理的に書き込めない設計にすることで、事故の経路そのものを塞ぐ。
+ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS manual_registered BOOLEAN NOT NULL DEFAULT true;
+-- auto_tagsも同様の理由で_WATCHLIST_COLSに含めない。形式：
+-- {"AUTO_MOMENTUM_DAY": {"score": 82, "addedAt": "2026-09-04T09:00:00+09:00",
+--   "expiresAt": "2026-09-05T09:00:00+09:00"}, "AUTO_BREAK": {...}}
+-- のように理由キーごとに独立したスコア・追加日時・有効期限を持つ。専用のマージ関数
+-- （merge_auto_tag）でキー単位の追加・上書きのみを行い、他の理由キーには触れない。
+ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS auto_tags JSONB;
 """
 
 
@@ -1218,6 +1233,90 @@ def upsert_watchlist_item(database_url, user_id, item):
         ok = _upsert_watchlist_item_conn(conn, user_id, item)
         conn.commit()
     return ok
+
+
+# v3-9（監視銘柄自動登録エンジン）：手動登録との事故防止のため、auto_tags/manual_registeredは
+# _WATCHLIST_COLS（クライアントの汎用保存エンドポイントの書き込み許可列）に含めず、以下の専用
+# 関数だけが触る。upsert_watchlist_item()側の一般的な部分更新の仕組みとは完全に独立させている。
+def auto_register_or_tag_watchlist_item(database_url, user_id, code, market, reason_key, tag_value, item_fields=None):
+    """自動登録エンジン専用。銘柄が未登録なら manual_registered=false で新規作成し、既に存在する
+    銘柄（手動登録・他の自動登録いずれでも）なら auto_tags の reason_key キーだけをマージする
+    （他のキー・manual_registered・name/sector等の既存値には一切触れない）。
+    tag_value例: {"score": 82, "addedAt": "...", "expiresAt": "..."}
+    item_fields: 新規作成時のみ使うname/sector/kana等の初期値（dict、省略可）。既存行の更新には使わない。
+    戻り値: True=成功。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return False
+    item_fields = item_fields or {}
+    tag_json = json.dumps({reason_key: tag_value}, ensure_ascii=False)
+    with pool.connection() as conn:
+        # ①未登録の場合だけ新規作成（ON CONFLICT DO NOTHING＝既存行があれば何もしない＝
+        # 既存のmanual_registeredや他の列を一切上書きしない）。
+        extra_cols = [c for c in _WATCHLIST_COLS if c in item_fields]
+        conn.execute(
+            f"INSERT INTO watchlist (user_id, code, market, manual_registered, auto_tags"
+            + ("".join(f", {c}" for c in extra_cols)) + ") "
+            f"VALUES (%s, %s, %s, false, %s::jsonb" + ("".join(", %s" for _ in extra_cols)) + ") "
+            f"ON CONFLICT (user_id, code, market) DO NOTHING",
+            [user_id, code, market, tag_json] + [item_fields.get(c) for c in extra_cols],
+        )
+        # ②reason_keyのタグをマージ（新規作成された行にも、既存行にも同じ処理で適用される＝
+        # 二重に書く必要がない）。COALESCEでauto_tagsが元々NULLの既存行にも対応する。
+        conn.execute(
+            "UPDATE watchlist SET auto_tags = COALESCE(auto_tags, '{}'::jsonb) || %s::jsonb, "
+            "updated_at = now(), active = true "
+            "WHERE user_id = %s AND code = %s AND market = %s",
+            [tag_json, user_id, code, market],
+        )
+        conn.commit()
+    return True
+
+
+def cleanup_expired_auto_tags(database_url, user_id):
+    """auto_tagsの中で有効期限切れの理由キーだけを取り除く。結果としてauto_tagsが空になり、
+    かつ manual_registered=false（＝自動登録のみで維持されていた銘柄）かつ保有ポジションでも
+    ない銘柄は、監視銘柄から削除する。手動登録銘柄（manual_registered=true）は auto_tags が
+    空になっても絶対に削除しない（タグを空にするだけ）。呼び出し側（/api/watchlist等）から
+    軽量に毎回呼べるよう、対象行が無ければ何もしない設計。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return {"expired": 0, "deleted": 0}
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    expired_count = 0
+    deleted_count = 0
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id, code, market, manual_registered, auto_tags FROM watchlist "
+                "WHERE user_id = %s AND auto_tags IS NOT NULL AND auto_tags != '{}'::jsonb",
+                [user_id],
+            )
+            rows = cur.fetchall()
+        if not rows:
+            return {"expired": 0, "deleted": 0}
+        # 保有ポジション（portfolio.active=true）のコードは自動削除対象から除外する。
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT code, market FROM portfolio WHERE user_id = %s AND active = true", [user_id])
+            held = {(r["code"], r["market"]) for r in cur.fetchall()}
+        for row in rows:
+            tags = row["auto_tags"] or {}
+            kept = {k: v for k, v in tags.items() if not (isinstance(v, dict) and v.get("expiresAt") and v["expiresAt"] < now_iso)}
+            if len(kept) == len(tags):
+                continue  # 期限切れなし
+            expired_count += len(tags) - len(kept)
+            if not kept and not row["manual_registered"] and (row["code"], row["market"]) not in held:
+                # 自動登録のみで維持されていた銘柄が、有効なauto_tagsを1件も持たなくなった
+                # ＝手動登録でも保有中でもない → 削除して良い唯一のケース。
+                conn.execute("DELETE FROM watchlist WHERE id = %s", [row["id"]])
+                deleted_count += 1
+            else:
+                conn.execute(
+                    "UPDATE watchlist SET auto_tags = %s::jsonb, updated_at = now() WHERE id = %s",
+                    [json.dumps(kept, ensure_ascii=False), row["id"]],
+                )
+        conn.commit()
+    return {"expired": expired_count, "deleted": deleted_count}
 
 
 def delete_watchlist_item(database_url, user_id, code, market=None):

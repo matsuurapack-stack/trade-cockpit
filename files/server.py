@@ -15,6 +15,7 @@ import secrets
 import calendar
 import datetime
 import threading
+import concurrent.futures
 import webbrowser
 import unicodedata
 import urllib.parse
@@ -1677,6 +1678,261 @@ def get_jp_issue_master():
     return out
 
 
+# ============================================================
+# v3-9（監視銘柄自動登録エンジン）：🐒 MOMENTUM DAY
+# まずMOMENTUM DAYだけを完成させ、Stage1市場全体スキャナー・auto_tags・期限管理を共通基盤として
+# 後続のAUTO_BREAK/AUTO_RS/AUTO_SECTOR_LEADER等に展開する方針（ユーザー指示）。
+# ============================================================
+
+# Stage1（市場全体スキャン）のキャッシュ有効期間。相場データはユーザー間で共通のため、
+# プロセス内メモリにグローバルキャッシュ1本だけを持ち、全ユーザー・全タブで共有する
+# （4000銘柄スキャンをアクセスのたびに繰り返さない）。初期値10分。実測のスキャン所要時間・
+# API負荷を見て調整する前提（run_momentum_day_scanの戻り値で毎回実測値を報告する）。
+MOMENTUM_STAGE1_TTL_SEC = 600
+_momentum_stage1_cache = {"builtAt": 0, "rows": {}, "durationSec": None, "requestCount": None,
+                           "codesScanned": 0, "pricesReturned": 0, "nikkeiChangePct": None}
+_momentum_stage1_lock = threading.Lock()
+
+MOMENTUM_LITE_THRESHOLD = 40    # Stage1のみでMOMENTUM_LITE_SCOREがこの点以上をStage2候補にする
+MOMENTUM_LITE_MAX_CANDIDATES = 100  # Stage2（銘柄ごとに日足履歴を追加取得）に回す上限件数
+# 2026-09-04実測：初期値70では、全面高の日に東証全体3899銘柄中84銘柄が登録される事態になった
+# （「今日だけ何かがおかしいくらい強い銘柄」という趣旨に対して明らかに多すぎる）。実データの
+# 分布（登録候補のfinalScoreがおおむね70〜100に広く分布）を見て85へ引き上げ。実運用しながら
+# さらに調整する前提の暫定値。
+MOMENTUM_SCORE_THRESHOLD = 85   # Stage2まで終えたMOMENTUM_SCOREがこの点以上で自動登録
+MOMENTUM_TAG_EXPIRE_HOURS = 18  # AUTO_MOMENTUM_DAYタグの有効期間の目安（当日限定。大引け後〜
+                                 # 翌営業日の朝には失効させる想定で、厳密な「翌営業日9時」計算は
+                                 # せず、当日中は確実に有効な時間で単純化する）
+# 2026-09-04実測：Stage2を直列実行すると100件で約340秒かかった（1件あたりget_daily_history()の
+# ネットワーク待ちが支配的）。ThreadPoolExecutorで並列化し、立花証券APIへの同時負荷を抑える
+# ため上限を設ける（無制限並列は避ける）。
+MOMENTUM_STAGE2_WORKERS = 10
+
+
+def run_momentum_stage1(force=False):
+    """東証全銘柄（get_jp_issue_master、約4000件）を対象に、立花証券APIのget_market_price()
+    （内部でPRICE_CHUNK＝40件ずつに自動分割される、既存の仕組みをそのまま利用）で当日値を
+    一括取得し、Stage1（MOMENTUM LITE）で使う指標だけを算出する：
+      changePct（当日騰落率）／turnover（売買代金、price×volume）／highRetention（高値維持率、
+      current/dayHigh）／marketRS（対市場＝changePct−日経平均changePct）／
+      sectorRS（対セクター＝changePct−セクター平均changePct、セクターはget_jp_issue_masterの分類）
+    出来高倍率・ブレイク判定など「銘柄ごとに追加の日足履歴取得が要る」指標はここでは扱わない
+    （Stage2の責務。4000銘柄全部に日足取得をかけると非現実的な負荷になるため）。
+    結果はMOMENTUM_STAGE1_TTL_SEC秒プロセス内キャッシュし、同時アクセスによる二重スキャンは
+    _momentum_stage1_lockで防ぐ（ロック取得を待っていた呼び出しは、ロック解放後にキャッシュが
+    新しくなっていればそれをそのまま使う＝二重チェックロッキング）。"""
+    global _momentum_stage1_cache
+    now = time.time()
+    if not force and _momentum_stage1_cache["rows"] and (now - _momentum_stage1_cache["builtAt"] < MOMENTUM_STAGE1_TTL_SEC):
+        return _momentum_stage1_cache
+    with _momentum_stage1_lock:
+        now = time.time()
+        if not force and _momentum_stage1_cache["rows"] and (now - _momentum_stage1_cache["builtAt"] < MOMENTUM_STAGE1_TTL_SEC):
+            return _momentum_stage1_cache
+        t0 = time.time()
+        master = get_jp_issue_master()
+        codes = list(master.keys())
+        if tachibana_api is None or not codes:
+            _momentum_stage1_cache = {"builtAt": time.time(), "rows": {}, "durationSec": 0,
+                                       "requestCount": 0, "codesScanned": 0, "pricesReturned": 0,
+                                       "nikkeiChangePct": None}
+            return _momentum_stage1_cache
+        try:
+            prices = tachibana_api.get_market_price(codes)
+        except Exception as e:
+            print("  Stage1市場全体スキャン失敗", e)
+            prices = {}
+        request_count = -(-len(codes) // tachibana_api.PRICE_CHUNK)  # 切り上げ除算
+
+        market_env = _market_environment()
+        nikkei_chg = market_env.get("nikkeiChangePct")
+
+        # セクター別の当日平均騰落率（対セクターの基準）。get_jp_issue_masterのsector分類を使う。
+        sector_sum, sector_count = {}, {}
+        for code, p in prices.items():
+            chg = p.get("changePct")
+            sector = master.get(code, {}).get("sector")
+            if chg is not None and sector:
+                sector_sum[sector] = sector_sum.get(sector, 0.0) + chg
+                sector_count[sector] = sector_count.get(sector, 0) + 1
+        sector_avg = {s: sector_sum[s] / sector_count[s] for s in sector_sum}
+
+        rows = {}
+        for code, p in prices.items():
+            chg = p.get("changePct")
+            t, high, volume = p.get("t"), p.get("high"), p.get("volume")
+            sector = master.get(code, {}).get("sector")
+            turnover = (t * volume) if (t is not None and volume is not None) else None
+            high_retention = (t / high) if (t is not None and high) else None
+            market_rs = (chg - nikkei_chg) if (chg is not None and nikkei_chg is not None) else None
+            sector_rs = (chg - sector_avg[sector]) if (chg is not None and sector in sector_avg) else None
+            rows[code] = {
+                "code": code, "name": master.get(code, {}).get("name"), "sector": sector,
+                "changePct": chg, "current": t, "high": high, "low": p.get("low"),
+                "open": p.get("open"), "volume": volume, "turnover": turnover,
+                "highRetention": high_retention, "marketRS": market_rs, "sectorRS": sector_rs,
+                "ask": p.get("ask"), "bid": p.get("bid"),
+            }
+        _momentum_stage1_cache = {
+            "builtAt": time.time(), "rows": rows, "durationSec": round(time.time() - t0, 1),
+            "requestCount": request_count, "codesScanned": len(codes), "pricesReturned": len(prices),
+            "nikkeiChangePct": nikkei_chg,
+        }
+    return _momentum_stage1_cache
+
+
+def _scale_score(v, lo, hi, points):
+    """v が lo 以下なら0点、hi 以上なら満点(points)、間は線形補間。"""
+    if v is None:
+        return 0.0
+    if v <= lo:
+        return 0.0
+    if v >= hi:
+        return points
+    return (v - lo) / (hi - lo) * points
+
+
+def _momentum_lite_score(row):
+    """MOMENTUM_LITE_SCORE（0〜100）：Stage1だけで市場全体4000銘柄について算出できる指標のみ
+    使う（出来高倍率は使わない＝ユーザー指示）。配点は初期値（実データの分布を見て調整する前提）。
+      当日騰落率      最大40点（0%で0点、+15%以上で満点）
+      高値維持率      最大25点（90%未満で0点、99%以上で満点）
+      対市場          最大15点（0pt以下で0点、+5pt以上で満点）
+      対セクター      最大10点（0pt以下で0点、+3pt以上で満点）
+      売買代金        最大10点（3千万円未満で0点、3億円以上で満点）"""
+    score = 0.0
+    score += _scale_score(row.get("changePct"), 0, 15, 40)
+    score += _scale_score(row.get("highRetention"), 0.90, 0.99, 25)
+    score += _scale_score(row.get("marketRS"), 0, 5, 15)
+    score += _scale_score(row.get("sectorRS"), 0, 3, 10)
+    score += _scale_score(row.get("turnover"), 3e7, 3e8, 10)
+    return round(min(score, 100.0), 1)
+
+
+def select_momentum_stage1_candidates(stage1):
+    """Stage1結果からMOMENTUM_LITE_SCORE降順で並べ、閾値以上・上位MOMENTUM_LITE_MAX_CANDIDATES件
+    だけをStage2に回す候補として返す（[(liteScore, code, row), ...]）。"""
+    scored = []
+    for code, row in stage1["rows"].items():
+        s = _momentum_lite_score(row)
+        if s >= MOMENTUM_LITE_THRESHOLD:
+            scored.append((s, code, row))
+    scored.sort(key=lambda x: -x[0])
+    return scored[:MOMENTUM_LITE_MAX_CANDIDATES]
+
+
+def _momentum_stage2_detail(code, stage1_row):
+    """Stage1通過銘柄だけに、日足履歴が要る指標（出来高倍率・3か月ブレイク・年初来高値更新）を
+    追加する。1銘柄につき_tachibana_daily_arrays()（get_daily_history）を1回だけ呼ぶ
+    （既存のBREAKOUT_LOOKBACK_DAYS・_tachibana_daily_arraysをそのまま再利用、新規API種別の
+    追加なし）。取得失敗・データ不足時はNoneを返し、呼び出し側はStage1情報だけで暫定スコアを使う。"""
+    arrays = _tachibana_daily_arrays(code)
+    if not arrays:
+        return None
+    closes, opens, highs, lows, volumes = arrays
+    if len(volumes) < 6:
+        return None
+    current = stage1_row.get("current") if stage1_row.get("current") is not None else closes[-1]
+    vol_avg5 = sum(volumes[-6:-1]) / 5
+    vol_ratio = (volumes[-1] / vol_avg5) if vol_avg5 else None
+    breakout_lookback_high = (max(highs[-(BREAKOUT_LOOKBACK_DAYS + 1):-1])
+                               if len(highs) >= BREAKOUT_LOOKBACK_DAYS + 1 else None)
+    active_break = bool(breakout_lookback_high is not None and current > breakout_lookback_high)
+    high52w = max(highs[-min(252, len(highs)):]) if highs else current
+    new_year_high = bool(current >= high52w * 0.999)
+    return {"volRatio": round(vol_ratio, 2) if vol_ratio is not None else None,
+            "activeBreak": active_break, "newYearHigh": new_year_high,
+            "breakoutLookbackHigh": round(breakout_lookback_high, 1) if breakout_lookback_high is not None else None,
+            "high52w": round(high52w, 1)}
+
+
+def _momentum_final_score(lite_score, stage2):
+    """MOMENTUM_SCORE最終値：Stage1のMOMENTUM_LITE_SCOREを土台に、Stage2で分かった
+    出来高倍率・ACTIVE_BREAK・年初来高値更新を加点する。
+      出来高倍率：1倍あたり3点（5倍で頭打ち＝最大15点）
+      ACTIVE_BREAK（3か月高値ブレイク）：+10点
+      年初来高値更新：+5点
+    Stage2データが取得できなかった銘柄はStage1スコアをそのまま最終スコアとする
+    （＝日足履歴が取れない銘柄を一律減点はしない。ただし加点も無いため相対的に順位は下がる）。"""
+    if not stage2:
+        return lite_score
+    score = lite_score
+    if stage2.get("volRatio") is not None:
+        score += min(stage2["volRatio"], 5) * 3
+    if stage2.get("activeBreak"):
+        score += 10
+    if stage2.get("newYearHigh"):
+        score += 5
+    return round(min(score, 100.0), 1)
+
+
+def run_momentum_day_scan(database_url, user_id, force=False):
+    """Stage1（市場全体スキャン）→Stage1候補選定→Stage2（絞り込み後の詳細）→MOMENTUM_SCORE
+    確定→閾値以上を監視銘柄へauto_register_or_tag_watchlist_item()で自動登録、までの一連の処理。
+    戻り値はUI表示・実データでの閾値調整レポートの両方に使うサマリー。
+    S高張り付き（値幅制限の上限に貼り付いて実質売買できない状態）は専用の気配情報APIが無いため、
+    「現在値が当日高値とほぼ一致し、かつ売気配(ask)が立っていない（＝買い一色で売り注文が
+    尽きている）」という間接的な近似で判定する（stuckLimitUp、あくまで簡易推定）。"""
+    stage1 = run_momentum_stage1(force=force)
+    candidates = select_momentum_stage1_candidates(stage1)
+    t_stage2_start = time.time()
+
+    # Stage2はcandidates 1件につきget_daily_history()1回＝ネットワークI/O待ちが支配的なため、
+    # ThreadPoolExecutorで並列化する（初回実測：直列だと100件で約340秒。データの取得内容自体は
+    # 変えず、待ち時間だけ重ねる）。MOMENTUM_STAGE2_WORKERSは立花証券APIへの同時負荷を抑える
+    # ための上限（無制限に並列化しない）。
+    stage2_results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MOMENTUM_STAGE2_WORKERS) as ex:
+        futures = {ex.submit(_momentum_stage2_detail, code, row): code for _, code, row in candidates}
+        for fut in concurrent.futures.as_completed(futures):
+            code = futures[fut]
+            try:
+                stage2_results[code] = fut.result()
+            except Exception as e:
+                print("  Stage2詳細取得失敗", code, e)
+                stage2_results[code] = None
+    stage2_duration = round(time.time() - t_stage2_start, 1)
+
+    registered, details = [], []
+    for lite_score, code, row in candidates:
+        stage2 = stage2_results.get(code)
+        final_score = _momentum_final_score(lite_score, stage2)
+        stuck_limit_up = bool(row.get("current") is not None and row.get("high")
+                               and row["current"] >= row["high"] * 0.999 and not row.get("ask"))
+        detail = {"code": code, "name": row.get("name"), "sector": row.get("sector"),
+                   "changePct": row.get("changePct"), "highRetention": row.get("highRetention"),
+                   "marketRS": row.get("marketRS"), "sectorRS": row.get("sectorRS"),
+                   "turnover": row.get("turnover"), "liteScore": lite_score,
+                   "finalScore": final_score, "stage2": stage2, "stuckLimitUp": stuck_limit_up}
+        details.append(detail)
+        if final_score >= MOMENTUM_SCORE_THRESHOLD and database_url and investment_db is not None:
+            now_dt = datetime.datetime.now(datetime.timezone.utc)
+            tag_value = {"score": final_score, "addedAt": now_dt.isoformat(),
+                         "expiresAt": (now_dt + datetime.timedelta(hours=MOMENTUM_TAG_EXPIRE_HOURS)).isoformat(),
+                         "stuckLimitUp": stuck_limit_up}
+            try:
+                ok = investment_db.auto_register_or_tag_watchlist_item(
+                    database_url, user_id, code, "JP", "AUTO_MOMENTUM_DAY", tag_value,
+                    item_fields={"name": row.get("name"), "sector": row.get("sector"), "source": "auto_momentum_day"})
+            except Exception as e:
+                print("  MOMENTUM DAY自動登録失敗", code, e)
+                ok = False
+            if ok:
+                registered.append(detail)
+    details.sort(key=lambda d: -d["finalScore"])
+    return {
+        "stage1CodesScanned": stage1["codesScanned"], "stage1PricesReturned": stage1["pricesReturned"],
+        "stage1DurationSec": stage1["durationSec"], "stage1RequestCount": stage1["requestCount"],
+        "stage1CacheAgeSec": round(time.time() - stage1["builtAt"], 1) if stage1["builtAt"] else None,
+        "stage1CandidateCount": len(candidates),
+        "stage2EvaluatedCount": len(details),
+        "stage2DurationSec": stage2_duration,
+        "registeredCount": len(registered),
+        "registered": registered,
+        "allCandidates": details,  # 閾値調整の判断材料として、上位20件だけでなく全件返す
+    }
+
+
 def analyze_stock(w, market_env=None):
     """12-1章・technical_analysis_rules.md：ローソク足パターン・移動平均線の並び／クロス・
     ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
@@ -2913,6 +3169,18 @@ class Handler(SimpleHTTPRequestHandler):
                 "marketRiskScore": env.get("marketRiskScore"), "marketRiskLabel": env.get("marketRiskLabel"),
                 "marketCondition": env.get("marketCondition"),
             })
+        elif self.path.startswith("/api/momentum-scan"):
+            # v3-9：🐒 MOMENTUM DAY。「リアルタイムデータを反映」ボタンと同じ設計思想で、
+            # ユーザーが明示的にクリックしたときだけ実行する（ページ表示のたびに自動実行はしない。
+            # 4000銘柄スキャンは重いため）。force=1でStage1キャッシュを無視して強制再スキャン。
+            qs = urllib.parse.urlparse(self.path).query
+            force = urllib.parse.parse_qs(qs).get("force", ["0"])[0] == "1"
+            print(f"[取得] MOMENTUM DAYスキャン開始（force={force}）…")
+            result = run_momentum_day_scan(DATABASE_URL, self.current_user, force=force)
+            print(f"  Stage1 {result['stage1CodesScanned']}銘柄スキャン（{result['stage1DurationSec']}秒・"
+                  f"リクエスト{result['stage1RequestCount']}回）→ Stage2候補{result['stage1CandidateCount']}件"
+                  f"→ 自動登録{result['registeredCount']}件")
+            self._send_json(result)
         elif self.path.startswith("/api/trade-candidates"):
             candidates = investment_db.list_trade_candidates(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"candidates": candidates})
@@ -2926,6 +3194,14 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json({"imports": imports})
         elif self.path.startswith("/api/watchlist"):
             # v3-2：watchlist本体（Neonが正）。?market=JP|USで絞り込み。
+            # v3-9：一覧を返す前に期限切れauto_tagsを掃除する（遅延評価。専用のcronは持たないため、
+            # アクセスされたタイミングで軽くチェックする方式。手動登録銘柄・保有ポジションは
+            # cleanup_expired_auto_tags側の判定で絶対に削除されない）。
+            if investment_db is not None and DATABASE_URL:
+                try:
+                    investment_db.cleanup_expired_auto_tags(DATABASE_URL, self.current_user)
+                except Exception as e:
+                    print("  auto_tags期限切れ掃除に失敗（一覧取得は続行）", e)
             qs = urllib.parse.urlparse(self.path).query
             market = urllib.parse.parse_qs(qs).get("market", [None])[0]
             items = investment_db.list_watchlist(DATABASE_URL, self.current_user, market=market) if (investment_db is not None and DATABASE_URL) else []

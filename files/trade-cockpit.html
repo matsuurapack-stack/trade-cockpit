@@ -1307,6 +1307,24 @@ const ACTION_STATUS_META = {
   RISK:        {icon:"⚠",label:"RISK",        color:"var(--down)"},
   NONE:        {icon:"",label:"",color:"var(--inkFaint)"},
 };
+
+// v3-9（監視銘柄自動登録エンジン）：🐒 MOMENTUM DAY専用バッジ。「買い推奨」ではないことを
+// 徹底するため、Primary/Action Status（enrichWatchRow、SSoT）の判定には一切影響しない完全に
+// 独立した表示のみ（w.auto_tags.AUTO_MOMENTUM_DAYは監視銘柄の付帯情報として持っているだけ）。
+// WEAKENINGは新たにスコアを再計算するのではなく、既存のPrimary/Action Status（30秒ごとの
+// 自動更新で再評価される）がRISK/FAILED_BREAK/WEAKになった時点で「崩れ始めた」とみなす
+// （無料データの更新頻度に合わせた軽量な判定、8-8の方針）。
+const MOMENTUM_BADGE_META={
+  ACTIVE:    {icon:"🐒",label:"MOMENTUM DAY",color:"#b8860b"},
+  WEAKENING: {icon:"🐒",label:"MOMENTUM WEAKENING",color:"var(--down)"},
+};
+function deriveMomentumBadge(w){
+  const tag=w.auto_tags?.AUTO_MOMENTUM_DAY;
+  if(!tag)return null;
+  const weakening=w.actionStatus==="RISK"||w.status==="FAILED_BREAK"||w.status==="WEAK";
+  return {meta:weakening?MOMENTUM_BADGE_META.WEAKENING:MOMENTUM_BADGE_META.ACTIVE,
+    score:tag.score,stuckLimitUp:!!tag.stuckLimitUp};
+}
 // RISK/WAITの具体的な理由コード→短い日本語ラベル（一覧のtooltip・詳細表示用）。
 const RISK_REASON_META = {
   CHASE_UP:      "急騰(高値圏)",
@@ -1550,7 +1568,7 @@ function rankTop5(enriched,stockQuotes){
     .slice(0,5);
 }
 
-function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel}){
+function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan}){
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
 
@@ -1590,7 +1608,8 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
     const c={HOT:0,ACTIVE_BREAK:0,WEAK_BREAK:0,FAILED_BREAK:0,WATCH:0,WEAK:0,
       ENTRY_READY:0,WAIT:0,RISK:0,rs70:0};
     enriched.forEach(w=>{c[w.status]=(c[w.status]||0)+1;c[w.actionStatus]=(c[w.actionStatus]||0)+1;
-      if(w.rsScore!=null&&w.rsScore>=70)c.rs70++;});
+      if(w.rsScore!=null&&w.rsScore>=70)c.rs70++;
+      if(w.auto_tags?.AUTO_MOMENTUM_DAY)c.momentum=(c.momentum||0)+1;});
     return c;
   },[enriched]);
   const [statusFilters,setStatusFilters]=useState(new Set()); // Primary Status。空集合＝フィルタなし
@@ -1599,6 +1618,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
   const [marketRsFilter,setMarketRsFilter]=useState(false); // Market RS +2pt以上のみ
   const [pctFilter,setPctFilter]=useState(""); // "up" | "down" | ""
   const [sectorFilter,setSectorFilter]=useState("");
+  const [momentumFilter,setMomentumFilter]=useState(false); // v3-9：🐒 MOMENTUM DAYのみ表示
   const [showAll,setShowAll]=useState(false);
   const toggleStatusFilter=(st)=>setStatusFilters(prev=>{const n=new Set(prev);n.has(st)?n.delete(st):n.add(st);return n;});
   const toggleActionFilter=(st)=>setActionFilters(prev=>{const n=new Set(prev);n.has(st)?n.delete(st):n.add(st);return n;});
@@ -1610,10 +1630,11 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
     &&(!marketRsFilter||(w.marketRS!=null&&w.marketRS>=2))
     &&(!pctFilter||(pctFilter==="up"?(w.pct!=null&&w.pct>0):(w.pct!=null&&w.pct<0)))
     &&(!sectorFilter||w.sector===sectorFilter)
-  ),[sorted,statusFilters,actionFilters,rsFilter,marketRsFilter,pctFilter,sectorFilter]);
+    &&(!momentumFilter||!!w.auto_tags?.AUTO_MOMENTUM_DAY)
+  ),[sorted,statusFilters,actionFilters,rsFilter,marketRsFilter,pctFilter,sectorFilter,momentumFilter]);
   const TOP_N=10;
   const displayed=showAll?filtered:filtered.slice(0,TOP_N);
-  const hasFilter=statusFilters.size>0||actionFilters.size>0||rsFilter||marketRsFilter||!!pctFilter||!!sectorFilter;
+  const hasFilter=statusFilters.size>0||actionFilters.size>0||rsFilter||marketRsFilter||!!pctFilter||!!sectorFilter||momentumFilter;
 
   // 今日の候補（trade_candidates。8番）
   const [candidates,setCandidates]=useState([]);
@@ -1785,6 +1806,17 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
 
     {/* サマリー（v3設計案19番）：46銘柄を読ませる前にまず件数だけで状況を把握できるようにする。
         v3-6：Primary Status（強さ）とAction Status（今入れるか）を分けて集計する。 */}
+    {/* v3-9：🐒 MOMENTUM DAY。「リアルタイムデータを反映」ボタンと同じく明示クリック時だけ実行
+        （東証全体スキャンは重いため自動実行しない）。結果サマリーは調整の判断材料として簡潔に表示。 */}
+    <div style={{display:"flex",alignItems:"center",gap:8,marginTop:10}}>
+      <button className="action-btn" style={{fontSize:12}} disabled={momentumScanning} onClick={onMomentumScan}>
+        {momentumScanning?"🐒 スキャン中…（数分かかります）":"🐒 MOMENTUM DAYスキャン"}
+      </button>
+      {momentumResult && !momentumScanning && <span style={{fontSize:11,color:"var(--inkFaint)"}}>
+        東証{momentumResult.stage1CodesScanned}銘柄スキャン（{momentumResult.stage1DurationSec}秒）→
+        候補{momentumResult.stage1CandidateCount}件→自動登録{momentumResult.registeredCount}件
+      </span>}
+    </div>
     <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:10,fontSize:12}}>
       <span style={{fontWeight:700}}>今日の監視銘柄 {items.length}</span>
       <span className="chip" style={{fontSize:11}}>🔥 HOT {summary.HOT||0}</span>
@@ -1821,7 +1853,8 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         <option value="">セクター（すべて）</option>
         {sectorOptions.map(s=><option key={s} value={s}>{s}</option>)}
       </select>
-      {hasFilter && <button className="iconbtn" style={{fontSize:11}} onClick={()=>{setStatusFilters(new Set());setActionFilters(new Set());setRsFilter(false);setMarketRsFilter(false);setPctFilter("");setSectorFilter("");}}>フィルタ解除</button>}
+      <button className={"chip"+(momentumFilter?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>setMomentumFilter(v=>!v)}>🐒 MOMENTUM DAY {summary.momentum||0}</button>
+      {hasFilter && <button className="iconbtn" style={{fontSize:11}} onClick={()=>{setStatusFilters(new Set());setActionFilters(new Set());setRsFilter(false);setMarketRsFilter(false);setPctFilter("");setSectorFilter("");setMomentumFilter(false);}}>フィルタ解除</button>}
       <label style={{fontSize:12,color:"var(--inkSoft)",marginLeft:"auto"}}>並び順：
         <select value={sortKey} onChange={e=>setSortKey(e.target.value)} style={{fontSize:12,padding:"3px 6px",marginLeft:4}}>
           <option value="priority">今日注目すべき順（既定）</option>
@@ -1872,6 +1905,11 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
               <td style={{whiteSpace:"nowrap",overflow:"hidden",borderLeft:`3px solid ${meta.color}`,paddingRight:10}} title={statusTitle}>
                 <div style={{fontWeight:700,fontSize:11.5,color:meta.color,whiteSpace:"nowrap"}}>{meta.icon} {meta.label}</div>
                 {actionMeta.label && <div style={{fontWeight:700,fontSize:10.5,color:actionMeta.color,whiteSpace:"nowrap",marginTop:1}}>{actionMeta.icon} {actionMeta.label}</div>}
+                {(()=>{const mb=deriveMomentumBadge(w);if(!mb)return null;
+                  return <div style={{fontWeight:700,fontSize:10,color:mb.meta.color,whiteSpace:"nowrap",marginTop:1}}
+                    title={`MOMENTUM_SCORE ${mb.score}${mb.stuckLimitUp?"／登録時点でS高張り付き":""}（本日限定・買い推奨ではありません）`}>
+                    {mb.meta.icon} {mb.meta.label}{mb.stuckLimitUp?"（S高）":""}
+                  </div>;})()}
               </td>
               <td className="mono" style={{fontWeight:800,fontSize:15,textAlign:"right",paddingLeft:10,color:rsFg}}>{w.rsScore!=null?w.rsScore:"—"}</td>
               <td className="mono" style={{fontWeight:700,fontSize:13}}>{w.code}</td>
@@ -3964,6 +4002,37 @@ function App(){
   };
   const removeWatchTarget=(code)=>setS(p=>({...p,watchTargets:p.watchTargets.filter(c=>c!==code)}));
 
+  // v3-9（監視銘柄自動登録エンジン）：🐒 MOMENTUM DAY。既存の「リアルタイムデータを反映」ボタンと
+  // 同じ考え方で、ユーザーが明示的にクリックしたときだけサーバー側で東証全体スキャン（Stage1→
+  // Stage2）を実行する（ページ表示のたびに自動実行はしない）。完了後、自動登録された銘柄を
+  // 一覧に反映するため監視銘柄（JP）を再取得する。
+  const [momentumScanning,setMomentumScanning]=useState(false);
+  const [momentumResult,setMomentumResult]=useState(null);
+  const runMomentumScan=async()=>{
+    setMomentumScanning(true);
+    setMomentumResult(null);
+    try{
+      const r=await fetch("/api/momentum-scan");
+      if(r.ok){
+        const d=await r.json();
+        setMomentumResult(d);
+        const jr=await fetch("/api/watchlist?market=JP");
+        if(jr.ok){
+          const jd=await jr.json();
+          if(Array.isArray(jd.items)){
+            // v3-9：「監視銘柄」タブの表示対象はwatchlist（Neon）全体ではなくs.watchTargets
+            // （コード一覧、ローカル管理）という別軸のため、自動登録された銘柄が実際にタブへ
+            // 表示されるようにwatchTargetsへもマージする（無ければ何も見えない事故を防ぐ）。
+            const registeredCodes=(d.registered||[]).map(x=>x.code);
+            setS(p=>({...p,watchlist:jd.items,
+              watchTargets:[...new Set([...p.watchTargets,...registeredCodes])]}));
+          }
+        }
+      }
+    }catch(e){}
+    setMomentumScanning(false);
+  };
+
   // 売買記録（トレードジャーナル）：銘柄分析カードの「記録に追加」ボタンから、そのカードの
   // entry/stop/target/marketEnv/entryReasonを初期値にしたドラフトを開き、「記録」タブへ遷移する。
   // 保存するまでs.journalには追加しない（下書き段階ではjournalDraft stateのみで保持）。
@@ -4349,7 +4418,8 @@ function App(){
         onRemove={removeWatchTarget} metrics={s.metrics} watchlistAll={watchlistAll} breakoutLevels={s.breakoutLevels}
         analysisData={s.analysisData} marketRiskLabel={s.marketRisk?.marketRiskLabel}
         activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)}
-        onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}/>}
+        onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}
+        momentumScanning={momentumScanning} momentumResult={momentumResult} onMomentumScan={runMomentumScan}/>}
 
       {/* ===== BRIEFING（日本市場） ===== */}
       {tab==="briefing" && <div>
