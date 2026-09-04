@@ -2066,6 +2066,21 @@ function evaluateChartBreakdown(tradeStyle,current,indicators,positionFlags,enrS
   }
   return {level:fired.length>=2?"STRONG":fired.length===1?"WEAK":"NONE",fired};
 }
+// v3-8 Step7（トレーリングストップ）：含み益が一定水準を超えたら「持ち続ける」より「利益を
+// 守るためにSLを切り上げていく」段階に移すという考え方。値幅（トレーリング幅）はATR14
+// （analyze_stock()で既に計算済み、新規APIコールなし）があればそれを使い、無ければ現在値からの
+// %で代用する（server.pyのatr_ref＝ATR代用ロジックと同じ考え方）。DAYはザラ場の値動きに合わせて
+// 幅を狭く・トレーリング開始の含み益しきい値も低く、SWINGは日足のノイズを拾いすぎないよう
+// 幅を広く・しきい値も高くする。
+function calcTrailingWidth(tradeStyle,current,atr14){
+  if(current==null)return null;
+  const mult=tradeStyle==="DAY"?1.0:1.5;
+  if(atr14!=null&&atr14>0)return atr14*mult;
+  return current*(tradeStyle==="DAY"?0.02:0.05); // ATRが無い場合の代用（DAY:2%／SWING:5%）
+}
+const TRAIL_START_PCT={DAY:3,SWING:5};   // この含み益%を超えたらトレーリング開始を提案
+const HOLD_STRONG_PCT={DAY:8,SWING:15};  // トレーリング幅が計算できない場合のフォールバック表示用
+
 function derivePositionStatus({avgPrice,tradeStyle,current,currentStop,initialStop,target1,positionFlags,pnlPct,indicators,enrStatus}){
   const reasons=[];
   // 1. HARD STOP（Step2・SWING限定・絶対最優先。他のいかなる材料でも上書きしない）
@@ -2105,12 +2120,26 @@ function derivePositionStatus({avgPrice,tradeStyle,current,currentStop,initialSt
   // 5. 警戒シグナル1つ：CAUTION（注視）
   if(warnCount>=1)return {status:"CAUTION",reasons};
 
-  // 6. トレーリング中（利益保護・追随中）
-  if(trailKey==="TRAILING"||trailKey==="PROTECT")
-    return {status:"TRAIL",reasons:[`トレーリング状態：${TRAILING_STATUS_META[trailKey].label}`]};
-
-  // 7. 含み益+15%以上・警戒シグナルなし
-  if(pnlPct!=null&&pnlPct>=15)return {status:"HOLD_STRONG",reasons:[]};
+  // 6. トレーリング（Step7）：現在SLを手動で利益保護・追随中に設定済み（既存のderiveTrailingStatus）、
+  //    またはDAY/SWING別のしきい値を超える含み益に達していれば、トレーリング開始の目安として提案する。
+  //    ATR14（indicators.atr14、既存の分析結果を再利用）から算出したトレーリング幅ぶんだけ現在値
+  //    から離した価格をsuggestedTrailingStopとして添える（あくまで目安の提示で、current_stopの
+  //    自動書き換えは行わない）。
+  const manualTrailing=trailKey==="TRAILING"||trailKey==="PROTECT";
+  const trailStartPct=TRAIL_START_PCT[tradeStyle]??5;
+  if(manualTrailing||(pnlPct!=null&&pnlPct>=trailStartPct)){
+    const width=calcTrailingWidth(tradeStyle,current,indicators?.atr14);
+    if(current!=null&&width!=null){
+      const r=pnlPct!=null?[`含み益${pnlPct.toFixed(1)}%＝トレーリング開始の目安（幅：${tradeStyle==="DAY"?"ATR×1.0相当":"ATR×1.5相当"}）`]:[];
+      if(manualTrailing)r.push(`現在SL状態：${TRAILING_STATUS_META[trailKey].label}`);
+      return {status:"TRAIL",reasons:r,suggestedTrailingStop:Math.round((current-width)*100)/100};
+    }
+    if(manualTrailing)return {status:"TRAIL",reasons:[`現在SL状態：${TRAILING_STATUS_META[trailKey].label}`]};
+  }
+  // 7. 含み益がHOLD_STRONGしきい値以上だが、現在値・ATRが揃わずトレーリング幅を計算できない場合の
+  //    フォールバック表示（「強い含み益」であることだけを伝える）。
+  const holdStrongPct=HOLD_STRONG_PCT[tradeStyle]??15;
+  if(pnlPct!=null&&pnlPct>=holdStrongPct)return {status:"HOLD_STRONG",reasons:[`含み益${pnlPct.toFixed(1)}%（トレーリング幅を計算するデータ不足）`]};
 
   // 8. デフォルト（通常保有継続）
   return {status:"HOLD",reasons:[]};
@@ -2340,6 +2369,10 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap}){
                   </span>
                   {posResult.reasons.length>0 && <span style={{fontSize:10.5,color:"var(--inkFaint)"}} title={posResult.reasons.join("／")}>
                     {posResult.reasons[0]}{posResult.reasons.length>1?` 他${posResult.reasons.length-1}件`:""}
+                  </span>}
+                  {/* v3-8 Step7：トレーリング開始の目安価格（あくまで提案。current_stopの自動書き換えはしない） */}
+                  {posResult.suggestedTrailingStop!=null && <span style={{fontSize:10.5,color:"var(--up)"}}>
+                    トレーリング目安SL <span className="mono" style={{fontWeight:700}}>{posResult.suggestedTrailingStop.toLocaleString()}</span>
                   </span>}
                 </div>
                 {enr && <div style={{fontSize:10,color:"var(--inkFaint)",marginTop:2}}>
