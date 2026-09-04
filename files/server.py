@@ -2061,6 +2061,22 @@ def analyze_stock(w, market_env=None):
     # かかわらず、その後失速して前日終値を割り込むまで戻された＝始値の強さが最後まで持たなかった状態。
     gap_up_failure = bool(gu_pct is not None and gu_pct >= 2 and prev is not None and current <= prev)
 
+    # ---- v3-8 Step6（ポジション管理：出来高複合判定）：出来高単独では売買判断の根拠にせず、
+    # 必ず価格の動き（下落／高値圏からの反落／ブレイク失敗）と組み合わせた複合条件でのみフラグを
+    # 立てる。新規API呼び出しなし（既存のvol_surge/high_zone/breakout_lookback_high/change_pct/
+    # hi・c・rngを再利用）。ポジション管理側（derivePositionStatus）でもCAUTION/REDUCE/EXIT等の
+    # 判断材料の一つとして合算するのみで、この複合フラグ単独で撤退等を決めることはしない。
+    # ①出来高増加＋下落：出来高急増を伴って当日下落＝売り優勢（分配の可能性）。
+    volume_up_with_decline = bool(vol_surge and change_pct is not None and change_pct < 0)
+    # ②高値圏＋大出来高＋反落：52週高値圏を維持しつつ出来高急増があったのに、終値が当日高値から
+    # 大きく戻された＝高値圏での天井圏売り抜けの可能性。
+    high_zone_volume_reversal = bool(high_zone and vol_surge and c <= hi - rng * 0.3)
+    # ③ブレイク失敗＋出来高増加：直近ブレイク水準（breakout_lookback_high、既存のブレイクアウト
+    # entry採用ロジックと同一の値）に当日高値でタッチ／上抜けしたが、出来高急増を伴いながら
+    # 終値はその水準を割り込んで引けた＝ブレイクの失敗（だまし）。
+    failed_breakout_with_volume = bool(breakout_lookback_high is not None and vol_surge
+                                        and hi >= breakout_lookback_high and c < breakout_lookback_high)
+
     # trading_rules.mdのチャート確認優先順位（出来高→移動平均線→VWAP→ボリンジャーバンド→RSI）に合わせ、
     # 複数シグナルが同時点灯した場合はこの順で「最有力の根拠」を選ぶ（VWAP/RSIは単独の買いシグナルを
     # 持たず、entry調整の理由として別途entry_reasonsに追記される）。
@@ -2665,6 +2681,10 @@ def analyze_stock(w, market_env=None):
             "recentLow5m": round(recent_low_5m, 2) if recent_low_5m is not None else None,
             "breakoutLookbackHigh": round(breakout_lookback_high, 2) if breakout_lookback_high is not None else None,
             "swingLowRecent": round(swing_low_recent, 2) if swing_low_recent is not None else None,
+            # Step6：出来高複合判定（出来高単独では立てない、価格の動きとの組み合わせのみ）。
+            "volumeUpWithDecline": volume_up_with_decline,
+            "highZoneVolumeReversal": high_zone_volume_reversal,
+            "failedBreakoutWithVolume": failed_breakout_with_volume,
         },
         "tradeRules": {
             "entryChecklist": entry_checklist,

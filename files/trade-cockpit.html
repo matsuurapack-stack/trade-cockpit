@@ -2082,6 +2082,14 @@ function derivePositionStatus({avgPrice,tradeStyle,current,currentStop,initialSt
   // 警戒1件分として合算する（個別の内訳はreasonsにそのまま列挙し、根拠を追える形にする）。
   const chart=evaluateChartBreakdown(tradeStyle,current,indicators,positionFlags,enrStatus);
   chart.fired.forEach(f=>reasons.push(`チャート崩れ：${f}`));
+  // Step6（出来高複合判定）：出来高は単独では判断材料にせず、価格の動きと組み合わせた複合条件
+  // （サーバー側で既に判定済み）のみを警戒材料の一つとして加える。この3条件のうちどれか1つだけが
+  // 立っている状態は他のケースと同様にCAUTIONどまりで、単独でREDUCE/EXITには至らない
+  // （「出来高だけで撤退等を決めない」という要件を、他の警戒シグナルと同じ加算の仕組みに載せる
+  // ことで満たす＝出来高複合フラグ専用の特別な即断ルートは作らない）。
+  if(positionFlags?.volumeUpWithDecline)reasons.push("出来高複合：出来高増加を伴う下落");
+  if(positionFlags?.highZoneVolumeReversal)reasons.push("出来高複合：高値圏で大出来高からの反落");
+  if(positionFlags?.failedBreakoutWithVolume)reasons.push("出来高複合：ブレイク失敗（出来高増加を伴う）");
   const warnCount=reasons.length;
 
   const trailKey=deriveTrailingStatus(currentStop,initialStop,avgPrice,current);
