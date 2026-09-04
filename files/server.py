@@ -2253,6 +2253,119 @@ def run_break_scan(database_url, user_id, force=False):
     }
 
 
+# ============================================================
+# v3-9続き：📈 AUTO_RS
+# MOMENTUM DAY・AUTO_BREAKと同じStage1（run_momentum_stage1、キャッシュ共有）・auto_tags・
+# CURRENT/SEEN構造を再利用する。AUTO_RSは対市場／対セクターというStage1だけで既に算出済みの
+# 指標が主軸のため、【Stage2（銘柄ごとの日足履歴取得）を持たない】設計にした＝3エンジンの中で
+# 最も軽量（追加のAPI呼び出しがゼロ、Stage1スキャンの結果だけで完結する）。
+# 【設計原則】ここでも「総合RS>=75」等はenrichWatchRow()の正式なRS Scoreとは別物（市場全体を
+# スキャンするための近似で、対市場・対セクターの生の値を直接使う）。登録後の実際のPrimary/
+# Action StatusはenrichWatchRow()がSSoTのまま。
+# ============================================================
+AUTO_RS_SCORE_THRESHOLD = 55  # 実データを見て調整する前提の初期値（MOMENTUM DAY/AUTO_BREAKと同じ運用）
+AUTO_RS_MAX_REGISTER = 15
+AUTO_RS_TAG_EXPIRE_DAYS = 2   # 元の設計案どおり2〜3営業日の短めの目安
+
+
+def _auto_rs_score(row, nikkei_chg):
+    """AUTO_RS_SCORE：対市場マイナスの銘柄はそもそも候補外（None）。大幅下落中（前日比-3%以下）
+    または高値から10%以上崩れている銘柄も除外＝Falling Knifeの簡易ガード（日足履歴を使わない
+    軽量版のため、MOMENTUM DAY/AUTO_BREAKほど厳密ではない点に留意）。
+      対市場          最大40点（0pt以下で0点、+6pt以上で満点）
+      対セクター      最大25点（0pt以下で0点、+4pt以上で満点）
+      売買代金        最大20点（10億円未満で0点、100億円以上で満点、_liquidity_multiplierも別途乗算）
+      高値維持率      最大15点（90%未満で0点、99%以上で満点）
+      地合い耐性ボーナス：日経平均が-0.3%以下の軟調日に、当該銘柄が-0.5%以上（プラス〜小幅安）を
+      維持している場合＋15点（「地合いが悪いのに強い」を明示的に評価）。"""
+    market_rs = row.get("marketRS")
+    if market_rs is None or market_rs < 0:
+        return None
+    chg = row.get("changePct")
+    hr = row.get("highRetention")
+    if chg is not None and chg <= -3:
+        return None
+    if hr is not None and hr < 0.90:
+        return None
+    score = 0.0
+    score += _scale_score(market_rs, 0, 6, 40)
+    score += _scale_score(row.get("sectorRS"), 0, 4, 25)
+    score += _scale_score(row.get("turnover"), 1e9, 1e10, 20)
+    score += _scale_score(hr, 0.90, 0.99, 15)
+    if nikkei_chg is not None and nikkei_chg <= -0.3 and chg is not None and chg >= -0.5:
+        score += 15
+    score *= _liquidity_multiplier(row.get("turnover"))
+    return round(score, 1)
+
+
+def select_auto_rs_candidates(stage1):
+    nikkei_chg = stage1.get("nikkeiChangePct")
+    scored = []
+    for code, row in stage1["rows"].items():
+        s = _auto_rs_score(row, nikkei_chg)
+        if s is not None:
+            scored.append((s, code, row))
+    scored.sort(key=lambda x: -x[0])
+    return scored
+
+
+def run_auto_rs_scan(database_url, user_id, force=False):
+    """Stage1（run_momentum_stage1、キャッシュ共有）→AUTO_RS_SCORE算出→閾値を満たした上位
+    AUTO_RS_MAX_REGISTER件を「AUTO_RS_CURRENT」として登録、新TOP外に落ちた旧CURRENTは
+    「AUTO_RS_SEEN」へ降格。Stage2（追加の日足履歴取得）を持たないため、他の2エンジンより
+    高速・低負荷。"""
+    stage1 = run_momentum_stage1(force=force)
+    scored = select_auto_rs_candidates(stage1)
+    details = [{"code": code, "name": row.get("name"), "sector": row.get("sector"),
+                "changePct": row.get("changePct"), "highRetention": row.get("highRetention"),
+                "marketRS": row.get("marketRS"), "sectorRS": row.get("sectorRS"),
+                "turnover": row.get("turnover"), "finalScore": s}
+               for s, code, row in scored]
+    to_register = [d for d in details if d["finalScore"] >= AUTO_RS_SCORE_THRESHOLD][:AUTO_RS_MAX_REGISTER]
+
+    registered, demoted = [], []
+    if database_url and investment_db is not None:
+        old_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_RS_CURRENT", market="JP")
+        new_current_codes = {d["code"] for d in to_register}
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        expires_at = (now_dt + datetime.timedelta(days=AUTO_RS_TAG_EXPIRE_DAYS)).isoformat()
+
+        for d in to_register:
+            tag_value = {"score": d["finalScore"], "addedAt": now_dt.isoformat(), "expiresAt": expires_at}
+            try:
+                ok = investment_db.auto_register_or_tag_watchlist_item(
+                    database_url, user_id, d["code"], "JP", "AUTO_RS_CURRENT", tag_value,
+                    item_fields={"name": d["name"], "sector": d["sector"], "source": "auto_rs"})
+                investment_db.remove_auto_tag_key(database_url, user_id, d["code"], "JP", "AUTO_RS_SEEN")
+            except Exception as e:
+                print("  AUTO_RS登録（CURRENT）失敗", d["code"], e)
+                ok = False
+            if ok:
+                registered.append(d)
+
+        for code in old_current - new_current_codes:
+            try:
+                investment_db.auto_register_or_tag_watchlist_item(
+                    database_url, user_id, code, "JP", "AUTO_RS_SEEN",
+                    {"addedAt": now_dt.isoformat(), "expiresAt": expires_at})
+                investment_db.remove_auto_tag_key(database_url, user_id, code, "JP", "AUTO_RS_CURRENT")
+                demoted.append(code)
+            except Exception as e:
+                print("  AUTO_RS降格（SEEN化）失敗", code, e)
+    return {
+        "stage1CodesScanned": stage1["codesScanned"], "stage1PricesReturned": stage1["pricesReturned"],
+        "stage1DurationSec": stage1["durationSec"], "stage1RequestCount": stage1["requestCount"],
+        "stage1CacheAgeSec": round(time.time() - stage1["builtAt"], 1) if stage1["builtAt"] else None,
+        "stage1BuiltAtJst": _jst_time_str(stage1["builtAt"]),
+        "stage1ScanFailed": stage1.get("scanFailed", False), "stage1UsedStaleCache": stage1.get("usedStaleCache", False),
+        "candidateCount": len(details),
+        "demotedToSeenCount": len(demoted), "demotedToSeen": demoted,
+        "registeredCount": len(registered),
+        "registered": registered,
+        "allCandidates": details,
+    }
+
+
 def analyze_stock(w, market_env=None):
     """12-1章・technical_analysis_rules.md：ローソク足パターン・移動平均線の並び／クロス・
     ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
@@ -3511,6 +3624,17 @@ class Handler(SimpleHTTPRequestHandler):
             result = run_break_scan(DATABASE_URL, self.current_user, force=force)
             print(f"  Stage1 {result['stage1CodesScanned']}銘柄スキャン（{result['stage1DurationSec']}秒）→ "
                   f"ブレイク候補{result['stage2ValidCount']}件→自動登録{result['registeredCount']}件"
+                  f"（降格{result['demotedToSeenCount']}件）")
+            self._send_json(result)
+        elif self.path.startswith("/api/rs-scan"):
+            # v3-9続き：📈 AUTO_RS。Stage1はMOMENTUM DAY/AUTO_BREAKと共有キャッシュ。
+            # Stage2（追加の日足履歴取得）を持たないため3エンジンの中で最も軽量・高速。
+            qs = urllib.parse.urlparse(self.path).query
+            force = urllib.parse.parse_qs(qs).get("force", ["0"])[0] == "1"
+            print(f"[取得] AUTO_RSスキャン開始（force={force}）…")
+            result = run_auto_rs_scan(DATABASE_URL, self.current_user, force=force)
+            print(f"  Stage1 {result['stage1CodesScanned']}銘柄スキャン（{result['stage1DurationSec']}秒）→ "
+                  f"RS候補{result['candidateCount']}件→自動登録{result['registeredCount']}件"
                   f"（降格{result['demotedToSeenCount']}件）")
             self._send_json(result)
         elif self.path.startswith("/api/trade-candidates"):

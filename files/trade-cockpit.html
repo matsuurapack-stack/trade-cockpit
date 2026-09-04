@@ -1357,6 +1357,25 @@ function deriveBreakBadge(w){
   if(seen)return {tier:"seen",meta:BREAK_BADGE_META.SEEN,score:seen.score};
   return null;
 }
+
+// v3-9続き：📈 AUTO_RS専用バッジ。同じCURRENT/SEEN構造。WEAKENINGは、CURRENT保持中の銘柄の
+// Primary StatusがWEAKへ、またはAction StatusがRISKへ転じた時点で切り替える（RS型には
+// BREAKのような明確な「失敗」概念が無いため、既存Statusの弱含みシグナルを流用）。
+const RS_BADGE_META={
+  ACTIVE:    {icon:"📈",label:"AUTO RS",color:"#1a5fb4"},
+  WEAKENING: {icon:"📈",label:"RS WEAKENING",color:"var(--down)"},
+  SEEN:      {icon:"📈",label:"RS履歴(圏外)",color:"var(--inkFaint)"},
+};
+function deriveRsBadge(w){
+  const cur=w.auto_tags?.AUTO_RS_CURRENT;
+  const seen=w.auto_tags?.AUTO_RS_SEEN;
+  if(cur){
+    const weakening=w.status==="WEAK"||w.actionStatus==="RISK";
+    return {tier:"current",meta:weakening?RS_BADGE_META.WEAKENING:RS_BADGE_META.ACTIVE,score:cur.score};
+  }
+  if(seen)return {tier:"seen",meta:RS_BADGE_META.SEEN,score:seen.score};
+  return null;
+}
 // RISK/WAITの具体的な理由コード→短い日本語ラベル（一覧のtooltip・詳細表示用）。
 const RISK_REASON_META = {
   CHASE_UP:      "急騰(高値圏)",
@@ -1600,7 +1619,7 @@ function rankTop5(enriched,stockQuotes){
     .slice(0,5);
 }
 
-function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan}){
+function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan}){
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
 
@@ -1645,7 +1664,9 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
       if(w.auto_tags?.AUTO_MOMENTUM_DAY_CURRENT)c.momentumCurrent=(c.momentumCurrent||0)+1;
       if(w.auto_tags?.AUTO_MOMENTUM_DAY_SEEN)c.momentumSeen=(c.momentumSeen||0)+1;
       if(w.auto_tags?.AUTO_BREAK_CURRENT)c.breakCurrent=(c.breakCurrent||0)+1;
-      if(w.auto_tags?.AUTO_BREAK_SEEN)c.breakSeen=(c.breakSeen||0)+1;});
+      if(w.auto_tags?.AUTO_BREAK_SEEN)c.breakSeen=(c.breakSeen||0)+1;
+      if(w.auto_tags?.AUTO_RS_CURRENT)c.rsCurrent=(c.rsCurrent||0)+1;
+      if(w.auto_tags?.AUTO_RS_SEEN)c.rsSeen=(c.rsSeen||0)+1;});
     return c;
   },[enriched]);
   const [statusFilters,setStatusFilters]=useState(new Set()); // Primary Status。空集合＝フィルタなし
@@ -1659,6 +1680,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
   // 「🐒 本日履歴」チップは"history"を指す。
   const [momentumFilter,setMomentumFilter]=useState("");
   const [breakFilter,setBreakFilter]=useState(""); // ""|"current"|"history"（AUTO_BREAK版、同じ考え方）
+  const [rsAutoFilter,setRsAutoFilter]=useState(""); // ""|"current"|"history"（AUTO_RS版、同じ考え方）
   const [showAll,setShowAll]=useState(false);
   const toggleStatusFilter=(st)=>setStatusFilters(prev=>{const n=new Set(prev);n.has(st)?n.delete(st):n.add(st);return n;});
   const toggleActionFilter=(st)=>setActionFilters(prev=>{const n=new Set(prev);n.has(st)?n.delete(st):n.add(st);return n;});
@@ -1676,10 +1698,13 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
     &&(!breakFilter||(breakFilter==="current"
         ?!!w.auto_tags?.AUTO_BREAK_CURRENT
         :!!(w.auto_tags?.AUTO_BREAK_CURRENT||w.auto_tags?.AUTO_BREAK_SEEN)))
-  ),[sorted,statusFilters,actionFilters,rsFilter,marketRsFilter,pctFilter,sectorFilter,momentumFilter,breakFilter]);
+    &&(!rsAutoFilter||(rsAutoFilter==="current"
+        ?!!w.auto_tags?.AUTO_RS_CURRENT
+        :!!(w.auto_tags?.AUTO_RS_CURRENT||w.auto_tags?.AUTO_RS_SEEN)))
+  ),[sorted,statusFilters,actionFilters,rsFilter,marketRsFilter,pctFilter,sectorFilter,momentumFilter,breakFilter,rsAutoFilter]);
   const TOP_N=10;
   const displayed=showAll?filtered:filtered.slice(0,TOP_N);
-  const hasFilter=statusFilters.size>0||actionFilters.size>0||rsFilter||marketRsFilter||!!pctFilter||!!sectorFilter||!!momentumFilter||!!breakFilter;
+  const hasFilter=statusFilters.size>0||actionFilters.size>0||rsFilter||marketRsFilter||!!pctFilter||!!sectorFilter||!!momentumFilter||!!breakFilter||!!rsAutoFilter;
 
   // 今日の候補（trade_candidates。8番）
   const [candidates,setCandidates]=useState([]);
@@ -1877,6 +1902,17 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
           　⚠ 市場スキャン更新失敗・{breakResult.stage1UsedStaleCache?"直近データ使用":"データなし"}
         </span>}
       </span>}
+      {/* v3-9続き：📈 AUTO_RS。Stage2を持たないため他の2つより高速。 */}
+      <button className="action-btn" style={{fontSize:12}} disabled={rsScanning} onClick={onRsScan}>
+        {rsScanning?"📈 スキャン中…":"📈 AUTO RSスキャン"}
+      </button>
+      {rsScanResult && !rsScanning && <span style={{fontSize:11,color:"var(--inkFaint)"}}>
+        候補{rsScanResult.candidateCount}件→自動登録{rsScanResult.registeredCount}件（降格{rsScanResult.demotedToSeenCount}件・
+        直近スキャン：{rsScanResult.stage1BuiltAtJst}）
+        {rsScanResult.stage1ScanFailed && <span style={{color:"var(--down)",fontWeight:700}}>
+          　⚠ 市場スキャン更新失敗・{rsScanResult.stage1UsedStaleCache?"直近データ使用":"データなし"}
+        </span>}
+      </span>}
     </div>
     <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:10,fontSize:12}}>
       <span style={{fontWeight:700}}>今日の監視銘柄 {items.length}</span>
@@ -1932,7 +1968,15 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         title="過去にAUTO_BREAKで拾われた銘柄（現在は圏外のSEENも含む）">
         🚀 BREAK履歴 {(summary.breakCurrent||0)+(summary.breakSeen||0)}
       </button>
-      {hasFilter && <button className="iconbtn" style={{fontSize:11}} onClick={()=>{setStatusFilters(new Set());setActionFilters(new Set());setRsFilter(false);setMarketRsFilter(false);setPctFilter("");setSectorFilter("");setMomentumFilter("");setBreakFilter("");}}>フィルタ解除</button>}
+      {/* v3-9続き：AUTO_RS版。「📈 AUTO RS」＝最新TOP（CURRENT）、「📈 RS履歴」＝CURRENT＋SEEN。 */}
+      <button className={"chip"+(rsAutoFilter==="current"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+        onClick={()=>setRsAutoFilter(v=>v==="current"?"":"current")}>📈 AUTO RS {summary.rsCurrent||0}</button>
+      <button className={"chip"+(rsAutoFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+        onClick={()=>setRsAutoFilter(v=>v==="history"?"":"history")}
+        title="過去にAUTO_RSで拾われた銘柄（現在は圏外のSEENも含む）">
+        📈 RS履歴 {(summary.rsCurrent||0)+(summary.rsSeen||0)}
+      </button>
+      {hasFilter && <button className="iconbtn" style={{fontSize:11}} onClick={()=>{setStatusFilters(new Set());setActionFilters(new Set());setRsFilter(false);setMarketRsFilter(false);setPctFilter("");setSectorFilter("");setMomentumFilter("");setBreakFilter("");setRsAutoFilter("");}}>フィルタ解除</button>}
       <label style={{fontSize:12,color:"var(--inkSoft)",marginLeft:"auto"}}>並び順：
         <select value={sortKey} onChange={e=>setSortKey(e.target.value)} style={{fontSize:12,padding:"3px 6px",marginLeft:4}}>
           <option value="priority">今日注目すべき順（既定）</option>
@@ -1992,6 +2036,11 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                   return <div style={{fontWeight:700,fontSize:10,color:bb.meta.color,whiteSpace:"nowrap",marginTop:1}}
                     title={`BREAK_SCORE ${bb.score}${bb.breakTier?"／"+bb.breakTier:""}（監視登録理由であり、買い推奨ではありません）`}>
                     {bb.meta.icon} {bb.meta.label}
+                  </div>;})()}
+                {(()=>{const rb=deriveRsBadge(w);if(!rb)return null;
+                  return <div style={{fontWeight:700,fontSize:10,color:rb.meta.color,whiteSpace:"nowrap",marginTop:1}}
+                    title={`AUTO_RS_SCORE ${rb.score}（監視登録理由であり、買い推奨ではありません）`}>
+                    {rb.meta.icon} {rb.meta.label}
                   </div>;})()}
               </td>
               <td className="mono" style={{fontWeight:800,fontSize:15,textAlign:"right",paddingLeft:10,color:rsFg}}>{w.rsScore!=null?w.rsScore:"—"}</td>
@@ -4142,6 +4191,32 @@ function App(){
     setBreakScanning(false);
   };
 
+  // v3-9続き：📈 AUTO_RS。同じくStage1キャッシュを共有（MOMENTUM DAY/AUTO_BREAKと共通）。
+  // Stage2を持たないため他の2つより軽量・高速。
+  const [rsScanning,setRsScanning]=useState(false);
+  const [rsScanResult,setRsScanResult]=useState(null);
+  const runRsScan=async()=>{
+    setRsScanning(true);
+    setRsScanResult(null);
+    try{
+      const r=await fetch("/api/rs-scan");
+      if(r.ok){
+        const d=await r.json();
+        setRsScanResult(d);
+        const jr=await fetch("/api/watchlist?market=JP");
+        if(jr.ok){
+          const jd=await jr.json();
+          if(Array.isArray(jd.items)){
+            const registeredCodes=(d.registered||[]).map(x=>x.code);
+            setS(p=>({...p,watchlist:jd.items,
+              watchTargets:[...new Set([...p.watchTargets,...registeredCodes])]}));
+          }
+        }
+      }
+    }catch(e){}
+    setRsScanning(false);
+  };
+
   // 売買記録（トレードジャーナル）：銘柄分析カードの「記録に追加」ボタンから、そのカードの
   // entry/stop/target/marketEnv/entryReasonを初期値にしたドラフトを開き、「記録」タブへ遷移する。
   // 保存するまでs.journalには追加しない（下書き段階ではjournalDraft stateのみで保持）。
@@ -4529,7 +4604,8 @@ function App(){
         activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)}
         onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}
         momentumScanning={momentumScanning} momentumResult={momentumResult} onMomentumScan={runMomentumScan}
-        breakScanning={breakScanning} breakResult={breakResult} onBreakScan={runBreakScan}/>}
+        breakScanning={breakScanning} breakResult={breakResult} onBreakScan={runBreakScan}
+        rsScanning={rsScanning} rsScanResult={rsScanResult} onRsScan={runRsScan}/>}
 
       {/* ===== BRIEFING（日本市場） ===== */}
       {tab==="briefing" && <div>
