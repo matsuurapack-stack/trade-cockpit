@@ -1982,6 +1982,28 @@ function calcUnrealizedPnl(avgPrice,quantity,current){
   const pct=avgPrice>0?(current-avgPrice)/avgPrice*100:null;
   return {amount,pct};
 }
+// v3-8 Step2（SWING HARD STOP＝-10%絶対損切りルール）：
+// このルールは「取得単価×0.90」という純粋な計算のみで成り立ち、チャートの崩れ・出来高・
+// ファンダメンタルズ・Primary/Action Status等いかなる他の判定材料も参照しない＝構造的に
+// 上書き不可能（他ロジックがこの関数の戻り値を書き換える経路が存在しない）。DAYは対象外
+// （DAY/SWINGでチャート崩れ判定の重み付けを変える方針はStep5で別途対応）。
+function calcHardStop(avgPrice,tradeStyle){
+  if(tradeStyle!=="SWING"||avgPrice==null)return null;
+  return avgPrice*0.90;
+}
+// pnlPct（=calcUnrealizedPnlのpct、取得単価からの騰落率）をそのまま使う。新しい騰落率計算は
+// 増やさない。-10%以下は問答無用でSTOP、-8%〜-10%未満は接近警告、それより浅ければ通常。
+function hardStopState(pnlPct){
+  if(pnlPct==null)return null;
+  if(pnlPct<=-10)return "STOP";
+  if(pnlPct<=-8)return "APPROACHING";
+  return "OK";
+}
+const HARD_STOP_STATE_META={
+  STOP:{label:"🔴 STOP：-10%ハードストップ到達",color:"var(--down)"},
+  APPROACHING:{label:"⚠ HARD STOP接近（-8%〜-10%）",color:"var(--down)"},
+  OK:{label:null,color:null},
+};
 // RR = (TP1 - 取得値または現在値) / (取得値または現在値 - 現在SL)。ロング前提。
 // 0除算・現在SL >= 基準値などの異常ケースはnull（表示側で「--」）。
 function calcPositionRR(tp1,basisPrice,currentStop){
@@ -2112,16 +2134,20 @@ function PortfolioPanel({stockQuotes,analysisData}){
     const basisPrice=it.average_price??current;
     const rr=calcPositionRR(it.target_1,basisPrice,it.current_stop);
     const trailKey=deriveTrailingStatus(it.current_stop,it.initial_stop,it.average_price,current);
+    const hardStopPrice=calcHardStop(it.average_price,it.trade_style);
+    const hsState=hardStopState(pnlPct);
     const a=analysisData?.[it.code];
     await copyChatGPTPayload("利確・損切り相談","position_management",{
       stock:{code:it.code,name:it.name,market:it.market},
       position:{
+        trade_style:it.trade_style||null,
         quantity:it.quantity,average_price_actual:it.average_price,current,
         unrealized_pnl:{amount:pnlAmount,pct:pnlPct},
         initial_stop:it.initial_stop,current_stop:it.current_stop,
         target_1:it.target_1,target_2:it.target_2,rr,trailing_status:TRAILING_STATUS_META[trailKey].label,
+        hard_stop_swing:hardStopPrice!=null?{price:hardStopPrice,state:hsState}:null,
       },
-      note:"average_price_actualは実際に約定した取得単価（ポジション管理の基準）。以下のtrade_analysis_reference.entry_theoreticalはトレード分析タブの理論値で、参考情報にすぎず取得単価とは別物。",
+      note:"average_price_actualは実際に約定した取得単価（ポジション管理の基準）。hard_stop_swingはSWING限定の-10%絶対損切りルールで、他のどの材料よりも優先される（stateがSTOPなら他条件に関わらず撤退が原則）。以下のtrade_analysis_reference.entry_theoreticalはトレード分析タブの理論値で、参考情報にすぎず取得単価とは別物。",
       trade_analysis_reference:a?{
         grade:gradeFromAnalysis(a),action:classifyEntryStrategy(a),
         entry_theoretical:a.entry,initial_stop_theoretical:a.stop,
@@ -2178,6 +2204,10 @@ function PortfolioPanel({stockQuotes,analysisData}){
               const trailKey=deriveTrailingStatus(it.current_stop,it.initial_stop,it.average_price,current);
               const trailMeta=TRAILING_STATUS_META[trailKey];
               const editingStop=stopDraftFor===it.code+it.market;
+              // v3-8 Step2：SWING限定の-10%絶対損切りルール。他のいかなる判定より優先表示する。
+              const hardStopPrice=calcHardStop(it.average_price,it.trade_style);
+              const hsState=hardStopState(pnlPct);
+              const hsMeta=hsState?HARD_STOP_STATE_META[hsState]:null;
               return <div key={it.code+it.market} style={{border:"1px solid var(--rule)",borderRadius:5,padding:"10px 12px",background:"var(--bg)"}}>
                 <div style={{display:"flex",alignItems:"baseline",gap:8}}>
                   <span style={{fontWeight:800,fontSize:13.5}}>{it.name||it.code}</span>
@@ -2188,6 +2218,14 @@ function PortfolioPanel({stockQuotes,analysisData}){
                     {it.trade_style==="DAY"?"DAY":"SWING"}</button>}
                   <button className="iconbtn" style={{marginLeft:"auto"}} title="削除" onClick={()=>remove(it.code,it.market)}>×</button>
                 </div>
+                {/* v3-8 Step2：SWINGの-10%ハードストップ。他のどの材料（チャート・出来高・
+                    ファンダメンタルズ・Primary/Action Status等）にも左右されない絶対ルールとして、
+                    カード最上部に他の情報より優先して表示する。 */}
+                {hsMeta?.label && <div style={{display:"flex",alignItems:"center",gap:6,marginTop:4,padding:"4px 8px",
+                    background:"var(--downBg)",border:`1px solid ${hsMeta.color}`,borderRadius:3,
+                    fontSize:11.5,fontWeight:800,color:hsMeta.color}}>
+                  {hsMeta.label}（取得単価比 {pnlPct!=null?pnlPct.toFixed(1):"—"}%）
+                </div>}
                 {/* v3-8 Step1：取引タイプ未設定（既存ポジション）はここで設定を促す。設定するまで
                     HARD STOP等の取引タイプ依存ロジックは動かない（後続Stepで実装）。 */}
                 {!it.trade_style && <div style={{display:"flex",alignItems:"center",gap:6,marginTop:4,fontSize:11,color:"var(--down)"}}>
@@ -2229,6 +2267,11 @@ function PortfolioPanel({stockQuotes,analysisData}){
                   <div><span style={{color:"var(--inkSoft)"}}>TP1 </span><span className="mono">{it.target_1!=null?it.target_1.toLocaleString():"—"}</span></div>
                   <div><span style={{color:"var(--inkSoft)"}}>TP2 </span><span className="mono">{it.target_2!=null?it.target_2.toLocaleString():"—"}</span></div>
                   <div><span style={{color:"var(--inkSoft)"}}>RR </span><span className="mono" style={{fontWeight:700}}>{rr!=null?`1 : ${rr.toFixed(2)}`:"--"}</span></div>
+                  {hardStopPrice!=null && <div title="SWING限定・取得単価×0.90。他条件に関わらずこれを下回れば撤退が原則。">
+                    <span style={{color:"var(--down)"}}>HARD STOP </span>
+                    <span className="mono" style={{fontWeight:700,color:"var(--down)"}}>{Math.round(hardStopPrice).toLocaleString()}</span>
+                    <span style={{color:"var(--inkFaint)"}}>（-10%）</span>
+                  </div>}
                 </div>
                 <div style={{marginTop:6}}>
                   <span style={{fontSize:10.5,fontWeight:700,color:trailMeta.color,border:`1px solid ${trailMeta.color}`,borderRadius:3,padding:"1px 6px"}}>状態：{trailMeta.label}</span>
