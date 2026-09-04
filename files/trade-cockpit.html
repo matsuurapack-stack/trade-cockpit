@@ -2021,6 +2021,63 @@ const TRAILING_STATUS_META={
   PROTECT:{label:"利益保護",color:"var(--up)"},
   TRAILING:{label:"トレーリング",color:"var(--up)"},
 };
+
+// v3-8 Step4（ポジション管理ロジック再設計）：ポジション専用のStatus判定。
+// 【最重要原則】銘柄分析（新規エントリー判断）とポジション管理（継続保有/利確/損切り/撤退判断）は
+// 判断基準を分離する。enrichWatchRow()のPrimary/Action Status・riskReasons・waitReasonsは
+// 「参考情報」としてのみ別枠で表示し、この関数の分岐条件には一切使わない（新規エントリー用の
+// 判定を保有継続の最終判断に流用しない）。土台となる材料は、Step2（HARD STOP）・Step3（大陰線/
+// ギャップ失敗の軽量フラグ）・既存のトレーリング状態・利確①到達のみ。Step5（DAY/SWING別チャート
+// 崩れ判定）・Step6（出来高複合判定）・Step7（トレーリング幅のDAY/SWING分岐）で判定材料を
+// 段階的に追加していく前提（現時点でのEXIT/REDUCE判定はStep3フラグの単純カウントのみによる
+// 暫定版で、Step5以降でチャート崩れの重み付けを加えて精緻化する）。
+const POSITION_STATUS_META={
+  STOP:{label:"STOP",icon:"🔴",color:"var(--down)"},
+  EXIT:{label:"EXIT",icon:"🚪",color:"var(--down)"},
+  REDUCE:{label:"REDUCE",icon:"✂",color:"var(--down)"},
+  CAUTION:{label:"CAUTION",icon:"⚠",color:"var(--down)"},
+  TAKE_PROFIT:{label:"TAKE PROFIT",icon:"💰",color:"var(--up)"},
+  TRAIL:{label:"TRAIL",icon:"📈",color:"var(--up)"},
+  HOLD_STRONG:{label:"HOLD STRONG",icon:"💪",color:"var(--up)"},
+  HOLD:{label:"HOLD",icon:"🤝",color:"var(--inkSoft)"},
+};
+function derivePositionStatus({avgPrice,tradeStyle,current,currentStop,initialStop,target1,positionFlags,pnlPct}){
+  const reasons=[];
+  // 1. HARD STOP（Step2・SWING限定・絶対最優先。他のいかなる材料でも上書きしない）
+  const hardStopPrice=calcHardStop(avgPrice,tradeStyle);
+  const hsState=hardStopPrice!=null?hardStopState(pnlPct):null;
+  if(hsState==="STOP"){
+    return {status:"STOP",reasons:[`SWINGの-10%ハードストップに到達（取得単価比 ${pnlPct!=null?pnlPct.toFixed(1):"—"}%）`]};
+  }
+  // 2. 警戒シグナルの収集（単独では撤退トリガーにしない。Step5以降で重み付けを追加予定）
+  if(hsState==="APPROACHING")reasons.push("SWING HARD STOPに接近（-8%〜-10%）");
+  if(positionFlags?.longBearishCandle)reasons.push("直近に大陰線（実体の大きい陰線）");
+  if(positionFlags?.gapUpFailure)reasons.push("寄り付きの上放れがその後失速（ギャップ失敗）");
+  const warnCount=reasons.length;
+
+  const trailKey=deriveTrailingStatus(currentStop,initialStop,avgPrice,current);
+  const tp1Reached=target1!=null&&current!=null&&current>=target1;
+
+  // 3. 利確①到達は警戒シグナルの有無に関わらず知らせる（見逃し防止。警戒理由があれば併記）
+  if(tp1Reached)return {status:"TAKE_PROFIT",reasons:[...reasons,"利確①水準に到達"]};
+
+  // 4. 警戒シグナル2つ以上：含み損ならEXIT検討、含み益ならREDUCE（一部利確）検討
+  if(warnCount>=2){
+    return {status:(pnlPct!=null&&pnlPct<=0)?"EXIT":"REDUCE",reasons};
+  }
+  // 5. 警戒シグナル1つ：CAUTION（注視）
+  if(warnCount>=1)return {status:"CAUTION",reasons};
+
+  // 6. トレーリング中（利益保護・追随中）
+  if(trailKey==="TRAILING"||trailKey==="PROTECT")
+    return {status:"TRAIL",reasons:[`トレーリング状態：${TRAILING_STATUS_META[trailKey].label}`]};
+
+  // 7. 含み益+15%以上・警戒シグナルなし
+  if(pnlPct!=null&&pnlPct>=15)return {status:"HOLD_STRONG",reasons:[]};
+
+  // 8. デフォルト（通常保有継続）
+  return {status:"HOLD",reasons:[]};
+}
 // current_stopが未設定ならOFF。initial_stopのままなら「初期SL」。average_priceと一致すれば
 // 「建値」。average_priceより上に上げてあれば「利益保護」、さらに現在値との乖離が小さい
 // （値幅を詰めて追随中とみなせる目安として3%以内）場合は「トレーリング」とする。完全自動売買は
@@ -2044,7 +2101,7 @@ function deriveTrailingStatus(currentStop,initialStop,avgPrice,current){
 // 直接編集・保存できる。stockQuotes（現在値）・analysisData（トレード分析タブのentry/stop/
 // target/fullExitTargetのスナップショット）を新たにpropsで受け取り、既存の取得済みデータを
 // 再利用する（新規リクエストは追加しない）。
-function PortfolioPanel({stockQuotes,analysisData}){
+function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap}){
   const [items,setItems]=useState([]);
   const [loading,setLoading]=useState(true);
   // v3-8（ポジション管理ロジック再設計 Step1）：取引タイプ（DAY/SWING）を新規登録時に必須化。
@@ -2208,6 +2265,14 @@ function PortfolioPanel({stockQuotes,analysisData}){
               const hardStopPrice=calcHardStop(it.average_price,it.trade_style);
               const hsState=hardStopState(pnlPct);
               const hsMeta=hsState?HARD_STOP_STATE_META[hsState]:null;
+              // v3-8 Step4：ポジション専用Status。銘柄分析用のPrimary/Action Status（enr）とは
+              // 別ロジックで、あくまで保有判断専用（enrはこの下で「参考情報」としてのみ添える）。
+              const posFlags=analysisData?.[it.code]?.positionFlags;
+              const posResult=derivePositionStatus({avgPrice:it.average_price,tradeStyle:it.trade_style,
+                current,currentStop:it.current_stop,initialStop:it.initial_stop,target1:it.target_1,
+                positionFlags:posFlags,pnlPct});
+              const posMeta=POSITION_STATUS_META[posResult.status];
+              const enr=analysisEnrichedMap?.get(it.code);
               return <div key={it.code+it.market} style={{border:"1px solid var(--rule)",borderRadius:5,padding:"10px 12px",background:"var(--bg)"}}>
                 <div style={{display:"flex",alignItems:"baseline",gap:8}}>
                   <span style={{fontWeight:800,fontSize:13.5}}>{it.name||it.code}</span>
@@ -2225,6 +2290,21 @@ function PortfolioPanel({stockQuotes,analysisData}){
                     background:"var(--downBg)",border:`1px solid ${hsMeta.color}`,borderRadius:3,
                     fontSize:11.5,fontWeight:800,color:hsMeta.color}}>
                   {hsMeta.label}（取得単価比 {pnlPct!=null?pnlPct.toFixed(1):"—"}%）
+                </div>}
+                {/* v3-8 Step4：ポジション専用Status（HOLD_STRONG/HOLD/TRAIL/TAKE_PROFIT/CAUTION/
+                    REDUCE/EXIT/STOP）。カード全体の再配置はStep8で行うため、現時点ではここに
+                    追加表示するのみ。 */}
+                <div style={{display:"flex",alignItems:"center",gap:6,marginTop:6,flexWrap:"wrap"}}>
+                  <span style={{fontSize:11.5,fontWeight:800,color:posMeta.color,border:`1px solid ${posMeta.color}`,borderRadius:3,padding:"2px 7px"}}>
+                    {posMeta.icon} {posMeta.label}
+                  </span>
+                  {posResult.reasons.length>0 && <span style={{fontSize:10.5,color:"var(--inkFaint)"}} title={posResult.reasons.join("／")}>
+                    {posResult.reasons[0]}{posResult.reasons.length>1?` 他${posResult.reasons.length-1}件`:""}
+                  </span>}
+                </div>
+                {enr && <div style={{fontSize:10,color:"var(--inkFaint)",marginTop:2}}>
+                  （参考・新規エントリー判断用の指標であり保有判断には使用していません：銘柄分析 {PRIMARY_STATUS_META[enr.status]?.label||enr.status}
+                  {enr.actionStatus&&enr.actionStatus!=="NONE"?`・${ACTION_STATUS_META[enr.actionStatus]?.label||enr.actionStatus}`:""}）
                 </div>}
                 {/* v3-8 Step1：取引タイプ未設定（既存ポジション）はここで設定を促す。設定するまで
                     HARD STOP等の取引タイプ依存ロジックは動かない（後続Stepで実装）。 */}
@@ -4737,7 +4817,7 @@ function App(){
       {tab==="position" && <div style={{marginTop:18}}>
         <div className="sec-head">ポジション</div>
         <div className="sec-note">保有中の建玉のみを表示します。売買記録・振り返りは「記録」タブへ。</div>
-        <PortfolioPanel stockQuotes={s.stockQuotes} analysisData={s.analysisData}/>
+        <PortfolioPanel stockQuotes={s.stockQuotes} analysisData={s.analysisData} analysisEnrichedMap={analysisEnrichedMap}/>
       </div>}
 
       {/* ===== 投資判断ログ（2026-09-02新規） ===== */}
