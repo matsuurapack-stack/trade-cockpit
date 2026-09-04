@@ -1696,10 +1696,12 @@ _momentum_stage1_lock = threading.Lock()
 MOMENTUM_LITE_THRESHOLD = 40    # Stage1のみでMOMENTUM_LITE_SCOREがこの点以上をStage2候補にする
 MOMENTUM_LITE_MAX_CANDIDATES = 100  # Stage2（銘柄ごとに日足履歴を追加取得）に回す上限件数
 # 2026-09-04実測：初期値70では、全面高の日に東証全体3899銘柄中84銘柄が登録される事態になった
-# （「今日だけ何かがおかしいくらい強い銘柄」という趣旨に対して明らかに多すぎる）。実データの
-# 分布（登録候補のfinalScoreがおおむね70〜100に広く分布）を見て85へ引き上げ。実運用しながら
-# さらに調整する前提の暫定値。
-MOMENTUM_SCORE_THRESHOLD = 85   # Stage2まで終えたMOMENTUM_SCOREがこの点以上で自動登録
+# （「今日だけ何かがおかしいくらい強い銘柄」という趣旨に対して明らかに多すぎる）。ユーザー
+# フィードバックにより、単純な閾値だけでなく「閾値以上の中から上位N件だけ」という相対順位方式
+# を併用する設計に変更（下のrun_momentum_day_scan参照）。スコアが低い日に無理にN件埋めることは
+# しない。
+MOMENTUM_SCORE_THRESHOLD = 90    # Stage2まで終えたMOMENTUM_SCOREの最低ライン
+MOMENTUM_FINAL_MAX_REGISTER = 15  # 閾値を満たした銘柄の中から、実際に自動登録するのは上位この件数まで
 MOMENTUM_TAG_EXPIRE_HOURS = 18  # AUTO_MOMENTUM_DAYタグの有効期間の目安（当日限定。大引け後〜
                                  # 翌営業日の朝には失効させる想定で、厳密な「翌営業日9時」計算は
                                  # せず、当日中は確実に有効な時間で単純化する）
@@ -1792,21 +1794,42 @@ def _scale_score(v, lo, hi, points):
     return (v - lo) / (hi - lo) * points
 
 
+def _liquidity_multiplier(turnover):
+    """デイトレ対象として売買できる厚みがあるかの掛け目（0.2〜1.0）。ユーザー指示：
+    売買代金10億円未満は原則低評価、30億円以上で加点、100億円以上で高評価。単純な加点ではなく
+    スコア全体に掛ける乗数にすることで、他の指標がどれだけ良くても薄商いの銘柄が上位に来ないよう
+    強く抑制する（実データ分布を見て調整する前提の暫定しきい値）。"""
+    if turnover is None:
+        return 0.5  # 不明時は過度な優遇も冷遇もしない中間値
+    if turnover >= 1e10:   # 100億円以上
+        return 1.0
+    if turnover >= 3e9:    # 30億円以上
+        return 0.85
+    if turnover >= 1e9:    # 10億円以上
+        return 0.55
+    return 0.2              # 10億円未満＝原則低評価
+
+
 def _momentum_lite_score(row):
-    """MOMENTUM_LITE_SCORE（0〜100）：Stage1だけで市場全体4000銘柄について算出できる指標のみ
-    使う（出来高倍率は使わない＝ユーザー指示）。配点は初期値（実データの分布を見て調整する前提）。
-      当日騰落率      最大40点（0%で0点、+15%以上で満点）
-      高値維持率      最大25点（90%未満で0点、99%以上で満点）
+    """MOMENTUM_LITE_SCORE：Stage1だけで市場全体約3900銘柄について算出できる指標のみ使う
+    （出来高倍率は使わない＝Stage2の責務）。2026-09-04ユーザーフィードバックにより、単に
+    「+8〜10%上がっただけ」で高得点になり過ぎないよう当日騰落率の配点比重を下げ、売買代金・
+    高値維持率を重視する配点に変更。さらに_liquidity_multiplier()を掛けて薄商い銘柄を
+    全体的に抑制する（優先順位：1.売買代金 2.高値維持率 3.当日騰落率 4.対市場 5.対セクター）。
+      売買代金        最大30点（10億円未満で0点、100億円以上で満点）
+      高値維持率      最大25点（92%未満で0点、99.5%以上で満点。「高値からどれだけ離れていないか」を重視）
+      当日騰落率      最大20点（0%で0点、+10%以上で満点。以前は+15%で満点・配点40だったのを
+                      大幅に抑え、「上がっただけ」の銘柄が単独で上位に来にくくする）
       対市場          最大15点（0pt以下で0点、+5pt以上で満点）
-      対セクター      最大10点（0pt以下で0点、+3pt以上で満点）
-      売買代金        最大10点（3千万円未満で0点、3億円以上で満点）"""
+      対セクター      最大10点（0pt以下で0点、+3pt以上で満点）"""
     score = 0.0
-    score += _scale_score(row.get("changePct"), 0, 15, 40)
-    score += _scale_score(row.get("highRetention"), 0.90, 0.99, 25)
+    score += _scale_score(row.get("turnover"), 1e9, 1e10, 30)
+    score += _scale_score(row.get("highRetention"), 0.92, 0.995, 25)
+    score += _scale_score(row.get("changePct"), 0, 10, 20)
     score += _scale_score(row.get("marketRS"), 0, 5, 15)
     score += _scale_score(row.get("sectorRS"), 0, 3, 10)
-    score += _scale_score(row.get("turnover"), 3e7, 3e8, 10)
-    return round(min(score, 100.0), 1)
+    score *= _liquidity_multiplier(row.get("turnover"))
+    return round(score, 1)
 
 
 def select_momentum_stage1_candidates(stage1):
@@ -1847,23 +1870,28 @@ def _momentum_stage2_detail(code, stage1_row):
 
 
 def _momentum_final_score(lite_score, stage2):
-    """MOMENTUM_SCORE最終値：Stage1のMOMENTUM_LITE_SCOREを土台に、Stage2で分かった
-    出来高倍率・ACTIVE_BREAK・年初来高値更新を加点する。
-      出来高倍率：1倍あたり3点（5倍で頭打ち＝最大15点）
-      ACTIVE_BREAK（3か月高値ブレイク）：+10点
-      年初来高値更新：+5点
+    """MOMENTUM_SCORE最終値：Stage1のMOMENTUM_LITE_SCORE（既に売買代金の掛け目を反映済み）を
+    土台に、Stage2で分かった出来高倍率・ACTIVE_BREAK・年初来高値更新を加点する。
+      出来高倍率：1倍あたり4点（5倍で頭打ち＝最大20点。優先順位4番目として厚めに配点）
+      ACTIVE_BREAK（3か月高値ブレイク）：+8点
+      年初来高値更新：+4点
+    2026-09-04ユーザーフィードバックにより、100点で丸め込む（クランプする）のをやめた。
+    以前は「+12%だが高値から8%崩れている」銘柄と「+6%だが高値維持率がほぼ100%・出来高5倍」
+    銘柄が両方100点に張り付いて区別できない事態が起きていたため、上位ほど差が付くよう
+    そのままのスコアを返す（自動登録の閾値判定・上位N件の相対順位付けの両方に使うだけで、
+    ちょうど0〜100に収まる保証は元々していない）。
     Stage2データが取得できなかった銘柄はStage1スコアをそのまま最終スコアとする
     （＝日足履歴が取れない銘柄を一律減点はしない。ただし加点も無いため相対的に順位は下がる）。"""
     if not stage2:
         return lite_score
     score = lite_score
     if stage2.get("volRatio") is not None:
-        score += min(stage2["volRatio"], 5) * 3
+        score += min(stage2["volRatio"], 5) * 4
     if stage2.get("activeBreak"):
-        score += 10
+        score += 8
     if stage2.get("newYearHigh"):
-        score += 5
-    return round(min(score, 100.0), 1)
+        score += 4
+    return round(score, 1)
 
 
 def run_momentum_day_scan(database_url, user_id, force=False):
@@ -1893,33 +1921,43 @@ def run_momentum_day_scan(database_url, user_id, force=False):
                 stage2_results[code] = None
     stage2_duration = round(time.time() - t_stage2_start, 1)
 
-    registered, details = [], []
+    # v3-9改訂（2026-09-04ユーザーフィードバック）：単純な閾値判定だけでなく、閾値を満たした
+    # 銘柄の中から上位MOMENTUM_FINAL_MAX_REGISTER件だけを実際に登録する「相対順位方式」を併用する。
+    # スコアが低い日に無理に件数を埋めることはしない（該当が3件しかなければ3件だけ登録する）。
+    details = []
     for lite_score, code, row in candidates:
         stage2 = stage2_results.get(code)
         final_score = _momentum_final_score(lite_score, stage2)
         stuck_limit_up = bool(row.get("current") is not None and row.get("high")
                                and row["current"] >= row["high"] * 0.999 and not row.get("ask"))
-        detail = {"code": code, "name": row.get("name"), "sector": row.get("sector"),
-                   "changePct": row.get("changePct"), "highRetention": row.get("highRetention"),
-                   "marketRS": row.get("marketRS"), "sectorRS": row.get("sectorRS"),
-                   "turnover": row.get("turnover"), "liteScore": lite_score,
-                   "finalScore": final_score, "stage2": stage2, "stuckLimitUp": stuck_limit_up}
-        details.append(detail)
-        if final_score >= MOMENTUM_SCORE_THRESHOLD and database_url and investment_db is not None:
-            now_dt = datetime.datetime.now(datetime.timezone.utc)
-            tag_value = {"score": final_score, "addedAt": now_dt.isoformat(),
-                         "expiresAt": (now_dt + datetime.timedelta(hours=MOMENTUM_TAG_EXPIRE_HOURS)).isoformat(),
-                         "stuckLimitUp": stuck_limit_up}
-            try:
-                ok = investment_db.auto_register_or_tag_watchlist_item(
-                    database_url, user_id, code, "JP", "AUTO_MOMENTUM_DAY", tag_value,
-                    item_fields={"name": row.get("name"), "sector": row.get("sector"), "source": "auto_momentum_day"})
-            except Exception as e:
-                print("  MOMENTUM DAY自動登録失敗", code, e)
-                ok = False
-            if ok:
-                registered.append(detail)
+        details.append({"code": code, "name": row.get("name"), "sector": row.get("sector"),
+                         "changePct": row.get("changePct"), "highRetention": row.get("highRetention"),
+                         "marketRS": row.get("marketRS"), "sectorRS": row.get("sectorRS"),
+                         "turnover": row.get("turnover"), "volRatio": (stage2 or {}).get("volRatio"),
+                         "liteScore": lite_score, "finalScore": final_score, "stage2": stage2,
+                         "stuckLimitUp": stuck_limit_up, "row": row})
     details.sort(key=lambda d: -d["finalScore"])
+    to_register = [d for d in details if d["finalScore"] >= MOMENTUM_SCORE_THRESHOLD][:MOMENTUM_FINAL_MAX_REGISTER]
+
+    registered = []
+    for d in to_register:
+        if not (database_url and investment_db is not None):
+            continue
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        tag_value = {"score": d["finalScore"], "addedAt": now_dt.isoformat(),
+                     "expiresAt": (now_dt + datetime.timedelta(hours=MOMENTUM_TAG_EXPIRE_HOURS)).isoformat(),
+                     "stuckLimitUp": d["stuckLimitUp"]}
+        try:
+            ok = investment_db.auto_register_or_tag_watchlist_item(
+                database_url, user_id, d["code"], "JP", "AUTO_MOMENTUM_DAY", tag_value,
+                item_fields={"name": d["name"], "sector": d["sector"], "source": "auto_momentum_day"})
+        except Exception as e:
+            print("  MOMENTUM DAY自動登録失敗", d["code"], e)
+            ok = False
+        if ok:
+            registered.append(d)
+    for d in details:
+        d.pop("row", None)  # rowは選定計算専用の内部情報。レスポンスには含めない
     return {
         "stage1CodesScanned": stage1["codesScanned"], "stage1PricesReturned": stage1["pricesReturned"],
         "stage1DurationSec": stage1["durationSec"], "stage1RequestCount": stage1["requestCount"],
