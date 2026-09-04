@@ -2041,7 +2041,32 @@ const POSITION_STATUS_META={
   HOLD_STRONG:{label:"HOLD STRONG",icon:"💪",color:"var(--up)"},
   HOLD:{label:"HOLD",icon:"🤝",color:"var(--inkSoft)"},
 };
-function derivePositionStatus({avgPrice,tradeStyle,current,currentStop,initialStop,target1,positionFlags,pnlPct}){
+// v3-8 Step5（ポジション管理：DAY/SWING別チャート崩れ判定）：取引タイプによって重視する
+// シグナルを変える。DAY重視＝VWAP割れ・5分足直近安値割れ・ブレイク水準割れ・高値からの急反落
+// （ザラ場の値動き中心）。SWING重視＝直近スイング安値割れ・5日線割れ・25日線割れ・ブレイク水準
+// 割れ・FAILED_BREAK（日足〜数日単位のトレンド中心）。VWAPはDAYのみの材料でSWING側の判定には
+// 一切含めない＝「VWAP単独でSWINGをEXITにしない」という要件を、判定式ではなく信号セット自体を
+// 分けることで構造的に満たす。FAILED_BREAKはenrichWatchRow()のPrimary Statusだが、ここでは
+// 「保有判断そのもの」ではなく「チャート崩れの一材料」として他の価格ベース信号と同列に扱うだけ
+// （Step4の原則＝Action Status等を最終判断に流用しないことには反しない）。新規APIコールなし。
+function evaluateChartBreakdown(tradeStyle,current,indicators,positionFlags,enrStatus){
+  if(current==null)return {level:"NONE",fired:[]};
+  const fired=[];
+  if(tradeStyle==="DAY"){
+    if(indicators?.vwap!=null && current<indicators.vwap)fired.push("VWAP割れ");
+    if(positionFlags?.recentLow5m!=null && current<positionFlags.recentLow5m)fired.push("5分足直近安値割れ");
+    if(positionFlags?.breakoutLookbackHigh!=null && current<positionFlags.breakoutLookbackHigh)fired.push("直近ブレイク水準割れ");
+    if(indicators?.intradayHigh>0 && (indicators.intradayHigh-current)/indicators.intradayHigh>=0.03)fired.push("高値から急反落（-3%以上）");
+  }else if(tradeStyle==="SWING"){
+    if(positionFlags?.swingLowRecent!=null && current<positionFlags.swingLowRecent)fired.push("直近スイング安値割れ");
+    if(indicators?.ma5Daily!=null && current<indicators.ma5Daily)fired.push("5日線割れ");
+    if(indicators?.ma25!=null && current<indicators.ma25)fired.push("25日線割れ");
+    if(positionFlags?.breakoutLookbackHigh!=null && current<positionFlags.breakoutLookbackHigh)fired.push("直近ブレイク水準割れ");
+    if(enrStatus==="FAILED_BREAK")fired.push("Primary StatusがFAILED_BREAK");
+  }
+  return {level:fired.length>=2?"STRONG":fired.length===1?"WEAK":"NONE",fired};
+}
+function derivePositionStatus({avgPrice,tradeStyle,current,currentStop,initialStop,target1,positionFlags,pnlPct,indicators,enrStatus}){
   const reasons=[];
   // 1. HARD STOP（Step2・SWING限定・絶対最優先。他のいかなる材料でも上書きしない）
   const hardStopPrice=calcHardStop(avgPrice,tradeStyle);
@@ -2049,10 +2074,14 @@ function derivePositionStatus({avgPrice,tradeStyle,current,currentStop,initialSt
   if(hsState==="STOP"){
     return {status:"STOP",reasons:[`SWINGの-10%ハードストップに到達（取得単価比 ${pnlPct!=null?pnlPct.toFixed(1):"—"}%）`]};
   }
-  // 2. 警戒シグナルの収集（単独では撤退トリガーにしない。Step5以降で重み付けを追加予定）
+  // 2. 警戒シグナルの収集（単独では撤退トリガーにしない。個々の重みはStep6以降でさらに精緻化予定）
   if(hsState==="APPROACHING")reasons.push("SWING HARD STOPに接近（-8%〜-10%）");
   if(positionFlags?.longBearishCandle)reasons.push("直近に大陰線（実体の大きい陰線）");
   if(positionFlags?.gapUpFailure)reasons.push("寄り付きの上放れがその後失速（ギャップ失敗）");
+  // Step5：DAY/SWING別チャート崩れ判定。STRONG（2件以上該当）は警戒2件分、WEAK（1件該当）は
+  // 警戒1件分として合算する（個別の内訳はreasonsにそのまま列挙し、根拠を追える形にする）。
+  const chart=evaluateChartBreakdown(tradeStyle,current,indicators,positionFlags,enrStatus);
+  chart.fired.forEach(f=>reasons.push(`チャート崩れ：${f}`));
   const warnCount=reasons.length;
 
   const trailKey=deriveTrailingStatus(currentStop,initialStop,avgPrice,current);
@@ -2267,12 +2296,15 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap}){
               const hsMeta=hsState?HARD_STOP_STATE_META[hsState]:null;
               // v3-8 Step4：ポジション専用Status。銘柄分析用のPrimary/Action Status（enr）とは
               // 別ロジックで、あくまで保有判断専用（enrはこの下で「参考情報」としてのみ添える）。
+              // Step5：DAY/SWING別チャート崩れ判定用にindicators（VWAP・5日線・25日線・当日高値）
+              // も渡す（analysisData、既存の分析結果をそのまま再利用。新規取得なし）。
               const posFlags=analysisData?.[it.code]?.positionFlags;
+              const posIndicators=analysisData?.[it.code]?.indicators;
+              const enr=analysisEnrichedMap?.get(it.code);
               const posResult=derivePositionStatus({avgPrice:it.average_price,tradeStyle:it.trade_style,
                 current,currentStop:it.current_stop,initialStop:it.initial_stop,target1:it.target_1,
-                positionFlags:posFlags,pnlPct});
+                positionFlags:posFlags,pnlPct,indicators:posIndicators,enrStatus:enr?.status});
               const posMeta=POSITION_STATUS_META[posResult.status];
-              const enr=analysisEnrichedMap?.get(it.code);
               return <div key={it.code+it.market} style={{border:"1px solid var(--rule)",borderRadius:5,padding:"10px 12px",background:"var(--bg)"}}>
                 <div style={{display:"flex",alignItems:"baseline",gap:8}}>
                   <span style={{fontWeight:800,fontSize:13.5}}>{it.name||it.code}</span>

@@ -1787,6 +1787,11 @@ def analyze_stock(w, market_env=None):
     breakout_confirmed = bool(breakout_lookback_high is not None and vol_surge and current > breakout_lookback_high)
     vol_ratio_for_breakout = (volumes[-1] / vol_avg5) if (vol_avg5 and breakout_confirmed) else None
 
+    # ---- v3-8 Step5（ポジション管理：DAY/SWING別チャート崩れ判定の材料）：直近10営業日
+    # （当日を除く）の安値＝「直近スイング安値」の簡易版。新規API呼び出しはせず、この関数内で
+    # 既に取得済みのlows配列を再利用する。----
+    swing_low_recent = min(lows[-11:-1]) if len(lows) >= 11 else (min(lows[:-1]) if len(lows) >= 2 else None)
+
     # ---- trading_rules_追加分ルール①：好決算日等の様子見ルール。5%以上のGU or 出来高急増で、
     # 寄り付きから60分未満・かつ押し目がまだ形成されていなければ「様子見中」とする。----
     watch_status = None
@@ -2650,10 +2655,16 @@ def analyze_stock(w, market_env=None):
         "daysToEarnings": days_to_earnings,  # 決算またぎ期待値機能：10日前からのカウントダウン表示に使う
         "autoEarningsStars": auto_earnings_stars,  # 決算期待値の星（過去の上方/下方修正比率・直近決算・過熱度から自動算出）
         "assessment": assessment,  # Trade Cockpit v2 Phase2：Falling Knife/Chase Risk・Entry Conditions集計・8軸ラベル・ルールベース判断文
-        # v3-8 Step3：ポジション管理（Step5のチャート崩れ判定）向けの軽量フラグ。新規API呼び出しなし。
+        # v3-8 Step3・Step5：ポジション管理（チャート崩れ判定）向けの軽量フラグ・水準。
+        # 新規API呼び出しなし（この関数内で既に計算済みの値をそのまま返すだけ）。
         "positionFlags": {
             "longBearishCandle": long_bearish_candle,
             "gapUpFailure": gap_up_failure,
+            # Step5：DAY重視＝直近ブレイク水準・5分足直近安値、SWING重視＝直近スイング安値・
+            # 5日線・25日線（5日線・25日線はindicators.ma5Daily/ma25を流用、ここでは重複させない）。
+            "recentLow5m": round(recent_low_5m, 2) if recent_low_5m is not None else None,
+            "breakoutLookbackHigh": round(breakout_lookback_high, 2) if breakout_lookback_high is not None else None,
+            "swingLowRecent": round(swing_low_recent, 2) if swing_low_recent is not None else None,
         },
         "tradeRules": {
             "entryChecklist": entry_checklist,
