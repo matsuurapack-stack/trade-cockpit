@@ -1685,6 +1685,11 @@ def analyze_stock(w, market_env=None):
     if not isinstance(market_env, dict):
         market_env = {"text": market_env or "", "nikkeiChangePct": None, "bad": False}
     code = w.get("code", "")
+    # v3-7（押し目エントリー価格帯の見直し）：フロント（enrichWatchRow）が既に算出済みのPrimary
+    # Status／Action Status。サーバー側で同じ判定を再実装しない（二重ロジックを避ける）ため、
+    # フロントから渡された値をそのまま受け取るだけ（未送信時はNoneのまま＝通常銘柄扱い）。
+    client_primary_status = w.get("primaryStatus")
+    client_action_status = w.get("actionStatus")
     sym = _yf_symbol(w)
     tk = yf.Ticker(sym)  # 分足・決算カレンダー・ファンダメンタルは相当データが無いためyfinanceのまま使用
 
@@ -2138,6 +2143,66 @@ def analyze_stock(w, market_env=None):
             "label": f"出来高ブレイクアウト（直近3か月高値{breakout_lookback_high:.1f}を出来高{vol_ratio_for_breakout:.1f}倍で上抜け）",
         }
 
+    # ---- v3-7（押し目エントリー価格帯の見直し）：「押し目＝大きく落ちた価格」ではなく「上昇
+    # トレンドを壊さない浅い押し目」と定義し直す。優先順位（①VWAP付近 ②直近ブレイク水準
+    # ③前日高値 ④当日押し安値 ⑤短期支持線 ⑥ATR補正）で、現在値未満・かつ乖離が大きすぎない
+    # 候補を順に探す（ATRは他に根拠がない時の最終手段に格下げ）。
+    # ACTIVE_BREAK/HOT×ENTRY_READYの銘柄（client_primary_status/client_action_status、フロントの
+    # enrichWatchRowと同じ判定をそのまま受け取るだけ＝二重ロジックにしない）は0.5〜2.5%の浅い
+    # ゾーンのみを候補として許容し、それより深い候補しかなければ「押し目候補なし」とする。
+    # 通常銘柄は0〜4%を許容範囲とし、-4%を超える場合は「ここまで落ちたらもう入れない」価格を
+    # 押し目として出さず、深い調整待ち／トレンド再確認ゾーンという定性的な表示にする。
+    # 既存のentry（stop/target/株数目安等、多数の計算がこれに依存）には影響させず、
+    # 表示専用の新フィールドpullbackEntryとして別途返す。
+    prev_day_high = highs[-2] if len(highs) >= 2 else None
+    short_support = ma25  # 「その期間に買った投資家の平均取得価格」という既存解釈を短期支持線として流用（新規計算なし）
+    pullback_candidates = []
+    if vwap is not None and current > vwap:
+        pullback_candidates.append(("VWAP付近", vwap))
+    if breakout_lookback_high is not None and current > breakout_lookback_high:
+        pullback_candidates.append(("直近ブレイク水準", breakout_lookback_high))
+    if prev_day_high is not None and current > prev_day_high:
+        pullback_candidates.append(("前日高値", prev_day_high))
+    if intraday_low is not None and current > intraday_low:
+        pullback_candidates.append(("当日押し安値", intraday_low))
+    if short_support is not None and current > short_support:
+        pullback_candidates.append(("短期支持線(25日線)", short_support))
+
+    is_strong_ready = client_primary_status in ("ACTIVE_BREAK", "HOT") and client_action_status == "ENTRY_READY"
+    min_dev, max_dev = (0.5, 2.5) if is_strong_ready else (0.0, 4.0)
+
+    pb_basis, pb_price = None, None
+    for basis, price in pullback_candidates:
+        dev = (current - price) / current * 100 if current else 0
+        if min_dev <= dev <= max_dev:
+            pb_basis, pb_price = basis, price
+            break
+    if pb_price is None and not is_strong_ready:
+        # ⑥ATR補正：優先度①〜⑤に使える候補が無い通常銘柄だけの最終手段（強い銘柄では使わず
+        # 「候補なし」を優先＝ATRで無理に浅い数字を作らない）。
+        atr_dev_price = current - atr_ref * 0.3
+        dev = (current - atr_dev_price) / current * 100 if current else 0
+        if min_dev <= dev <= max_dev:
+            pb_basis, pb_price = "ATR補正", atr_dev_price
+
+    if pb_price is not None:
+        pb_dev_pct = (current - pb_price) / current * 100
+        if pb_dev_pct <= 1:
+            pb_zone_label = "浅い押し目"
+        elif pb_dev_pct <= 2.5:
+            pb_zone_label = "標準的な押し目"
+        else:
+            pb_zone_label = "深い押し"
+        pullback_entry = {
+            "status": "candidate",
+            "zoneLow": round(pb_price * 0.997, 2), "zoneHigh": round(pb_price * 1.003, 2),
+            "basis": pb_basis, "zoneLabel": pb_zone_label, "deviationPct": round(pb_dev_pct, 2),
+        }
+    elif is_strong_ready:
+        pullback_entry = {"status": "no_candidate"}
+    else:
+        pullback_entry = {"status": "deep_adjustment" if is_uptrend_early else "trend_recheck"}
+
     # ---- 損切り単価(目安)：ATR相当(当日実測 or 日次ATR)の1倍を損切り幅の目安とする（ザラ場内で許容できる下振れ）。
     # entry確定後に算出するため、当日安値による下限調整をentryにも先に反映済み（旧実装は
     # entry未調整のままstopだけ当日安値でかさ上げしていたため、entryより高いstopが出る不具合があった）。----
@@ -2536,6 +2601,7 @@ def analyze_stock(w, market_env=None):
     return {
         "current": round(current, 2),
         "entry": round(entry, 2), "entryReason": "・".join(entry_reasons),
+        "pullbackEntry": pullback_entry,  # v3-7：表示用の押し目価格帯（ゾーン・根拠・分類）。entryとは独立
         "stop": round(stop, 2), "stopReason": "・".join(stop_reasons),
         "target": round(target, 2), "targetReason": "・".join(target_reasons),
         "fullExitTarget": round(full_exit_target, 2),
