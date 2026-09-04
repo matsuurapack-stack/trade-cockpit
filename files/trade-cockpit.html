@@ -1345,7 +1345,7 @@ const AXIS_LABEL_META={
   "STRONG":{color:"var(--up)"},"WEAK":{color:"var(--down)"},
   "POSITIVE":{color:"var(--up)"},"RISK":{color:"var(--down)"},
 };
-function AssessmentCard({assessment:a,marginBadge,marginRatio,enr}){
+function AssessmentCard({assessment:a,marginBadge,marginRatio,enr,sectorRank}){
   const meta=PRIMARY_STATUS_META[enr.status];
   const actionMeta=ACTION_STATUS_META[enr.actionStatus];
   const reasonList=enr.actionStatus==="RISK"?enr.riskReasons.map(r=>RISK_REASON_META[r])
@@ -1371,7 +1371,12 @@ function AssessmentCard({assessment:a,marginBadge,marginRatio,enr}){
       <span className="chip" style={{fontSize:10.5}}>Day Trade: {dayTradeLabel}</span>
       <span className="chip" style={{fontSize:10.5}}>Swing: {swingLabel}</span>
       {a.marketRiskScore!=null && <span className="chip" style={{fontSize:10.5}}>Market Risk {a.marketRiskScore}（{a.marketRiskLabel}）</span>}
-      {a.marketRS!=null && <span className="chip" style={{fontSize:10.5}}>Market RS {a.marketRS>0?"+":""}{a.marketRS}pt</span>}
+      {/* v3-6 Step2：ラベルを監視銘柄一覧と統一（Market RS→対市場・Sector RS→対セクター）。
+          値も監視銘柄一覧と同じenr（enrichWatchRow、ライブなstockQuotes基準）を使い、サーバー側の
+          assessment.marketRS（分析取得時点のスナップショット）とは別々に持たない（二重ロジック回避）。 */}
+      {enr?.marketRS!=null && <span className="chip" style={{fontSize:10.5}} title="対市場：銘柄騰落率 − 日経平均騰落率">対市場 {enr.marketRS>0?"+":""}{enr.marketRS.toFixed(1)}pt</span>}
+      {enr?.sectorRS!=null && <span className="chip" style={{fontSize:10.5}} title="対セクター：銘柄騰落率 − セクター平均騰落率">対セクター {enr.sectorRS>0?"+":""}{enr.sectorRS.toFixed(1)}pt</span>}
+      {sectorRank && <span className="chip" style={{fontSize:10.5}} title="本日のセクター別平均騰落率での順位（登録銘柄ベース）">セクター順位 {sectorRank.rank}/{sectorRank.total}位（{sectorRank.avgPct>0?"+":""}{sectorRank.avgPct.toFixed(2)}%）</span>}
       <span className="chip" style={{fontSize:10.5}}>Entry Conditions {a.entryConditionsMet}/{a.entryConditionsTotal}</span>
     </div>
     {a.judgmentText && <div style={{fontSize:12,color:"var(--ink)",marginTop:6,lineHeight:1.6}}>{a.judgmentText}</div>}
@@ -3303,6 +3308,16 @@ function App(){
     const enriched=computeEnrichedWatch(analysisItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData,s.marketRisk?.marketRiskLabel);
     return new Map(enriched.map(e=>[e.code,e]));
   },[analysisItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData,s.marketRisk]);
+  // v3-6 Step2（銘柄分析画面にセクター情報を追加）：既存groupStocks()（セクター別平均騰落率・
+  // 合計売買代金、日次モニターの「本日の注目セクター」等で既に使っている共通関数）をそのまま
+  // 再利用し、セクター別の当日騰落率で順位付けする（新規計算・新規リクエストなし）。
+  // sector→{avgPct,rank,totalCount,totalTurnover,count}のMap。
+  const sectorRankMap=useMemo(()=>{
+    const groups=groupStocks(watchlistAll||[],s.stockQuotes,w=>w.sector).filter(g=>g.avgPct!=null);
+    const ranked=[...groups].sort((a,b)=>b.avgPct-a.avgPct);
+    const total=ranked.length;
+    return new Map(ranked.map((g,i)=>[g.key,{avgPct:g.avgPct,rank:i+1,total,count:g.count,totalTurnover:g.totalTurnover}]));
+  },[watchlistAll,s.stockQuotes]);
   // 2026-08-21 ユーザー要望：監視銘柄は日本市場に限定（アメリカ市場タブの「監視銘柄」ボタンは
   // 撤去済みだが、念のためここでも日本株以外は除外しておく）。
   const watchTargetItems=useMemo(()=>s.watchTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean).filter(w=>w.market==="JP"),[s.watchTargets,allWatch]);
@@ -4137,7 +4152,7 @@ function App(){
                             </div>}
                           {a.marketEnv && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>{a.marketEnv}</div>}
                           {/* ===== Trade Cockpit v2 Phase2：総合判断・8軸・Entry Conditions・Falling Knife/Chase Risk ===== */}
-                          {a.assessment && enr && <AssessmentCard assessment={a.assessment} marginBadge={a.tradeRules?.marginBadge} marginRatio={a.tradeRules?.marginRatio} enr={enr}/>}
+                          {a.assessment && enr && <AssessmentCard assessment={a.assessment} marginBadge={a.tradeRules?.marginBadge} marginRatio={a.tradeRules?.marginRatio} enr={enr} sectorRank={sectorRankMap.get(w.sector)}/>}
                           {a.tradeRules?.watchStatus && <div style={{fontSize:11.5,fontWeight:700,color:"var(--accent)",background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>⏳ {a.tradeRules.watchStatus}</div>}
                           {/* エントリーのタイミングルール（最新版）：初押し／高値ブレイクに該当する最有力タイミング(★5)を強調表示 */}
                           {a.tradeRules?.entryPattern && <div style={{fontSize:11.5,fontWeight:700,color:"var(--up)",background:"var(--upBg)",border:"1px solid var(--up)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>★★★★★ {a.tradeRules.entryPattern.label}</div>}
