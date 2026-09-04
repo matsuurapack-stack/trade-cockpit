@@ -1345,6 +1345,42 @@ const AXIS_LABEL_META={
   "STRONG":{color:"var(--up)"},"WEAK":{color:"var(--down)"},
   "POSITIVE":{color:"var(--up)"},"RISK":{color:"var(--down)"},
 };
+// v3-6 Step3（Entry Conditionsの視覚チェックリスト）：既存データ（server.py analyze_stock()の
+// tradeRules.entryChecklist・tradeRules.marginBadge、enrichWatchRow()のmarketRS/sectorRS/
+// breakType/waitReasons）だけを使い、新規計算は追加しない。エントリー判断に効く項目を8個に
+// 絞る（旧entryChecklistの全項目ダンプ＝SHOW_ANALYSIS_CHECKLISTS=falseで現在非表示、とは別物で
+// 恒久的に表示する）。成立数だけでBUY判定はしない（あくまで判断材料の可視化、結論はPrimary/
+// Action Statusバッジ側が担う）。
+function EntryConditionsChecklist({a,enr}){
+  const findChecklist=(key)=>a.tradeRules?.entryChecklist?.find(c=>c.key===key);
+  const vwapItem=findChecklist("vwap");
+  const volumeItem=findChecklist("volume");
+  const items=[
+    {key:"marketRS",label:"対市場プラス",pass:enr.marketRS!=null?enr.marketRS>0:null},
+    {key:"sectorRS",label:"対セクタープラス",pass:enr.sectorRS!=null?enr.sectorRS>0:null},
+    {key:"vwap",label:"VWAP上",pass:vwapItem?vwapItem.pass:null},
+    {key:"volume",label:"出来高増加",pass:volumeItem?volumeItem.pass:null},
+    {key:"rangeConfirmed",label:"下げ止まり確認",pass:!enr.waitReasons.includes("RANGE_UNCONFIRMED")},
+    {key:"breakout",label:"高値ブレイク",pass:enr.breakType!=null},
+    {key:"marketSoft",label:"地合い許容",pass:!enr.waitReasons.includes("MARKET_SOFT")},
+    {key:"marginOk",label:"需給警戒なし",pass:a.tradeRules?.marginBadge?(a.tradeRules.marginBadge!=="caution"&&a.tradeRules.marginBadge!=="danger"):null},
+  ];
+  const known=items.filter(it=>it.pass!=null);
+  const met=known.filter(it=>it.pass).length;
+  return <div style={{border:"1px solid var(--rule)",borderRadius:4,padding:"8px 10px",marginBottom:8,background:"var(--card)"}}>
+    <div style={{fontSize:11.5,fontWeight:700,color:"var(--inkSoft)",marginBottom:6}}>ENTRY CONDITIONS</div>
+    <div style={{display:"flex",flexDirection:"column",gap:3}}>
+      {items.map(it=><div key={it.key} style={{fontSize:12,display:"flex",alignItems:"center",gap:6,
+          color:it.pass==null?"var(--inkFaint)":it.pass?"var(--up)":"var(--inkSoft)"}}>
+        <span>{it.pass==null?"？":it.pass?"✅":"⬜"}</span><span>{it.label}</span>
+      </div>)}
+    </div>
+    <div style={{fontSize:11.5,fontWeight:700,color:"var(--inkSoft)",marginTop:6}}>
+      {met} / {known.length} 条件成立{known.length<items.length?`（判定不能${items.length-known.length}件を除く）`:""}
+    </div>
+  </div>;
+}
+
 function AssessmentCard({assessment:a,marginBadge,marginRatio,enr,sectorRank}){
   const meta=PRIMARY_STATUS_META[enr.status];
   const actionMeta=ACTION_STATUS_META[enr.actionStatus];
@@ -4153,6 +4189,7 @@ function App(){
                           {a.marketEnv && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>{a.marketEnv}</div>}
                           {/* ===== Trade Cockpit v2 Phase2：総合判断・8軸・Entry Conditions・Falling Knife/Chase Risk ===== */}
                           {a.assessment && enr && <AssessmentCard assessment={a.assessment} marginBadge={a.tradeRules?.marginBadge} marginRatio={a.tradeRules?.marginRatio} enr={enr} sectorRank={sectorRankMap.get(w.sector)}/>}
+                          {enr && <EntryConditionsChecklist a={a} enr={enr}/>}
                           {a.tradeRules?.watchStatus && <div style={{fontSize:11.5,fontWeight:700,color:"var(--accent)",background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>⏳ {a.tradeRules.watchStatus}</div>}
                           {/* エントリーのタイミングルール（最新版）：初押し／高値ブレイクに該当する最有力タイミング(★5)を強調表示 */}
                           {a.tradeRules?.entryPattern && <div style={{fontSize:11.5,fontWeight:700,color:"var(--up)",background:"var(--upBg)",border:"1px solid var(--up)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>★★★★★ {a.tradeRules.entryPattern.label}</div>}
