@@ -1280,7 +1280,7 @@ const ENTRY_STRATEGY_META={
 // グループ化する（第1階層＝グループボタン、第2階層＝グループ内サブタブ）。
 const TAB_GROUPS=[
   {key:"watch",label:"監視銘柄",tabs:[{key:"watch",label:"監視銘柄"}]},
-  {key:"market",label:"市場",tabs:[{key:"monitor",label:"概況"},{key:"briefing",label:"日本株一覧"},{key:"us",label:"米国株一覧"}]},
+  {key:"market",label:"市場",tabs:[{key:"monitor",label:"概況"},{key:"briefing",label:"日本株一覧"},{key:"us",label:"米国株一覧"},{key:"events",label:"イベント"}]},
   {key:"tradeAnalysis",label:"トレード分析",tabs:[{key:"analysis",label:"分析"},{key:"earnings",label:"決算"}]},
   {key:"position",label:"ポジション",tabs:[{key:"position",label:"ポジション"}]},
   {key:"record",label:"記録",tabs:[{key:"journal",label:"記録"},{key:"investlog",label:"投資判断ログ"},{key:"chatgptimport",label:"ChatGPT取込"},{key:"stats",label:"統計"}]},
@@ -1472,6 +1472,152 @@ function relevantMarketMetricKeys(w){
   else keys.push("nasdaq");
   return [...new Set(keys)];
 }
+// v3-9続き（PHASE 3 EVENT/EARNINGS INTELLIGENCE）：イベント接近を銘柄分析・ポジションの判断材料
+// として表示する（Primary/Action Statusには一切干渉しない、あくまで参考情報）。
+// 営業日ベースの日数計算は簡易版（土日だけ除外、祝日は考慮しない）。
+function businessDaysUntil(dateStr){
+  if(!dateStr)return null;
+  const target=new Date(dateStr+"T00:00:00+09:00");
+  if(isNaN(target.getTime()))return null;
+  const today=new Date();
+  const todayJst=new Date(today.getFullYear(),today.getMonth(),today.getDate());
+  const targetJst=new Date(target.getFullYear(),target.getMonth(),target.getDate());
+  let diffDays=Math.round((targetJst-todayJst)/86400000);
+  if(diffDays<=0)return diffDays; // 当日・過去はそのまま返す（0=当日、負=既に経過）
+  let businessDays=0,cursor=new Date(todayJst);
+  for(let i=0;i<diffDays;i++){
+    cursor=new Date(cursor.getTime()+86400000);
+    const dow=cursor.getDay();
+    if(dow!==0&&dow!==6)businessDays++;
+  }
+  return businessDays;
+}
+// 銘柄コード・セクターに関連するイベントのうち、直近のもの（未来のみ、withinDays日以内）を返す。
+function nextEventForCode(events,code,sector,withinDays=45){
+  if(!events||!events.length)return null;
+  const todayStr=new Date().toISOString().slice(0,10);
+  const relevant=events.filter(ev=>{
+    if(!ev.event_date||ev.event_date<todayStr)return false;
+    const stocks=ev.affected_stocks||[];
+    const sectors=ev.affected_sectors||[];
+    const matches=stocks.includes(code)||(sector&&sectors.includes(sector));
+    if(!matches)return false;
+    const days=businessDaysUntil(ev.event_date);
+    return days!=null&&days<=withinDays;
+  });
+  if(!relevant.length)return null;
+  return relevant.sort((a,b)=>a.event_date.localeCompare(b.event_date))[0];
+}
+const EVENT_TYPE_ICON={ECONOMIC:"📊",CENTRAL_BANK:"🏦",EARNINGS:"📅",INDEX_REBALANCE:"📈",
+  POLITICAL:"🏛",GEOPOLITICAL:"🌐",PRODUCT_EVENT:"🚀",OTHER:"📌"};
+// tradeStyle省略時（銘柄分析タブ、まだポジションを持っていない段階）はDAY/SWINGの注記を出さない。
+// ポジションタブから渡された場合だけ、DAY/SWINGで扱いを変える注記を添える（ユーザー要望：
+// イベント接近を機械的にRISKへ変更せず、DAY/SWINGで参考情報の出し方だけを変える）。
+function EventRiskNote({events,code,sector,tradeStyle}){
+  const ev=useMemo(()=>nextEventForCode(events,code,sector),[events,code,sector]);
+  if(!ev)return null;
+  const days=businessDaysUntil(ev.event_date);
+  const icon=EVENT_TYPE_ICON[ev.event_type]||EVENT_TYPE_ICON.OTHER;
+  const dayLabel=days===0?"本日":days===1?"1営業日後":`${days}営業日後`;
+  const importanceHot=ev.importance==="HIGH"||ev.importance==="高";
+  let styleNote=null;
+  if(tradeStyle==="DAY"){
+    styleNote="DAY：当日引けまでに手仕舞うなら影響は限定的";
+  }else if(tradeStyle==="SWING"&&days!=null&&days<=10){
+    styleNote="SWING：このイベントをまたぐ可能性＝重要なリスク";
+  }
+  return <div style={{fontSize:11,color:importanceHot?"var(--down)":"var(--inkSoft)",
+      background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"4px 8px",marginBottom:8}}
+    title={`情報源：${ev.source||"—"}／検証状態：${ev.verification_status}（画像由来の情報は確定情報として扱わない）`}>
+    {icon} {ev.title}まで{dayLabel}
+    {importanceHot&&" ⚠重要度高"}
+    {ev.verification_status==="UNVERIFIED"&&" （未検証）"}
+    {ev.verification_status==="IMAGE_DERIVED"&&" （画像由来・要確認）"}
+    {styleNote&&<div style={{marginTop:2,color:"var(--inkFaint)"}}>{styleNote}</div>}
+  </div>;
+}
+
+// v3-9続き（PHASE 3）：イベント一覧タブ。ChatGPT等で画像→JSON化したイベント情報をコピー
+// 貼り付けでimportする（有料AI APIは使わない）。既存のwatchlist import等と同じ
+// 「貼り付け→保存→リロード」パターン。
+function EventsPanel({events,onReload}){
+  const [pasteText,setPasteText]=useState("");
+  const [importing,setImporting]=useState(false);
+  const [importMsg,setImportMsg]=useState("");
+  const doImport=async()=>{
+    let parsed;
+    try{parsed=JSON.parse(pasteText);}catch(e){setImportMsg("JSONの形式が正しくありません: "+e.message);return;}
+    const list=Array.isArray(parsed)?parsed:(parsed&&parsed.events)||[];
+    if(!Array.isArray(list)||!list.length){setImportMsg("events配列が見つかりません（[...]または{\"events\":[...]}の形式で貼り付けてください）");return;}
+    setImporting(true);
+    try{
+      const r=await fetch("/api/market-events/import",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({events:list})});
+      if(r.ok){
+        const d=await r.json();
+        setImportMsg(`取り込み完了：${d.imported}件（不備でスキップ${d.skipped}件）`);
+        setPasteText("");
+        onReload();
+      }else{
+        setImportMsg("取り込みに失敗しました");
+      }
+    }catch(e){setImportMsg("通信エラー: "+e.message);}
+    setImporting(false);
+  };
+  const removeEvent=async(id)=>{
+    if(!confirm("このイベントを削除しますか？"))return;
+    try{
+      await fetch("/api/market-events/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});
+      onReload();
+    }catch(e){}
+  };
+  const sorted=useMemo(()=>[...events].sort((a,b)=>(a.event_date||"").localeCompare(b.event_date||"")),[events]);
+  const todayStr=new Date().toISOString().slice(0,10);
+  const upcoming=sorted.filter(e=>e.event_date>=todayStr);
+  const past=sorted.filter(e=>e.event_date<todayStr);
+  return <div style={{marginTop:18}}>
+    <div className="sec-head">イベント</div>
+    <div className="sec-note" style={{fontSize:13}}>
+      経済指標・決算・中央銀行会合等の予定をJSONで貼り付けてimportします。ChatGPT等で画像から作成したJSONもそのまま使えます（有料AI APIは使用しません）。
+      画像由来の情報は確定情報として扱わず、verification_status（IMAGE_DERIVED/UNVERIFIED/VERIFIED）を必ず保存します。
+      Primary/Action Statusには直接反映せず、銘柄分析・ポジション画面に参考情報として表示するだけです。
+    </div>
+    <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 12px",marginBottom:14}}>
+      <textarea value={pasteText} onChange={e=>setPasteText(e.target.value)} rows={6}
+        placeholder={'例: [{"event_date":"2026-09-10","title":"米雇用統計","event_type":"ECONOMIC","importance":"HIGH","country":"US","source":"ChatGPT画像認識","verification_status":"IMAGE_DERIVED"}]'}
+        style={{width:"100%",fontSize:12,padding:8,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",fontFamily:"monospace",boxSizing:"border-box"}}/>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8}}>
+        <button className="btn primary" disabled={importing||!pasteText.trim()} onClick={doImport}>{importing?"取り込み中…":"JSONを取り込む"}</button>
+        {importMsg && <span style={{fontSize:12,color:"var(--inkSoft)"}}>{importMsg}</span>}
+      </div>
+    </div>
+    <div className="sec-head" style={{fontSize:13}}>今後のイベント（{upcoming.length}件）</div>
+    {upcoming.length===0
+      ? <div style={{padding:16,color:"var(--inkFaint)",fontSize:13}}>登録されているイベントはありません。</div>
+      : <div style={{display:"flex",flexDirection:"column",gap:6}}>
+          {upcoming.map(ev=>{
+            const days=businessDaysUntil(ev.event_date);
+            const icon=EVENT_TYPE_ICON[ev.event_type]||EVENT_TYPE_ICON.OTHER;
+            return <div key={ev.id} style={{display:"flex",alignItems:"center",gap:10,padding:"7px 10px",border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)",fontSize:12.5,flexWrap:"wrap"}}>
+              <span className="mono" style={{color:"var(--inkSoft)",width:90}}>{ev.event_date}{ev.event_time?` ${ev.event_time}`:""}</span>
+              <span style={{fontWeight:700}}>{icon} {ev.title}</span>
+              {ev.importance && <span style={{fontSize:11,color:(ev.importance==="HIGH"||ev.importance==="高")?"var(--down)":"var(--inkFaint)"}}>{ev.importance}</span>}
+              <span style={{fontSize:11,color:"var(--inkFaint)"}}>{days!=null?(days<=0?"本日":days+"営業日後"):""}</span>
+              <span style={{fontSize:10.5,color:"var(--inkFaint)",border:"1px solid var(--rule)",borderRadius:3,padding:"1px 5px"}}>{ev.verification_status}</span>
+              {ev.affected_stocks && ev.affected_stocks.length>0 && <span style={{fontSize:11,color:"var(--inkFaint)"}}>{ev.affected_stocks.join("・")}</span>}
+              <button className="iconbtn" style={{marginLeft:"auto"}} title="削除" onClick={()=>removeEvent(ev.id)}>×</button>
+            </div>;
+          })}
+        </div>}
+    {past.length>0 && <details style={{marginTop:16}}>
+      <summary style={{cursor:"pointer",fontSize:12.5,color:"var(--inkSoft)"}}>過去のイベント（{past.length}件）</summary>
+      <div style={{display:"flex",flexDirection:"column",gap:4,marginTop:8}}>
+        {past.slice(-30).reverse().map(ev=><div key={ev.id} style={{fontSize:11.5,color:"var(--inkFaint)"}}>{ev.event_date} {ev.title}</div>)}
+      </div>
+    </details>}
+  </div>;
+}
+
 function RelevantMarketSummary({w,metrics}){
   const keys=relevantMarketMetricKeys(w);
   const rows=keys.map(k=>METRICS.find(m=>m.key===k)).filter(Boolean);
@@ -2474,7 +2620,7 @@ function deriveTrailingStatus(currentStop,initialStop,avgPrice,current){
 // 直接編集・保存できる。stockQuotes（現在値）・analysisData（トレード分析タブのentry/stop/
 // target/fullExitTargetのスナップショット）を新たにpropsで受け取り、既存の取得済みデータを
 // 再利用する（新規リクエストは追加しない）。
-function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap}){
+function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEvents}){
   const [items,setItems]=useState([]);
   const [loading,setLoading]=useState(true);
   // v3-8（ポジション管理ロジック再設計 Step1）：取引タイプ（DAY/SWING）を新規登録時に必須化。
@@ -2748,6 +2894,10 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap}){
                     {posResult.reasons.map((r,i)=><li key={i}>{r}</li>)}
                   </ul>
                 </div>}
+
+                {/* v3-9続き（PHASE 3）：イベント接近（参考情報のみ、Statusには不干渉）。
+                    trade_styleに応じてDAY/SWINGで扱いを変える注記を添える。 */}
+                <EventRiskNote events={marketEvents} code={it.code} sector={it.sector} tradeStyle={it.trade_style}/>
 
                 {/* ⑧ 操作・参考情報・メモ */}
                 <div style={{display:"flex",alignItems:"center",gap:6,marginTop:8,flexWrap:"wrap"}}>
@@ -3985,6 +4135,14 @@ function App(){
       .map(([code,v])=>({code,name:v.name,sector:v.sector,kana:v.kana,market:"JP",tvSymbol:"TSE:"+code}));
     return [...curated,...extra];
   },[jpIssueMaster]);
+  // v3-9続き（PHASE 3 EVENT/EARNINGS INTELLIGENCE）：market_events（経済指標・決算・中銀会合等）。
+  // ページ表示時に1回だけ取得する（jpIssueMasterと同じパターン）。EventsPanel（イベントタブ）
+  // でimport後は明示的にリロードする。
+  const [marketEvents,setMarketEvents]=useState([]);
+  const loadMarketEvents=()=>{
+    fetch("/api/market-events").then(r=>r.ok?r.json():null).then(d=>{if(d)setMarketEvents(d.events||[]);}).catch(()=>{});
+  };
+  useEffect(()=>{loadMarketEvents();},[]);
   const masterUS=useMemo(()=>MASTER.filter(m=>m.market==="US"),[]);
 
   // 12章：分析タブの対象銘柄（日本市場・アメリカ市場どちらの登録銘柄からも追加され得る）
@@ -4815,6 +4973,9 @@ function App(){
         <p className="foot" style={{marginTop:16}}>※ 対象は現行のダウ工業株30種平均構成銘柄。業種分類は日本市場と同じ東証33業種の枠組みで統一しています（GICSセクターではありません）。アメリカ市場銘柄のニュース・決算・IRは「ニュース」タブのサマリー・海外市況・適時開示に統合表示しています。</p>
       </div>}
 
+      {/* ===== イベント（PHASE 3：EVENT/EARNINGS INTELLIGENCE） ===== */}
+      {tab==="events" && <EventsPanel events={marketEvents} onReload={loadMarketEvents}/>}
+
 
       {/* ===== 決算分析（日本市場・アメリカ市場の登録銘柄テーブルの「決算」ボタンで追加） ===== */}
       {tab==="earnings" && <div style={{marginTop:18}}>
@@ -4986,6 +5147,7 @@ function App(){
                             </div>}
                           {a.marketEnv && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>{a.marketEnv}</div>}
                           <RelevantMarketSummary w={w} metrics={s.metrics}/>
+                          <EventRiskNote events={marketEvents} code={w.code} sector={w.sector}/>
                           {/* ===== Trade Cockpit v2 Phase2：総合判断・8軸・Entry Conditions・Falling Knife/Chase Risk ===== */}
                           {a.assessment && enr && <AssessmentCard assessment={a.assessment} marginBadge={a.tradeRules?.marginBadge} marginRatio={a.tradeRules?.marginRatio} enr={enr} sectorRank={sectorRankMap.get(w.sector)}/>}
                           {enr && <StatusReasonPanel enr={enr} a={a}/>}
@@ -5358,7 +5520,7 @@ function App(){
       {tab==="position" && <div style={{marginTop:18}}>
         <div className="sec-head">ポジション</div>
         <div className="sec-note">保有中の建玉のみを表示します。売買記録・振り返りは「記録」タブへ。</div>
-        <PortfolioPanel stockQuotes={s.stockQuotes} analysisData={s.analysisData} analysisEnrichedMap={analysisEnrichedMap}/>
+        <PortfolioPanel stockQuotes={s.stockQuotes} analysisData={s.analysisData} analysisEnrichedMap={analysisEnrichedMap} marketEvents={marketEvents}/>
       </div>}
 
       {/* ===== 投資判断ログ（2026-09-02新規） ===== */}

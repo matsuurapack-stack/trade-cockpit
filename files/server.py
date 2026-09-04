@@ -4161,6 +4161,14 @@ class Handler(SimpleHTTPRequestHandler):
             signal_type = params.get("signal_type", [None])[0]
             events = investment_db.list_auto_signal_events(DATABASE_URL, self.current_user, code=code, signal_type=signal_type) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"events": events})
+        elif self.path.startswith("/api/market-events"):
+            # v3-9続き（PHASE 3 EVENT/EARNINGS INTELLIGENCE）：?from=&to=（ISO日付）で絞り込み可能。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            from_date = params.get("from", [None])[0]
+            to_date = params.get("to", [None])[0]
+            events = investment_db.list_market_events(DATABASE_URL, self.current_user, from_date=from_date, to_date=to_date) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"events": events})
         elif self.path.startswith("/api/trade-candidates"):
             candidates = investment_db.list_trade_candidates(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"candidates": candidates})
@@ -4413,6 +4421,26 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             body = self._read_json_body()
             investment_db.delete_watchlist_item(DATABASE_URL, self.current_user, body.get("code"), body.get("market"))
+            self._send_json({"ok": True})
+        elif self.path == "/api/market-events/import":
+            # v3-9続き（PHASE 3 EVENT/EARNINGS INTELLIGENCE）：ChatGPTで画像→JSON化したイベント
+            # 一覧を貼り付けてimportする。body: {"events": [{event_date,title,...}, ...]}。
+            # 画像由来の情報を確定情報として扱わないため、verification_status未指定は
+            # UNVERIFIEDになる（investment_db.import_market_events側の既定）。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            events = body.get("events")
+            if not isinstance(events, list):
+                self._send_json({"error": "eventsは配列で指定してください"})
+                return
+            result = investment_db.import_market_events(DATABASE_URL, self.current_user, events)
+            self._send_json(result)
+        elif self.path == "/api/market-events/delete":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            investment_db.delete_market_event(DATABASE_URL, self.current_user, body.get("id"))
             self._send_json({"ok": True})
         elif self.path == "/api/watchlist/migrate":
             # 既存ユーザーのlocalStorage watchlistを1回だけNeonへ取り込む（investmentLogMigratedと

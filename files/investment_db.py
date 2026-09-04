@@ -373,6 +373,40 @@ CREATE TABLE IF NOT EXISTS auto_signal_events (
 );
 CREATE INDEX IF NOT EXISTS idx_auto_signal_events_code ON auto_signal_events(user_id, code, signal_type);
 CREATE INDEX IF NOT EXISTS idx_auto_signal_events_date ON auto_signal_events(user_id, event_date);
+
+-- v3-9続き（2026-09-05・PHASE 3 EVENT/EARNINGS INTELLIGENCE）：経済指標・決算・中銀会合等の
+-- イベント情報。ChatGPTで画像（経済カレンダー・決算スケジュール等）をJSON化してコピー貼り付けで
+-- import する想定（有料AI APIは使わない）。画像由来の情報を確定情報として扱わないよう、
+-- verification_status（IMAGE_DERIVED/UNVERIFIED/VERIFIED）を必ず持たせる。既存のnews関連
+-- テーブル（news_feedback）とは役割が異なる（あちらは「不要」フィードバックのログのみで、
+-- ニュース本体もイベント情報も保存していない）ため重複しない。
+-- 同一イベントの重複importを避けるため(user_id, event_date, title)にUNIQUE制約を付ける
+-- （既存のwatchlist等と違いupsertで「後から検証状態だけ更新」等を許容するため、
+-- ON CONFLICT DO UPDATEで使う）。
+CREATE TABLE IF NOT EXISTS market_events (
+    id                    SERIAL PRIMARY KEY,
+    user_id               TEXT NOT NULL,
+    event_date            DATE NOT NULL,
+    event_time            TEXT,     -- 自由書式（"21:30"等）。厳密なタイムゾーン計算はしない
+    timezone              TEXT,
+    title                 TEXT NOT NULL,
+    country               TEXT,
+    event_type            TEXT NOT NULL DEFAULT 'OTHER',  -- ECONOMIC|CENTRAL_BANK|EARNINGS|INDEX_REBALANCE|POLITICAL|GEOPOLITICAL|PRODUCT_EVENT|OTHER
+    importance            TEXT,     -- HIGH|MEDIUM|LOW等、自由記述も許容
+    affected_markets      JSONB,
+    affected_sectors      JSONB,
+    affected_stocks       JSONB,    -- ["7203","9984"]等、銘柄分析画面での紐付けに使う
+    impact_channels       JSONB,
+    source                TEXT,
+    source_type           TEXT,     -- IMAGE|TEXT|MANUAL等
+    verification_status   TEXT NOT NULL DEFAULT 'UNVERIFIED',  -- IMAGE_DERIVED|UNVERIFIED|VERIFIED
+    notes                 TEXT,
+    raw_payload           JSONB,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, event_date, title)
+);
+CREATE INDEX IF NOT EXISTS idx_market_events_user_date ON market_events(user_id, event_date);
 """
 
 
@@ -1441,6 +1475,103 @@ def list_auto_signal_events(database_url, user_id, code=None, signal_type=None, 
                 params,
             )
             return [_row_to_json(r) for r in cur.fetchall()]
+
+
+# v3-9続き（2026-09-05・PHASE 3 EVENT/EARNINGS INTELLIGENCE）：market_events。
+# 既存のwatchlist_imports/chatgpt_importsと同じ「validation→duplicate check→保存」の考え方を
+# 踏襲しつつ、イベントは1件ずつ個別に検索・参照したい（銘柄分析画面での「次回決算まで何営業日」
+# 等の計算に使うため）ため、JSON全体を1行で保存するのではなく、パース後に1イベント1行で
+# upsertする設計にする。
+_MARKET_EVENT_COLS = ["event_time", "timezone", "country", "event_type", "importance",
+                       "affected_markets", "affected_sectors", "affected_stocks", "impact_channels",
+                       "source", "source_type", "verification_status", "notes", "raw_payload"]
+_MARKET_EVENT_JSONB_COLS = {"affected_markets", "affected_sectors", "affected_stocks", "impact_channels", "raw_payload"}
+
+
+def _upsert_market_event_conn(conn, user_id, ev):
+    """1件のイベントdictをupsertする。event_date・titleは必須（無ければNoneを返し呼び出し側で
+    カウントしない）。verification_statusは未指定ならUNVERIFIED（画像由来等を確定情報として
+    扱わない、既定の安全側）。"""
+    event_date = ev.get("event_date") or ev.get("date")
+    title = ev.get("title")
+    if not event_date or not title:
+        return False
+    cols = ["event_date", "title"] + [c for c in _MARKET_EVENT_COLS if c in ev or c == "verification_status"]
+    values = []
+    for c in cols:
+        if c == "event_date":
+            values.append(event_date)
+        elif c == "title":
+            values.append(title)
+        elif c == "verification_status":
+            values.append(ev.get("verification_status") or "UNVERIFIED")
+        elif c in _MARKET_EVENT_JSONB_COLS:
+            values.append(json.dumps(ev.get(c), ensure_ascii=False) if ev.get(c) is not None else None)
+        else:
+            values.append(ev.get(c))
+    update_cols = [c for c in cols if c not in ("event_date", "title")]
+    conn.execute(
+        f"INSERT INTO market_events (user_id, {', '.join(cols)}) "
+        f"VALUES (%s, {', '.join(['%s::jsonb' if c in _MARKET_EVENT_JSONB_COLS else '%s' for c in cols])}) "
+        f"ON CONFLICT (user_id, event_date, title) DO UPDATE SET "
+        f"{', '.join(c + ' = EXCLUDED.' + c for c in update_cols)}, updated_at = now()",
+        [user_id] + values,
+    )
+    return True
+
+
+def import_market_events(database_url, user_id, events):
+    """events（dictのリスト、JSON貼り付けのimport想定）を1件ずつupsertする。
+    戻り値: {"imported": N, "skipped": M}（event_date/titleが無い行はskip）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return {"imported": 0, "skipped": len(events)}
+    imported = skipped = 0
+    with pool.connection() as conn:
+        for ev in events:
+            if not isinstance(ev, dict):
+                skipped += 1
+                continue
+            ok = _upsert_market_event_conn(conn, user_id, ev)
+            if ok:
+                imported += 1
+            else:
+                skipped += 1
+        conn.commit()
+    return {"imported": imported, "skipped": skipped}
+
+
+def list_market_events(database_url, user_id, from_date=None, to_date=None, limit=200):
+    """user_idのイベントをevent_date昇順で返す。from_date/to_dateはISO日付文字列（両端含む）。
+    省略時は全期間（limit件まで）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = ["user_id = %s"], [user_id]
+    if from_date:
+        where.append("event_date >= %s")
+        params.append(from_date)
+    if to_date:
+        where.append("event_date <= %s")
+        params.append(to_date)
+    params.append(limit)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT * FROM market_events WHERE {' AND '.join(where)} "
+                f"ORDER BY event_date ASC LIMIT %s",
+                params,
+            )
+            return [_row_to_json(r) for r in cur.fetchall()]
+
+
+def delete_market_event(database_url, user_id, event_id):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return
+    with pool.connection() as conn:
+        conn.execute("DELETE FROM market_events WHERE user_id = %s AND id = %s", [user_id, event_id])
+        conn.commit()
 
 
 def delete_watchlist_item(database_url, user_id, code, market=None):
