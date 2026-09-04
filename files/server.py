@@ -2464,6 +2464,17 @@ def _sector_leader_score(row, sector_stats):
     return round(score, 1), rank, sector_stats["total"], sector_vs_market, sector_stats["avg"].get(sector)
 
 
+# 2026-09-05（ユーザー指示：SECTOR STRENGTH補助フラグ）：「強いセクターの主役」と「弱いセクター
+# の中で一人だけ強い銘柄」を区別するための内部フラグ。SECTOR_LEADER_SCOREの計算・配点は一切
+# 変更せず、既に算出済みのsector_vs_market（セクター対市場）を見て分類するだけ（新しい判定基準・
+# 追加のAPI呼び出しは無し）。将来の「SECTOR_LEADER件数」「STRONG_SECTOR比率」等の検証に
+# 使えるよう、タグにそのまま保存する。
+def _sector_strength_flag(sector_vs_market):
+    if sector_vs_market is None:
+        return None
+    return "STRONG_SECTOR" if sector_vs_market > 0 else "WEAK_SECTOR_LEADER"
+
+
 def select_sector_leader_candidates(stage1, sector_stats):
     scored = []
     for code, row in stage1["rows"].items():
@@ -2488,7 +2499,7 @@ def run_sector_leader_scan(database_url, user_id, force=False):
                 "marketRS": row.get("marketRS"), "sectorRS": row.get("sectorRS"),
                 "turnover": row.get("turnover"), "finalScore": s,
                 "sectorRank": rank, "sectorTotal": total, "sectorVsMarket": sector_vs_market,
-                "sectorAvgPct": sector_avg}
+                "sectorAvgPct": sector_avg, "sectorStrength": _sector_strength_flag(sector_vs_market)}
                for s, code, row, rank, total, sector_vs_market, sector_avg in scored]
     to_register = [d for d in details if d["finalScore"] >= SECTOR_LEADER_SCORE_THRESHOLD][:SECTOR_LEADER_MAX_REGISTER]
 
@@ -2501,6 +2512,7 @@ def run_sector_leader_scan(database_url, user_id, force=False):
 
         for d in to_register:
             tag_value = {"score": d["finalScore"], "sectorRank": d["sectorRank"], "sectorTotal": d["sectorTotal"],
+                         "sectorStrength": d["sectorStrength"],
                          "addedAt": now_dt.isoformat(), "expiresAt": expires_at}
             try:
                 ok = investment_db.auto_register_or_tag_watchlist_item(
@@ -2529,6 +2541,195 @@ def run_sector_leader_scan(database_url, user_id, force=False):
         "stage1BuiltAtJst": _jst_time_str(stage1["builtAt"]),
         "stage1ScanFailed": stage1.get("scanFailed", False), "stage1UsedStaleCache": stage1.get("usedStaleCache", False),
         "candidateCount": len(details),
+        "demotedToSeenCount": len(demoted), "demotedToSeen": demoted,
+        "registeredCount": len(registered),
+        "registered": registered,
+        "allCandidates": details,
+    }
+
+
+# ============================================================
+# v3-9続き：🌊 AUTO_PULLBACK
+# 同じStage1（run_momentum_stage1、キャッシュ共有）を利用し、AUTO_BREAKと同様にStage2
+# （銘柄ごとの日足履歴、_tachibana_daily_arraysをそのまま再利用）を持つ構成。
+# 【設計原則】「新高値」ではなく「強い銘柄が浅く押して、まだ上昇トレンドを崩していない」状態を
+# 拾う。VWAP付近までの押し・VWAP再奪回は、市場全体スキャンで全銘柄に分足（イントラデイ）を
+# 追加取得するのは負荷が大きすぎるため（yfinanceのレート制限リスク・立花証券APIの連続大量
+# リクエスト双方を避ける、2026-09-04の教訓）採用せず、日足だけで近似できる代替指標（MA25からの
+# 上方乖離・前日高値／3か月高値からの浅い乖離・安値切り上げ・出来高健全性）で代用する。
+# 「単に大きく下落しただけ」は複数のガード（上昇トレンド判定・乖離レンジ・出来高下限）で除外。
+# ============================================================
+AUTO_PULLBACK_LITE_MAX_CANDIDATES = 100
+AUTO_PULLBACK_SCORE_THRESHOLD = 50  # 実データを見て調整する前提の初期値（他エンジンと同じ運用）
+AUTO_PULLBACK_MAX_REGISTER = 15
+AUTO_PULLBACK_TAG_EXPIRE_DAYS = 2
+AUTO_PULLBACK_STAGE2_WORKERS = 10
+
+
+def _pullback_lite_score(row):
+    """Stage1だけでの一次選定：対市場・対セクターで強さを保っている銘柄を広く拾う。
+    2026-09-05実測で発覚した不具合の修正：当初は「当日-4%〜+1%」という絶対的なchg上限も
+    課していたが、日経平均自体が+1%を超えて上昇した日には marketRS(=chg−nikkei_chg)>=0 と
+    chg<=+1% が数学的に両立しえず候補が0件になってしまっていた（marketRS>=0の条件だけで
+    「その日の勢いだけで跳ねた銘柄」は既に十分絞り込めるため、絶対的なchg上限は不要と判断し
+    撤去）。「新高値ではなく押し目」という判定自体は、この後のStage2（pullbackDevPct＝
+    直近高値からの乖離率が0.3〜6%の範囲）が正式に担当する。"""
+    chg = row.get("changePct")
+    if chg is None or chg < -4:
+        return None
+    market_rs = row.get("marketRS")
+    if market_rs is None or market_rs < 0:
+        return None
+    score = 0.0
+    score += _scale_score(market_rs, 0, 5, 30)
+    score += _scale_score(row.get("sectorRS"), 0, 3, 20)
+    score += _scale_score(row.get("turnover"), 1e9, 1e10, 20)
+    score *= _liquidity_multiplier(row.get("turnover"))
+    return round(score, 1)
+
+
+def select_pullback_stage1_candidates(stage1):
+    scored = []
+    for code, row in stage1["rows"].items():
+        s = _pullback_lite_score(row)
+        if s is not None:
+            scored.append((s, code, row))
+    scored.sort(key=lambda x: -x[0])
+    return scored[:AUTO_PULLBACK_LITE_MAX_CANDIDATES]
+
+
+def _pullback_stage2_detail(code, stage1_row):
+    """Stage1通過銘柄だけに、日足履歴が要る指標（MA25・押し目の乖離率・安値切り上げ・出来高
+    倍率）を追加する。VWAPの代わりにMA25からの上方乖離を「トレンドの強さ」の代理指標として使う。"""
+    arrays = _tachibana_daily_arrays(code)
+    if not arrays:
+        return None
+    closes, opens, highs, lows, volumes = arrays
+    if len(closes) < 26 or len(volumes) < 6 or len(lows) < 2:
+        return None
+    current = stage1_row.get("current") if stage1_row.get("current") is not None else closes[-1]
+    ma25 = sum(closes[-25:]) / 25
+    uptrend = current > ma25
+    vol_avg5 = sum(volumes[-6:-1]) / 5
+    vol_ratio = (volumes[-1] / vol_avg5) if vol_avg5 else None
+    breakout_lookback_high = (max(highs[-(BREAKOUT_LOOKBACK_DAYS + 1):-1])
+                               if len(highs) >= BREAKOUT_LOOKBACK_DAYS + 1 else None)
+    prev_day_high = highs[-2]
+    # 押し目の基準水準：直近ブレイク水準（3か月高値）があればそちらを優先、無ければ前日高値。
+    ref_high = breakout_lookback_high if breakout_lookback_high is not None else prev_day_high
+    pullback_dev_pct = ((ref_high - current) / ref_high * 100) if (ref_high and ref_high > 0) else None
+    higher_low = bool(lows[-1] >= lows[-2] * 0.995)  # 安値切り上げ（0.5%の許容誤差）
+    return {"ma25": round(ma25, 1), "uptrend": uptrend,
+            "volRatio": round(vol_ratio, 2) if vol_ratio is not None else None,
+            "higherLow": higher_low, "refHigh": round(ref_high, 1) if ref_high is not None else None,
+            "pullbackDevPct": round(pullback_dev_pct, 2) if pullback_dev_pct is not None else None}
+
+
+def _pullback_final_score(row, stage2):
+    """PULLBACK_SCORE：上昇トレンドが崩れている（現在値がMA25未満）銘柄はそもそも対象外。
+    押し目の乖離が浅すぎる（まだ高値圏＝押し目になっていない）または深すぎる（6%超＝
+    ただの下落）銘柄も対象外。出来高が薄すぎる（0.7倍未満）銘柄も「見放された押し目」として除外。
+      対市場（marketRS）        最大30点
+      押し目の浅さ              最大25点（0.3%程度で満点、6%で0点）
+      安値切り上げ              +20点（binary）
+      出来高健全性              最大15点（0.7倍未満は対象外、1.5倍以上で満点）
+      MA25からの上方乖離        最大10点（トレンドの強さの補強）"""
+    if not stage2 or not stage2["uptrend"]:
+        return None
+    dev = stage2.get("pullbackDevPct")
+    if dev is None or dev < 0.3 or dev > 6:
+        return None
+    vol_ratio = stage2.get("volRatio")
+    if vol_ratio is not None and vol_ratio < 0.7:
+        return None
+    score = 0.0
+    score += _scale_score(row.get("marketRS"), 0, 5, 30)
+    score += _scale_score(6 - dev, 0, 5.7, 25)
+    if stage2.get("higherLow"):
+        score += 20
+    if vol_ratio is not None:
+        score += _scale_score(vol_ratio, 0.7, 1.5, 15)
+    current, ma25 = row.get("current"), stage2.get("ma25")
+    if current is not None and ma25:
+        score += _scale_score((current - ma25) / ma25 * 100, 0, 5, 10)
+    score *= _liquidity_multiplier(row.get("turnover"))
+    return round(score, 1)
+
+
+def run_pullback_scan(database_url, user_id, force=False):
+    """Stage1（キャッシュ共有）→PULLBACK候補選定→Stage2（並列、AUTO_BREAKと同じ構成）→
+    PULLBACK_SCORE確定→閾値を満たした上位AUTO_PULLBACK_MAX_REGISTER件を
+    「AUTO_PULLBACK_CURRENT」として登録、新TOP外に落ちた旧CURRENTは「AUTO_PULLBACK_SEEN」へ降格。"""
+    stage1 = run_momentum_stage1(force=force)
+    candidates = select_pullback_stage1_candidates(stage1)
+    t_stage2_start = time.time()
+
+    stage2_results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=AUTO_PULLBACK_STAGE2_WORKERS) as ex:
+        futures = {ex.submit(_pullback_stage2_detail, code, row): code for _, code, row in candidates}
+        for fut in concurrent.futures.as_completed(futures):
+            code = futures[fut]
+            try:
+                stage2_results[code] = fut.result()
+            except Exception as e:
+                print("  PULLBACK Stage2詳細取得失敗", code, e)
+                stage2_results[code] = None
+    stage2_duration = round(time.time() - t_stage2_start, 1)
+
+    details = []
+    for lite_score, code, row in candidates:
+        stage2 = stage2_results.get(code)
+        final_score = _pullback_final_score(row, stage2)
+        if final_score is None:
+            continue
+        details.append({"code": code, "name": row.get("name"), "sector": row.get("sector"),
+                         "changePct": row.get("changePct"), "highRetention": row.get("highRetention"),
+                         "marketRS": row.get("marketRS"), "sectorRS": row.get("sectorRS"),
+                         "turnover": row.get("turnover"), "liteScore": lite_score,
+                         "finalScore": final_score, "stage2": stage2})
+    details.sort(key=lambda d: -d["finalScore"])
+    to_register = [d for d in details if d["finalScore"] >= AUTO_PULLBACK_SCORE_THRESHOLD][:AUTO_PULLBACK_MAX_REGISTER]
+
+    registered, demoted = [], []
+    if database_url and investment_db is not None:
+        old_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_PULLBACK_CURRENT", market="JP")
+        new_current_codes = {d["code"] for d in to_register}
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        expires_at = (now_dt + datetime.timedelta(days=AUTO_PULLBACK_TAG_EXPIRE_DAYS)).isoformat()
+
+        for d in to_register:
+            tag_value = {"score": d["finalScore"], "pullbackDevPct": d["stage2"]["pullbackDevPct"],
+                         "higherLow": d["stage2"]["higherLow"],
+                         "addedAt": now_dt.isoformat(), "expiresAt": expires_at}
+            try:
+                ok = investment_db.auto_register_or_tag_watchlist_item(
+                    database_url, user_id, d["code"], "JP", "AUTO_PULLBACK_CURRENT", tag_value,
+                    item_fields={"name": d["name"], "sector": d["sector"], "source": "auto_pullback"})
+                investment_db.remove_auto_tag_key(database_url, user_id, d["code"], "JP", "AUTO_PULLBACK_SEEN")
+            except Exception as e:
+                print("  AUTO_PULLBACK登録（CURRENT）失敗", d["code"], e)
+                ok = False
+            if ok:
+                registered.append(d)
+
+        for code in old_current - new_current_codes:
+            try:
+                investment_db.auto_register_or_tag_watchlist_item(
+                    database_url, user_id, code, "JP", "AUTO_PULLBACK_SEEN",
+                    {"addedAt": now_dt.isoformat(), "expiresAt": expires_at})
+                investment_db.remove_auto_tag_key(database_url, user_id, code, "JP", "AUTO_PULLBACK_CURRENT")
+                demoted.append(code)
+            except Exception as e:
+                print("  AUTO_PULLBACK降格（SEEN化）失敗", code, e)
+    return {
+        "stage1CodesScanned": stage1["codesScanned"], "stage1PricesReturned": stage1["pricesReturned"],
+        "stage1DurationSec": stage1["durationSec"], "stage1RequestCount": stage1["requestCount"],
+        "stage1CacheAgeSec": round(time.time() - stage1["builtAt"], 1) if stage1["builtAt"] else None,
+        "stage1BuiltAtJst": _jst_time_str(stage1["builtAt"]),
+        "stage1ScanFailed": stage1.get("scanFailed", False), "stage1UsedStaleCache": stage1.get("usedStaleCache", False),
+        "stage1CandidateCount": len(candidates),
+        "stage2ValidCount": len(details),
+        "stage2DurationSec": stage2_duration,
         "demotedToSeenCount": len(demoted), "demotedToSeen": demoted,
         "registeredCount": len(registered),
         "registered": registered,
@@ -3815,6 +4016,16 @@ class Handler(SimpleHTTPRequestHandler):
             result = run_sector_leader_scan(DATABASE_URL, self.current_user, force=force)
             print(f"  Stage1 {result['stage1CodesScanned']}銘柄スキャン（{result['stage1DurationSec']}秒）→ "
                   f"候補{result['candidateCount']}件→自動登録{result['registeredCount']}件"
+                  f"（降格{result['demotedToSeenCount']}件）")
+            self._send_json(result)
+        elif self.path.startswith("/api/pullback-scan"):
+            # v3-9続き：🌊 AUTO_PULLBACK。Stage1共有・AUTO_BREAKと同じくStage2あり（日足履歴）。
+            qs = urllib.parse.urlparse(self.path).query
+            force = urllib.parse.parse_qs(qs).get("force", ["0"])[0] == "1"
+            print(f"[取得] AUTO_PULLBACKスキャン開始（force={force}）…")
+            result = run_pullback_scan(DATABASE_URL, self.current_user, force=force)
+            print(f"  Stage1 {result['stage1CodesScanned']}銘柄スキャン（{result['stage1DurationSec']}秒）→ "
+                  f"押し目候補{result['stage2ValidCount']}件→自動登録{result['registeredCount']}件"
                   f"（降格{result['demotedToSeenCount']}件）")
             self._send_json(result)
         elif self.path.startswith("/api/trade-candidates"):
