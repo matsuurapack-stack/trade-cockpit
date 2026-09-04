@@ -2043,6 +2043,19 @@ def analyze_stock(w, market_env=None):
         atr_ref = intraday_range
         used_intraday_range = True
 
+    # ---- v3-8 Step3（ポジション管理ロジック再設計）：「大陰線」「ギャップ失敗」の軽量フラグ。
+    # 新規のAPI呼び出しは行わず、この関数内で既に取得済みの当日始値(o)/前日終値(prev)/高値(hi)/
+    # 安値(lo)/現在値(current)/ATR(atr_ref)/前日比(change_pct)のみで判定する。ポジション管理
+    # （Step5でDAY/SWING別のチャート崩れ判定の補助材料として使用予定）専用の指標で、
+    # 銘柄分析タブのBUYシグナル判定（long_bull_top等）には影響しない独立フィールド。
+    # 大陰線：実体(body)が値幅(rng)の6割以上を占める陰線で、終値が安値付近（下位25%）まで
+    # 押し込まれ、ATR比でも十分な大きさがあり、前日終値比でも明確なマイナス（-3%以下）。
+    long_bearish_candle = bool(is_bear and body >= rng * 0.6 and c <= lo + rng * 0.25
+                                and body >= atr_ref * 0.5 and change_pct is not None and change_pct <= -3)
+    # ギャップ失敗：寄り付きで2%以上の上放れ（gu_pct、既存のルール①と同じ算出値）があったにも
+    # かかわらず、その後失速して前日終値を割り込むまで戻された＝始値の強さが最後まで持たなかった状態。
+    gap_up_failure = bool(gu_pct is not None and gu_pct >= 2 and prev is not None and current <= prev)
+
     # trading_rules.mdのチャート確認優先順位（出来高→移動平均線→VWAP→ボリンジャーバンド→RSI）に合わせ、
     # 複数シグナルが同時点灯した場合はこの順で「最有力の根拠」を選ぶ（VWAP/RSIは単独の買いシグナルを
     # 持たず、entry調整の理由として別途entry_reasonsに追記される）。
@@ -2637,6 +2650,11 @@ def analyze_stock(w, market_env=None):
         "daysToEarnings": days_to_earnings,  # 決算またぎ期待値機能：10日前からのカウントダウン表示に使う
         "autoEarningsStars": auto_earnings_stars,  # 決算期待値の星（過去の上方/下方修正比率・直近決算・過熱度から自動算出）
         "assessment": assessment,  # Trade Cockpit v2 Phase2：Falling Knife/Chase Risk・Entry Conditions集計・8軸ラベル・ルールベース判断文
+        # v3-8 Step3：ポジション管理（Step5のチャート崩れ判定）向けの軽量フラグ。新規API呼び出しなし。
+        "positionFlags": {
+            "longBearishCandle": long_bearish_candle,
+            "gapUpFailure": gap_up_failure,
+        },
         "tradeRules": {
             "entryChecklist": entry_checklist,
             "avoidChecklist": avoid_checklist,
