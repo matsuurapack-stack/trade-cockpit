@@ -2081,7 +2081,18 @@ function calcTrailingWidth(tradeStyle,current,atr14){
 const TRAIL_START_PCT={DAY:3,SWING:5};   // この含み益%を超えたらトレーリング開始を提案
 const HOLD_STRONG_PCT={DAY:8,SWING:15};  // トレーリング幅が計算できない場合のフォールバック表示用
 
-function derivePositionStatus({avgPrice,tradeStyle,current,currentStop,initialStop,target1,positionFlags,pnlPct,indicators,enrStatus}){
+// v3-8 Step9（板情報）：立花証券APIから取得できる最良気配（ask/bid、stockQuotes[code].ask/bid、
+// 既存の/api/stock-quotesがtachibana接続時に上書きする値をそのまま再利用。新規APIコールなし）
+// のみを扱う。板の深さ・数量は立花証券APIでは取得できない（tachibana_api.get_market_price()の
+// コメント参照）ため、スプレッド（ask-bid）の広さだけを判定材料にする。スプレッドが現在値比
+// 0.5%以上に広がっている＝板が薄く売り抜けにくい可能性、という補助情報に限定する。
+function evaluateSpreadWarning(ask,bid,current){
+  if(ask==null||bid==null||current==null||current<=0||ask<=bid)return null;
+  const spreadPct=(ask-bid)/current*100;
+  return spreadPct>=0.5?{spreadPct:Math.round(spreadPct*100)/100}:null;
+}
+
+function derivePositionStatus({avgPrice,tradeStyle,current,currentStop,initialStop,target1,positionFlags,pnlPct,indicators,enrStatus,ask,bid}){
   const reasons=[];
   // 1. HARD STOP（Step2・SWING限定・絶対最優先。他のいかなる材料でも上書きしない）
   const hardStopPrice=calcHardStop(avgPrice,tradeStyle);
@@ -2105,6 +2116,11 @@ function derivePositionStatus({avgPrice,tradeStyle,current,currentStop,initialSt
   if(positionFlags?.volumeUpWithDecline)reasons.push("出来高複合：出来高増加を伴う下落");
   if(positionFlags?.highZoneVolumeReversal)reasons.push("出来高複合：高値圏で大出来高からの反落");
   if(positionFlags?.failedBreakoutWithVolume)reasons.push("出来高複合：ブレイク失敗（出来高増加を伴う）");
+  // Step9（板情報）：最良気配のスプレッド拡大は、それ単独では警戒シグナルに数えない。価格・出来高・
+  // チャートのいずれかで既に1件以上の警戒が立っているときだけ「補強材料」として1件追加する
+  // （＝板情報だけでreasonsがゼロから発生することはなく、常に他の材料との複合条件になる）。
+  const spreadWarning=evaluateSpreadWarning(ask,bid,current);
+  if(spreadWarning&&reasons.length>0)reasons.push(`板：スプレッド拡大（${spreadWarning.spreadPct}%、流動性低下の可能性）`);
   const warnCount=reasons.length;
 
   const trailKey=deriveTrailingStatus(currentStop,initialStop,avgPrice,current);
@@ -2338,9 +2354,13 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap}){
               const posFlags=analysisData?.[it.code]?.positionFlags;
               const posIndicators=analysisData?.[it.code]?.indicators;
               const enr=analysisEnrichedMap?.get(it.code);
+              // Step9：最良気配（stockQuotesが立花証券API接続時に上書きするask/bid、新規取得なし）
+              const boardAsk=num(stockQuotes?.[it.code]?.ask);
+              const boardBid=num(stockQuotes?.[it.code]?.bid);
               const posResult=derivePositionStatus({avgPrice:it.average_price,tradeStyle:it.trade_style,
                 current,currentStop:it.current_stop,initialStop:it.initial_stop,target1:it.target_1,
-                positionFlags:posFlags,pnlPct,indicators:posIndicators,enrStatus:enr?.status});
+                positionFlags:posFlags,pnlPct,indicators:posIndicators,enrStatus:enr?.status,
+                ask:boardAsk,bid:boardBid});
               const posMeta=POSITION_STATUS_META[posResult.status];
               // v3-8 Step8（UIカード再設計）：表示順を「取引タイプ→ポジションStatus→取得値/現在値/
               // 損益→HARD STOP/現在SL→Trailing/利確候補→チャート・出来高警戒（Statusの理由として
@@ -2375,6 +2395,11 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap}){
                 <div className="mono" style={{fontSize:12,color:"var(--inkSoft)",marginTop:8}}>
                   {it.quantity!=null?`${it.quantity.toLocaleString()}株`:"—株"} @ {it.average_price!=null?it.average_price.toLocaleString():"—"}
                   {"　現在 "}{current!=null?current.toLocaleString():"—"}
+                  {/* v3-8 Step9：最良気配（立花証券API接続時のみ）。板の深さ・数量は取得できないため
+                      表示もbid/askとスプレッドのみ。あくまで参考の補助情報。 */}
+                  {boardBid!=null && boardAsk!=null && <span style={{color:"var(--inkFaint)",fontSize:11}}>
+                    {"　気配 "}{boardBid.toLocaleString()}/{boardAsk.toLocaleString()}
+                  </span>}
                 </div>
                 <div className="mono" style={{fontSize:15,fontWeight:800,marginTop:2,
                     color:pnlAmount==null?"var(--inkFaint)":pnlAmount>0?"var(--up)":pnlAmount<0?"var(--down)":"var(--inkSoft)"}}>
