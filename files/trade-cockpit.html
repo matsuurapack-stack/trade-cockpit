@@ -1336,19 +1336,20 @@ const TRADE_CANDIDATE_STATUS_OPTIONS=[
 // 色は既存entryChecklist/avoidChecklistの慣習に合わせる（--up=赤=好材料寄り、--down=緑=警告寄り。
 // CLAUDE.md記載の「上昇=赤・下落=緑」の株価配色とは別に、このアプリでは買いシグナル=赤／
 // 見送り警告=緑の対比として使われている。混同しないよう既存チップと同じ配色に揃える）。
-const ASSESSMENT_STATUS_META={
-  HOT:{icon:"🔥",label:"HOT",color:"var(--up)"},
-  WATCH:{icon:"👀",label:"WATCH",color:"var(--accent)"},
-  WAIT:{icon:"⏳",label:"WAIT",color:"var(--inkSoft)"},
-  WEAK:{icon:"💤",label:"WEAK",color:"var(--inkFaint)"},
-};
+// v3-6 Step1（Status統合）：独自のoverallStatus（HOT/WATCH/WAIT/WEAK、サーバー側の別ロジック）は
+// 廃止し、監視銘柄タブと全く同じPrimary Status／Action Status（enrichWatchRow()の出力、enrプロパティ
+// で受け取る）に統一した。「一覧ではHOT+WAIT、分析画面では別の判定」という矛盾を防ぐため。
+// ASSESSMENT_STATUS_METAは不要になったため削除（PRIMARY_STATUS_META/ACTION_STATUS_METAを使う）。
 const AXIS_LABEL_META={
   "RISK ON":{color:"var(--up)"},"NEUTRAL":{color:"var(--inkSoft)"},"RISK OFF":{color:"var(--down)"},
   "STRONG":{color:"var(--up)"},"WEAK":{color:"var(--down)"},
   "POSITIVE":{color:"var(--up)"},"RISK":{color:"var(--down)"},
 };
-function AssessmentCard({assessment:a,marginBadge,marginRatio}){
-  const meta=ASSESSMENT_STATUS_META[a.overallStatus]||ASSESSMENT_STATUS_META.WEAK;
+function AssessmentCard({assessment:a,marginBadge,marginRatio,enr}){
+  const meta=PRIMARY_STATUS_META[enr.status];
+  const actionMeta=ACTION_STATUS_META[enr.actionStatus];
+  const reasonList=enr.actionStatus==="RISK"?enr.riskReasons.map(r=>RISK_REASON_META[r])
+    :enr.actionStatus==="WAIT"?enr.waitReasons.map(r=>WAIT_REASON_META[r]):[];
   const axisRows=[
     ["Market",a.axes?.market],["Supply/Demand",a.axes?.supplyDemand],
     ["Technical",a.axes?.technical],["Catalyst",a.axes?.catalyst],
@@ -1356,6 +1357,7 @@ function AssessmentCard({assessment:a,marginBadge,marginRatio}){
   // v3 Phase3（設計案37番）：Day Trade／Swingを分けて表示。新規のサーバー計算は追加せず、
   // 既存assessmentの値（Falling Knife/Chase Risk・Entry Conditions・Market/RS）から
   // クライアント側で導出するだけ（Day Tradeは短期シグナル寄り、Swingは地合い・RS寄りを重視）。
+  // ※Step1時点ではそのまま残置（Primary/Action Statusとの整理はStep4以降で検討）。
   const dayTradeLabel = (a.fallingKnife||a.chaseRisk) ? "WAIT"
     : (a.entryConditionsTotal>0 && a.entryConditionsMet===a.entryConditionsTotal) ? "STRONG WATCH"
     : (a.entryConditionsMet>0) ? "WATCH" : "NEUTRAL";
@@ -1364,6 +1366,8 @@ function AssessmentCard({assessment:a,marginBadge,marginRatio}){
   return <div style={{border:"1px solid var(--rule)",borderRadius:4,padding:"8px 10px",marginBottom:8,background:"var(--card)"}}>
     <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
       <span style={{fontWeight:800,fontSize:13,color:meta.color}}>{meta.icon} {meta.label}</span>
+      {actionMeta.label && <span style={{fontWeight:800,fontSize:13,color:actionMeta.color}}
+        title={reasonList.length?reasonList.join("・"):undefined}>{actionMeta.icon} {actionMeta.label}</span>}
       <span className="chip" style={{fontSize:10.5}}>Day Trade: {dayTradeLabel}</span>
       <span className="chip" style={{fontSize:10.5}}>Swing: {swingLabel}</span>
       {a.marketRiskScore!=null && <span className="chip" style={{fontSize:10.5}}>Market Risk {a.marketRiskScore}（{a.marketRiskLabel}）</span>}
@@ -3292,6 +3296,13 @@ function App(){
   // 12章：分析タブの対象銘柄（日本市場・アメリカ市場どちらの登録銘柄からも追加され得る）
   const allWatch=useMemo(()=>[...s.watchlist,...s.watchlistUS],[s.watchlist,s.watchlistUS]);
   const analysisItems=useMemo(()=>s.analysisTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean),[s.analysisTargets,allWatch]);
+  // v3-6 Step1（銘柄分析画面のStatus統合）：監視銘柄タブと全く同じcomputeEnrichedWatch()を
+  // 分析対象銘柄にも適用し、Primary Status／Action Statusを二重ロジックにせず共有する
+  // （「一覧ではHOT+WAIT、分析画面では別判定」という矛盾を防ぐ）。code→enrichWatchRow結果のMap。
+  const analysisEnrichedMap=useMemo(()=>{
+    const enriched=computeEnrichedWatch(analysisItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData,s.marketRisk?.marketRiskLabel);
+    return new Map(enriched.map(e=>[e.code,e]));
+  },[analysisItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData,s.marketRisk]);
   // 2026-08-21 ユーザー要望：監視銘柄は日本市場に限定（アメリカ市場タブの「監視銘柄」ボタンは
   // 撤去済みだが、念のためここでも日本株以外は除外しておく）。
   const watchTargetItems=useMemo(()=>s.watchTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean).filter(w=>w.market==="JP"),[s.watchTargets,allWatch]);
@@ -4080,6 +4091,7 @@ function App(){
               <div className="grid" style={{gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))"}}>
                 {analysisItems.map(w=>{
                   const a=s.analysisData[w.code];
+                  const enr=analysisEnrichedMap.get(w.code); // v3-6 Step1：監視銘柄タブと共通のPrimary/Action Status
                   return <div key={w.code} className="card">
                     <div className="card-hd" style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
                       <div><div className="card-t">{w.name}</div><div className="card-n mono">{w.code}</div></div>
@@ -4125,7 +4137,7 @@ function App(){
                             </div>}
                           {a.marketEnv && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>{a.marketEnv}</div>}
                           {/* ===== Trade Cockpit v2 Phase2：総合判断・8軸・Entry Conditions・Falling Knife/Chase Risk ===== */}
-                          {a.assessment && <AssessmentCard assessment={a.assessment} marginBadge={a.tradeRules?.marginBadge} marginRatio={a.tradeRules?.marginRatio}/>}
+                          {a.assessment && enr && <AssessmentCard assessment={a.assessment} marginBadge={a.tradeRules?.marginBadge} marginRatio={a.tradeRules?.marginRatio} enr={enr}/>}
                           {a.tradeRules?.watchStatus && <div style={{fontSize:11.5,fontWeight:700,color:"var(--accent)",background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>⏳ {a.tradeRules.watchStatus}</div>}
                           {/* エントリーのタイミングルール（最新版）：初押し／高値ブレイクに該当する最有力タイミング(★5)を強調表示 */}
                           {a.tradeRules?.entryPattern && <div style={{fontSize:11.5,fontWeight:700,color:"var(--up)",background:"var(--upBg)",border:"1px solid var(--up)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>★★★★★ {a.tradeRules.entryPattern.label}</div>}
