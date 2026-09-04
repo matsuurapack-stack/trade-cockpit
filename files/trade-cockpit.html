@@ -1345,6 +1345,68 @@ const AXIS_LABEL_META={
   "STRONG":{color:"var(--up)"},"WEAK":{color:"var(--down)"},
   "POSITIVE":{color:"var(--up)"},"RISK":{color:"var(--down)"},
 };
+// v3-6 Step4（「なぜWAIT/RISKなのか」の理由→待つもの表示）：riskReasons/waitReasons（Step1で
+// 既に導入済みのenrichWatchRow出力）を具体的な文章にする。数値はすべて既に取得済みのenr／
+// a.indicators／a.fallingKnifeReasons・a.chaseRiskReasons（サーバー側で既に文章化済み）から
+// 組み立てるだけで、新規計算は追加しない。
+function describeRiskReason(code,enr,a){
+  const pctTxt=enr.pct!=null?(enr.pct>0?"+":"")+enr.pct.toFixed(1)+"%":"—";
+  switch(code){
+    case "CHASE_UP": return `当日${pctTxt}（高値圏のまま反落なし）`;
+    case "VWAP_EXTENDED": {
+      const vwap=a.indicators?.vwap;
+      if(vwap!=null&&a.current!=null)return `VWAP比+${((a.current-vwap)/vwap*100).toFixed(1)}%乖離`;
+      return RISK_REASON_META.VWAP_EXTENDED;
+    }
+    case "VOLUME_CRASH": return `出来高急増を伴う急落（当日${pctTxt}）`;
+    case "FALLING_KNIFE": return a.fallingKnifeReasons?.join("・")||RISK_REASON_META.FALLING_KNIFE;
+    case "CHASE_RISK": return a.chaseRiskReasons?.join("・")||RISK_REASON_META.CHASE_RISK;
+    case "SPIKE_REVERSAL": return `急騰後に高値から反落（当日${pctTxt}）`;
+    case "EXTREME_MOVE": return `当日${pctTxt}の急変動`;
+    case "MARGIN_DANGER": return a.tradeRules?.marginRatio!=null?`信用倍率${a.tradeRules.marginRatio}倍`:RISK_REASON_META.MARGIN_DANGER;
+    case "RSI_HOT": return a.indicators?.rsi!=null?`RSI ${a.indicators.rsi}`:RISK_REASON_META.RSI_HOT;
+    default: return RISK_REASON_META[code]||code;
+  }
+}
+function describeWaitReason(code,enr,a){
+  switch(code){
+    case "VWAP_NOT_RECLAIMED": return a.indicators?.vwap!=null?`VWAP ${a.indicators.vwap}未回復`:WAIT_REASON_META.VWAP_NOT_RECLAIMED;
+    case "RANGE_UNCONFIRMED": return "当日安値圏からの反発が浅い（下げ止まり未確認）";
+    case "NEAR_BREAKOUT": return "ブレイク水準まで僅差（未突破）";
+    case "SECTOR_WEAK": return enr.sectorRS!=null?`対セクター${enr.sectorRS>0?"+":""}${enr.sectorRS.toFixed(1)}pt`:WAIT_REASON_META.SECTOR_WEAK;
+    case "MARKET_SOFT": return "地合いが軟調";
+    default: return WAIT_REASON_META[code]||code;
+  }
+}
+// Action Statusが改善するために「何を待てばよいか」の一言。理由コードごとに固定の短文を
+// 対応させるだけ（新規判定ロジックではなく、既存のriskReasons/waitReasonsの言い換え）。
+const RISK_RESOLUTION_META={
+  CHASE_UP:"押し目待ち（追いかけない）", VWAP_EXTENDED:"VWAPへの回帰待ち",
+  VOLUME_CRASH:"出来高が落ち着くまで様子見", FALLING_KNIFE:"下げ止まり確認まで様子見",
+  CHASE_RISK:"押し目待ち（高値掴み回避）", SPIKE_REVERSAL:"反落が収まるまで様子見",
+  EXTREME_MOVE:"値動き沈静化まで様子見", MARGIN_DANGER:"信用需給の改善待ち", RSI_HOT:"過熱解消（RSI低下）待ち",
+};
+const WAIT_RESOLUTION_META={
+  VWAP_NOT_RECLAIMED:"VWAP回復待ち", RANGE_UNCONFIRMED:"下げ止まり確認待ち",
+  NEAR_BREAKOUT:"高値更新（ブレイク成立）待ち", SECTOR_WEAK:"セクター全体の回復待ち", MARKET_SOFT:"地合いの回復待ち",
+};
+function StatusReasonPanel({enr,a}){
+  if(enr.actionStatus!=="RISK"&&enr.actionStatus!=="WAIT")return null;
+  const isRisk=enr.actionStatus==="RISK";
+  const codes=isRisk?enr.riskReasons:enr.waitReasons;
+  const describe=isRisk?describeRiskReason:describeWaitReason;
+  const resolutionMeta=isRisk?RISK_RESOLUTION_META:WAIT_RESOLUTION_META;
+  const resolutions=[...new Set(codes.map(c=>resolutionMeta[c]).filter(Boolean))];
+  const meta=ACTION_STATUS_META[enr.actionStatus];
+  return <div style={{border:`1px solid ${meta.color}`,borderRadius:4,padding:"8px 10px",marginBottom:8,background:"var(--band)"}}>
+    <div style={{fontWeight:800,fontSize:12.5,color:meta.color,marginBottom:4}}>{meta.icon} {meta.label} の理由</div>
+    <div style={{display:"flex",flexDirection:"column",gap:2}}>
+      {codes.map(c=><div key={c} style={{fontSize:11.5,color:"var(--ink)"}}>・{describe(c,enr,a)}</div>)}
+    </div>
+    {resolutions.length>0 && <div style={{fontSize:12,fontWeight:700,color:meta.color,marginTop:6}}>→ {resolutions.join("・")}</div>}
+  </div>;
+}
+
 // v3-6 Step3（Entry Conditionsの視覚チェックリスト）：既存データ（server.py analyze_stock()の
 // tradeRules.entryChecklist・tradeRules.marginBadge、enrichWatchRow()のmarketRS/sectorRS/
 // breakType/waitReasons）だけを使い、新規計算は追加しない。エントリー判断に効く項目を8個に
@@ -4189,6 +4251,7 @@ function App(){
                           {a.marketEnv && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>{a.marketEnv}</div>}
                           {/* ===== Trade Cockpit v2 Phase2：総合判断・8軸・Entry Conditions・Falling Knife/Chase Risk ===== */}
                           {a.assessment && enr && <AssessmentCard assessment={a.assessment} marginBadge={a.tradeRules?.marginBadge} marginRatio={a.tradeRules?.marginRatio} enr={enr} sectorRank={sectorRankMap.get(w.sector)}/>}
+                          {enr && <StatusReasonPanel enr={enr} a={a}/>}
                           {enr && <EntryConditionsChecklist a={a} enr={enr}/>}
                           {a.tradeRules?.watchStatus && <div style={{fontSize:11.5,fontWeight:700,color:"var(--accent)",background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>⏳ {a.tradeRules.watchStatus}</div>}
                           {/* エントリーのタイミングルール（最新版）：初押し／高値ブレイクに該当する最有力タイミング(★5)を強調表示 */}
