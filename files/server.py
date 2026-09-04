@@ -1688,10 +1688,38 @@ def get_jp_issue_master():
 # プロセス内メモリにグローバルキャッシュ1本だけを持ち、全ユーザー・全タブで共有する
 # （4000銘柄スキャンをアクセスのたびに繰り返さない）。初期値10分。実測のスキャン所要時間・
 # API負荷を見て調整する前提（run_momentum_day_scanの戻り値で毎回実測値を報告する）。
+# 2026-09-04（ユーザーフィードバック：立花証券APIのRemoteDisconnected対策）：MOMENTUM DAYと
+# AUTO_BREAKの両方がこの同じrun_momentum_stage1()を呼ぶため、市場全体スキャンは常に1つの
+# キャッシュ・1つのロックを共有する（今後AUTO_RS/AUTO_SECTOR_LEADER等を追加してもここを
+# 再利用するだけでよく、各エンジンが個別に3900銘柄を取得する設計にはしない）。
 MOMENTUM_STAGE1_TTL_SEC = 600
+# force=Trueでの強制再スキャンでも、この秒数を下回る間隔では実際のAPI呼び出しをしない
+# （スキャンボタン連打・複数エンジンの立て続けの呼び出しでAPIに連続大量リクエストを送らない
+# ための下限、ユーザー指示：最低90〜120秒）。TTLより短いのでforceの意味は「TTL内でも、
+# クールダウンさえ空いていれば早めに更新できる」ようにするため。
+MOMENTUM_STAGE1_MIN_COOLDOWN_SEC = 100
+MOMENTUM_STAGE1_FETCH_MAX_ATTEMPTS = 3  # RemoteDisconnected等のAPIエラー時の再試行上限（無限リトライ禁止）
 _momentum_stage1_cache = {"builtAt": 0, "rows": {}, "durationSec": None, "requestCount": None,
-                           "codesScanned": 0, "pricesReturned": 0, "nikkeiChangePct": None}
+                           "codesScanned": 0, "pricesReturned": 0, "nikkeiChangePct": None,
+                           "scanFailed": False, "usedStaleCache": False}
 _momentum_stage1_lock = threading.Lock()
+_momentum_stage1_scan_in_progress = False  # ユーザー指示の「scan_in_progress」相当。UI表示・
+                                            # ログ用途で明示的に持つ（実際の排他制御はロック本体が担う）。
+
+
+def _fetch_market_price_with_retry(codes):
+    """立花証券APIへの市場全体一括取得。RemoteDisconnected等の接続エラー時は、即座に大量
+    リクエストを再送するのではなく段階的に待機してから再試行する（3秒→6秒、最大
+    MOMENTUM_STAGE1_FETCH_MAX_ATTEMPTS回、無限リトライはしない）。全て失敗したらNoneを返し、
+    呼び出し側で直近の正常キャッシュへのフォールバックを判断する。"""
+    for attempt in range(1, MOMENTUM_STAGE1_FETCH_MAX_ATTEMPTS + 1):
+        try:
+            return tachibana_api.get_market_price(codes)
+        except Exception as e:
+            print(f"  市場全体スキャン失敗（{attempt}/{MOMENTUM_STAGE1_FETCH_MAX_ATTEMPTS}回目）", e)
+            if attempt < MOMENTUM_STAGE1_FETCH_MAX_ATTEMPTS:
+                time.sleep(attempt * 3)
+    return None
 
 MOMENTUM_LITE_THRESHOLD = 40    # Stage1のみでMOMENTUM_LITE_SCOREがこの点以上をStage2候補にする
 MOMENTUM_LITE_MAX_CANDIDATES = 100  # Stage2（銘柄ごとに日足履歴を追加取得）に回す上限件数
@@ -1711,6 +1739,28 @@ MOMENTUM_TAG_EXPIRE_HOURS = 18  # AUTO_MOMENTUM_DAYタグの有効期間の目�
 MOMENTUM_STAGE2_WORKERS = 10
 
 
+def _jst_time_str(epoch_sec):
+    """UNIX時刻(秒)をJSTのHH:MM文字列にする。UIの「直近スキャン：15:21」表示用。"""
+    if not epoch_sec:
+        return None
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    return datetime.datetime.fromtimestamp(epoch_sec, jst).strftime("%H:%M")
+
+
+def _stage1_needs_refresh(force):
+    """キャッシュ更新が必要かどうかの判定。force=Trueでも、直近スキャンから
+    MOMENTUM_STAGE1_MIN_COOLDOWN_SEC秒未満なら更新不要（クールダウン優先）とすることで、
+    スキャンボタン連打や複数エンジンの立て続けの呼び出しで市場全体スキャンを繰り返さない。"""
+    has_cache = bool(_momentum_stage1_cache["rows"])
+    if not has_cache:
+        return True
+    age = time.time() - _momentum_stage1_cache["builtAt"]
+    cooldown_elapsed = age >= MOMENTUM_STAGE1_MIN_COOLDOWN_SEC
+    if force:
+        return cooldown_elapsed
+    return age >= MOMENTUM_STAGE1_TTL_SEC
+
+
 def run_momentum_stage1(force=False):
     """東証全銘柄（get_jp_issue_master、約4000件）を対象に、立花証券APIのget_market_price()
     （内部でPRICE_CHUNK＝40件ずつに自動分割される、既存の仕組みをそのまま利用）で当日値を
@@ -1720,30 +1770,42 @@ def run_momentum_stage1(force=False):
       sectorRS（対セクター＝changePct−セクター平均changePct、セクターはget_jp_issue_masterの分類）
     出来高倍率・ブレイク判定など「銘柄ごとに追加の日足履歴取得が要る」指標はここでは扱わない
     （Stage2の責務。4000銘柄全部に日足取得をかけると非現実的な負荷になるため）。
-    結果はMOMENTUM_STAGE1_TTL_SEC秒プロセス内キャッシュし、同時アクセスによる二重スキャンは
-    _momentum_stage1_lockで防ぐ（ロック取得を待っていた呼び出しは、ロック解放後にキャッシュが
-    新しくなっていればそれをそのまま使う＝二重チェックロッキング）。"""
-    global _momentum_stage1_cache
-    now = time.time()
-    if not force and _momentum_stage1_cache["rows"] and (now - _momentum_stage1_cache["builtAt"] < MOMENTUM_STAGE1_TTL_SEC):
+    結果はMOMENTUM_STAGE1_TTL_SEC秒プロセス内キャッシュし、force=Trueでも
+    MOMENTUM_STAGE1_MIN_COOLDOWN_SEC秒未満の間隔では実際のAPI取得をしない（クールダウン）。
+    同時アクセスによる二重スキャンは_momentum_stage1_lockで防ぐ（ロック取得を待っていた
+    呼び出しは、ロック解放後にキャッシュが新しくなっていればそれをそのまま使う＝
+    二重チェックロッキング。MOMENTUM DAY・AUTO_BREAK・今後のAUTO_RS等、複数エンジンが
+    同時にこの関数を呼んでも、実際の3900銘柄取得は1回で済む）。
+    API取得が全て失敗した場合（RemoteDisconnected等）は直近の正常キャッシュがあればそれを
+    scanFailed=Trueと共に返す（呼び出し側はUIに「市場スキャン更新失敗・直近データ使用」を
+    表示できる）。"""
+    global _momentum_stage1_cache, _momentum_stage1_scan_in_progress
+    if not _stage1_needs_refresh(force):
         return _momentum_stage1_cache
     with _momentum_stage1_lock:
-        now = time.time()
-        if not force and _momentum_stage1_cache["rows"] and (now - _momentum_stage1_cache["builtAt"] < MOMENTUM_STAGE1_TTL_SEC):
+        if not _stage1_needs_refresh(force):
             return _momentum_stage1_cache
+        _momentum_stage1_scan_in_progress = True
         t0 = time.time()
         master = get_jp_issue_master()
         codes = list(master.keys())
         if tachibana_api is None or not codes:
+            _momentum_stage1_scan_in_progress = False
             _momentum_stage1_cache = {"builtAt": time.time(), "rows": {}, "durationSec": 0,
                                        "requestCount": 0, "codesScanned": 0, "pricesReturned": 0,
-                                       "nikkeiChangePct": None}
+                                       "nikkeiChangePct": None, "scanFailed": True, "usedStaleCache": False}
             return _momentum_stage1_cache
-        try:
-            prices = tachibana_api.get_market_price(codes)
-        except Exception as e:
-            print("  Stage1市場全体スキャン失敗", e)
-            prices = {}
+        prices = _fetch_market_price_with_retry(codes)
+        if prices is None:
+            # 全リトライ失敗：直近の正常キャッシュがあればそれを使い続ける（無限リトライしない）。
+            _momentum_stage1_scan_in_progress = False
+            if _momentum_stage1_cache["rows"]:
+                _momentum_stage1_cache = {**_momentum_stage1_cache, "scanFailed": True, "usedStaleCache": True}
+            else:
+                _momentum_stage1_cache = {"builtAt": time.time(), "rows": {}, "durationSec": round(time.time() - t0, 1),
+                                           "requestCount": 0, "codesScanned": len(codes), "pricesReturned": 0,
+                                           "nikkeiChangePct": None, "scanFailed": True, "usedStaleCache": False}
+            return _momentum_stage1_cache
         request_count = -(-len(codes) // tachibana_api.PRICE_CHUNK)  # 切り上げ除算
 
         market_env = _market_environment()
@@ -1778,8 +1840,9 @@ def run_momentum_stage1(force=False):
         _momentum_stage1_cache = {
             "builtAt": time.time(), "rows": rows, "durationSec": round(time.time() - t0, 1),
             "requestCount": request_count, "codesScanned": len(codes), "pricesReturned": len(prices),
-            "nikkeiChangePct": nikkei_chg,
+            "nikkeiChangePct": nikkei_chg, "scanFailed": False, "usedStaleCache": False,
         }
+        _momentum_stage1_scan_in_progress = False
     return _momentum_stage1_cache
 
 
@@ -1985,6 +2048,8 @@ def run_momentum_day_scan(database_url, user_id, force=False):
         "stage1CodesScanned": stage1["codesScanned"], "stage1PricesReturned": stage1["pricesReturned"],
         "stage1DurationSec": stage1["durationSec"], "stage1RequestCount": stage1["requestCount"],
         "stage1CacheAgeSec": round(time.time() - stage1["builtAt"], 1) if stage1["builtAt"] else None,
+        "stage1BuiltAtJst": _jst_time_str(stage1["builtAt"]),
+        "stage1ScanFailed": stage1.get("scanFailed", False), "stage1UsedStaleCache": stage1.get("usedStaleCache", False),
         "stage1CandidateCount": len(candidates),
         "demotedToSeenCount": len(demoted), "demotedToSeen": demoted,
         "stage2EvaluatedCount": len(details),
@@ -2009,7 +2074,10 @@ def run_momentum_day_scan(database_url, user_id, force=False):
 # ============================================================
 BREAK_LITE_THRESHOLD = 30
 BREAK_LITE_MAX_CANDIDATES = 100
-BREAK_SCORE_THRESHOLD = 65        # 実データを見て調整する前提の初期値
+# 2026-09-04実測：初期値65では東証3899銘柄中1件しか登録されなかった（目標5〜20件を下回る）。
+# 実データの分布（登録候補のfinalScoreが上位でも45〜73点程度に収まっていた）を見て52へ変更
+# （ユーザー指示：まず52で数営業日運用し、50までは下げない。配点自体は変更しない）。
+BREAK_SCORE_THRESHOLD = 52
 BREAK_FINAL_MAX_REGISTER = 20     # 1回のスキャンで登録する上限（無理に埋めない）
 BREAK_TAG_EXPIRE_DAYS = 3         # AUTO_BREAKはMOMENTUM DAYと違い数日有効（短期スイング候補）
 BREAK_STAGE2_WORKERS = 10
@@ -2173,6 +2241,8 @@ def run_break_scan(database_url, user_id, force=False):
         "stage1CodesScanned": stage1["codesScanned"], "stage1PricesReturned": stage1["pricesReturned"],
         "stage1DurationSec": stage1["durationSec"], "stage1RequestCount": stage1["requestCount"],
         "stage1CacheAgeSec": round(time.time() - stage1["builtAt"], 1) if stage1["builtAt"] else None,
+        "stage1BuiltAtJst": _jst_time_str(stage1["builtAt"]),
+        "stage1ScanFailed": stage1.get("scanFailed", False), "stage1UsedStaleCache": stage1.get("usedStaleCache", False),
         "stage1CandidateCount": len(candidates),
         "stage2ValidCount": len(details),  # ブレイク条件を満たし候補となった件数（対象外は除外済み）
         "stage2DurationSec": stage2_duration,

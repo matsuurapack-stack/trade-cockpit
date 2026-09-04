@@ -1858,8 +1858,12 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         {momentumScanning?"🐒 スキャン中…（数分かかります）":"🐒 MOMENTUM DAYスキャン"}
       </button>
       {momentumResult && !momentumScanning && <span style={{fontSize:11,color:"var(--inkFaint)"}}>
-        東証{momentumResult.stage1CodesScanned}銘柄スキャン（{momentumResult.stage1DurationSec}秒）→
+        東証{momentumResult.stage1CodesScanned}銘柄スキャン（{momentumResult.stage1DurationSec}秒・
+        直近スキャン：{momentumResult.stage1BuiltAtJst}）→
         候補{momentumResult.stage1CandidateCount}件→自動登録{momentumResult.registeredCount}件
+        {momentumResult.stage1ScanFailed && <span style={{color:"var(--down)",fontWeight:700}}>
+          　⚠ 市場スキャン更新失敗・{momentumResult.stage1UsedStaleCache?"直近データ使用":"データなし"}
+        </span>}
       </span>}
       {/* v3-9続き：🚀 AUTO_BREAK。Stage1はサーバー側で共有キャッシュのため、直近でMOMENTUM DAY
           スキャン済みなら市場全体の再取得は起きずStage2（ブレイク判定）だけで済む。 */}
@@ -1867,7 +1871,11 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         {breakScanning?"🚀 スキャン中…（数分かかります）":"🚀 AUTO BREAKスキャン"}
       </button>
       {breakResult && !breakScanning && <span style={{fontSize:11,color:"var(--inkFaint)"}}>
-        候補{breakResult.stage2ValidCount}件→自動登録{breakResult.registeredCount}件（降格{breakResult.demotedToSeenCount}件）
+        候補{breakResult.stage2ValidCount}件→自動登録{breakResult.registeredCount}件（降格{breakResult.demotedToSeenCount}件・
+        直近スキャン：{breakResult.stage1BuiltAtJst}）
+        {breakResult.stage1ScanFailed && <span style={{color:"var(--down)",fontWeight:700}}>
+          　⚠ 市場スキャン更新失敗・{breakResult.stage1UsedStaleCache?"直近データ使用":"データなし"}
+        </span>}
       </span>}
     </div>
     <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:10,fontSize:12}}>
