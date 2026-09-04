@@ -2666,28 +2666,50 @@ def select_pullback_stage1_candidates(stage1):
 
 def _pullback_stage2_detail(code, stage1_row):
     """Stage1通過銘柄だけに、日足履歴が要る指標（MA25・押し目の乖離率・安値切り上げ・出来高
-    倍率）を追加する。VWAPの代わりにMA25からの上方乖離を「トレンドの強さ」の代理指標として使う。"""
+    倍率）を追加する。VWAPの代わりにMA25からの上方乖離を「トレンドの強さ」の代理指標として使う。
+    2026-09-05 PHASE2追加：「今日/前日高値からの1〜2%の押し」を「本当の押し目」と誤認しない
+    ように、①直近高値が何営業日前に形成されたか（daysSinceHigh、recentHighDateの代わりに
+    使える同等情報。日足配列のインデックスだけで算出でき、新規API不要）、②MA25自体が上向きか
+    （ma25Rising、5営業日前のMA25と比較）を追加する。"""
     arrays = _tachibana_daily_arrays(code)
     if not arrays:
         return None
     closes, opens, highs, lows, volumes = arrays
-    if len(closes) < 26 or len(volumes) < 6 or len(lows) < 2:
+    if len(closes) < 30 or len(volumes) < 6 or len(lows) < 2:
         return None
     current = stage1_row.get("current") if stage1_row.get("current") is not None else closes[-1]
     ma25 = sum(closes[-25:]) / 25
     uptrend = current > ma25
+    # MA25の傾き：5営業日前時点のMA25と比較して上向きかどうか（既存の日足配列だけで算出、追加API不要）。
+    ma25_prev = sum(closes[-30:-5]) / 25
+    ma25_slope_pct = ((ma25 - ma25_prev) / ma25_prev * 100) if ma25_prev else None
+    ma25_rising = bool(ma25_slope_pct is not None and ma25_slope_pct > 0)
     vol_avg5 = sum(volumes[-6:-1]) / 5
     vol_ratio = (volumes[-1] / vol_avg5) if vol_avg5 else None
-    breakout_lookback_high = (max(highs[-(BREAKOUT_LOOKBACK_DAYS + 1):-1])
-                               if len(highs) >= BREAKOUT_LOOKBACK_DAYS + 1 else None)
+    # 直近高値（3か月高値）の探索。単なるmax()ではなく、何営業日前がピークだったかも同時に求める
+    # （argmax、当日を除く既存のhighs配列のスライスだけで完結、追加API不要）。
+    lookback_window = highs[-(BREAKOUT_LOOKBACK_DAYS + 1):-1] if len(highs) >= BREAKOUT_LOOKBACK_DAYS + 1 else []
+    if lookback_window:
+        max_idx = max(range(len(lookback_window)), key=lambda i: lookback_window[i])
+        breakout_lookback_high = lookback_window[max_idx]
+        days_since_breakout_high = len(lookback_window) - max_idx  # 末尾（=前営業日）がピークなら1
+    else:
+        breakout_lookback_high = None
+        days_since_breakout_high = None
     prev_day_high = highs[-2]
-    # 押し目の基準水準：直近ブレイク水準（3か月高値）があればそちらを優先、無ければ前日高値。
-    ref_high = breakout_lookback_high if breakout_lookback_high is not None else prev_day_high
+    # 押し目の基準水準：直近ブレイク水準（3か月高値）があればそちらを優先、無ければ前日高値
+    # （この場合は定義上「1営業日前の高値」となる）。
+    if breakout_lookback_high is not None:
+        ref_high, days_since_high = breakout_lookback_high, days_since_breakout_high
+    else:
+        ref_high, days_since_high = prev_day_high, 1
     pullback_dev_pct = ((ref_high - current) / ref_high * 100) if (ref_high and ref_high > 0) else None
     higher_low = bool(lows[-1] >= lows[-2] * 0.995)  # 安値切り上げ（0.5%の許容誤差）
-    return {"ma25": round(ma25, 1), "uptrend": uptrend,
+    return {"ma25": round(ma25, 1), "uptrend": uptrend, "ma25SlopePct": round(ma25_slope_pct, 2) if ma25_slope_pct is not None else None,
+            "ma25Rising": ma25_rising,
             "volRatio": round(vol_ratio, 2) if vol_ratio is not None else None,
             "higherLow": higher_low, "refHigh": round(ref_high, 1) if ref_high is not None else None,
+            "daysSinceHigh": days_since_high,
             "pullbackDevPct": round(pullback_dev_pct, 2) if pullback_dev_pct is not None else None}
 
 
@@ -2695,11 +2717,19 @@ def _pullback_final_score(row, stage2):
     """PULLBACK_SCORE：上昇トレンドが崩れている（現在値がMA25未満）銘柄はそもそも対象外。
     押し目の乖離が浅すぎる（まだ高値圏＝押し目になっていない）または深すぎる（6%超＝
     ただの下落）銘柄も対象外。出来高が薄すぎる（0.7倍未満）銘柄も「見放された押し目」として除外。
+    （既存ゲート・配点は維持）
       対市場（marketRS）        最大30点
       押し目の浅さ              最大25点（0.3%程度で満点、6%で0点）
       安値切り上げ              +20点（binary）
       出来高健全性              最大15点（0.7倍未満は対象外、1.5倍以上で満点）
-      MA25からの上方乖離        最大10点（トレンドの強さの補強）"""
+      MA25からの上方乖離        最大10点（トレンドの強さの補強）
+    2026-09-05 PHASE2追加：「本当の押し目」（数営業日前に高値形成→調整→MA25上向き）を
+    より高く評価する。
+      直近高値の形成タイミング  最大15点（1営業日前で0点、10営業日以上前で満点）
+      MA25の傾き（上向き）      +10点
+    さらに、直近高値がまさに1営業日前（＝実質「前日高値から1〜2%押しただけ」）の場合は、
+    合計スコアを0.5倍に減点する（対象外にはしないが、「本当の押し目」として高評価しすぎない、
+    というユーザー方針をスコア面で反映する）。"""
     if not stage2 or not stage2["uptrend"]:
         return None
     dev = stage2.get("pullbackDevPct")
@@ -2718,7 +2748,14 @@ def _pullback_final_score(row, stage2):
     current, ma25 = row.get("current"), stage2.get("ma25")
     if current is not None and ma25:
         score += _scale_score((current - ma25) / ma25 * 100, 0, 5, 10)
+    days_since_high = stage2.get("daysSinceHigh")
+    if days_since_high is not None:
+        score += _scale_score(days_since_high, 1, 10, 15)
+    if stage2.get("ma25Rising"):
+        score += 10
     score *= _liquidity_multiplier(row.get("turnover"))
+    if days_since_high is not None and days_since_high < 2:
+        score *= 0.5  # 高値形成から1営業日以内の押しは「本当の押し目」として過大評価しない
     return round(score, 1)
 
 
@@ -2768,6 +2805,7 @@ def run_pullback_scan(database_url, user_id, force=False):
         for d in to_register:
             tag_value = {"score": d["finalScore"], "pullbackDevPct": d["stage2"]["pullbackDevPct"],
                          "higherLow": d["stage2"]["higherLow"],
+                         "daysSinceHigh": d["stage2"].get("daysSinceHigh"), "ma25Rising": d["stage2"].get("ma25Rising"),
                          "addedAt": now_dt.isoformat(), "expiresAt": expires_at}
             try:
                 ok = investment_db.auto_register_or_tag_watchlist_item(
@@ -2796,8 +2834,14 @@ def run_pullback_scan(database_url, user_id, force=False):
             ma25 = d["stage2"].get("ma25")
             current = d.get("current")
             ma25_dev_pct = round((current - ma25) / ma25 * 100, 2) if (current and ma25) else None
+            # recentHighDateは実際のカレンダー日付を取得するには_tachibana_daily_arraysの
+            # 戻り値に日付配列を追加する必要があり非該当（新規のデータ取得は増やさない方針）。
+            # 「同等情報」としてdaysSinceHigh（直近高値が何営業日前か）を代わりに保存する
+            # （ユーザー承認済み：recentHighDate「または同等情報」）。
             return {"recentHighDeviation": d["stage2"].get("pullbackDevPct"),
+                    "daysSinceHigh": d["stage2"].get("daysSinceHigh"),
                     "ma25Deviation": ma25_dev_pct,
+                    "ma25Slope": d["stage2"].get("ma25SlopePct"), "ma25Rising": d["stage2"].get("ma25Rising"),
                     "higherLow": d["stage2"].get("higherLow"),
                     "volumeRatio": d["stage2"].get("volRatio")}
         _record_signal_transitions(database_url, user_id, "PULLBACK", "JP",
