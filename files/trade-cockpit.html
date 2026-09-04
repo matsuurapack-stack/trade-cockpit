@@ -2342,7 +2342,13 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap}){
                 current,currentStop:it.current_stop,initialStop:it.initial_stop,target1:it.target_1,
                 positionFlags:posFlags,pnlPct,indicators:posIndicators,enrStatus:enr?.status});
               const posMeta=POSITION_STATUS_META[posResult.status];
+              // v3-8 Step8（UIカード再設計）：表示順を「取引タイプ→ポジションStatus→取得値/現在値/
+              // 損益→HARD STOP/現在SL→Trailing/利確候補→チャート・出来高警戒（Statusの理由として
+              // 既に列挙）→判断理由→操作」に統一。既存のENTRY READY等（enr、銘柄分析用の参考情報）
+              // は主役にせず、末尾に小さく添えるだけにする。ロジック自体（derivePositionStatus等）は
+              // 変更しない、表示順のみの並び替え。
               return <div key={it.code+it.market} style={{border:"1px solid var(--rule)",borderRadius:5,padding:"10px 12px",background:"var(--bg)"}}>
+                {/* ① 取引タイプ（ヘッダー：銘柄名・コード・DAY/SWING切替・削除） */}
                 <div style={{display:"flex",alignItems:"baseline",gap:8}}>
                   <span style={{fontWeight:800,fontSize:13.5}}>{it.name||it.code}</span>
                   <span className="mono" style={{fontSize:11,color:"var(--inkFaint)"}}>{it.code}</span>
@@ -2352,45 +2358,21 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap}){
                     {it.trade_style==="DAY"?"DAY":"SWING"}</button>}
                   <button className="iconbtn" style={{marginLeft:"auto"}} title="削除" onClick={()=>remove(it.code,it.market)}>×</button>
                 </div>
-                {/* v3-8 Step2：SWINGの-10%ハードストップ。他のどの材料（チャート・出来高・
-                    ファンダメンタルズ・Primary/Action Status等）にも左右されない絶対ルールとして、
-                    カード最上部に他の情報より優先して表示する。 */}
-                {hsMeta?.label && <div style={{display:"flex",alignItems:"center",gap:6,marginTop:4,padding:"4px 8px",
-                    background:"var(--downBg)",border:`1px solid ${hsMeta.color}`,borderRadius:3,
-                    fontSize:11.5,fontWeight:800,color:hsMeta.color}}>
-                  {hsMeta.label}（取得単価比 {pnlPct!=null?pnlPct.toFixed(1):"—"}%）
-                </div>}
-                {/* v3-8 Step4：ポジション専用Status（HOLD_STRONG/HOLD/TRAIL/TAKE_PROFIT/CAUTION/
-                    REDUCE/EXIT/STOP）。カード全体の再配置はStep8で行うため、現時点ではここに
-                    追加表示するのみ。 */}
-                <div style={{display:"flex",alignItems:"center",gap:6,marginTop:6,flexWrap:"wrap"}}>
-                  <span style={{fontSize:11.5,fontWeight:800,color:posMeta.color,border:`1px solid ${posMeta.color}`,borderRadius:3,padding:"2px 7px"}}>
-                    {posMeta.icon} {posMeta.label}
-                  </span>
-                  {posResult.reasons.length>0 && <span style={{fontSize:10.5,color:"var(--inkFaint)"}} title={posResult.reasons.join("／")}>
-                    {posResult.reasons[0]}{posResult.reasons.length>1?` 他${posResult.reasons.length-1}件`:""}
-                  </span>}
-                  {/* v3-8 Step7：トレーリング開始の目安価格（あくまで提案。current_stopの自動書き換えはしない） */}
-                  {posResult.suggestedTrailingStop!=null && <span style={{fontSize:10.5,color:"var(--up)"}}>
-                    トレーリング目安SL <span className="mono" style={{fontWeight:700}}>{posResult.suggestedTrailingStop.toLocaleString()}</span>
-                  </span>}
-                </div>
-                {enr && <div style={{fontSize:10,color:"var(--inkFaint)",marginTop:2}}>
-                  （参考・新規エントリー判断用の指標であり保有判断には使用していません：銘柄分析 {PRIMARY_STATUS_META[enr.status]?.label||enr.status}
-                  {enr.actionStatus&&enr.actionStatus!=="NONE"?`・${ACTION_STATUS_META[enr.actionStatus]?.label||enr.actionStatus}`:""}）
-                </div>}
-                {/* v3-8 Step1：取引タイプ未設定（既存ポジション）はここで設定を促す。設定するまで
-                    HARD STOP等の取引タイプ依存ロジックは動かない（後続Stepで実装）。 */}
                 {!it.trade_style && <div style={{display:"flex",alignItems:"center",gap:6,marginTop:4,fontSize:11,color:"var(--down)"}}>
                   ⚠ 取引タイプ未設定：
                   <button className="action-btn" style={{fontSize:10.5,padding:"2px 8px"}} onClick={()=>saveTradeStyle(it,"DAY")}>DAYに設定</button>
                   <button className="action-btn" style={{fontSize:10.5,padding:"2px 8px"}} onClick={()=>saveTradeStyle(it,"SWING")}>SWINGに設定</button>
                 </div>}
-                <div style={{display:"flex",alignItems:"center",gap:6,marginTop:4}}>
-                  {positionConsultMsg && <span style={{fontSize:10.5,color:"var(--accent)",fontWeight:700}}>{positionConsultMsg}</span>}
-                  <button className="action-btn" style={{fontSize:11}} onClick={()=>copyPositionConsult(it)}>🤖 利確・損切り相談</button>
+
+                {/* ② ポジションStatus（このカードの主役。HOLD_STRONG〜STOPの8状態） */}
+                <div style={{display:"flex",alignItems:"center",gap:6,marginTop:8}}>
+                  <span style={{fontSize:13,fontWeight:800,color:posMeta.color,border:`1px solid ${posMeta.color}`,borderRadius:3,padding:"3px 9px"}}>
+                    {posMeta.icon} {posMeta.label}
+                  </span>
                 </div>
-                <div className="mono" style={{fontSize:12,color:"var(--inkSoft)",marginTop:2}}>
+
+                {/* ③ 取得値/現在値/損益 */}
+                <div className="mono" style={{fontSize:12,color:"var(--inkSoft)",marginTop:8}}>
                   {it.quantity!=null?`${it.quantity.toLocaleString()}株`:"—株"} @ {it.average_price!=null?it.average_price.toLocaleString():"—"}
                   {"　現在 "}{current!=null?current.toLocaleString():"—"}
                 </div>
@@ -2399,7 +2381,19 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap}){
                   {pnlAmount!=null?`${pnlAmount>0?"+":""}${Math.round(pnlAmount).toLocaleString()}円`:"—"}
                   {pnlPct!=null && <span style={{fontSize:12,fontWeight:700,marginLeft:6}}>({pnlPct>0?"+":""}{pnlPct.toFixed(2)}%)</span>}
                 </div>
-                <div style={{display:"flex",flexWrap:"wrap",gap:10,marginTop:8,fontSize:12}}>
+
+                {/* ④ HARD STOP／現在SL */}
+                {hsMeta?.label && <div style={{display:"flex",alignItems:"center",gap:6,marginTop:8,padding:"4px 8px",
+                    background:"var(--downBg)",border:`1px solid ${hsMeta.color}`,borderRadius:3,
+                    fontSize:11.5,fontWeight:800,color:hsMeta.color}}>
+                  {hsMeta.label}（取得単価比 {pnlPct!=null?pnlPct.toFixed(1):"—"}%）
+                </div>}
+                <div style={{display:"flex",flexWrap:"wrap",gap:10,marginTop:8,fontSize:12,alignItems:"center"}}>
+                  {hardStopPrice!=null && <div title="SWING限定・取得単価×0.90。他条件に関わらずこれを下回れば撤退が原則。">
+                    <span style={{color:"var(--down)"}}>HARD STOP </span>
+                    <span className="mono" style={{fontWeight:700,color:"var(--down)"}}>{Math.round(hardStopPrice).toLocaleString()}</span>
+                    <span style={{color:"var(--inkFaint)"}}>（-10%）</span>
+                  </div>}
                   <div>
                     <span style={{color:"var(--inkSoft)"}}>SL </span>
                     <span className="mono">{it.initial_stop!=null?it.initial_stop.toLocaleString():"—"}</span>
@@ -2417,19 +2411,38 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap}){
                           {it.current_stop!=null?it.current_stop.toLocaleString():"未設定"}
                         </span>}
                   </div>
+                </div>
+
+                {/* ⑤ Trailing／利確候補 */}
+                <div style={{display:"flex",flexWrap:"wrap",gap:10,marginTop:6,fontSize:12,alignItems:"center"}}>
+                  <span style={{fontSize:10.5,fontWeight:700,color:trailMeta.color,border:`1px solid ${trailMeta.color}`,borderRadius:3,padding:"1px 6px"}}>状態：{trailMeta.label}</span>
+                  {posResult.suggestedTrailingStop!=null && <span style={{fontSize:11,color:"var(--up)"}}>
+                    トレーリング目安SL <span className="mono" style={{fontWeight:700}}>{posResult.suggestedTrailingStop.toLocaleString()}</span>
+                  </span>}
                   <div><span style={{color:"var(--inkSoft)"}}>TP1 </span><span className="mono">{it.target_1!=null?it.target_1.toLocaleString():"—"}</span></div>
                   <div><span style={{color:"var(--inkSoft)"}}>TP2 </span><span className="mono">{it.target_2!=null?it.target_2.toLocaleString():"—"}</span></div>
                   <div><span style={{color:"var(--inkSoft)"}}>RR </span><span className="mono" style={{fontWeight:700}}>{rr!=null?`1 : ${rr.toFixed(2)}`:"--"}</span></div>
-                  {hardStopPrice!=null && <div title="SWING限定・取得単価×0.90。他条件に関わらずこれを下回れば撤退が原則。">
-                    <span style={{color:"var(--down)"}}>HARD STOP </span>
-                    <span className="mono" style={{fontWeight:700,color:"var(--down)"}}>{Math.round(hardStopPrice).toLocaleString()}</span>
-                    <span style={{color:"var(--inkFaint)"}}>（-10%）</span>
-                  </div>}
                 </div>
-                <div style={{marginTop:6}}>
-                  <span style={{fontSize:10.5,fontWeight:700,color:trailMeta.color,border:`1px solid ${trailMeta.color}`,borderRadius:3,padding:"1px 6px"}}>状態：{trailMeta.label}</span>
-                  {it.memo && <span style={{fontSize:11,color:"var(--inkFaint)",marginLeft:8}}>{it.memo}</span>}
+
+                {/* ⑥⑦ チャート・出来高警戒／判断理由（Step3〜6のフラグはposResult.reasonsに集約済み。
+                    ここでは省略せず全件表示する） */}
+                {posResult.reasons.length>0 && <div style={{marginTop:8,padding:"6px 8px",background:"var(--card)",border:"1px solid var(--rule)",borderRadius:3}}>
+                  <div style={{fontSize:10.5,fontWeight:700,color:"var(--inkSoft)",marginBottom:2}}>判断理由</div>
+                  <ul style={{margin:0,paddingLeft:16,fontSize:11,color:"var(--inkSoft)"}}>
+                    {posResult.reasons.map((r,i)=><li key={i}>{r}</li>)}
+                  </ul>
+                </div>}
+
+                {/* ⑧ 操作・参考情報・メモ */}
+                <div style={{display:"flex",alignItems:"center",gap:6,marginTop:8,flexWrap:"wrap"}}>
+                  {positionConsultMsg && <span style={{fontSize:10.5,color:"var(--accent)",fontWeight:700}}>{positionConsultMsg}</span>}
+                  <button className="action-btn" style={{fontSize:11}} onClick={()=>copyPositionConsult(it)}>🤖 利確・損切り相談</button>
                 </div>
+                {enr && <div style={{fontSize:10,color:"var(--inkFaint)",marginTop:4}}>
+                  （参考・新規エントリー判断用の指標であり保有判断には使用していません：銘柄分析 {PRIMARY_STATUS_META[enr.status]?.label||enr.status}
+                  {enr.actionStatus&&enr.actionStatus!=="NONE"?`・${ACTION_STATUS_META[enr.actionStatus]?.label||enr.actionStatus}`:""}）
+                </div>}
+                {it.memo && <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:4}}>{it.memo}</div>}
               </div>;
             })}
           </div>}
