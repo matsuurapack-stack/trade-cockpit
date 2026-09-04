@@ -1995,6 +1995,194 @@ def run_momentum_day_scan(database_url, user_id, force=False):
     }
 
 
+# ============================================================
+# v3-9続き：🚀 AUTO_BREAK
+# MOMENTUM DAYで作ったStage1市場全体スキャナー（run_momentum_stage1、同じキャッシュをそのまま
+# 共有）・auto_tags・CURRENT/SEEN構造を再利用して展開する（ユーザー指示）。
+# 【設計原則】Primary/Action Status（ACTIVE_BREAK/WEAK_BREAK/FAILED_BREAK等）のSingle Source
+# of Truthは引き続きフロントのenrichWatchRow()。この自動登録エンジンは「監視に値するブレイク
+# 銘柄を見つけて登録する」だけの役割で、breakType/breakQualityの正式な判定はenrichWatchRow()に
+# 委ねる。ここで使うbreak_tier（年初来高値／3か月高値／前日高値のどれを満たすか）は、
+# 市場全体約3900銘柄をスキャンするための軽量な一次判定であり、analyze_stock()の
+# breakout_confirmed/breakout_lookback_highと同じ考え方を流用しただけの近似（二重の「正式」
+# 判定を作らない、あくまで自動登録の入口用）。
+# ============================================================
+BREAK_LITE_THRESHOLD = 30
+BREAK_LITE_MAX_CANDIDATES = 100
+BREAK_SCORE_THRESHOLD = 65        # 実データを見て調整する前提の初期値
+BREAK_FINAL_MAX_REGISTER = 20     # 1回のスキャンで登録する上限（無理に埋めない）
+BREAK_TAG_EXPIRE_DAYS = 3         # AUTO_BREAKはMOMENTUM DAYと違い数日有効（短期スイング候補）
+BREAK_STAGE2_WORKERS = 10
+
+
+def _break_lite_score(row):
+    """BREAK候補の一次選定（Stage1のみ、履歴取得なし）。売買代金・高値維持率を重視し、
+    出来高倍率・ブレイク種別はStage2で確定する。"""
+    score = 0.0
+    score += _scale_score(row.get("turnover"), 1e9, 1e10, 30)
+    score += _scale_score(row.get("highRetention"), 0.92, 0.995, 30)
+    score += _scale_score(row.get("marketRS"), 0, 5, 20)
+    score += _scale_score(row.get("sectorRS"), 0, 3, 10)
+    score += _scale_score(row.get("changePct"), 0, 8, 10)
+    score *= _liquidity_multiplier(row.get("turnover"))
+    return round(score, 1)
+
+
+def select_break_stage1_candidates(stage1):
+    scored = []
+    for code, row in stage1["rows"].items():
+        s = _break_lite_score(row)
+        if s >= BREAK_LITE_THRESHOLD:
+            scored.append((s, code, row))
+    scored.sort(key=lambda x: -x[0])
+    return scored[:BREAK_LITE_MAX_CANDIDATES]
+
+
+def _break_stage2_detail(code, stage1_row):
+    """Stage1通過銘柄だけに、日足履歴が要るブレイク種別判定を追加する。
+    年初来高値＞3か月高値（＝直近レジスタンス突破）＞前日高値突破、の順で重要度が高い
+    （同時に複数満たす場合は最上位のtierだけを採用、加算しない）。
+    breakout_lookback_high・high52wはanalyze_stock()と同じ計算（BREAKOUT_LOOKBACK_DAYS=63・
+    直近252営業日）をそのまま流用し、判定基準を二重に定義しない。"""
+    arrays = _tachibana_daily_arrays(code)
+    if not arrays:
+        return None
+    closes, opens, highs, lows, volumes = arrays
+    if len(volumes) < 6 or len(highs) < 2:
+        return None
+    current = stage1_row.get("current") if stage1_row.get("current") is not None else closes[-1]
+    vol_avg5 = sum(volumes[-6:-1]) / 5
+    vol_ratio = (volumes[-1] / vol_avg5) if vol_avg5 else None
+    breakout_lookback_high = (max(highs[-(BREAKOUT_LOOKBACK_DAYS + 1):-1])
+                               if len(highs) >= BREAKOUT_LOOKBACK_DAYS + 1 else None)
+    high52w = max(highs[-min(252, len(highs)):]) if highs else current
+    prev_day_high = highs[-2]
+    year_high = bool(current >= high52w * 0.999)
+    three_month_high = bool(breakout_lookback_high is not None and current > breakout_lookback_high)
+    prev_day_break = bool(current > prev_day_high)
+    # analyze_stock()のbreakout_confirmedと同じ基準（3か月高値を出来高1.5倍以上で上抜け）。
+    active_break_confirmed = bool(three_month_high and vol_ratio is not None and vol_ratio >= 1.5)
+    if year_high:
+        break_tier, break_tier_points = "YEAR_HIGH", 30
+    elif three_month_high:
+        break_tier, break_tier_points = "3M_HIGH", 25
+    elif prev_day_break:
+        break_tier, break_tier_points = "PREV_DAY_HIGH", 15
+    else:
+        break_tier, break_tier_points = None, 0
+    return {"volRatio": round(vol_ratio, 2) if vol_ratio is not None else None,
+            "breakoutLookbackHigh": round(breakout_lookback_high, 1) if breakout_lookback_high is not None else None,
+            "high52w": round(high52w, 1), "prevDayHigh": round(prev_day_high, 1),
+            "yearHigh": year_high, "threeMonthHigh": three_month_high, "prevDayHighBreak": prev_day_break,
+            "activeBreakConfirmed": active_break_confirmed,
+            "breakTier": break_tier, "breakTierPoints": break_tier_points}
+
+
+def _break_final_score(row, stage2):
+    """BREAK_SCORE：ブレイク条件を一つも満たさない銘柄・高値から5%以上崩れている銘柄は
+    対象外（None）とし、そもそも候補にしない（ユーザー指示：FAILED_BREAK相当は新規登録しない）。
+      ブレイク重要度：年初来高値30点 ＞ 3か月高値（レジスタンス突破）25点 ＞ 前日高値突破15点
+      出来高倍率：最大20点（1倍あたり4点、5倍で頭打ち）
+      高値維持率：最大20点（95%未満0点＝対象外基準と同じ境界、99.9%以上で満点）
+      対市場：最大10点／対セクター：最大5点
+      最後に売買代金の掛け目（_liquidity_multiplier、MOMENTUM DAYと共通）を掛け、
+      「年初来高値でも流動性が低い銘柄は過大評価しない」を担保する。"""
+    if not stage2 or not stage2["breakTier"]:
+        return None
+    hr = row.get("highRetention")
+    if hr is not None and hr < 0.95:
+        return None
+    score = stage2["breakTierPoints"]
+    if stage2.get("volRatio") is not None:
+        score += min(stage2["volRatio"], 5) * 4
+    score += _scale_score(hr, 0.95, 0.999, 20)
+    score += _scale_score(row.get("marketRS"), 0, 5, 10)
+    score += _scale_score(row.get("sectorRS"), 0, 3, 5)
+    score *= _liquidity_multiplier(row.get("turnover"))
+    return round(score, 1)
+
+
+def run_break_scan(database_url, user_id, force=False):
+    """MOMENTUM DAYと同じ2段階構成＋CURRENT/SEEN構造。Stage1（run_momentum_stage1、キャッシュ
+    共有）→BREAK候補選定→Stage2（ブレイク種別確定）→BREAK_SCORE確定→閾値を満たした上位
+    BREAK_FINAL_MAX_REGISTER件を「AUTO_BREAK_CURRENT」として登録、新TOP外に落ちた旧CURRENTは
+    「AUTO_BREAK_SEEN」へ降格。FAILED_BREAKへの転落（＝Primary Statusの変化）はフロント側の
+    enrichWatchRow()が検知して表示するため、ここでは扱わない（Primary/Action Statusの
+    Single Source of Truthを保つ）。"""
+    stage1 = run_momentum_stage1(force=force)
+    candidates = select_break_stage1_candidates(stage1)
+    t_stage2_start = time.time()
+
+    stage2_results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=BREAK_STAGE2_WORKERS) as ex:
+        futures = {ex.submit(_break_stage2_detail, code, row): code for _, code, row in candidates}
+        for fut in concurrent.futures.as_completed(futures):
+            code = futures[fut]
+            try:
+                stage2_results[code] = fut.result()
+            except Exception as e:
+                print("  BREAK Stage2詳細取得失敗", code, e)
+                stage2_results[code] = None
+    stage2_duration = round(time.time() - t_stage2_start, 1)
+
+    details = []
+    for lite_score, code, row in candidates:
+        stage2 = stage2_results.get(code)
+        final_score = _break_final_score(row, stage2)
+        if final_score is None:
+            continue  # ブレイク条件なし、または高値から5%以上崩れている＝候補にしない
+        details.append({"code": code, "name": row.get("name"), "sector": row.get("sector"),
+                         "changePct": row.get("changePct"), "highRetention": row.get("highRetention"),
+                         "marketRS": row.get("marketRS"), "sectorRS": row.get("sectorRS"),
+                         "turnover": row.get("turnover"), "liteScore": lite_score,
+                         "finalScore": final_score, "stage2": stage2})
+    details.sort(key=lambda d: -d["finalScore"])
+    to_register = [d for d in details if d["finalScore"] >= BREAK_SCORE_THRESHOLD][:BREAK_FINAL_MAX_REGISTER]
+
+    registered, demoted = [], []
+    if database_url and investment_db is not None:
+        old_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_BREAK_CURRENT", market="JP")
+        new_current_codes = {d["code"] for d in to_register}
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        expires_at = (now_dt + datetime.timedelta(days=BREAK_TAG_EXPIRE_DAYS)).isoformat()
+
+        for d in to_register:
+            tag_value = {"score": d["finalScore"], "breakTier": d["stage2"]["breakTier"],
+                         "addedAt": now_dt.isoformat(), "expiresAt": expires_at}
+            try:
+                ok = investment_db.auto_register_or_tag_watchlist_item(
+                    database_url, user_id, d["code"], "JP", "AUTO_BREAK_CURRENT", tag_value,
+                    item_fields={"name": d["name"], "sector": d["sector"], "source": "auto_break"})
+                investment_db.remove_auto_tag_key(database_url, user_id, d["code"], "JP", "AUTO_BREAK_SEEN")
+            except Exception as e:
+                print("  AUTO_BREAK登録（CURRENT）失敗", d["code"], e)
+                ok = False
+            if ok:
+                registered.append(d)
+
+        for code in old_current - new_current_codes:
+            try:
+                investment_db.auto_register_or_tag_watchlist_item(
+                    database_url, user_id, code, "JP", "AUTO_BREAK_SEEN",
+                    {"addedAt": now_dt.isoformat(), "expiresAt": expires_at})
+                investment_db.remove_auto_tag_key(database_url, user_id, code, "JP", "AUTO_BREAK_CURRENT")
+                demoted.append(code)
+            except Exception as e:
+                print("  AUTO_BREAK降格（SEEN化）失敗", code, e)
+    return {
+        "stage1CodesScanned": stage1["codesScanned"], "stage1PricesReturned": stage1["pricesReturned"],
+        "stage1DurationSec": stage1["durationSec"], "stage1RequestCount": stage1["requestCount"],
+        "stage1CacheAgeSec": round(time.time() - stage1["builtAt"], 1) if stage1["builtAt"] else None,
+        "stage1CandidateCount": len(candidates),
+        "stage2ValidCount": len(details),  # ブレイク条件を満たし候補となった件数（対象外は除外済み）
+        "stage2DurationSec": stage2_duration,
+        "demotedToSeenCount": len(demoted), "demotedToSeen": demoted,
+        "registeredCount": len(registered),
+        "registered": registered,
+        "allCandidates": details,
+    }
+
+
 def analyze_stock(w, market_env=None):
     """12-1章・technical_analysis_rules.md：ローソク足パターン・移動平均線の並び／クロス・
     ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
@@ -3242,6 +3430,18 @@ class Handler(SimpleHTTPRequestHandler):
             print(f"  Stage1 {result['stage1CodesScanned']}銘柄スキャン（{result['stage1DurationSec']}秒・"
                   f"リクエスト{result['stage1RequestCount']}回）→ Stage2候補{result['stage1CandidateCount']}件"
                   f"→ 自動登録{result['registeredCount']}件")
+            self._send_json(result)
+        elif self.path.startswith("/api/break-scan"):
+            # v3-9続き：🚀 AUTO_BREAK。MOMENTUM DAYと同じ設計思想（明示クリック時のみ実行）。
+            # Stage1（市場全体スキャン）はrun_momentum_stage1のキャッシュをそのまま共有するため、
+            # 直近でMOMENTUM DAYスキャン済みなら追加の市場全体取得は発生しない。
+            qs = urllib.parse.urlparse(self.path).query
+            force = urllib.parse.parse_qs(qs).get("force", ["0"])[0] == "1"
+            print(f"[取得] AUTO_BREAKスキャン開始（force={force}）…")
+            result = run_break_scan(DATABASE_URL, self.current_user, force=force)
+            print(f"  Stage1 {result['stage1CodesScanned']}銘柄スキャン（{result['stage1DurationSec']}秒）→ "
+                  f"ブレイク候補{result['stage2ValidCount']}件→自動登録{result['registeredCount']}件"
+                  f"（降格{result['demotedToSeenCount']}件）")
             self._send_json(result)
         elif self.path.startswith("/api/trade-candidates"):
             candidates = investment_db.list_trade_candidates(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []

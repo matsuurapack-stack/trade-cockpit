@@ -1335,6 +1335,28 @@ function deriveMomentumBadge(w){
   if(seen)return {tier:"seen",meta:MOMENTUM_BADGE_META.SEEN,score:seen.score,stuckLimitUp:!!seen.stuckLimitUp};
   return null;
 }
+
+// v3-9続き：🚀 AUTO_BREAK専用バッジ。既存のPrimary StatusとしてのACTIVE BREAK（enrichWatchRow・
+// SSoT・銘柄の現在の状態）と、自動登録理由としてのAUTO BREAK（このバッジ・過去にブレイク条件で
+// 拾われた履歴）は役割が別なので混同しないよう表示も分ける。BREAK_WEAKENINGは、CURRENT登録中の
+// 銘柄がPrimary StatusでFAILED_BREAKへ転落した時点で切り替える（新規スコア計算はしない。
+// MOMENTUM_WEAKENINGと同じ考え方）。MOMENTUM DAYと同様CURRENT/SEENの2段階。
+const BREAK_BADGE_META={
+  ACTIVE:    {icon:"🚀",label:"AUTO BREAK",color:"#0d7a3f"},
+  WEAKENING: {icon:"🚀",label:"BREAK WEAKENING",color:"var(--down)"},
+  SEEN:      {icon:"🚀",label:"BREAK履歴(圏外)",color:"var(--inkFaint)"},
+};
+function deriveBreakBadge(w){
+  const cur=w.auto_tags?.AUTO_BREAK_CURRENT;
+  const seen=w.auto_tags?.AUTO_BREAK_SEEN;
+  if(cur){
+    const weakening=w.status==="FAILED_BREAK";
+    return {tier:"current",meta:weakening?BREAK_BADGE_META.WEAKENING:BREAK_BADGE_META.ACTIVE,
+      score:cur.score,breakTier:cur.breakTier};
+  }
+  if(seen)return {tier:"seen",meta:BREAK_BADGE_META.SEEN,score:seen.score};
+  return null;
+}
 // RISK/WAITの具体的な理由コード→短い日本語ラベル（一覧のtooltip・詳細表示用）。
 const RISK_REASON_META = {
   CHASE_UP:      "急騰(高値圏)",
@@ -1578,7 +1600,7 @@ function rankTop5(enriched,stockQuotes){
     .slice(0,5);
 }
 
-function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan}){
+function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan}){
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
 
@@ -1621,7 +1643,9 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
       if(w.rsScore!=null&&w.rsScore>=70)c.rs70++;
       // v3-9改訂：CURRENT（最新TOP15）とSEEN（本日圏外に落ちた履歴）を別カウントする。
       if(w.auto_tags?.AUTO_MOMENTUM_DAY_CURRENT)c.momentumCurrent=(c.momentumCurrent||0)+1;
-      if(w.auto_tags?.AUTO_MOMENTUM_DAY_SEEN)c.momentumSeen=(c.momentumSeen||0)+1;});
+      if(w.auto_tags?.AUTO_MOMENTUM_DAY_SEEN)c.momentumSeen=(c.momentumSeen||0)+1;
+      if(w.auto_tags?.AUTO_BREAK_CURRENT)c.breakCurrent=(c.breakCurrent||0)+1;
+      if(w.auto_tags?.AUTO_BREAK_SEEN)c.breakSeen=(c.breakSeen||0)+1;});
     return c;
   },[enriched]);
   const [statusFilters,setStatusFilters]=useState(new Set()); // Primary Status。空集合＝フィルタなし
@@ -1634,6 +1658,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
   // 入りした銘柄（CURRENT＋SEEN）を表示。「🐒 MOMENTUM DAY」チップは"current"を、
   // 「🐒 本日履歴」チップは"history"を指す。
   const [momentumFilter,setMomentumFilter]=useState("");
+  const [breakFilter,setBreakFilter]=useState(""); // ""|"current"|"history"（AUTO_BREAK版、同じ考え方）
   const [showAll,setShowAll]=useState(false);
   const toggleStatusFilter=(st)=>setStatusFilters(prev=>{const n=new Set(prev);n.has(st)?n.delete(st):n.add(st);return n;});
   const toggleActionFilter=(st)=>setActionFilters(prev=>{const n=new Set(prev);n.has(st)?n.delete(st):n.add(st);return n;});
@@ -1648,10 +1673,13 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
     &&(!momentumFilter||(momentumFilter==="current"
         ?!!w.auto_tags?.AUTO_MOMENTUM_DAY_CURRENT
         :!!(w.auto_tags?.AUTO_MOMENTUM_DAY_CURRENT||w.auto_tags?.AUTO_MOMENTUM_DAY_SEEN)))
-  ),[sorted,statusFilters,actionFilters,rsFilter,marketRsFilter,pctFilter,sectorFilter,momentumFilter]);
+    &&(!breakFilter||(breakFilter==="current"
+        ?!!w.auto_tags?.AUTO_BREAK_CURRENT
+        :!!(w.auto_tags?.AUTO_BREAK_CURRENT||w.auto_tags?.AUTO_BREAK_SEEN)))
+  ),[sorted,statusFilters,actionFilters,rsFilter,marketRsFilter,pctFilter,sectorFilter,momentumFilter,breakFilter]);
   const TOP_N=10;
   const displayed=showAll?filtered:filtered.slice(0,TOP_N);
-  const hasFilter=statusFilters.size>0||actionFilters.size>0||rsFilter||marketRsFilter||!!pctFilter||!!sectorFilter||!!momentumFilter;
+  const hasFilter=statusFilters.size>0||actionFilters.size>0||rsFilter||marketRsFilter||!!pctFilter||!!sectorFilter||!!momentumFilter||!!breakFilter;
 
   // 今日の候補（trade_candidates。8番）
   const [candidates,setCandidates]=useState([]);
@@ -1833,6 +1861,14 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         東証{momentumResult.stage1CodesScanned}銘柄スキャン（{momentumResult.stage1DurationSec}秒）→
         候補{momentumResult.stage1CandidateCount}件→自動登録{momentumResult.registeredCount}件
       </span>}
+      {/* v3-9続き：🚀 AUTO_BREAK。Stage1はサーバー側で共有キャッシュのため、直近でMOMENTUM DAY
+          スキャン済みなら市場全体の再取得は起きずStage2（ブレイク判定）だけで済む。 */}
+      <button className="action-btn" style={{fontSize:12}} disabled={breakScanning} onClick={onBreakScan}>
+        {breakScanning?"🚀 スキャン中…（数分かかります）":"🚀 AUTO BREAKスキャン"}
+      </button>
+      {breakResult && !breakScanning && <span style={{fontSize:11,color:"var(--inkFaint)"}}>
+        候補{breakResult.stage2ValidCount}件→自動登録{breakResult.registeredCount}件（降格{breakResult.demotedToSeenCount}件）
+      </span>}
     </div>
     <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:10,fontSize:12}}>
       <span style={{fontWeight:700}}>今日の監視銘柄 {items.length}</span>
@@ -1879,7 +1915,16 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         title="本日中に一度でも最新TOP15に入った銘柄（現在は外れているSEENも含む）">
         🐒 本日履歴 {(summary.momentumCurrent||0)+(summary.momentumSeen||0)}
       </button>
-      {hasFilter && <button className="iconbtn" style={{fontSize:11}} onClick={()=>{setStatusFilters(new Set());setActionFilters(new Set());setRsFilter(false);setMarketRsFilter(false);setPctFilter("");setSectorFilter("");setMomentumFilter("");}}>フィルタ解除</button>}
+      {/* v3-9続き：AUTO_BREAK版。「🚀 AUTO BREAK」＝最新TOP（CURRENT）、「🚀 BREAK履歴」＝
+          CURRENT＋SEEN。Primary StatusのACTIVE BREAKチップ（別行、既存）とは別軸。 */}
+      <button className={"chip"+(breakFilter==="current"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+        onClick={()=>setBreakFilter(v=>v==="current"?"":"current")}>🚀 AUTO BREAK {summary.breakCurrent||0}</button>
+      <button className={"chip"+(breakFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+        onClick={()=>setBreakFilter(v=>v==="history"?"":"history")}
+        title="過去にAUTO_BREAKで拾われた銘柄（現在は圏外のSEENも含む）">
+        🚀 BREAK履歴 {(summary.breakCurrent||0)+(summary.breakSeen||0)}
+      </button>
+      {hasFilter && <button className="iconbtn" style={{fontSize:11}} onClick={()=>{setStatusFilters(new Set());setActionFilters(new Set());setRsFilter(false);setMarketRsFilter(false);setPctFilter("");setSectorFilter("");setMomentumFilter("");setBreakFilter("");}}>フィルタ解除</button>}
       <label style={{fontSize:12,color:"var(--inkSoft)",marginLeft:"auto"}}>並び順：
         <select value={sortKey} onChange={e=>setSortKey(e.target.value)} style={{fontSize:12,padding:"3px 6px",marginLeft:4}}>
           <option value="priority">今日注目すべき順（既定）</option>
@@ -1934,6 +1979,11 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                   return <div style={{fontWeight:700,fontSize:10,color:mb.meta.color,whiteSpace:"nowrap",marginTop:1}}
                     title={`MOMENTUM_SCORE ${mb.score}${mb.stuckLimitUp?"／登録時点でS高張り付き":""}（本日限定・買い推奨ではありません）`}>
                     {mb.meta.icon} {mb.meta.label}{mb.stuckLimitUp?"（S高）":""}
+                  </div>;})()}
+                {(()=>{const bb=deriveBreakBadge(w);if(!bb)return null;
+                  return <div style={{fontWeight:700,fontSize:10,color:bb.meta.color,whiteSpace:"nowrap",marginTop:1}}
+                    title={`BREAK_SCORE ${bb.score}${bb.breakTier?"／"+bb.breakTier:""}（監視登録理由であり、買い推奨ではありません）`}>
+                    {bb.meta.icon} {bb.meta.label}
                   </div>;})()}
               </td>
               <td className="mono" style={{fontWeight:800,fontSize:15,textAlign:"right",paddingLeft:10,color:rsFg}}>{w.rsScore!=null?w.rsScore:"—"}</td>
@@ -4058,6 +4108,32 @@ function App(){
     setMomentumScanning(false);
   };
 
+  // v3-9続き：🚀 AUTO_BREAK。MOMENTUM DAYと同じ設計（明示クリック時のみ実行、Stage1キャッシュは
+  // サーバー側で共有されるため直近でMOMENTUM DAYスキャン済みなら市場全体の再取得は起きない）。
+  const [breakScanning,setBreakScanning]=useState(false);
+  const [breakResult,setBreakResult]=useState(null);
+  const runBreakScan=async()=>{
+    setBreakScanning(true);
+    setBreakResult(null);
+    try{
+      const r=await fetch("/api/break-scan");
+      if(r.ok){
+        const d=await r.json();
+        setBreakResult(d);
+        const jr=await fetch("/api/watchlist?market=JP");
+        if(jr.ok){
+          const jd=await jr.json();
+          if(Array.isArray(jd.items)){
+            const registeredCodes=(d.registered||[]).map(x=>x.code);
+            setS(p=>({...p,watchlist:jd.items,
+              watchTargets:[...new Set([...p.watchTargets,...registeredCodes])]}));
+          }
+        }
+      }
+    }catch(e){}
+    setBreakScanning(false);
+  };
+
   // 売買記録（トレードジャーナル）：銘柄分析カードの「記録に追加」ボタンから、そのカードの
   // entry/stop/target/marketEnv/entryReasonを初期値にしたドラフトを開き、「記録」タブへ遷移する。
   // 保存するまでs.journalには追加しない（下書き段階ではjournalDraft stateのみで保持）。
@@ -4444,7 +4520,8 @@ function App(){
         analysisData={s.analysisData} marketRiskLabel={s.marketRisk?.marketRiskLabel}
         activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)}
         onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}
-        momentumScanning={momentumScanning} momentumResult={momentumResult} onMomentumScan={runMomentumScan}/>}
+        momentumScanning={momentumScanning} momentumResult={momentumResult} onMomentumScan={runMomentumScan}
+        breakScanning={breakScanning} breakResult={breakResult} onBreakScan={runBreakScan}/>}
 
       {/* ===== BRIEFING（日本市場） ===== */}
       {tab==="briefing" && <div>
