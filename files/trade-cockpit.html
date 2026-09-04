@@ -1501,13 +1501,18 @@ function AssessmentCard({assessment:a,marginBadge,marginRatio,enr,sectorRank}){
       <span className="chip" style={{fontSize:10.5}}>Day Trade: {dayTradeLabel}</span>
       <span className="chip" style={{fontSize:10.5}}>Swing: {swingLabel}</span>
       {a.marketRiskScore!=null && <span className="chip" style={{fontSize:10.5}}>Market Risk {a.marketRiskScore}（{a.marketRiskLabel}）</span>}
-      {/* v3-6 Step2：ラベルを監視銘柄一覧と統一（Market RS→対市場・Sector RS→対セクター）。
-          値も監視銘柄一覧と同じenr（enrichWatchRow、ライブなstockQuotes基準）を使い、サーバー側の
-          assessment.marketRS（分析取得時点のスナップショット）とは別々に持たない（二重ロジック回避）。 */}
-      {enr?.marketRS!=null && <span className="chip" style={{fontSize:10.5}} title="対市場：銘柄騰落率 − 日経平均騰落率">対市場 {enr.marketRS>0?"+":""}{enr.marketRS.toFixed(1)}pt</span>}
-      {enr?.sectorRS!=null && <span className="chip" style={{fontSize:10.5}} title="対セクター：銘柄騰落率 − セクター平均騰落率">対セクター {enr.sectorRS>0?"+":""}{enr.sectorRS.toFixed(1)}pt</span>}
-      {sectorRank && <span className="chip" style={{fontSize:10.5}} title="本日のセクター別平均騰落率での順位（登録銘柄ベース）">セクター順位 {sectorRank.rank}/{sectorRank.total}位（{sectorRank.avgPct>0?"+":""}{sectorRank.avgPct.toFixed(2)}%）</span>}
       <span className="chip" style={{fontSize:10.5}}>Entry Conditions {a.entryConditionsMet}/{a.entryConditionsTotal}</span>
+    </div>
+    {/* v3-6 Step2（改訂）：総合RS／対市場／対セクター／セクター順位を1行のコンパクトな
+        サマリー行にまとめる（例："総合RS 78 / 対市場 +7.1 / 対セクター +2.2 / セクター順位 3/31"）。
+        個別チップとして他の情報（Day Trade/Swing/Market Risk等）に混ぜず独立させ、情報過多を
+        避けつつ一目で把握できるようにした。値は監視銘柄一覧と同じenr（enrichWatchRow）由来で、
+        表示名も監視銘柄一覧と統一（RS→総合RS・Market RS→対市場・Sector RS→対セクター）。
+        既存のRS計算・セクター集計（groupStocks／calcRsScore）を再利用するのみで、新規の
+        二重ロジックは追加していない。 */}
+    <div className="mono" style={{fontSize:12,color:"var(--inkSoft)",marginTop:6}}
+      title="総合RS：市場とセクターに対する相対的な強さを0〜100で表した総合スコア／対市場：銘柄騰落率−日経平均騰落率／対セクター：銘柄騰落率−セクター平均騰落率／セクター順位：本日のセクター別平均騰落率での順位">
+      総合RS {enr.rsScore??"—"} / 対市場 {enr.marketRS!=null?(enr.marketRS>0?"+":"")+enr.marketRS.toFixed(1):"—"} / 対セクター {enr.sectorRS!=null?(enr.sectorRS>0?"+":"")+enr.sectorRS.toFixed(1):"—"} / セクター順位 {sectorRank?`${sectorRank.rank}/${sectorRank.total}`:"—"}
     </div>
     {a.judgmentText && <div style={{fontSize:12,color:"var(--ink)",marginTop:6,lineHeight:1.6}}>{a.judgmentText}</div>}
     {axisRows.length>0 && <div style={{display:"flex",flexWrap:"wrap",gap:4,marginTop:6}}>
