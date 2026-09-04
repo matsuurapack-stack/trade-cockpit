@@ -319,6 +319,11 @@ ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS initial_stop NUMERIC;
 ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS current_stop NUMERIC;
 ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS target_1 NUMERIC;
 ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS target_2 NUMERIC;
+
+-- v3-8（ポジション管理ロジック再設計 Step1）：取引タイプ（DAY/SWING）。既存ポジションは
+-- NULL（未設定）を許容し、UI側で設定を促す。HARD STOP（-10%ルール）等はSWING限定のため
+-- この列が必須の起点になる。
+ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS trade_style TEXT;
 """
 
 
@@ -1264,7 +1269,8 @@ def list_portfolio(database_url, user_id):
 
 
 _PORTFOLIO_COLS = ["name", "quantity", "average_price", "acquired_at", "memo",
-                   "initial_stop", "current_stop", "target_1", "target_2"]  # marketはINSERT文で別途固定列として扱うためここには含めない
+                   "initial_stop", "current_stop", "target_1", "target_2",
+                   "trade_style"]  # marketはINSERT文で別途固定列として扱うためここには含めない
 
 
 def upsert_portfolio_item(database_url, user_id, item):

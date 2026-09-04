@@ -2025,8 +2025,10 @@ function deriveTrailingStatus(currentStop,initialStop,avgPrice,current){
 function PortfolioPanel({stockQuotes,analysisData}){
   const [items,setItems]=useState([]);
   const [loading,setLoading]=useState(true);
+  // v3-8（ポジション管理ロジック再設計 Step1）：取引タイプ（DAY/SWING）を新規登録時に必須化。
+  // SWINGの-10% HARD STOP等、取引タイプに応じた判断ロジックの起点となるフィールドのため。
   const emptyDraft={code:"",name:"",market:"JP",quantity:"",average_price:"",acquired_at:"",memo:"",
-    initial_stop:"",target_1:"",target_2:""};
+    initial_stop:"",target_1:"",target_2:"",trade_style:""};
   const [draft,setDraft]=useState(emptyDraft);
   const [saving,setSaving]=useState(false);
 
@@ -2089,6 +2091,16 @@ function PortfolioPanel({stockQuotes,analysisData}){
     }catch(e){}
   };
 
+  // v3-8 Step1：既存ポジション（取引タイプ未設定＝NULL）にDAY/SWINGを後から設定するための
+  // ワンクリック保存（他の列は送らないので上書きされない＝部分更新の仕組みを利用）。
+  const saveTradeStyle=async(it,style)=>{
+    try{
+      await fetch("/api/portfolio/save",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({code:it.code,market:it.market,trade_style:style})});
+      load();
+    }catch(e){}
+  };
+
   // v3-4（ChatGPT連携の再配置）：「利確・損切り相談」。ポジションの実データ（実際の平均取得単価
   // 基準）に加えて、対応するトレード分析結果（analysisData、あれば）を「参考情報」として別枠で
   // 添える。ポジション管理の基準は実際の取得単価であり、トレード分析のentryは参考値である旨を
@@ -2126,11 +2138,15 @@ function PortfolioPanel({stockQuotes,analysisData}){
       <div style={{fontWeight:700,color:"var(--ink)",fontSize:13}}>保有株（portfolio）</div>
       <span style={{fontSize:11,color:"var(--inkFaint)"}}>{items.length}銘柄</span>
     </div>
-    <div style={{display:"grid",gridTemplateColumns:"70px 1fr 55px 70px 90px 110px",gap:6,marginBottom:6}}>
+    <div style={{display:"grid",gridTemplateColumns:"70px 1fr 55px 90px 70px 90px 110px",gap:6,marginBottom:6}}>
       <input placeholder="コード" value={draft.code} onChange={e=>setDraft({...draft,code:e.target.value})} style={fieldStyle}/>
       <input placeholder="銘柄名" value={draft.name} onChange={e=>setDraft({...draft,name:e.target.value})} style={fieldStyle}/>
       <select value={draft.market} onChange={e=>setDraft({...draft,market:e.target.value})} style={fieldStyle}>
         <option value="JP">JP</option><option value="US">US</option>
+      </select>
+      {/* v3-8 Step1：取引タイプは新規登録で必須（未選択のプレースホルダーを空値のoptionとして用意）。 */}
+      <select value={draft.trade_style} onChange={e=>setDraft({...draft,trade_style:e.target.value})} style={{...fieldStyle,fontWeight:draft.trade_style?400:700,color:draft.trade_style?"var(--ink)":"var(--down)"}}>
+        <option value="">取引タイプ*</option><option value="DAY">DAY（デイトレ）</option><option value="SWING">SWING（スイング）</option>
       </select>
       <input placeholder="株数" value={draft.quantity} onChange={e=>setDraft({...draft,quantity:e.target.value})} style={fieldStyle}/>
       <input placeholder="平均取得単価（実際の約定単価）" value={draft.average_price} onChange={e=>setDraft({...draft,average_price:e.target.value})} style={fieldStyle}/>
@@ -2142,10 +2158,12 @@ function PortfolioPanel({stockQuotes,analysisData}){
       <input placeholder="利確②" value={draft.target_2} onChange={e=>setDraft({...draft,target_2:e.target.value})} style={fieldStyle}/>
       <input placeholder="メモ" value={draft.memo} onChange={e=>setDraft({...draft,memo:e.target.value})} style={fieldStyle}/>
       {analysisForDraft && <button className="action-btn" type="button" onClick={applyAnalysisValues} title="トレード分析タブでのこの銘柄のstop/利確①/利確②を下書きに反映します（参考値。実際の取得単価は上の欄に手入力してください）">分析値を使う</button>}
-      <button className="btn" onClick={save} disabled={saving||!draft.code.trim()}>追加</button>
+      <button className="btn" onClick={save} disabled={saving||!draft.code.trim()||!draft.trade_style} title={!draft.trade_style?"取引タイプ（DAY/SWING）の選択が必須です":undefined}>追加</button>
     </div>
     <div className="sec-note" style={{marginTop:-4,marginBottom:10}}>
-      ※ 平均取得単価は実際に約定した単価を入力してください（トレード分析タブのentryは参考値で、ポジション管理の基準にはしません）。初期SL・利確①②は任意入力で、トレード分析タブで「分析」済みの銘柄なら「分析値を使う」で反映できます。
+      ※ 取引タイプ（DAY/SWING）は新規登録に必須です。SWINGは-10%の絶対損切りルール等、取引タイプに応じた判断が働きます。
+      平均取得単価は実際に約定した単価を入力してください（トレード分析タブのentryは参考値で、ポジション管理の基準にはしません）。
+      初期SL・利確①②は任意入力で、トレード分析タブで「分析」済みの銘柄なら「分析値を使う」で反映できます。
     </div>
     {loading
       ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>読み込み中…</div>
@@ -2164,8 +2182,19 @@ function PortfolioPanel({stockQuotes,analysisData}){
                 <div style={{display:"flex",alignItems:"baseline",gap:8}}>
                   <span style={{fontWeight:800,fontSize:13.5}}>{it.name||it.code}</span>
                   <span className="mono" style={{fontSize:11,color:"var(--inkFaint)"}}>{it.code}</span>
+                  {it.trade_style && <button className="iconbtn" style={{fontSize:10.5,fontWeight:700,color:"var(--inkSoft)",border:"1px solid var(--rule)",borderRadius:3,padding:"1px 6px"}}
+                    title="クリックでDAY⇔SWINGを切り替え"
+                    onClick={()=>saveTradeStyle(it,it.trade_style==="DAY"?"SWING":"DAY")}>
+                    {it.trade_style==="DAY"?"DAY":"SWING"}</button>}
                   <button className="iconbtn" style={{marginLeft:"auto"}} title="削除" onClick={()=>remove(it.code,it.market)}>×</button>
                 </div>
+                {/* v3-8 Step1：取引タイプ未設定（既存ポジション）はここで設定を促す。設定するまで
+                    HARD STOP等の取引タイプ依存ロジックは動かない（後続Stepで実装）。 */}
+                {!it.trade_style && <div style={{display:"flex",alignItems:"center",gap:6,marginTop:4,fontSize:11,color:"var(--down)"}}>
+                  ⚠ 取引タイプ未設定：
+                  <button className="action-btn" style={{fontSize:10.5,padding:"2px 8px"}} onClick={()=>saveTradeStyle(it,"DAY")}>DAYに設定</button>
+                  <button className="action-btn" style={{fontSize:10.5,padding:"2px 8px"}} onClick={()=>saveTradeStyle(it,"SWING")}>SWINGに設定</button>
+                </div>}
                 <div style={{display:"flex",alignItems:"center",gap:6,marginTop:4}}>
                   {positionConsultMsg && <span style={{fontSize:10.5,color:"var(--accent)",fontWeight:700}}>{positionConsultMsg}</span>}
                   <button className="action-btn" style={{fontSize:11}} onClick={()=>copyPositionConsult(it)}>🤖 利確・損切り相談</button>
