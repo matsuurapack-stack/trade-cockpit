@@ -1957,6 +1957,49 @@ def _momentum_final_score(lite_score, stage2):
     return round(score, 1)
 
 
+def _jst_today_date_str():
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    return datetime.datetime.now(jst).date().isoformat()
+
+
+# v3-9続き（2026-09-05・PHASE 1 AUTO SIGNAL LOG）：5つの自動登録エンジン共通のシグナル履歴記録。
+# watchlist.auto_tags（現在状態、CURRENT/SEEN・期限切れで消える）とは役割を分離し、
+# auto_signal_eventsには状態遷移（ENTER_CURRENT/EXIT_CURRENT/REENTER_CURRENT）が起きた時だけ
+# 1行追加する（同じCURRENT銘柄を毎スキャンINSERTしない＝重複防止の要）。各run_*_scanの
+# CURRENT/SEEN更新ブロックの直後から1回呼ぶだけで済む共通ヘルパー。既存のauto_tags/CURRENT/SEEN/
+# manual_registered保護/ポジション保護/Stage1共有キャッシュには一切手を加えない（追加のみ）。
+def _record_signal_transitions(database_url, user_id, signal_type, market,
+                                to_register, old_current, old_seen, demoted, metadata_fn):
+    """to_register: このスキャンで登録対象になった詳細dictのリスト（code/finalScore/changePct/
+    marketRS/sectorRS/turnover/current・highRetentionは任意のキーを持つ想定）。
+    old_current/old_seen: このスキャン開始前のCURRENT/SEENコード集合。
+    demoted: このスキャンでCURRENT→SEENへ降格したコードのリスト。
+    metadata_fn(d): エンジン固有のmetadata dictを組み立てるcallable。"""
+    if not (database_url and investment_db is not None):
+        return
+    event_date = _jst_today_date_str()
+    for d in to_register:
+        code = d["code"]
+        if code in old_current:
+            continue  # 既にCURRENT中＝状態遷移なし、記録しない（重複防止）
+        event_type = "REENTER_CURRENT" if code in old_seen else "ENTER_CURRENT"
+        try:
+            investment_db.log_auto_signal_event(
+                database_url, user_id, code, market, signal_type, event_type, event_date,
+                score=d.get("finalScore"), current_price=d.get("current"),
+                day_change_pct=d.get("changePct"), market_rs=d.get("marketRS"),
+                sector_rs=d.get("sectorRS"), turnover=d.get("turnover"),
+                high_retention=d.get("highRetention"), metadata=metadata_fn(d))
+        except Exception as e:
+            print(f"  {signal_type} signal_event記録失敗（{event_type}）", code, e)
+    for code in demoted:
+        try:
+            investment_db.log_auto_signal_event(
+                database_url, user_id, code, market, signal_type, "EXIT_CURRENT", event_date, metadata={})
+        except Exception as e:
+            print(f"  {signal_type} signal_event記録失敗（EXIT_CURRENT）", code, e)
+
+
 def run_momentum_day_scan(database_url, user_id, force=False):
     """Stage1（市場全体スキャン）→Stage1候補選定→Stage2（絞り込み後の詳細）→MOMENTUM_SCORE
     確定→閾値を満たした上位MOMENTUM_FINAL_MAX_REGISTER件を「AUTO_MOMENTUM_DAY_CURRENT」として
@@ -2000,6 +2043,7 @@ def run_momentum_day_scan(database_url, user_id, force=False):
                          "changePct": row.get("changePct"), "highRetention": row.get("highRetention"),
                          "marketRS": row.get("marketRS"), "sectorRS": row.get("sectorRS"),
                          "turnover": row.get("turnover"), "volRatio": (stage2 or {}).get("volRatio"),
+                         "current": row.get("current"),
                          "liteScore": lite_score, "finalScore": final_score, "stage2": stage2,
                          "stuckLimitUp": stuck_limit_up, "row": row})
     details.sort(key=lambda d: -d["finalScore"])
@@ -2015,6 +2059,7 @@ def run_momentum_day_scan(database_url, user_id, force=False):
     registered, demoted = [], []
     if database_url and investment_db is not None:
         old_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_MOMENTUM_DAY_CURRENT", market="JP")
+        old_seen = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_MOMENTUM_DAY_SEEN", market="JP")
         new_current_codes = {d["code"] for d in to_register}
         now_dt = datetime.datetime.now(datetime.timezone.utc)
         expires_at = (now_dt + datetime.timedelta(hours=MOMENTUM_TAG_EXPIRE_HOURS)).isoformat()
@@ -2042,6 +2087,10 @@ def run_momentum_day_scan(database_url, user_id, force=False):
                 demoted.append(code)
             except Exception as e:
                 print("  MOMENTUM DAY降格（SEEN化）失敗", code, e)
+
+        _record_signal_transitions(database_url, user_id, "MOMENTUM_DAY", "JP",
+            to_register, old_current, old_seen, demoted,
+            metadata_fn=lambda d: {"stuckLimitUp": d.get("stuckLimitUp"), "volRatio": d.get("volRatio")})
     for d in details:
         d.pop("row", None)  # rowは選定計算専用の内部情報。レスポンスには含めない
     return {
@@ -2203,6 +2252,7 @@ def run_break_scan(database_url, user_id, force=False):
                          "changePct": row.get("changePct"), "highRetention": row.get("highRetention"),
                          "marketRS": row.get("marketRS"), "sectorRS": row.get("sectorRS"),
                          "turnover": row.get("turnover"), "liteScore": lite_score,
+                         "current": row.get("current"),
                          "finalScore": final_score, "stage2": stage2})
     details.sort(key=lambda d: -d["finalScore"])
     to_register = [d for d in details if d["finalScore"] >= BREAK_SCORE_THRESHOLD][:BREAK_FINAL_MAX_REGISTER]
@@ -2210,6 +2260,7 @@ def run_break_scan(database_url, user_id, force=False):
     registered, demoted = [], []
     if database_url and investment_db is not None:
         old_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_BREAK_CURRENT", market="JP")
+        old_seen = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_BREAK_SEEN", market="JP")
         new_current_codes = {d["code"] for d in to_register}
         now_dt = datetime.datetime.now(datetime.timezone.utc)
         expires_at = (now_dt + datetime.timedelta(days=BREAK_TAG_EXPIRE_DAYS)).isoformat()
@@ -2237,6 +2288,10 @@ def run_break_scan(database_url, user_id, force=False):
                 demoted.append(code)
             except Exception as e:
                 print("  AUTO_BREAK降格（SEEN化）失敗", code, e)
+
+        _record_signal_transitions(database_url, user_id, "BREAK", "JP",
+            to_register, old_current, old_seen, demoted,
+            metadata_fn=lambda d: {"breakTier": d["stage2"]["breakTier"], "volumeRatio": d["stage2"].get("volRatio")})
     return {
         "stage1CodesScanned": stage1["codesScanned"], "stage1PricesReturned": stage1["pricesReturned"],
         "stage1DurationSec": stage1["durationSec"], "stage1RequestCount": stage1["requestCount"],
@@ -2338,7 +2393,7 @@ def run_auto_rs_scan(database_url, user_id, force=False):
     details = [{"code": code, "name": row.get("name"), "sector": row.get("sector"),
                 "changePct": row.get("changePct"), "highRetention": row.get("highRetention"),
                 "marketRS": row.get("marketRS"), "sectorRS": row.get("sectorRS"),
-                "turnover": row.get("turnover"), "finalScore": s,
+                "turnover": row.get("turnover"), "finalScore": s, "current": row.get("current"),
                 "resilience": _rs_resilience_tier(row, nikkei_chg)}
                for s, code, row in scored]
     to_register = [d for d in details if d["finalScore"] >= AUTO_RS_SCORE_THRESHOLD][:AUTO_RS_MAX_REGISTER]
@@ -2346,6 +2401,7 @@ def run_auto_rs_scan(database_url, user_id, force=False):
     registered, demoted = [], []
     if database_url and investment_db is not None:
         old_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_RS_CURRENT", market="JP")
+        old_seen = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_RS_SEEN", market="JP")
         new_current_codes = {d["code"] for d in to_register}
         now_dt = datetime.datetime.now(datetime.timezone.utc)
         expires_at = (now_dt + datetime.timedelta(days=AUTO_RS_TAG_EXPIRE_DAYS)).isoformat()
@@ -2373,6 +2429,10 @@ def run_auto_rs_scan(database_url, user_id, force=False):
                 demoted.append(code)
             except Exception as e:
                 print("  AUTO_RS降格（SEEN化）失敗", code, e)
+
+        _record_signal_transitions(database_url, user_id, "RS", "JP",
+            to_register, old_current, old_seen, demoted,
+            metadata_fn=lambda d: {"resilience": d.get("resilience")})
     return {
         "stage1CodesScanned": stage1["codesScanned"], "stage1PricesReturned": stage1["pricesReturned"],
         "stage1DurationSec": stage1["durationSec"], "stage1RequestCount": stage1["requestCount"],
@@ -2497,7 +2557,7 @@ def run_sector_leader_scan(database_url, user_id, force=False):
     details = [{"code": code, "name": row.get("name"), "sector": row.get("sector"),
                 "changePct": row.get("changePct"), "highRetention": row.get("highRetention"),
                 "marketRS": row.get("marketRS"), "sectorRS": row.get("sectorRS"),
-                "turnover": row.get("turnover"), "finalScore": s,
+                "turnover": row.get("turnover"), "finalScore": s, "current": row.get("current"),
                 "sectorRank": rank, "sectorTotal": total, "sectorVsMarket": sector_vs_market,
                 "sectorAvgPct": sector_avg, "sectorStrength": _sector_strength_flag(sector_vs_market)}
                for s, code, row, rank, total, sector_vs_market, sector_avg in scored]
@@ -2506,6 +2566,7 @@ def run_sector_leader_scan(database_url, user_id, force=False):
     registered, demoted = [], []
     if database_url and investment_db is not None:
         old_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_SECTOR_LEADER_CURRENT", market="JP")
+        old_seen = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_SECTOR_LEADER_SEEN", market="JP")
         new_current_codes = {d["code"] for d in to_register}
         now_dt = datetime.datetime.now(datetime.timezone.utc)
         expires_at = (now_dt + datetime.timedelta(days=SECTOR_LEADER_TAG_EXPIRE_DAYS)).isoformat()
@@ -2534,6 +2595,11 @@ def run_sector_leader_scan(database_url, user_id, force=False):
                 demoted.append(code)
             except Exception as e:
                 print("  AUTO_SECTOR_LEADER降格（SEEN化）失敗", code, e)
+
+        _record_signal_transitions(database_url, user_id, "SECTOR_LEADER", "JP",
+            to_register, old_current, old_seen, demoted,
+            metadata_fn=lambda d: {"sectorStrength": d.get("sectorStrength"), "sectorRank": d.get("sectorRank"),
+                                    "sectorVsMarket": d.get("sectorVsMarket")})
     return {
         "stage1CodesScanned": stage1["codesScanned"], "stage1PricesReturned": stage1["pricesReturned"],
         "stage1DurationSec": stage1["durationSec"], "stage1RequestCount": stage1["requestCount"],
@@ -2686,6 +2752,7 @@ def run_pullback_scan(database_url, user_id, force=False):
                          "changePct": row.get("changePct"), "highRetention": row.get("highRetention"),
                          "marketRS": row.get("marketRS"), "sectorRS": row.get("sectorRS"),
                          "turnover": row.get("turnover"), "liteScore": lite_score,
+                         "current": row.get("current"),
                          "finalScore": final_score, "stage2": stage2})
     details.sort(key=lambda d: -d["finalScore"])
     to_register = [d for d in details if d["finalScore"] >= AUTO_PULLBACK_SCORE_THRESHOLD][:AUTO_PULLBACK_MAX_REGISTER]
@@ -2693,6 +2760,7 @@ def run_pullback_scan(database_url, user_id, force=False):
     registered, demoted = [], []
     if database_url and investment_db is not None:
         old_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_PULLBACK_CURRENT", market="JP")
+        old_seen = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_PULLBACK_SEEN", market="JP")
         new_current_codes = {d["code"] for d in to_register}
         now_dt = datetime.datetime.now(datetime.timezone.utc)
         expires_at = (now_dt + datetime.timedelta(days=AUTO_PULLBACK_TAG_EXPIRE_DAYS)).isoformat()
@@ -2721,6 +2789,19 @@ def run_pullback_scan(database_url, user_id, force=False):
                 demoted.append(code)
             except Exception as e:
                 print("  AUTO_PULLBACK降格（SEEN化）失敗", code, e)
+
+        def _pullback_metadata(d):
+            # 2026-09-05実測で発覚した不具合の修正：ma25Deviationにはma25そのもの（株価）ではなく
+            # 現在値からの乖離率(%)を保存する（フィールド名の意味と一致させる）。
+            ma25 = d["stage2"].get("ma25")
+            current = d.get("current")
+            ma25_dev_pct = round((current - ma25) / ma25 * 100, 2) if (current and ma25) else None
+            return {"recentHighDeviation": d["stage2"].get("pullbackDevPct"),
+                    "ma25Deviation": ma25_dev_pct,
+                    "higherLow": d["stage2"].get("higherLow"),
+                    "volumeRatio": d["stage2"].get("volRatio")}
+        _record_signal_transitions(database_url, user_id, "PULLBACK", "JP",
+            to_register, old_current, old_seen, demoted, metadata_fn=_pullback_metadata)
     return {
         "stage1CodesScanned": stage1["codesScanned"], "stage1PricesReturned": stage1["pricesReturned"],
         "stage1DurationSec": stage1["durationSec"], "stage1RequestCount": stage1["requestCount"],
@@ -4028,6 +4109,14 @@ class Handler(SimpleHTTPRequestHandler):
                   f"押し目候補{result['stage2ValidCount']}件→自動登録{result['registeredCount']}件"
                   f"（降格{result['demotedToSeenCount']}件）")
             self._send_json(result)
+        elif self.path.startswith("/api/auto-signal-events"):
+            # v3-9続き（PHASE 1 AUTO SIGNAL LOG）：検証・確認用の閲覧API。?code=・?signal_type=で絞り込み可能。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            code = params.get("code", [None])[0]
+            signal_type = params.get("signal_type", [None])[0]
+            events = investment_db.list_auto_signal_events(DATABASE_URL, self.current_user, code=code, signal_type=signal_type) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"events": events})
         elif self.path.startswith("/api/trade-candidates"):
             candidates = investment_db.list_trade_candidates(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"candidates": candidates})

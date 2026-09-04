@@ -339,6 +339,40 @@ ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS manual_registered BOOLEAN NOT NUL
 -- のように理由キーごとに独立したスコア・追加日時・有効期限を持つ。専用のマージ関数
 -- （merge_auto_tag）でキー単位の追加・上書きのみを行い、他の理由キーには触れない。
 ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS auto_tags JSONB;
+
+-- v3-9続き（2026-09-05・PHASE 1 AUTO SIGNAL LOG）：5つの自動登録エンジン（MOMENTUM DAY/
+-- AUTO_BREAK/AUTO_RS/AUTO_SECTOR_LEADER/AUTO_PULLBACK、将来のAUTO_REVERSAL/AUTO_VOLUME/
+-- AUTO_EARNINGSも含む）共通の恒久履歴テーブル。watchlist.auto_tags（CURRENT/SEEN・期限切れで
+-- 消える「現在状態」専用）とは役割を分離し、こちらは状態遷移（ENTER_CURRENT/EXIT_CURRENT/
+-- REENTER_CURRENT/EXPIRE）が起きた時だけ記録する。同じCURRENT銘柄を毎スキャンINSERTしない
+-- （呼び出し側＝各run_*_scanが遷移検知時のみ呼ぶ設計）。将来「AUTO_BREAK 52点以上は有効か」
+-- 等を翌営業日/3営業日後/5営業日後リターンで検証できるよう、発生時点の価格・指標をそのまま残す。
+-- primary_status/action_statusは、サーバー側のスキャンがenrichWatchRow()（クライアント専用の
+-- Single Source of Truth）の結果を持たないため、二重ロジックを避ける方針上、現時点ではNULLで
+-- 記録する（2026-09-05ユーザー判断：事後補完APIは見送り）。
+CREATE TABLE IF NOT EXISTS auto_signal_events (
+    id              SERIAL PRIMARY KEY,
+    user_id         TEXT NOT NULL,
+    code            TEXT NOT NULL,
+    market          TEXT NOT NULL DEFAULT 'JP',
+    signal_type     TEXT NOT NULL,  -- MOMENTUM_DAY|BREAK|RS|SECTOR_LEADER|PULLBACK|REVERSAL|VOLUME|EARNINGS
+    event_type      TEXT NOT NULL,  -- ENTER_CURRENT|EXIT_CURRENT|REENTER_CURRENT|EXPIRE
+    detected_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    event_date      DATE NOT NULL,  -- JST基準の日付（将来の営業日ベースのリターン計算の起点）
+    score           NUMERIC,
+    current_price   NUMERIC,
+    day_change_pct  NUMERIC,
+    market_rs       NUMERIC,
+    sector_rs       NUMERIC,
+    turnover        NUMERIC,
+    high_retention  NUMERIC,
+    primary_status  TEXT,
+    action_status   TEXT,
+    metadata        JSONB,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_auto_signal_events_code ON auto_signal_events(user_id, code, signal_type);
+CREATE INDEX IF NOT EXISTS idx_auto_signal_events_date ON auto_signal_events(user_id, event_date);
 """
 
 
@@ -1355,6 +1389,58 @@ def cleanup_expired_auto_tags(database_url, user_id):
                 )
         conn.commit()
     return {"expired": expired_count, "deleted": deleted_count}
+
+
+# v3-9続き（2026-09-05・PHASE 1 AUTO SIGNAL LOG）：5つの自動登録エンジン共通の履歴ログ。
+# watchlist.auto_tags（現在状態、CURRENT/SEEN・期限切れで消える）とは役割を分離し、こちらは
+# 状態遷移（ENTER_CURRENT/EXIT_CURRENT/REENTER_CURRENT/EXPIRE）が起きた時だけ1行追加する
+# 恒久履歴（削除・上書きは行わない）。呼び出し側（server.py）が「同じCURRENTの毎スキャン
+# 再INSERT」を避ける判定を行った上でこの関数を呼ぶ設計＝この関数自体は単純なINSERTのみ。
+def log_auto_signal_event(database_url, user_id, code, market, signal_type, event_type, event_date,
+                           score=None, current_price=None, day_change_pct=None, market_rs=None,
+                           sector_rs=None, turnover=None, high_retention=None,
+                           primary_status=None, action_status=None, metadata=None):
+    """auto_signal_eventsへ1件記録する。primary_status/action_statusは、サーバー側のスキャンが
+    enrichWatchRow()（クライアント専用のSSoT）の結果を持たないため、現時点では意図的にNULLの
+    まま記録する（2026-09-05ユーザー判断：事後補完APIは見送り）。戻り値: True=成功。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return False
+    with pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO auto_signal_events (user_id, code, market, signal_type, event_type, event_date, "
+            "score, current_price, day_change_pct, market_rs, sector_rs, turnover, high_retention, "
+            "primary_status, action_status, metadata) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",
+            [user_id, code, market, signal_type, event_type, event_date,
+             score, current_price, day_change_pct, market_rs, sector_rs, turnover, high_retention,
+             primary_status, action_status, json.dumps(metadata or {}, ensure_ascii=False)],
+        )
+        conn.commit()
+    return True
+
+
+def list_auto_signal_events(database_url, user_id, code=None, signal_type=None, limit=200):
+    """auto_signal_eventsの履歴を新しい順に返す（検証・確認用）。codeやsignal_typeで絞り込み可能。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = ["user_id = %s"], [user_id]
+    if code:
+        where.append("code = %s")
+        params.append(code)
+    if signal_type:
+        where.append("signal_type = %s")
+        params.append(signal_type)
+    params.append(limit)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT * FROM auto_signal_events WHERE {' AND '.join(where)} "
+                f"ORDER BY detected_at DESC LIMIT %s",
+                params,
+            )
+            return [_row_to_json(r) for r in cur.fetchall()]
 
 
 def delete_watchlist_item(database_url, user_id, code, market=None):
