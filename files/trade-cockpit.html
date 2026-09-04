@@ -1310,20 +1310,30 @@ const ACTION_STATUS_META = {
 
 // v3-9（監視銘柄自動登録エンジン）：🐒 MOMENTUM DAY専用バッジ。「買い推奨」ではないことを
 // 徹底するため、Primary/Action Status（enrichWatchRow、SSoT）の判定には一切影響しない完全に
-// 独立した表示のみ（w.auto_tags.AUTO_MOMENTUM_DAYは監視銘柄の付帯情報として持っているだけ）。
-// WEAKENINGは新たにスコアを再計算するのではなく、既存のPrimary/Action Status（30秒ごとの
-// 自動更新で再評価される）がRISK/FAILED_BREAK/WEAKになった時点で「崩れ始めた」とみなす
-// （無料データの更新頻度に合わせた軽量な判定、8-8の方針）。
+// 独立した表示のみ。
+// v3-9改訂（2026-09-04・CURRENT/SEENの分離）：同日に何度もスキャンするとその都度のTOP15が
+// 無限に累積する問題があったため、サーバー側がauto_tagsを
+// AUTO_MOMENTUM_DAY_CURRENT（最新スキャンのTOP15）／AUTO_MOMENTUM_DAY_SEEN（本日中に一度
+// TOP15入りしたが現在は外れている履歴）の2キーに分けて管理するようになった。
+// CURRENTを持つ銘柄はさらに、既存のPrimary/Action Status（30秒ごとの自動更新で再評価される）
+// がRISK/FAILED_BREAK/WEAKになった時点で「崩れ始めた」＝WEAKENING表示に切り替える
+// （新たにスコアを再計算するのではなく、無料データの更新頻度に合わせた軽量な判定、8-8の方針）。
+// SEENのみの銘柄は「本日どこかでTOP15入りしたが、今は外れている」ことを示す別バッジ。
 const MOMENTUM_BADGE_META={
   ACTIVE:    {icon:"🐒",label:"MOMENTUM DAY",color:"#b8860b"},
   WEAKENING: {icon:"🐒",label:"MOMENTUM WEAKENING",color:"var(--down)"},
+  SEEN:      {icon:"🐒",label:"本日モメンタム(圏外)",color:"var(--inkFaint)"},
 };
 function deriveMomentumBadge(w){
-  const tag=w.auto_tags?.AUTO_MOMENTUM_DAY;
-  if(!tag)return null;
-  const weakening=w.actionStatus==="RISK"||w.status==="FAILED_BREAK"||w.status==="WEAK";
-  return {meta:weakening?MOMENTUM_BADGE_META.WEAKENING:MOMENTUM_BADGE_META.ACTIVE,
-    score:tag.score,stuckLimitUp:!!tag.stuckLimitUp};
+  const cur=w.auto_tags?.AUTO_MOMENTUM_DAY_CURRENT;
+  const seen=w.auto_tags?.AUTO_MOMENTUM_DAY_SEEN;
+  if(cur){
+    const weakening=w.actionStatus==="RISK"||w.status==="FAILED_BREAK"||w.status==="WEAK";
+    return {tier:"current",meta:weakening?MOMENTUM_BADGE_META.WEAKENING:MOMENTUM_BADGE_META.ACTIVE,
+      score:cur.score,stuckLimitUp:!!cur.stuckLimitUp};
+  }
+  if(seen)return {tier:"seen",meta:MOMENTUM_BADGE_META.SEEN,score:seen.score,stuckLimitUp:!!seen.stuckLimitUp};
+  return null;
 }
 // RISK/WAITの具体的な理由コード→短い日本語ラベル（一覧のtooltip・詳細表示用）。
 const RISK_REASON_META = {
@@ -1609,7 +1619,9 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
       ENTRY_READY:0,WAIT:0,RISK:0,rs70:0};
     enriched.forEach(w=>{c[w.status]=(c[w.status]||0)+1;c[w.actionStatus]=(c[w.actionStatus]||0)+1;
       if(w.rsScore!=null&&w.rsScore>=70)c.rs70++;
-      if(w.auto_tags?.AUTO_MOMENTUM_DAY)c.momentum=(c.momentum||0)+1;});
+      // v3-9改訂：CURRENT（最新TOP15）とSEEN（本日圏外に落ちた履歴）を別カウントする。
+      if(w.auto_tags?.AUTO_MOMENTUM_DAY_CURRENT)c.momentumCurrent=(c.momentumCurrent||0)+1;
+      if(w.auto_tags?.AUTO_MOMENTUM_DAY_SEEN)c.momentumSeen=(c.momentumSeen||0)+1;});
     return c;
   },[enriched]);
   const [statusFilters,setStatusFilters]=useState(new Set()); // Primary Status。空集合＝フィルタなし
@@ -1618,7 +1630,10 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
   const [marketRsFilter,setMarketRsFilter]=useState(false); // Market RS +2pt以上のみ
   const [pctFilter,setPctFilter]=useState(""); // "up" | "down" | ""
   const [sectorFilter,setSectorFilter]=useState("");
-  const [momentumFilter,setMomentumFilter]=useState(false); // v3-9：🐒 MOMENTUM DAYのみ表示
+  // v3-9改訂：""＝フィルタなし／"current"＝最新TOP15のみ／"history"＝本日中に一度でもTOP15
+  // 入りした銘柄（CURRENT＋SEEN）を表示。「🐒 MOMENTUM DAY」チップは"current"を、
+  // 「🐒 本日履歴」チップは"history"を指す。
+  const [momentumFilter,setMomentumFilter]=useState("");
   const [showAll,setShowAll]=useState(false);
   const toggleStatusFilter=(st)=>setStatusFilters(prev=>{const n=new Set(prev);n.has(st)?n.delete(st):n.add(st);return n;});
   const toggleActionFilter=(st)=>setActionFilters(prev=>{const n=new Set(prev);n.has(st)?n.delete(st):n.add(st);return n;});
@@ -1630,11 +1645,13 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
     &&(!marketRsFilter||(w.marketRS!=null&&w.marketRS>=2))
     &&(!pctFilter||(pctFilter==="up"?(w.pct!=null&&w.pct>0):(w.pct!=null&&w.pct<0)))
     &&(!sectorFilter||w.sector===sectorFilter)
-    &&(!momentumFilter||!!w.auto_tags?.AUTO_MOMENTUM_DAY)
+    &&(!momentumFilter||(momentumFilter==="current"
+        ?!!w.auto_tags?.AUTO_MOMENTUM_DAY_CURRENT
+        :!!(w.auto_tags?.AUTO_MOMENTUM_DAY_CURRENT||w.auto_tags?.AUTO_MOMENTUM_DAY_SEEN)))
   ),[sorted,statusFilters,actionFilters,rsFilter,marketRsFilter,pctFilter,sectorFilter,momentumFilter]);
   const TOP_N=10;
   const displayed=showAll?filtered:filtered.slice(0,TOP_N);
-  const hasFilter=statusFilters.size>0||actionFilters.size>0||rsFilter||marketRsFilter||!!pctFilter||!!sectorFilter||momentumFilter;
+  const hasFilter=statusFilters.size>0||actionFilters.size>0||rsFilter||marketRsFilter||!!pctFilter||!!sectorFilter||!!momentumFilter;
 
   // 今日の候補（trade_candidates。8番）
   const [candidates,setCandidates]=useState([]);
@@ -1853,8 +1870,16 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         <option value="">セクター（すべて）</option>
         {sectorOptions.map(s=><option key={s} value={s}>{s}</option>)}
       </select>
-      <button className={"chip"+(momentumFilter?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>setMomentumFilter(v=>!v)}>🐒 MOMENTUM DAY {summary.momentum||0}</button>
-      {hasFilter && <button className="iconbtn" style={{fontSize:11}} onClick={()=>{setStatusFilters(new Set());setActionFilters(new Set());setRsFilter(false);setMarketRsFilter(false);setPctFilter("");setSectorFilter("");setMomentumFilter(false);}}>フィルタ解除</button>}
+      {/* v3-9改訂：「🐒 MOMENTUM DAY」＝最新TOP15（CURRENT）のみ。過去に強かったが今は外れた
+          銘柄は別チップ「🐒 本日履歴」（CURRENT＋SEEN）でのみ確認する。 */}
+      <button className={"chip"+(momentumFilter==="current"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+        onClick={()=>setMomentumFilter(v=>v==="current"?"":"current")}>🐒 MOMENTUM DAY {summary.momentumCurrent||0}</button>
+      <button className={"chip"+(momentumFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+        onClick={()=>setMomentumFilter(v=>v==="history"?"":"history")}
+        title="本日中に一度でも最新TOP15に入った銘柄（現在は外れているSEENも含む）">
+        🐒 本日履歴 {(summary.momentumCurrent||0)+(summary.momentumSeen||0)}
+      </button>
+      {hasFilter && <button className="iconbtn" style={{fontSize:11}} onClick={()=>{setStatusFilters(new Set());setActionFilters(new Set());setRsFilter(false);setMarketRsFilter(false);setPctFilter("");setSectorFilter("");setMomentumFilter("");}}>フィルタ解除</button>}
       <label style={{fontSize:12,color:"var(--inkSoft)",marginLeft:"auto"}}>並び順：
         <select value={sortKey} onChange={e=>setSortKey(e.target.value)} style={{fontSize:12,padding:"3px 6px",marginLeft:4}}>
           <option value="priority">今日注目すべき順（既定）</option>

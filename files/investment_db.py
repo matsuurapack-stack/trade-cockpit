@@ -1273,6 +1273,44 @@ def auto_register_or_tag_watchlist_item(database_url, user_id, code, market, rea
     return True
 
 
+# v3-9改訂（MOMENTUM DAY：CURRENT/SEENの分離）：同日に複数回スキャンした際、その都度のTOP15が
+# 無限に累積しないようにするため、「最新TOP15（CURRENT）」から外れた銘柄はタグを消さずに
+# 「本日圏内だった履歴（SEEN）」へ降格させる。この2関数は上のauto_register_or_tag_watchlist_item
+# と組み合わせて使う（降格＝SEENへの昇格はauto_register_or_tag_watchlist_item、CURRENTタグの
+# 除去はremove_auto_tag_keyで行う）。
+def remove_auto_tag_key(database_url, user_id, code, market, reason_key):
+    """auto_tagsから指定のreason_keyだけを取り除く（他のキー・manual_registered・name等の
+    既存値には一切触れない）。行が無い、またはそのキーを持たない場合は何もしない。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return False
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE watchlist SET auto_tags = auto_tags - %s, updated_at = now() "
+            "WHERE user_id = %s AND code = %s AND market = %s AND auto_tags ? %s",
+            [reason_key, user_id, code, market, reason_key],
+        )
+        conn.commit()
+    return True
+
+
+def get_codes_with_auto_tag(database_url, user_id, reason_key, market=None):
+    """指定のauto_tagsキーを持つ銘柄コードの集合を返す。新しいスキャン結果と比較して
+    「前回CURRENTだったが今回は外れた」銘柄を特定するために使う。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return set()
+    where = ["user_id = %s", "auto_tags ? %s"]
+    params = [user_id, reason_key]
+    if market:
+        where.append("market = %s")
+        params.append(market)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT code FROM watchlist WHERE {' AND '.join(where)}", params)
+            return {r[0] for r in cur.fetchall()}
+
+
 def cleanup_expired_auto_tags(database_url, user_id):
     """auto_tagsの中で有効期限切れの理由キーだけを取り除く。結果としてauto_tagsが空になり、
     かつ manual_registered=false（＝自動登録のみで維持されていた銘柄）かつ保有ポジションでも

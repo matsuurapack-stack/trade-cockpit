@@ -1896,8 +1896,11 @@ def _momentum_final_score(lite_score, stage2):
 
 def run_momentum_day_scan(database_url, user_id, force=False):
     """Stage1（市場全体スキャン）→Stage1候補選定→Stage2（絞り込み後の詳細）→MOMENTUM_SCORE
-    確定→閾値以上を監視銘柄へauto_register_or_tag_watchlist_item()で自動登録、までの一連の処理。
-    戻り値はUI表示・実データでの閾値調整レポートの両方に使うサマリー。
+    確定→閾値を満たした上位MOMENTUM_FINAL_MAX_REGISTER件を「AUTO_MOMENTUM_DAY_CURRENT」として
+    監視銘柄へ登録、旧CURRENTで新TOP15から外れた銘柄は「AUTO_MOMENTUM_DAY_SEEN」へ降格、
+    までの一連の処理。同日に何度スキャンしてもCURRENTは常に最新TOP15だけを指し、無限に累積
+    しない（SEENは当日の履歴として残るが、監視銘柄タブの主フィルターには出さない設計、
+    フロント側で対応）。戻り値はUI表示・実データでの閾値調整レポートの両方に使うサマリー。
     S高張り付き（値幅制限の上限に貼り付いて実質売買できない状態）は専用の気配情報APIが無いため、
     「現在値が当日高値とほぼ一致し、かつ売気配(ask)が立っていない（＝買い一色で売り注文が
     尽きている）」という間接的な近似で判定する（stuckLimitUp、あくまで簡易推定）。"""
@@ -1939,23 +1942,43 @@ def run_momentum_day_scan(database_url, user_id, force=False):
     details.sort(key=lambda d: -d["finalScore"])
     to_register = [d for d in details if d["finalScore"] >= MOMENTUM_SCORE_THRESHOLD][:MOMENTUM_FINAL_MAX_REGISTER]
 
-    registered = []
-    for d in to_register:
-        if not (database_url and investment_db is not None):
-            continue
+    # v3-9再改訂（2026-09-04ユーザーフィードバック：同日複数回スキャン時の累積を防ぐ）：
+    # 「最新TOP15（AUTO_MOMENTUM_DAY_CURRENT）」と「本日中に一度でもTOP15入りしたが現在は
+    # 外れている履歴（AUTO_MOMENTUM_DAY_SEEN）」を分離する。スキャンのたびに、
+    #   ①新しいTOP15に入った銘柄 → CURRENTタグを付与（SEENタグが付いていれば剥がす＝復帰）
+    #   ②旧CURRENTだったが新しいTOP15から外れた銘柄 → CURRENTタグを剥がし、SEENタグに切り替える
+    # これにより監視銘柄タブの「🐒 MOMENTUM DAY」フィルターは常に最新TOP15だけを指し、
+    # 過去に強かったが今は外れた銘柄は「🐒 本日履歴」側でのみ確認できる。
+    registered, demoted = [], []
+    if database_url and investment_db is not None:
+        old_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_MOMENTUM_DAY_CURRENT", market="JP")
+        new_current_codes = {d["code"] for d in to_register}
         now_dt = datetime.datetime.now(datetime.timezone.utc)
-        tag_value = {"score": d["finalScore"], "addedAt": now_dt.isoformat(),
-                     "expiresAt": (now_dt + datetime.timedelta(hours=MOMENTUM_TAG_EXPIRE_HOURS)).isoformat(),
-                     "stuckLimitUp": d["stuckLimitUp"]}
-        try:
-            ok = investment_db.auto_register_or_tag_watchlist_item(
-                database_url, user_id, d["code"], "JP", "AUTO_MOMENTUM_DAY", tag_value,
-                item_fields={"name": d["name"], "sector": d["sector"], "source": "auto_momentum_day"})
-        except Exception as e:
-            print("  MOMENTUM DAY自動登録失敗", d["code"], e)
-            ok = False
-        if ok:
-            registered.append(d)
+        expires_at = (now_dt + datetime.timedelta(hours=MOMENTUM_TAG_EXPIRE_HOURS)).isoformat()
+
+        for d in to_register:
+            tag_value = {"score": d["finalScore"], "addedAt": now_dt.isoformat(),
+                         "expiresAt": expires_at, "stuckLimitUp": d["stuckLimitUp"]}
+            try:
+                ok = investment_db.auto_register_or_tag_watchlist_item(
+                    database_url, user_id, d["code"], "JP", "AUTO_MOMENTUM_DAY_CURRENT", tag_value,
+                    item_fields={"name": d["name"], "sector": d["sector"], "source": "auto_momentum_day"})
+                investment_db.remove_auto_tag_key(database_url, user_id, d["code"], "JP", "AUTO_MOMENTUM_DAY_SEEN")
+            except Exception as e:
+                print("  MOMENTUM DAY自動登録（CURRENT）失敗", d["code"], e)
+                ok = False
+            if ok:
+                registered.append(d)
+
+        for code in old_current - new_current_codes:
+            try:
+                investment_db.auto_register_or_tag_watchlist_item(
+                    database_url, user_id, code, "JP", "AUTO_MOMENTUM_DAY_SEEN",
+                    {"addedAt": now_dt.isoformat(), "expiresAt": expires_at})
+                investment_db.remove_auto_tag_key(database_url, user_id, code, "JP", "AUTO_MOMENTUM_DAY_CURRENT")
+                demoted.append(code)
+            except Exception as e:
+                print("  MOMENTUM DAY降格（SEEN化）失敗", code, e)
     for d in details:
         d.pop("row", None)  # rowは選定計算専用の内部情報。レスポンスには含めない
     return {
@@ -1963,6 +1986,7 @@ def run_momentum_day_scan(database_url, user_id, force=False):
         "stage1DurationSec": stage1["durationSec"], "stage1RequestCount": stage1["requestCount"],
         "stage1CacheAgeSec": round(time.time() - stage1["builtAt"], 1) if stage1["builtAt"] else None,
         "stage1CandidateCount": len(candidates),
+        "demotedToSeenCount": len(demoted), "demotedToSeen": demoted,
         "stage2EvaluatedCount": len(details),
         "stage2DurationSec": stage2_duration,
         "registeredCount": len(registered),
