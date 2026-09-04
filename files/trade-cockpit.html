@@ -1331,6 +1331,38 @@ const TRADE_CANDIDATE_STATUS_OPTIONS=[
   {value:"BUY_CANDIDATE",label:"買い候補"},{value:"SKIP",label:"見送り"},
 ];
 
+// v3-6 Step5（銘柄分析画面のMarket要約）：Market→Sector→Stock→Entry→Riskの最初のMarketを、
+// カードを増やさずコンパクトな1行で示す。指数を全部並べず、その銘柄のセクター/テーマに
+// 関係が深いものだけに絞る（日経・USDJPYは日本株共通の基本セットとして常に含める）。
+// METRICS（日次モニターと共通の指数定義）・s.metrics（既に30秒おきに自動更新済みの値）を
+// そのまま使い、新規の取得処理は追加しない。TOPIX・TOPIX銀行業・BDI等、現状METRICSに
+// 存在しない指数は対象外（無料範囲・既存データのみという方針のため）。
+function relevantMarketMetricKeys(w){
+  const text=(w.sector||"")+" "+(w.theme||"");
+  const has=(s)=>text.includes(s);
+  const keys=["nikkei","usdjpy"];
+  if(has("銀行")||has("保険")||has("証券"))keys.push("us10y");
+  else if(has("海運")||has("空運")||has("鉱業")||has("石油"))keys.push("wti");
+  else if(has("電気機器")||has("精密機器")||has("情報・通信"))keys.push("sox","nasdaq");
+  else if(has("非鉄金属")||has("金属製品")||has("ガラス・土石"))keys.push("copper");
+  else keys.push("nasdaq");
+  return [...new Set(keys)];
+}
+function RelevantMarketSummary({w,metrics}){
+  const keys=relevantMarketMetricKeys(w);
+  const rows=keys.map(k=>METRICS.find(m=>m.key===k)).filter(Boolean);
+  if(!rows.length)return null;
+  return <div style={{display:"flex",flexWrap:"wrap",gap:12,fontSize:11.5,color:"var(--inkSoft)",marginBottom:8}}
+    title="この銘柄のセクター/テーマに関係が深い指数だけを表示（日次モニターと同じ既存データ）">
+    {rows.map(m=>{
+      const v=metrics?.[m.key];const t=v?num(v.t):null,p=v?num(v.p):null;
+      const pct=(t!=null&&p!=null&&p)?(t-p)/p*100:null;
+      return <span key={m.key} className="mono">{m.label} {t!=null?t.toFixed(m.dp):"—"}
+        {pct!=null && <span style={{color:pct>0?"var(--up)":pct<0?"var(--down)":"var(--inkSoft)"}}> {pct>0?"+":""}{pct.toFixed(2)}%</span>}
+      </span>;})}
+  </div>;
+}
+
 // 銘柄分析カード用の総合判断表示（Trade Cockpit v2 Phase2・24番）。server.py analyze_stock()の
 // assessmentをそのまま表示するだけ（AI不使用・ルールベースの結果を可視化するのみ）。
 // 色は既存entryChecklist/avoidChecklistの慣習に合わせる（--up=赤=好材料寄り、--down=緑=警告寄り。
@@ -4249,6 +4281,7 @@ function App(){
                               　/　売 {s.stockQuotes[w.code]?.ask!=null?num(s.stockQuotes[w.code].ask).toLocaleString():"—"}
                             </div>}
                           {a.marketEnv && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>{a.marketEnv}</div>}
+                          <RelevantMarketSummary w={w} metrics={s.metrics}/>
                           {/* ===== Trade Cockpit v2 Phase2：総合判断・8軸・Entry Conditions・Falling Knife/Chase Risk ===== */}
                           {a.assessment && enr && <AssessmentCard assessment={a.assessment} marginBadge={a.tradeRules?.marginBadge} marginRatio={a.tradeRules?.marginRatio} enr={enr} sectorRank={sectorRankMap.get(w.sector)}/>}
                           {enr && <StatusReasonPanel enr={enr} a={a}/>}
