@@ -2298,6 +2298,24 @@ def _auto_rs_score(row, nikkei_chg):
     return round(score, 1)
 
 
+# 2026-09-05（ユーザー指示：RS RESILIENCEフラグ）：「通常の強い銘柄」と「地合いが悪い日に特に
+# 強い銘柄」を区別するための内部フラグ。AUTO_RS_SCOREの計算・配点は一切変更せず、既に
+# _auto_rs_score()内にある地合い耐性ボーナスの判定条件（日経<=-0.3%かつ銘柄が-0.5%以上を
+# 維持）をそのまま流用して真偽値化するだけ（新しい判定基準は増やさない）。STRONGはより厳しい
+# 条件（日経<=-1%でも銘柄自体がプラス）。将来の「地合い悪化日の候補抽出」「翌日継続率」等の
+# 検証に使えるよう、タグにそのまま保存する（今回はバックテスト機能自体は作らない）。
+def _rs_resilience_tier(row, nikkei_chg):
+    chg = row.get("changePct")
+    market_rs = row.get("marketRS")
+    if nikkei_chg is None or chg is None:
+        return None
+    if nikkei_chg <= -1.0 and chg > 0:
+        return "STRONG"
+    if nikkei_chg <= -0.3 and chg >= -0.5 and market_rs is not None and market_rs >= 2:
+        return "NORMAL"
+    return None
+
+
 def select_auto_rs_candidates(stage1):
     nikkei_chg = stage1.get("nikkeiChangePct")
     scored = []
@@ -2315,11 +2333,13 @@ def run_auto_rs_scan(database_url, user_id, force=False):
     「AUTO_RS_SEEN」へ降格。Stage2（追加の日足履歴取得）を持たないため、他の2エンジンより
     高速・低負荷。"""
     stage1 = run_momentum_stage1(force=force)
+    nikkei_chg = stage1.get("nikkeiChangePct")
     scored = select_auto_rs_candidates(stage1)
     details = [{"code": code, "name": row.get("name"), "sector": row.get("sector"),
                 "changePct": row.get("changePct"), "highRetention": row.get("highRetention"),
                 "marketRS": row.get("marketRS"), "sectorRS": row.get("sectorRS"),
-                "turnover": row.get("turnover"), "finalScore": s}
+                "turnover": row.get("turnover"), "finalScore": s,
+                "resilience": _rs_resilience_tier(row, nikkei_chg)}
                for s, code, row in scored]
     to_register = [d for d in details if d["finalScore"] >= AUTO_RS_SCORE_THRESHOLD][:AUTO_RS_MAX_REGISTER]
 
@@ -2331,7 +2351,8 @@ def run_auto_rs_scan(database_url, user_id, force=False):
         expires_at = (now_dt + datetime.timedelta(days=AUTO_RS_TAG_EXPIRE_DAYS)).isoformat()
 
         for d in to_register:
-            tag_value = {"score": d["finalScore"], "addedAt": now_dt.isoformat(), "expiresAt": expires_at}
+            tag_value = {"score": d["finalScore"], "addedAt": now_dt.isoformat(), "expiresAt": expires_at,
+                         "resilience": d["resilience"]}
             try:
                 ok = investment_db.auto_register_or_tag_watchlist_item(
                     database_url, user_id, d["code"], "JP", "AUTO_RS_CURRENT", tag_value,
@@ -2352,6 +2373,155 @@ def run_auto_rs_scan(database_url, user_id, force=False):
                 demoted.append(code)
             except Exception as e:
                 print("  AUTO_RS降格（SEEN化）失敗", code, e)
+    return {
+        "stage1CodesScanned": stage1["codesScanned"], "stage1PricesReturned": stage1["pricesReturned"],
+        "stage1DurationSec": stage1["durationSec"], "stage1RequestCount": stage1["requestCount"],
+        "stage1CacheAgeSec": round(time.time() - stage1["builtAt"], 1) if stage1["builtAt"] else None,
+        "stage1BuiltAtJst": _jst_time_str(stage1["builtAt"]),
+        "stage1ScanFailed": stage1.get("scanFailed", False), "stage1UsedStaleCache": stage1.get("usedStaleCache", False),
+        "candidateCount": len(details),
+        "demotedToSeenCount": len(demoted), "demotedToSeen": demoted,
+        "registeredCount": len(registered),
+        "registered": registered,
+        "allCandidates": details,
+    }
+
+
+# ============================================================
+# v3-9続き：🏆 AUTO_SECTOR_LEADER
+# 同じStage1（run_momentum_stage1、キャッシュ共有）を再利用。Stage2なし＝AUTO_RSと同じく
+# 軽量版（セクター集計はStage1の結果を再集計するだけで、新規API呼び出しは発生しない）。
+# 【設計原則】「強いセクターにいる」だけでは高評価にしない。セクター順位・セクター対市場は
+# あくまで舞台の強さで、主役はrow["sectorRS"]（銘柄自身のセクター内での強さ＝「セクターの中で
+# さらに強い」）。売買代金の配点をわざと小さくし、「大型株で売買代金が大きいだけ」では
+# 高評価にならないようにする（ユーザー指示）。AUTO_RSとの重複は許容（むしろ高評価に値する
+# 組み合わせ、UIで両方のバッジが並ぶ設計）。
+# ============================================================
+SECTOR_LEADER_SCORE_THRESHOLD = 55  # 実データを見て調整する前提の初期値（他エンジンと同じ運用）
+SECTOR_LEADER_MAX_REGISTER = 15
+SECTOR_LEADER_TAG_EXPIRE_DAYS = 2
+
+
+def _compute_sector_stats(stage1, nikkei_chg):
+    """Stage1の全銘柄行からセクター別の当日平均騰落率を再集計し、順位付けする
+    （run_momentum_stage1内部のsector_avg計算と同じ考え方だが、キャッシュ構造は変更せず
+    このエンジン内で独立して再計算する＝他エンジンへの影響を避ける）。新規API呼び出しなし。"""
+    sums, counts = {}, {}
+    for row in stage1["rows"].values():
+        chg = row.get("changePct")
+        sector = row.get("sector")
+        if chg is not None and sector:
+            sums[sector] = sums.get(sector, 0.0) + chg
+            counts[sector] = counts.get(sector, 0) + 1
+    avg = {s: sums[s] / counts[s] for s in sums}
+    ranked = sorted(avg.items(), key=lambda x: -x[1])
+    rank = {sector: i + 1 for i, (sector, _) in enumerate(ranked)}
+    vs_market = {s: (avg[s] - nikkei_chg) if nikkei_chg is not None else None for s in avg}
+    return {"avg": avg, "rank": rank, "total": len(ranked), "vsMarket": vs_market}
+
+
+def _sector_rank_points(rank, total_sectors):
+    """セクター順位を得点化（上位3セクターで満点25点、15位以降は0点、間は線形）。"""
+    if rank is None:
+        return 0.0
+    if rank <= 3:
+        return 25.0
+    if rank >= 15:
+        return 0.0
+    return 25.0 * (15 - rank) / (15 - 3)
+
+
+def _sector_leader_score(row, sector_stats):
+    """SECTOR_LEADER_SCORE：セクター内で既に劣後している銘柄（sectorRS<0）はそもそも候補外。
+    大幅下落中・高値から10%以上崩れている銘柄も除外（他エンジンと同じFalling Knife簡易ガード）。
+      銘柄の対セクター（sectorRS）最大35点：主役。「セクターの中でさらに強い」を最重視
+      セクター順位          最大25点：強いセクターにいることの評価（ただし主役ではない）
+      セクター対市場        最大20点：セクター全体が市場よりどれだけ強いか
+      高値維持率            最大12点：一過性の急騰でないことの確認
+      売買代金              最大8点のみ：意図的に小さく配点（大型株優遇を避ける）。
+      最後に_liquidity_multiplierを乗算（極端に薄い銘柄は除外方向へ）。"""
+    sector = row.get("sector")
+    if not sector or sector not in sector_stats["avg"]:
+        return None
+    sector_rs = row.get("sectorRS")
+    if sector_rs is None or sector_rs < 0:
+        return None
+    chg = row.get("changePct")
+    hr = row.get("highRetention")
+    if chg is not None and chg <= -3:
+        return None
+    if hr is not None and hr < 0.90:
+        return None
+    rank = sector_stats["rank"].get(sector)
+    sector_vs_market = sector_stats["vsMarket"].get(sector)
+    score = 0.0
+    score += _scale_score(sector_rs, 0, 4, 35)
+    score += _sector_rank_points(rank, sector_stats["total"])
+    score += _scale_score(sector_vs_market, 0, 2, 20)
+    score += _scale_score(hr, 0.90, 0.99, 12)
+    score += _scale_score(row.get("turnover"), 1e9, 1e10, 8)
+    score *= _liquidity_multiplier(row.get("turnover"))
+    return round(score, 1), rank, sector_stats["total"], sector_vs_market, sector_stats["avg"].get(sector)
+
+
+def select_sector_leader_candidates(stage1, sector_stats):
+    scored = []
+    for code, row in stage1["rows"].items():
+        result = _sector_leader_score(row, sector_stats)
+        if result is not None:
+            s, rank, total, sector_vs_market, sector_avg = result
+            scored.append((s, code, row, rank, total, sector_vs_market, sector_avg))
+    scored.sort(key=lambda x: -x[0])
+    return scored
+
+
+def run_sector_leader_scan(database_url, user_id, force=False):
+    """Stage1（キャッシュ共有）→セクター別集計→SECTOR_LEADER_SCORE算出→閾値を満たした上位
+    SECTOR_LEADER_MAX_REGISTER件を「AUTO_SECTOR_LEADER_CURRENT」として登録、新TOP外に落ちた
+    旧CURRENTは「AUTO_SECTOR_LEADER_SEEN」へ降格。AUTO_RSと同じくStage2を持たない軽量版。"""
+    stage1 = run_momentum_stage1(force=force)
+    nikkei_chg = stage1.get("nikkeiChangePct")
+    sector_stats = _compute_sector_stats(stage1, nikkei_chg)
+    scored = select_sector_leader_candidates(stage1, sector_stats)
+    details = [{"code": code, "name": row.get("name"), "sector": row.get("sector"),
+                "changePct": row.get("changePct"), "highRetention": row.get("highRetention"),
+                "marketRS": row.get("marketRS"), "sectorRS": row.get("sectorRS"),
+                "turnover": row.get("turnover"), "finalScore": s,
+                "sectorRank": rank, "sectorTotal": total, "sectorVsMarket": sector_vs_market,
+                "sectorAvgPct": sector_avg}
+               for s, code, row, rank, total, sector_vs_market, sector_avg in scored]
+    to_register = [d for d in details if d["finalScore"] >= SECTOR_LEADER_SCORE_THRESHOLD][:SECTOR_LEADER_MAX_REGISTER]
+
+    registered, demoted = [], []
+    if database_url and investment_db is not None:
+        old_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_SECTOR_LEADER_CURRENT", market="JP")
+        new_current_codes = {d["code"] for d in to_register}
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        expires_at = (now_dt + datetime.timedelta(days=SECTOR_LEADER_TAG_EXPIRE_DAYS)).isoformat()
+
+        for d in to_register:
+            tag_value = {"score": d["finalScore"], "sectorRank": d["sectorRank"], "sectorTotal": d["sectorTotal"],
+                         "addedAt": now_dt.isoformat(), "expiresAt": expires_at}
+            try:
+                ok = investment_db.auto_register_or_tag_watchlist_item(
+                    database_url, user_id, d["code"], "JP", "AUTO_SECTOR_LEADER_CURRENT", tag_value,
+                    item_fields={"name": d["name"], "sector": d["sector"], "source": "auto_sector_leader"})
+                investment_db.remove_auto_tag_key(database_url, user_id, d["code"], "JP", "AUTO_SECTOR_LEADER_SEEN")
+            except Exception as e:
+                print("  AUTO_SECTOR_LEADER登録（CURRENT）失敗", d["code"], e)
+                ok = False
+            if ok:
+                registered.append(d)
+
+        for code in old_current - new_current_codes:
+            try:
+                investment_db.auto_register_or_tag_watchlist_item(
+                    database_url, user_id, code, "JP", "AUTO_SECTOR_LEADER_SEEN",
+                    {"addedAt": now_dt.isoformat(), "expiresAt": expires_at})
+                investment_db.remove_auto_tag_key(database_url, user_id, code, "JP", "AUTO_SECTOR_LEADER_CURRENT")
+                demoted.append(code)
+            except Exception as e:
+                print("  AUTO_SECTOR_LEADER降格（SEEN化）失敗", code, e)
     return {
         "stage1CodesScanned": stage1["codesScanned"], "stage1PricesReturned": stage1["pricesReturned"],
         "stage1DurationSec": stage1["durationSec"], "stage1RequestCount": stage1["requestCount"],
@@ -3635,6 +3805,16 @@ class Handler(SimpleHTTPRequestHandler):
             result = run_auto_rs_scan(DATABASE_URL, self.current_user, force=force)
             print(f"  Stage1 {result['stage1CodesScanned']}銘柄スキャン（{result['stage1DurationSec']}秒）→ "
                   f"RS候補{result['candidateCount']}件→自動登録{result['registeredCount']}件"
+                  f"（降格{result['demotedToSeenCount']}件）")
+            self._send_json(result)
+        elif self.path.startswith("/api/sector-leader-scan"):
+            # v3-9続き：🏆 AUTO_SECTOR_LEADER。Stage1共有・Stage2なし（AUTO_RSと同じく軽量）。
+            qs = urllib.parse.urlparse(self.path).query
+            force = urllib.parse.parse_qs(qs).get("force", ["0"])[0] == "1"
+            print(f"[取得] AUTO_SECTOR_LEADERスキャン開始（force={force}）…")
+            result = run_sector_leader_scan(DATABASE_URL, self.current_user, force=force)
+            print(f"  Stage1 {result['stage1CodesScanned']}銘柄スキャン（{result['stage1DurationSec']}秒）→ "
+                  f"候補{result['candidateCount']}件→自動登録{result['registeredCount']}件"
                   f"（降格{result['demotedToSeenCount']}件）")
             self._send_json(result)
         elif self.path.startswith("/api/trade-candidates"):
