@@ -479,6 +479,30 @@ CREATE TABLE IF NOT EXISTS expert_views (
     UNIQUE (user_id, expert_name, source_title, published_at)
 );
 CREATE INDEX IF NOT EXISTS idx_expert_views_user_date ON expert_views(user_id, published_at);
+
+-- v3-9続き（2026-09-05・PHASE 6 DAILY CHATGPT JSON IMPORT）：既存chatgpt_imports（2026-09-02
+-- 新設、投資ログ用のdate/market/watchlist/decisions/rule_updates形式＝kind='TRADING_LOG'）とは
+-- 別の用途で、日々のChatGPT⇄Trade Cockpit相談の要約（date/summary/trading_observations/
+-- app_changes/bugs_or_risks/new_rules_or_preferences/updates/claude_code_instruction形式）を
+-- 保存する。ユーザー指定により「既存テーブルを確認し、流用可能なら新テーブルを作らず拡張」
+-- した結果、新テーブルは作らずkind列で種別を分け、この形式用の列だけ追加する。
+-- payload_hashのUNIQUE制約（既存）をそのまま重複防止に使う＝同じ日でも内容が違えば
+-- 別レコードとして保存できる（ハッシュが変わるため）。
+-- updates=[]ならapply_status='NO_UPDATES'で確定し、investment_rules等には一切書き込まない
+-- （Import と Apply を明確に分離する設計）。
+ALTER TABLE chatgpt_imports ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'TRADING_LOG';
+ALTER TABLE chatgpt_imports ADD COLUMN IF NOT EXISTS summary JSONB;
+ALTER TABLE chatgpt_imports ADD COLUMN IF NOT EXISTS trading_observations JSONB;
+ALTER TABLE chatgpt_imports ADD COLUMN IF NOT EXISTS app_changes JSONB;
+ALTER TABLE chatgpt_imports ADD COLUMN IF NOT EXISTS bugs_or_risks JSONB;
+ALTER TABLE chatgpt_imports ADD COLUMN IF NOT EXISTS new_rules_or_preferences JSONB;
+ALTER TABLE chatgpt_imports ADD COLUMN IF NOT EXISTS updates JSONB;
+ALTER TABLE chatgpt_imports ADD COLUMN IF NOT EXISTS claude_code_instruction TEXT;
+-- apply_status候補：IMPORTED|NO_UPDATES|PREVIEWED|APPLIED|PARTIAL|FAILED
+ALTER TABLE chatgpt_imports ADD COLUMN IF NOT EXISTS apply_status TEXT;
+ALTER TABLE chatgpt_imports ADD COLUMN IF NOT EXISTS apply_result JSONB;
+ALTER TABLE chatgpt_imports ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_chatgpt_imports_kind ON chatgpt_imports(user_id, kind, imported_at DESC);
 """
 
 
@@ -1012,6 +1036,293 @@ def save_chatgpt_import(database_url, user_id, payload, force=False):
         n_rules += 1
 
     return {"dailyLogId": log_id, "importId": import_id, "judgments": n_judgments, "rulesAdded": n_rules}
+
+
+# ---- ChatGPT日次JSON（2026-09-05新規、PHASE 6 DAILY CHATGPT JSON IMPORT） ----
+# 上のsave_chatgpt_import（投資ログ形式・kind='TRADING_LOG'）とは別の用途。ChatGPTとの日々の
+# 投資・Trade Cockpit相談内容の要約（date/summary/trading_observations/app_changes/
+# bugs_or_risks/new_rules_or_preferences/updates/claude_code_instruction）をchatgpt_imports
+# テーブルにkind='DAILY_DIGEST'として保存する。「Import（履歴保存）」と「Apply（差分適用）」を
+# 明確に分離し、updates=[]の場合はinvestment_rules等に一切書き込まない
+# （ユーザー指定の最重要ルール）。
+
+# SWING -10% hard stop等、日次JSONだけで簡単に弱体化・削除されては困る重要ルールのrule_code。
+# 対象になった場合はWARNING_PROTECTEDとして扱い、Apply Updatesでは自動適用しない
+# （マイルールタブから手動で変更してもらう）。CURRENT/SEEN・Stage1共有キャッシュ・
+# enrichWatchRow() SSoT・Primary/Action分離等、investment_rulesの行として存在しない
+# アーキテクチャ上の不変条件は、そもそもtargetが"investment_rules."で始まらない限り
+# UNSUPPORTED_TARGETとして自動適用の対象外になる（コード側の保護は別途このリストに頼らない）。
+PROTECTED_RULE_CODES = {"SWING_STOP_LOSS"}
+
+
+def validate_daily_digest_payload(payload):
+    """日次JSON貼り付けを解析したdictを検証し、エラーメッセージのリストを返す（空なら合格）。
+    サーバー側検証が最終防衛線（validate_chatgpt_payloadと同じ位置付け）。"""
+    errors = []
+    if not isinstance(payload, dict):
+        return ["JSONのトップレベルはオブジェクトである必要があります"]
+    date = payload.get("date")
+    if not date or not isinstance(date, str) or not _DATE_RE.match(date):
+        errors.append("date は YYYY-MM-DD 形式の文字列で必須です")
+    for key in ("summary", "trading_observations", "app_changes", "bugs_or_risks",
+                "new_rules_or_preferences", "updates"):
+        v = payload.get(key)
+        if v is not None and not isinstance(v, list):
+            errors.append(f"{key} は配列である必要があります")
+    instruction = payload.get("claude_code_instruction")
+    if instruction is not None and not isinstance(instruction, str):
+        errors.append("claude_code_instruction は文字列である必要があります")
+    updates = payload.get("updates")
+    if isinstance(updates, list):
+        for i, u in enumerate(updates):
+            if not isinstance(u, dict):
+                errors.append(f"updates[{i}] はオブジェクトである必要があります")
+                continue
+            if not u.get("target"):
+                errors.append(f"updates[{i}] に target がありません")
+            ct = u.get("change_type")
+            if ct not in ("add", "update", "remove"):
+                errors.append(f"updates[{i}].change_type は add|update|remove のいずれかである必要があります（値: {ct}）")
+    return errors
+
+
+def find_daily_digest_duplicate(database_url, user_id, payload):
+    """同一内容（payload_hash一致）の取り込み済みDAILY_DIGESTレコードがあれば返す（無ければNone）。
+    同じdateでも内容が違えばhashが変わるため別レコードとして保存できる（修正版JSONの許容）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    h = _payload_hash(payload)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id, import_date, imported_at FROM chatgpt_imports "
+                "WHERE user_id = %s AND kind = 'DAILY_DIGEST' AND payload_hash = %s",
+                [user_id, h],
+            )
+            row = cur.fetchone()
+            return _row_to_json(row) if row else None
+
+
+def save_daily_digest_import(database_url, user_id, payload, force=False):
+    """検証済み（validate_daily_digest_payloadでエラー0件確認済み）のpayloadをchatgpt_importsへ
+    kind='DAILY_DIGEST'として保存するだけ（investment_rules等への書き込みは一切行わない＝
+    Applyは別関数で明示的に呼ぶまで実行しない）。
+    戻り値: {"error": ...} または {"importId":.., "applyStatus":.., "updatesCount":N}。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return {"error": "DB未設定（DATABASE_URLが未設定、またはpsycopg未インストール）"}
+    dup = find_daily_digest_duplicate(database_url, user_id, payload)
+    if dup and not force:
+        return {"error": f"同じ内容のログは既に取り込み済みです（{dup['import_date']}に取り込み、import_id {dup['id']}）"}
+    updates = payload.get("updates") or []
+    apply_status = "NO_UPDATES" if not updates else "IMPORTED"
+    h = _payload_hash(payload)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO chatgpt_imports (user_id, import_date, payload_hash, raw_payload, kind, "
+                "summary, trading_observations, app_changes, bugs_or_risks, new_rules_or_preferences, "
+                "updates, claude_code_instruction, apply_status) "
+                "VALUES (%s, %s, %s, %s::jsonb, 'DAILY_DIGEST', %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, "
+                "%s::jsonb, %s::jsonb, %s, %s) RETURNING id",
+                [
+                    user_id, payload.get("date"), h, json.dumps(payload, ensure_ascii=False),
+                    json.dumps(payload.get("summary") or [], ensure_ascii=False),
+                    json.dumps(payload.get("trading_observations") or [], ensure_ascii=False),
+                    json.dumps(payload.get("app_changes") or [], ensure_ascii=False),
+                    json.dumps(payload.get("bugs_or_risks") or [], ensure_ascii=False),
+                    json.dumps(payload.get("new_rules_or_preferences") or [], ensure_ascii=False),
+                    json.dumps(updates, ensure_ascii=False),
+                    payload.get("claude_code_instruction") or "",
+                    apply_status,
+                ],
+            )
+            import_id = cur.fetchone()[0]
+        conn.commit()
+    return {"importId": import_id, "applyStatus": apply_status, "updatesCount": len(updates)}
+
+
+def list_daily_digest_imports(database_url, user_id, limit=30):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id, import_date, imported_at, apply_status, applied_at, "
+                "summary, trading_observations, app_changes, bugs_or_risks, new_rules_or_preferences, "
+                "updates, claude_code_instruction FROM chatgpt_imports "
+                "WHERE user_id = %s AND kind = 'DAILY_DIGEST' ORDER BY imported_at DESC LIMIT %s",
+                [user_id, limit],
+            )
+            return [_row_to_json(r) for r in cur.fetchall()]
+
+
+def get_daily_digest_import(database_url, user_id, import_id):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM chatgpt_imports WHERE user_id = %s AND id = %s AND kind = 'DAILY_DIGEST'",
+                [user_id, import_id],
+            )
+            row = cur.fetchone()
+            return _row_to_json(row) if row else None
+
+
+def _rules_by_code(database_url, user_id):
+    by_code = {}
+    for r in list_rules(database_url, user_id):
+        rc = r.get("rule_code")
+        if rc:
+            by_code[rc.upper()] = r
+    return by_code
+
+
+def _diff_one_update(rules_by_code, update):
+    """updates[]の1件を、現在のinvestment_rulesと比較して差分ステータスを判定する（DBへの
+    書き込みは一切行わない）。status候補：NO_CHANGE（既存値と同じ）／ADD_CANDIDATE（targetが
+    存在しない）／DIFF（実際に差分があり適用可能）／WARNING_PROTECTED（保護ルールへの
+    update/remove、自動適用しない）／UNSUPPORTED_TARGET（investment_rules.*以外は自動適用
+    できない＝Claude Codeへの変更指示として手動対応）。"""
+    update = update or {}
+    target = update.get("target") or ""
+    change_type = update.get("change_type")
+    result = {"target": target, "change_type": change_type, "reason": update.get("reason"),
+              "instruction": update.get("instruction")}
+    if not target.startswith("investment_rules."):
+        result["status"] = "UNSUPPORTED_TARGET"
+        result["note"] = "investment_rules.<rule_code> 形式以外は自動適用できません（claude_code_instructionとして手動対応してください）"
+        return result
+    rule_code = target.split(".", 1)[1].strip().upper()
+    result["rule_code"] = rule_code
+    current = rules_by_code.get(rule_code)
+    result["current"] = ({"text": current.get("text"), "value": current.get("value"),
+                           "unit": current.get("unit"), "priority": current.get("priority")}
+                          if current else None)
+    proposed_text = update.get("text", update.get("instruction"))
+    proposed_value = update.get("value")
+    result["proposed"] = {
+        "text": proposed_text,
+        "value": proposed_value if proposed_value is not None else (current.get("value") if current else None),
+        "unit": update.get("unit", current.get("unit") if current else None),
+        "priority": update.get("priority", current.get("priority") if current else None),
+    }
+    protected = rule_code in PROTECTED_RULE_CODES
+
+    if change_type == "remove":
+        if not current:
+            result["status"] = "NO_CHANGE"
+            result["note"] = "対象が存在しないため削除不要"
+        elif protected:
+            result["status"] = "WARNING_PROTECTED"
+            result["note"] = "保護ルールのため自動適用しません。必要ならマイルールタブから手動で削除してください"
+        else:
+            result["status"] = "DIFF"
+        return result
+
+    if not current:
+        result["status"] = "ADD_CANDIDATE"
+        return result
+
+    # 実際の現在値との比較：valueが指定されていればvalueで比較（数値ルールの「本当の現在値」）、
+    # 無指定ならtext比較（自由記述ルール）。「ChatGPT JSONにupdateがある」だけでは更新しない。
+    if proposed_value is not None and current.get("value") is not None:
+        same = float(current["value"]) == float(proposed_value)
+    elif proposed_value is not None:
+        same = False
+    else:
+        same = (current.get("text") or "").strip() == (proposed_text or "").strip()
+
+    if same:
+        result["status"] = "NO_CHANGE"
+    elif protected:
+        result["status"] = "WARNING_PROTECTED"
+        result["note"] = "保護ルールのため自動適用しません。必要ならマイルールタブから手動で変更してください"
+    else:
+        result["status"] = "DIFF"
+    return result
+
+
+def preview_daily_digest_updates(database_url, user_id, import_id):
+    """指定importのupdates配列について、現在のinvestment_rulesと比較した差分プレビューを返す
+    （DBへの書き込みは一切行わない）。import_idが見つからなければNone。"""
+    row = get_daily_digest_import(database_url, user_id, import_id)
+    if row is None:
+        return None
+    updates = row.get("updates") or []
+    rules_by_code = _rules_by_code(database_url, user_id)
+    return [_diff_one_update(rules_by_code, u) for u in updates]
+
+
+def apply_daily_digest_updates(database_url, user_id, import_id):
+    """importに保存されたupdatesのうち、DIFF／ADD_CANDIDATEのものだけをinvestment_rulesへ
+    適用する。NO_CHANGE・WARNING_PROTECTED・UNSUPPORTED_TARGETは自動適用しない（安全側）。
+    クライアント側の古いプレビューを信用せず、適用直前に必ず差分判定を再計算する。
+    戻り値: {"error": ...} または {"results":[...], "applyStatus":..}。"""
+    row = get_daily_digest_import(database_url, user_id, import_id)
+    if row is None:
+        return {"error": "指定されたimportが見つかりません"}
+    updates = row.get("updates") or []
+    if not updates:
+        return {"results": [], "applyStatus": "NO_UPDATES"}
+
+    rules_by_code = _rules_by_code(database_url, user_id)
+    diffs = [_diff_one_update(rules_by_code, u) for u in updates]
+    applied = failed = 0
+    for d in diffs:
+        status = d["status"]
+        if status not in ("DIFF", "ADD_CANDIDATE"):
+            d["outcome"] = "SKIPPED"
+            continue
+        try:
+            rc = d["rule_code"]
+            current = rules_by_code.get(rc)
+            if d["change_type"] == "remove" and current:
+                delete_rule(database_url, user_id, current["id"])
+            else:
+                rid = current["id"] if current else ("structured-" + rc.lower())
+                upsert_rule(database_url, user_id, {
+                    "id": rid, "text": d["proposed"]["text"], "active": True,
+                    "createdAt": (current or {}).get("createdAt") or datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "rule_code": rc, "value": d["proposed"]["value"], "unit": d["proposed"]["unit"],
+                    "priority": d["proposed"]["priority"],
+                })
+            d["outcome"] = "APPLIED"
+            applied += 1
+        except Exception as e:
+            d["outcome"] = "FAILED"
+            d["error"] = str(e)
+            failed += 1
+
+    no_change_only = all(d["status"] == "NO_CHANGE" for d in diffs)
+    if failed and applied:
+        overall = "PARTIAL"
+    elif failed:
+        overall = "FAILED"
+    elif applied:
+        overall = "APPLIED"
+    elif no_change_only:
+        overall = "NO_UPDATES"
+    else:
+        # 全件WARNING_PROTECTED／UNSUPPORTED_TARGETで意図的にSKIPした場合。「何も変更する
+        # 必要が無かった」わけではなく「要対応だが自動適用しなかった」ことを区別するため
+        # NO_UPDATESではなくPARTIALとして報告する。
+        overall = "PARTIAL"
+
+    pool = _get_pool(database_url)
+    if pool is not None:
+        with pool.connection() as conn:
+            conn.execute(
+                "UPDATE chatgpt_imports SET apply_status = %s, apply_result = %s::jsonb, applied_at = now() "
+                "WHERE user_id = %s AND id = %s",
+                [overall, json.dumps(diffs, ensure_ascii=False), user_id, import_id],
+            )
+            conn.commit()
+    return {"results": diffs, "applyStatus": overall}
 
 
 # ---- 一括移行（旧localStorageのjournal・myRulesをまとめて取り込む） ----

@@ -3639,6 +3639,233 @@ function ChatGptImportPanel({journal,activeRules}){
   </div>;
 }
 
+// v3-9続き（2026-09-05・PHASE 6 DAILY CHATGPT JSON IMPORT）：上のChatGptImportPanel（投資ログ
+// 形式・kind='TRADING_LOG'）とは別の用途。ChatGPTとの日々のTrade Cockpit相談内容の要約
+// （summary/trading_observations/app_changes/bugs_or_risks/new_rules_or_preferences/updates/
+// claude_code_instruction）を貼り付けてimportする。Import（履歴保存）とApply Updates（差分の
+//明示適用）を分離し、updates=[]の場合はinvestment_rules等に一切書き込まない
+// （ユーザー指定の最重要ルール）。
+const CHATGPT_DAILY_SAMPLE=`{
+  "date": "${(()=>{const d=new Date();return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");})()}",
+  "summary": ["地合いは軟調、押し目待ちの銘柄が多い"],
+  "trading_observations": ["半導体セクターは決算前で様子見ムード"],
+  "app_changes": [],
+  "bugs_or_risks": [],
+  "new_rules_or_preferences": [],
+  "updates": [],
+  "claude_code_instruction": ""
+}`;
+function validateDailyDigestPayload(obj){
+  const errs=[];
+  if(typeof obj!=="object"||obj===null||Array.isArray(obj)){errs.push("JSONのトップレベルはオブジェクトである必要があります");return errs;}
+  if(!obj.date||!/^\d{4}-\d{2}-\d{2}$/.test(obj.date))errs.push("date は YYYY-MM-DD 形式の文字列で必須です");
+  ["summary","trading_observations","app_changes","bugs_or_risks","new_rules_or_preferences","updates"].forEach(k=>{
+    if(obj[k]!=null&&!Array.isArray(obj[k]))errs.push(`${k} は配列である必要があります`);
+  });
+  if(obj.claude_code_instruction!=null&&typeof obj.claude_code_instruction!=="string")errs.push("claude_code_instruction は文字列である必要があります");
+  (obj.updates||[]).forEach((u,i)=>{
+    if(!u||typeof u!=="object"){errs.push(`updates[${i}] はオブジェクトである必要があります`);return;}
+    if(!u.target)errs.push(`updates[${i}] に target がありません`);
+    if(!["add","update","remove"].includes(u.change_type))errs.push(`updates[${i}].change_type は add|update|remove のいずれかである必要があります（値: ${u.change_type}）`);
+  });
+  return errs;
+}
+const DIFF_STATUS_META={
+  NO_CHANGE:{label:"差分なし",color:"var(--inkFaint)"},
+  ADD_CANDIDATE:{label:"ADD候補",color:"var(--accent)"},
+  DIFF:{label:"差分あり",color:"var(--up)"},
+  WARNING_PROTECTED:{label:"⚠ 保護ルール",color:"var(--down)"},
+  UNSUPPORTED_TARGET:{label:"手動対応が必要",color:"var(--inkSoft)"},
+};
+function ChatGptDailyImportPanel(){
+  const [rawText,setRawText]=useState("");
+  const [parsed,setParsed]=useState(null);
+  const [parseErrors,setParseErrors]=useState([]);
+  const [importing,setImporting]=useState(false);
+  const [importMsg,setImportMsg]=useState("");
+  const [dupInfo,setDupInfo]=useState(null);
+  const [imports,setImports]=useState([]);
+  const [loadingImports,setLoadingImports]=useState(true);
+  const [previews,setPreviews]=useState({}); // importId -> [diff,...]
+  const [previewLoading,setPreviewLoading]=useState(null);
+  const [applyMsg,setApplyMsg]=useState({}); // importId -> message
+
+  const loadImports=async()=>{
+    setLoadingImports(true);
+    try{
+      const r=await fetch("/api/chatgpt-daily/list");
+      if(r.ok){const d=await r.json();setImports(Array.isArray(d.imports)?d.imports:[]);}
+    }catch(e){}
+    setLoadingImports(false);
+  };
+  useEffect(()=>{loadImports();},[]);
+
+  const parse=()=>{
+    setImportMsg("");setDupInfo(null);
+    let obj;
+    try{ obj=JSON.parse(rawText); }
+    catch(e){ setParsed(null);setParseErrors(["JSONとして正しくありません: "+e.message]);return; }
+    const errs=validateDailyDigestPayload(obj);
+    setParseErrors(errs);
+    setParsed(errs.length===0?obj:null);
+  };
+
+  const doImport=async(force)=>{
+    setImporting(true);setImportMsg("");setDupInfo(null);
+    try{
+      const r=await fetch("/api/chatgpt-daily/import",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({payload:parsed,force:!!force})});
+      const d=await r.json();
+      if(d.errors){setImportMsg("取り込み失敗：\n・"+d.errors.join("\n・"));}
+      else if(d.error){setDupInfo(d);}
+      else{
+        setImportMsg(`取り込みました（import ID ${d.importId}・updates ${d.updatesCount}件・状態 ${d.applyStatus}）`+
+          (d.applyStatus==="NO_UPDATES"?"　→ ルール変更はありません。":"　→ 下の履歴からDiff Previewを確認してください。"));
+        setRawText("");setParsed(null);setParseErrors([]);loadImports();
+      }
+    }catch(e){setImportMsg("取り込みに失敗しました。サーバーが起動しているか確認してください。");}
+    setImporting(false);
+  };
+
+  const loadPreview=async(importId)=>{
+    setPreviewLoading(importId);
+    try{
+      const r=await fetch(`/api/chatgpt-daily/preview?id=${importId}`);
+      if(r.ok){const d=await r.json();setPreviews(p=>({...p,[importId]:d.preview||[]}));}
+    }catch(e){}
+    setPreviewLoading(null);
+  };
+
+  const applyUpdates=async(importId)=>{
+    if(!confirm("差分プレビューで確認した内容をマイルールへ適用します。よろしいですか？"))return;
+    setApplyMsg(m=>({...m,[importId]:"適用中…"}));
+    try{
+      const r=await fetch("/api/chatgpt-daily/apply",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({importId})});
+      const d=await r.json();
+      if(d.error){setApplyMsg(m=>({...m,[importId]:"エラー: "+d.error}));}
+      else{
+        const applied=(d.results||[]).filter(x=>x.outcome==="APPLIED").length;
+        const skipped=(d.results||[]).filter(x=>x.outcome==="SKIPPED").length;
+        const failed=(d.results||[]).filter(x=>x.outcome==="FAILED").length;
+        setApplyMsg(m=>({...m,[importId]:`適用完了：状態 ${d.applyStatus}（適用${applied}件・スキップ${skipped}件・失敗${failed}件）`}));
+        setPreviews(p=>({...p,[importId]:d.results||[]}));
+        loadImports();
+      }
+    }catch(e){setApplyMsg(m=>({...m,[importId]:"通信エラー"}));}
+  };
+
+  const fieldStyle={width:"100%",fontSize:12,padding:8,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",fontFamily:"monospace",boxSizing:"border-box"};
+
+  return <div style={{marginTop:24,paddingTop:18,borderTop:"1px solid var(--ruleSoft)"}}>
+    <div className="sec-head">ChatGPT日次JSON</div>
+    <div className="sec-note">
+      ChatGPTとの日々のTrade Cockpit相談内容の要約（相場観・気付き・アプリ改善提案・バグ/リスク・新ルール案・差分updates）をJSONで貼り付けてimportします。
+      有料AI APIやChatGPT API連携は使いません（コピー＆ペーストのみ）。<b>updates=[]の場合、分析ロジック・ルール・AUTO判定は一切変更しません。</b>
+      importしただけではルールは変更されません（履歴保存のみ）。差分がある場合は履歴から「Diff Preview」で内容を確認し、「Apply Updates」を押した時だけマイルールへ反映します。
+      SWING -10%等の重要ルールは保護対象とし、自動適用しません（⚠ 保護ルールと表示された場合はマイルールタブから手動で判断してください）。
+    </div>
+
+    <div style={{marginTop:12}}>
+      <label style={{fontSize:11,color:"var(--inkSoft)",display:"block",marginBottom:2}}>ChatGPTが出力した日次JSON
+        <button className="action-btn" style={{marginLeft:8,fontSize:11}} onClick={()=>setRawText(CHATGPT_DAILY_SAMPLE)}>サンプルを入力</button>
+      </label>
+      <textarea value={rawText} onChange={e=>setRawText(e.target.value)} rows={10} placeholder='{"date":"2026-09-05", "summary":[], ...}' style={fieldStyle}/>
+      <button className="action-btn" style={{marginTop:8}} onClick={parse} disabled={!rawText.trim()}>解析</button>
+    </div>
+
+    {parseErrors.length>0 && <div className="card" style={{marginTop:12,padding:"10px 14px",border:"1px solid var(--down)"}}>
+      <b style={{color:"var(--down)"}}>入力内容にエラーがあります：</b>
+      <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:12.5,color:"var(--down)"}}>
+        {parseErrors.map((e,i)=><li key={i}>{e}</li>)}
+      </ul>
+    </div>}
+
+    {parsed && <div className="card" style={{marginTop:12,padding:"12px 14px"}}>
+      <b>プレビュー（{parsed.date}）</b>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginTop:8,fontSize:12}}>
+        <div>Summary：{(parsed.summary||[]).length}件</div>
+        <div>Trading observations：{(parsed.trading_observations||[]).length}件</div>
+        <div>App changes：{(parsed.app_changes||[]).length}件</div>
+        <div>Bugs / risks：{(parsed.bugs_or_risks||[]).length}件</div>
+        <div>New rules / preferences：{(parsed.new_rules_or_preferences||[]).length}件</div>
+        <div style={{fontWeight:700}}>Updates：{(parsed.updates||[]).length}件{(parsed.updates||[]).length===0?"　✅ ルール変更なし":"　⚠ 差分確認が必要"}</div>
+      </div>
+      {parsed.claude_code_instruction && <div style={{marginTop:8,fontSize:12,color:"var(--inkSoft)"}}>
+        Claude Codeへの変更指示（履歴保存のみ・自動実行しません）：{parsed.claude_code_instruction}
+      </div>}
+      {(parsed.updates||[]).length>0 && <div style={{marginTop:10}}>
+        <b style={{fontSize:12.5}}>updates（保存後、履歴のDiff Previewで既存値と比較できます）</b>
+        <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:12}}>
+          {parsed.updates.map((u,i)=><li key={i}>{u.target}（{u.change_type}）：{u.instruction||u.reason||""}</li>)}
+        </ul>
+      </div>}
+      <div style={{marginTop:14,display:"flex",gap:8,alignItems:"center"}}>
+        <button className="action-btn" disabled={importing} onClick={()=>doImport(false)}>NEONへ取り込み（履歴保存のみ）</button>
+        {importing && <span style={{fontSize:12,color:"var(--inkFaint)"}}>取り込み中…</span>}
+      </div>
+    </div>}
+
+    {dupInfo && <div className="card" style={{marginTop:12,padding:"10px 14px",border:"1px solid var(--rule)"}}>
+      <div style={{fontSize:12.5}}>{dupInfo.error}</div>
+      <button className="action-btn" style={{marginTop:8}} disabled={importing} onClick={()=>doImport(true)}>それでも保存する（重複を許可）</button>
+    </div>}
+
+    {importMsg && <div style={{marginTop:10,fontSize:12.5,whiteSpace:"pre-wrap"}}>{importMsg}</div>}
+
+    <div style={{marginTop:20}}>
+      <div className="sec-head" style={{fontSize:13}}>取り込み履歴</div>
+      {loadingImports
+        ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>読み込み中…</div>
+        : imports.length===0
+          ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>まだ取り込みはありません</div>
+          : <div style={{display:"flex",flexDirection:"column",gap:8,marginTop:6}}>
+              {imports.map(im=>{
+                const updatesCount=(im.updates||[]).length;
+                const preview=previews[im.id];
+                return <div key={im.id} style={{fontSize:12,padding:"8px 10px",border:"1px solid var(--ruleSoft)",borderRadius:4}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                    <span className="mono" style={{fontWeight:700}}>{im.import_date}</span>
+                    <span style={{color:"var(--inkFaint)"}}>Summary{(im.summary||[]).length}／Obs{(im.trading_observations||[]).length}／
+                      App{(im.app_changes||[]).length}／Bugs{(im.bugs_or_risks||[]).length}／Rules案{(im.new_rules_or_preferences||[]).length}</span>
+                    <span style={{fontWeight:700}}>updates {updatesCount}件</span>
+                    <span style={{fontSize:10.5,color:"var(--inkFaint)",border:"1px solid var(--rule)",borderRadius:3,padding:"1px 5px"}}>{im.apply_status}</span>
+                    {updatesCount>0 && <button className="iconbtn" style={{marginLeft:"auto"}} onClick={()=>loadPreview(im.id)}>
+                      {previewLoading===im.id?"確認中…":"Diff Preview"}
+                    </button>}
+                  </div>
+                  {im.claude_code_instruction && <div style={{marginTop:4,color:"var(--inkSoft)"}}>指示メモ：{im.claude_code_instruction}</div>}
+                  {preview && <div style={{marginTop:8,display:"flex",flexDirection:"column",gap:6}}>
+                    {preview.length===0
+                      ? <div style={{color:"var(--inkFaint)"}}>updatesはありません。</div>
+                      : preview.map((d,i)=>{
+                          const meta=DIFF_STATUS_META[d.status]||{label:d.status,color:"var(--inkSoft)"};
+                          return <div key={i} style={{border:"1px solid var(--rule)",borderRadius:3,padding:"6px 8px",background:"var(--card)"}}>
+                            <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+                              <span className="mono">{d.target}</span>
+                              <span style={{color:"var(--inkFaint)"}}>{d.change_type}</span>
+                              <span style={{color:meta.color,fontWeight:700}}>{meta.label}</span>
+                            </div>
+                            <div style={{marginTop:4,color:"var(--inkSoft)"}}>
+                              現在：{d.current?`${d.current.text||"—"}${d.current.value!=null?`（${d.current.value}${d.current.unit||""}）`:""}`:"（未登録）"}
+                              　→　提案：{d.proposed?.text||"—"}{d.proposed?.value!=null?`（${d.proposed.value}${d.proposed.unit||""}）`:""}
+                            </div>
+                            {d.reason && <div style={{color:"var(--inkFaint)"}}>理由：{d.reason}</div>}
+                            {d.note && <div style={{color:"var(--inkFaint)"}}>{d.note}</div>}
+                            {d.outcome && <div style={{color:"var(--inkFaint)"}}>結果：{d.outcome}{d.error?`（${d.error}）`:""}</div>}
+                          </div>;
+                        })}
+                    {preview.some(d=>d.status==="DIFF"||d.status==="ADD_CANDIDATE") &&
+                      <button className="action-btn" onClick={()=>applyUpdates(im.id)}>Apply Updates（差分だけ適用）</button>}
+                    {applyMsg[im.id] && <div style={{color:"var(--inkSoft)"}}>{applyMsg[im.id]}</div>}
+                  </div>}
+                </div>;
+              })}
+            </div>}
+    </div>
+  </div>;
+}
+
 // 監視銘柄インポート（Trade Cockpit v3 Phase5・設計案66-76番）：普段ChatGPTへ証券アプリの
 // スクリーンショットを共有しているユーザー向けに、ChatGPTが認識した銘柄一覧のJSONを貼り付けて
 // 一括登録できるようにする。画像解析はTrade Cockpit側では一切行わない（AI不使用の原則を維持）。
@@ -5872,6 +6099,7 @@ function App(){
       {tab==="chatgptimport" && <>
         <ChatGptImportPanel journal={s.journal} activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)}/>
         <WatchlistImportPanel watchlist={s.watchlist} setWatchlist={setWatchlistJP} masterJP={masterJP}/>
+        <ChatGptDailyImportPanel/>
       </>}
 
       {/* ===== 統計ダッシュボード（2026-09-02新規） ===== */}

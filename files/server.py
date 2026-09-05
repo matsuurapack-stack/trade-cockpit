@@ -4087,6 +4087,25 @@ class Handler(SimpleHTTPRequestHandler):
         elif self.path.startswith("/api/chatgpt-import/list"):
             imports = investment_db.list_chatgpt_imports(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"imports": imports})
+        elif self.path.startswith("/api/chatgpt-daily/list"):
+            # v3-9続き（PHASE 6 DAILY CHATGPT JSON IMPORT）：日次JSON取り込み履歴の一覧
+            # （既存の投資ログ取り込み=/api/chatgpt-import/listとは別系統・kind='DAILY_DIGEST'のみ）。
+            imports = investment_db.list_daily_digest_imports(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"imports": imports})
+        elif self.path.startswith("/api/chatgpt-daily/preview"):
+            # ?id=<import_id>。現在のinvestment_rulesと比較した差分プレビューを返すだけで、
+            # DBへの書き込みは一切行わない（Diff PreviewとApply Updatesを分離する設計）。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            import_id = params.get("id", [None])[0]
+            if not import_id or not (investment_db is not None and DATABASE_URL):
+                self._send_json({"error": "idが必要です"})
+                return
+            preview = investment_db.preview_daily_digest_updates(DATABASE_URL, self.current_user, int(import_id))
+            if preview is None:
+                self._send_json({"error": "指定されたimportが見つかりません"})
+                return
+            self._send_json({"preview": preview})
         elif self.path.startswith("/api/market-risk"):
             # Trade Cockpit v2 Phase3（設計案27番）：日次モニター最上部のTODAY'S MARKET用。
             # _market_environment()は指数のトレンド判定に3か月分の日足を毎回取得するため軽くは
@@ -4392,6 +4411,36 @@ class Handler(SimpleHTTPRequestHandler):
                 self._send_json({"errors": errors})
                 return
             result = investment_db.save_chatgpt_import(DATABASE_URL, self.current_user, payload, force=force)
+            self._send_json(result)
+        elif self.path == "/api/chatgpt-daily/import":
+            # v3-9続き（PHASE 6 DAILY CHATGPT JSON IMPORT）：STEP1「Import（履歴保存）」のみ。
+            # updates=[]でもinvestment_rules等には一切書き込まない（apply_status='NO_UPDATES'
+            # を保存するだけ）。updatesがあってもここでは保存するだけで適用はしない
+            # （STEP3の/api/chatgpt-daily/applyを明示的に呼ぶまで反映しない）。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            payload = body.get("payload")
+            force = bool(body.get("force"))
+            errors = investment_db.validate_daily_digest_payload(payload)
+            if errors:
+                self._send_json({"errors": errors})
+                return
+            result = investment_db.save_daily_digest_import(DATABASE_URL, self.current_user, payload, force=force)
+            self._send_json(result)
+        elif self.path == "/api/chatgpt-daily/apply":
+            # STEP3「Apply Updates（明示的に差分だけ適用）」。適用直前に必ずinvestment_rulesの
+            # 現在値を再取得して差分判定をやり直す（クライアント側の古いプレビューは信用しない）。
+            # NO_CHANGE・WARNING_PROTECTED（SWING -10%等の保護ルール）・UNSUPPORTED_TARGET
+            # （investment_rules.*以外）は自動適用しない。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            import_id = body.get("importId")
+            if not import_id:
+                self._send_json({"error": "importIdが必要です"})
+                return
+            result = investment_db.apply_daily_digest_updates(DATABASE_URL, self.current_user, int(import_id))
             self._send_json(result)
         # ---- 今日の候補（trade_candidates。2026-09-02新規、Trade Cockpit v2 Phase1） ----
         elif self.path == "/api/trade-candidates/save":
