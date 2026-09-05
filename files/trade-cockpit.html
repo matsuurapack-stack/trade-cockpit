@@ -155,7 +155,7 @@ td{padding:7px 10px;vertical-align:middle}
 <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 
 <script type="text/babel" data-presets="react">
-const { useState, useEffect, useRef, useMemo } = React;
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
 
 const num = (v) => (v === "" || v == null || isNaN(+v) ? null : +v);
 // Trade Cockpit v2 Phase6（ChatGPT双方向連携）：相談用テキストのクリップボードコピー共通処理。
@@ -1278,9 +1278,14 @@ const ENTRY_STRATEGY_META={
 // tabキー（monitor/news/watch/us/briefing/earnings/analysis/journal/investlog/chatgptimport/
 // stats/position）・各パネルの内部ロジックは一切変更せず、上部ナビゲーションの見せ方だけを
 // グループ化する（第1階層＝グループボタン、第2階層＝グループ内サブタブ）。
+// v3-9続き（2026-09-05・EVENT DASHBOARD）：新規メインタブ「📅 イベント」を独立グループとして
+// 追加（ニュース内のサブタブにはしない＝日々の売買判断に使う重要情報のため）。既存の
+// 市場>イベント（EventsPanel、JSON貼り付けimport用の管理画面）とラベルが重複しないよう、
+// こちらは「イベント登録」に改称する（tabキー"events"自体は変更しない＝既存コードへの影響なし）。
 const TAB_GROUPS=[
   {key:"watch",label:"監視銘柄",tabs:[{key:"watch",label:"監視銘柄"}]},
-  {key:"market",label:"市場",tabs:[{key:"monitor",label:"概況"},{key:"briefing",label:"日本株一覧"},{key:"us",label:"米国株一覧"},{key:"events",label:"イベント"}]},
+  {key:"market",label:"市場",tabs:[{key:"monitor",label:"概況"},{key:"briefing",label:"日本株一覧"},{key:"us",label:"米国株一覧"},{key:"events",label:"イベント登録"}]},
+  {key:"eventDashboard",label:"イベント",tabs:[{key:"eventDashboard",label:"イベント"}]},
   {key:"tradeAnalysis",label:"トレード分析",tabs:[{key:"analysis",label:"分析"},{key:"earnings",label:"決算"}]},
   {key:"position",label:"ポジション",tabs:[{key:"position",label:"ポジション"}]},
   {key:"record",label:"記録",tabs:[{key:"journal",label:"記録"},{key:"investlog",label:"投資判断ログ"},{key:"chatgptimport",label:"ChatGPT取込"},{key:"stats",label:"統計"}]},
@@ -1510,6 +1515,63 @@ function nextEventForCode(events,code,sector,withinDays=45){
 }
 const EVENT_TYPE_ICON={ECONOMIC:"📊",CENTRAL_BANK:"🏦",EARNINGS:"📅",INDEX_REBALANCE:"📈",
   POLITICAL:"🏛",GEOPOLITICAL:"🌐",PRODUCT_EVENT:"🚀",OTHER:"📌"};
+// v3-9続き（2026-09-05・EVENT DASHBOARD）：market_events（PHASE 3で導入済み）を新しい判定
+// ロジックを追加せずに「見やすく集約」するための表示専用ヘルパー群。既存のEventRiskNote・
+// EventsPanelのロジックには一切触れない。
+const EVENT_CATEGORY_FILTERS=[
+  {key:"ALL",label:"すべて",types:null},
+  {key:"ECONOMIC",label:"経済",types:["ECONOMIC"]},
+  {key:"CENTRAL_BANK",label:"中央銀行",types:["CENTRAL_BANK"]},
+  {key:"EARNINGS",label:"決算",types:["EARNINGS"]},
+  {key:"INDEX_REBALANCE",label:"指数",types:["INDEX_REBALANCE"]},
+  {key:"PRODUCT_EVENT",label:"企業",types:["PRODUCT_EVENT"]},
+  {key:"GEOPOLITICAL",label:"地政学",types:["GEOPOLITICAL","POLITICAL"]},
+];
+const EVENT_IMPORTANCE_META={HIGH:{icon:"🔴",label:"HIGH",color:"var(--down)"},
+  MEDIUM:{icon:"🟡",label:"MEDIUM",color:"var(--accent)"},LOW:{icon:"⚪",label:"LOW",color:"var(--inkFaint)"}};
+const EVENT_VERIFICATION_ICON={VERIFIED:"✅",IMAGE_DERIVED:"⚠",UNVERIFIED:"？"};
+// importanceは自由記述も許容している（market_events.importance）ため、日本語「高/中/低」・
+// 英語混在を吸収して正規化する。判定できないものはnull（フィルタでは「すべて」でのみ表示）。
+function normalizeEventImportance(imp){
+  if(!imp)return null;
+  const s=String(imp).toUpperCase();
+  if(s.includes("HIGH")||imp==="高")return"HIGH";
+  if(s.includes("MEDIUM")||imp==="中")return"MEDIUM";
+  if(s.includes("LOW")||imp==="低")return"LOW";
+  return null;
+}
+function eventDateJpLabel(dateStr){
+  const d=new Date(dateStr+"T00:00:00+09:00");
+  if(isNaN(d.getTime()))return dateStr;
+  const dow=["日","月","火","水","木","金","土"][d.getDay()];
+  return `${d.getMonth()+1}/${d.getDate()}（${dow}）`;
+}
+// 当日はevent_time（自由書式"21:30"等）があれば残り時間、無ければ「本日」。翌日以降はカレンダー
+// 日数が近ければ「N日後」、離れていれば営業日数を併記する（businessDaysUntilは既存関数を再利用）。
+function eventCountdownLabel(ev){
+  const todayStr=new Date().toISOString().slice(0,10);
+  if(!ev.event_date)return"";
+  if(ev.event_date<todayStr)return"終了";
+  if(ev.event_date===todayStr){
+    const m=/^(\d{1,2}):(\d{2})/.exec(ev.event_time||"");
+    if(m){
+      const now=new Date();
+      const target=new Date(now.getFullYear(),now.getMonth(),now.getDate(),Number(m[1]),Number(m[2]));
+      const diffMs=target-now;
+      if(diffMs>0){
+        const diffH=diffMs/3600000;
+        return diffH<1?`⏳ ${Math.max(1,Math.round(diffMs/60000))}分後`:`⏳ ${Math.round(diffH)}時間後`;
+      }
+    }
+    return"⏳ 本日";
+  }
+  const tomorrowStr=new Date(Date.now()+86400000).toISOString().slice(0,10);
+  if(ev.event_date===tomorrowStr)return"⏳ 明日";
+  const calDays=Math.round((new Date(ev.event_date+"T00:00:00+09:00")-new Date(todayStr+"T00:00:00+09:00"))/86400000);
+  if(calDays<=3)return`⏳ ${calDays}日後`;
+  const bDays=businessDaysUntil(ev.event_date);
+  return bDays!=null?`⏳ ${bDays}営業日後`:`⏳ ${calDays}日後`;
+}
 // v3-9続き（2026-09-05・PHASE 4 NEWS/CATALYST INTELLIGENCE）：news_catalysts用のアイコン・
 // freshness（新しさ）判定。catalyst_date（報じられた日）からの経過日数でTODAY/3D/7D/OLDを
 // 判定するが、event_date（指数採用・決算等の発効日）が未来にある場合はOLDでも重要性を維持する
@@ -1934,6 +1996,163 @@ function ExpertViewsPanel({views,onReload}){
             </div>;
           })}
         </div>}
+  </div>;
+}
+
+// v3-9続き（2026-09-05・EVENT DASHBOARD）：1件のイベントカード。PC・スマホ（390px程度）の
+// どちらでも崩れないよう、横長テーブルではなくflexWrapする1カラムカードのみで構成する。
+function EventDashboardCard({ev,heldRelated,watchedRelated,relatedNames}){
+  const icon=EVENT_TYPE_ICON[ev.event_type]||EVENT_TYPE_ICON.OTHER;
+  const isEarnings=ev.event_type==="EARNINGS";
+  const impNorm=normalizeEventImportance(ev.importance);
+  const impMeta=EVENT_IMPORTANCE_META[impNorm];
+  const countdown=eventCountdownLabel(ev);
+  const verifyIcon=EVENT_VERIFICATION_ICON[ev.verification_status]||"？";
+  return <div style={{padding:"10px 12px",border:"1px solid var(--rule)",borderRadius:4,
+      background:"var(--card)",borderLeft:heldRelated?"3px solid var(--up)":watchedRelated?"3px solid var(--accent)":"3px solid transparent"}}>
+    <div style={{display:"flex",flexWrap:"wrap",gap:8,alignItems:"center"}}>
+      <span className="mono" style={{color:"var(--inkSoft)",minWidth:44}}>{ev.event_time||"—"}</span>
+      <span style={{fontWeight:700}}>{isEarnings?"📊":icon} {ev.title}</span>
+      {impMeta && <span style={{fontSize:11,color:impMeta.color}}>{impMeta.icon} {impMeta.label}</span>}
+      {countdown && <span style={{fontSize:11,color:"var(--inkFaint)",marginLeft:"auto"}}>{countdown}</span>}
+    </div>
+    <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:6,fontSize:11,color:"var(--inkFaint)"}}>
+      {ev.country && <span style={{border:"1px solid var(--rule)",borderRadius:3,padding:"1px 5px"}}>{ev.country}</span>}
+      <span style={{border:"1px solid var(--rule)",borderRadius:3,padding:"1px 5px"}}>{ev.event_type}</span>
+      <span style={{border:"1px solid var(--rule)",borderRadius:3,padding:"1px 5px"}} title="画像由来・未検証の情報を確定情報として扱わない">{verifyIcon} {ev.verification_status}</span>
+      {heldRelated && <span style={{color:"var(--up)",fontWeight:700}}>📌 保有銘柄関連</span>}
+      {!heldRelated && watchedRelated && <span style={{color:"var(--accent)",fontWeight:700}}>📌 監視銘柄関連</span>}
+    </div>
+    {relatedNames && relatedNames.length>0 && <div style={{marginTop:4,fontSize:11,color:"var(--inkSoft)"}}>
+      {relatedNames.map(r=><span key={r.code} style={{marginRight:10}}>{r.name?`${r.name}（${r.code}）`:r.code}{r.held?" ⭐保有中":r.watched?" 監視中":""}</span>)}
+    </div>}
+  </div>;
+}
+
+// v3-9続き（2026-09-05・EVENT DASHBOARD）：新規メインタブ「📅 イベント」。既存market_events
+// （PHASE 3）を期間・重要度・種別で絞り込んで日付ごとに一覧表示するだけの参照画面。新しい
+// 判定ロジックは追加しない＝Primary/Action Status・AUTOスコア・Position Statusには一切影響
+// しない。EventRiskNote（銘柄分析・ポジションカード）はこのタブとは独立して従来通り動作する
+// （このタブはEventRiskNoteの元データを一覧で見せる役割）。
+function EventDashboardPanel({events,allWatch,heldItems}){
+  const [rangeDays,setRangeDays]=useState(7);
+  const [importanceFilter,setImportanceFilter]=useState("HIGH_MEDIUM"); // HIGH|HIGH_MEDIUM|ALL
+  const [categoryFilter,setCategoryFilter]=useState("ALL");
+
+  const todayStr=new Date().toISOString().slice(0,10);
+  const endDateStr=new Date(Date.now()+rangeDays*86400000).toISOString().slice(0,10);
+  const heldByCode=useMemo(()=>new Map((heldItems||[]).map(h=>[h.code,h])),[heldItems]);
+  const watchedByCode=useMemo(()=>new Map((allWatch||[]).map(w=>[w.code,w])),[allWatch]);
+  const isHeldRelated=useCallback(ev=>(ev.affected_stocks||[]).some(c=>heldByCode.has(c)),[heldByCode]);
+  const isWatchedRelated=useCallback(ev=>(ev.affected_stocks||[]).some(c=>watchedByCode.has(c)),[watchedByCode]);
+  const relatedNamesFor=useCallback(ev=>(ev.affected_stocks||[]).map(code=>{
+    const h=heldByCode.get(code),w=watchedByCode.get(code);
+    return{code,name:(h&&h.name)||(w&&w.name)||null,held:!!h,watched:!!w};
+  }),[heldByCode,watchedByCode]);
+
+  const categoryDef=EVENT_CATEGORY_FILTERS.find(c=>c.key===categoryFilter);
+  const filtered=useMemo(()=>{
+    return(events||[]).filter(ev=>{
+      if(!ev.event_date||ev.event_date<todayStr||ev.event_date>endDateStr)return false;
+      if(categoryDef&&categoryDef.types&&!categoryDef.types.includes(ev.event_type))return false;
+      if(isHeldRelated(ev))return true; // 保有銘柄の決算等はimportanceに関係なく表示（ユーザー指定）
+      const impNorm=normalizeEventImportance(ev.importance);
+      if(importanceFilter==="HIGH"&&impNorm!=="HIGH")return false;
+      if(importanceFilter==="HIGH_MEDIUM"&&!(impNorm==="HIGH"||impNorm==="MEDIUM"))return false;
+      return true;
+    });
+  },[events,todayStr,endDateStr,categoryDef,importanceFilter,isHeldRelated]);
+
+  const grouped=useMemo(()=>{
+    const map=new Map();
+    filtered.forEach(ev=>{
+      if(!map.has(ev.event_date))map.set(ev.event_date,[]);
+      map.get(ev.event_date).push(ev);
+    });
+    // 日付グループ自体は維持したまま、グループ内だけ保有＞監視＞重要イベント＞その他の順に
+    // 並べ替える（ユーザー指定：「完全な並び替えではなく、日付グループは維持」）。
+    return[...map.entries()].sort((a,b)=>a[0].localeCompare(b[0])).map(([date,evs])=>({
+      date,
+      events:[...evs].sort((a,b)=>{
+        const ah=isHeldRelated(a)?0:1,bh=isHeldRelated(b)?0:1;
+        if(ah!==bh)return ah-bh;
+        const aw=isWatchedRelated(a)?0:1,bw=isWatchedRelated(b)?0:1;
+        if(aw!==bw)return aw-bw;
+        const ai=normalizeEventImportance(a.importance)==="HIGH"?0:1,bi=normalizeEventImportance(b.importance)==="HIGH"?0:1;
+        if(ai!==bi)return ai-bi;
+        return(a.event_time||"").localeCompare(b.event_time||"");
+      }),
+    }));
+  },[filtered,isHeldRelated,isWatchedRelated]);
+
+  const todayHigh=useMemo(()=>filtered.filter(ev=>ev.event_date===todayStr&&
+    (normalizeEventImportance(ev.importance)==="HIGH"||isHeldRelated(ev))),[filtered,todayStr,isHeldRelated]);
+
+  const rangeOptions=[{v:0,label:"今日"},{v:3,label:"3日"},{v:7,label:"7日"},{v:14,label:"14日"}];
+  const importanceOptions=[{v:"HIGH",label:"HIGHのみ"},{v:"HIGH_MEDIUM",label:"HIGH+MEDIUM"},{v:"ALL",label:"すべて"}];
+
+  return<div style={{marginTop:18}}>
+    <div className="sec-head">📅 イベント</div>
+    <div className="sec-note" style={{fontSize:13}}>
+      既存の市場イベント（market_events、「市場」タブ内「イベント登録」から貼り付けimport）を期間・重要度・種別で絞り込んで一覧表示するだけの参照画面です。新しい判定ロジックは追加しておらず、Primary/Action Status・AUTOスコア・Position Statusには一切影響しません。保有銘柄に関係するイベント（決算等）は重要度フィルタに関係なく常に表示します。
+    </div>
+    {todayHigh.length>0 && <div style={{background:"var(--upBg)",border:"1px solid var(--up)",borderRadius:4,padding:"10px 14px",marginBottom:14}}>
+      <div style={{fontSize:13,fontWeight:700,color:"var(--up)"}}>⚠ 本日の重要イベント {todayHigh.length}件</div>
+      <div style={{marginTop:4,display:"flex",flexDirection:"column",gap:2}}>
+        {todayHigh.map(ev=><div key={ev.id} style={{fontSize:12.5,color:"var(--inkSoft)"}}>{ev.event_time?ev.event_time+"　":""}{ev.title}</div>)}
+      </div>
+    </div>}
+    <div style={{display:"flex",flexWrap:"wrap",gap:16,marginBottom:10}}>
+      <div>
+        <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:4}}>期間</div>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+          {rangeOptions.map(o=><button key={o.v} className={"chip"+(rangeDays===o.v?" on":"")} onClick={()=>setRangeDays(o.v)}>{o.label}</button>)}
+        </div>
+      </div>
+      <div>
+        <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:4}}>重要度</div>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+          {importanceOptions.map(o=><button key={o.v} className={"chip"+(importanceFilter===o.v?" on":"")} onClick={()=>setImportanceFilter(o.v)}>{o.label}</button>)}
+        </div>
+      </div>
+    </div>
+    <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:16}}>
+      {EVENT_CATEGORY_FILTERS.map(c=><button key={c.key} className={"chip"+(categoryFilter===c.key?" on":"")} onClick={()=>setCategoryFilter(c.key)}>{c.label}</button>)}
+    </div>
+    {grouped.length===0
+      ? <div style={{padding:24,textAlign:"center",color:"var(--inkFaint)",fontSize:13,border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)"}}>
+          該当する期間・条件のイベントはありません。
+        </div>
+      : grouped.map(g=><div key={g.date} style={{marginBottom:16}}>
+          <div style={{fontWeight:700,fontSize:13,marginBottom:6,borderBottom:"1px solid var(--ruleSoft)",paddingBottom:4}}>{eventDateJpLabel(g.date)}</div>
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {g.events.map(ev=><EventDashboardCard key={ev.id} ev={ev} heldRelated={isHeldRelated(ev)}
+              watchedRelated={isWatchedRelated(ev)} relatedNames={relatedNamesFor(ev)}/>)}
+          </div>
+        </div>)}
+  </div>;
+}
+
+// v3-9続き（2026-09-05・EVENT DASHBOARD）：日次モニター上部に表示する軽量ウィジェット
+// （本日のHIGHイベント・保有銘柄関連イベントを最大3件だけ）。日次モニター自体を大きくしない
+// ため、EventDashboardPanelの絞り込みロジック（EVENT_CATEGORY_FILTERS等）は使わず、
+// 「今日・重要 or 保有銘柄関連」だけのごく単純な抽出に留める。クリックで「イベント」タブへ。
+function TodayEventsWidget({events,heldItems,onOpen}){
+  const todayStr=new Date().toISOString().slice(0,10);
+  const heldCodes=useMemo(()=>new Set((heldItems||[]).map(h=>h.code)),[heldItems]);
+  const todayItems=useMemo(()=>(events||[])
+    .filter(ev=>ev.event_date===todayStr&&
+      (normalizeEventImportance(ev.importance)==="HIGH"||(ev.affected_stocks||[]).some(c=>heldCodes.has(c))))
+    .sort((a,b)=>(a.event_time||"").localeCompare(b.event_time||""))
+    .slice(0,3),[events,todayStr,heldCodes]);
+  if(!todayItems.length)return null;
+  return<div onClick={onOpen} style={{cursor:"pointer",background:"var(--band)",border:"1px solid var(--rule)",
+      borderRadius:4,padding:"8px 12px",marginBottom:12,display:"flex",flexDirection:"column",gap:2}}
+    title="クリックで「イベント」タブへ移動">
+    <div style={{fontSize:12,fontWeight:700,color:"var(--ink)"}}>📅 TODAY</div>
+    {todayItems.map(ev=><div key={ev.id} style={{fontSize:12,color:"var(--inkSoft)"}}>
+      {ev.event_time?ev.event_time+"　":""}{ev.title}
+    </div>)}
   </div>;
 }
 
@@ -4708,6 +4927,14 @@ function App(){
     fetch("/api/expert-views").then(r=>r.ok?r.json():null).then(d=>{if(d)setExpertViews(d.views||[]);}).catch(()=>{});
   };
   useEffect(()=>{loadExpertViews();},[]);
+  // v3-9続き（2026-09-05・EVENT DASHBOARD）：EventDashboardPanelの「保有銘柄関連」表示に使う
+  // 保有中コードの軽量な一覧（PortfolioPanel本体とは別に、App直下でも参照できるようにする）。
+  // PortfolioPanelの完全なフィールドは不要なため、この専用の軽いfetchのみ追加する。
+  const [heldItems,setHeldItems]=useState([]);
+  const loadHeldItems=()=>{
+    fetch("/api/portfolio").then(r=>r.ok?r.json():null).then(d=>{if(d)setHeldItems((d.items||[]).filter(it=>it.active!==false));}).catch(()=>{});
+  };
+  useEffect(()=>{loadHeldItems();},[]);
   const masterUS=useMemo(()=>MASTER.filter(m=>m.market==="US"),[]);
 
   // 12章：分析タブの対象銘柄（日本市場・アメリカ市場どちらの登録銘柄からも追加され得る）
@@ -5406,6 +5633,7 @@ function App(){
       {/* ===== 日次モニター（独立タブ） ===== */}
       {tab==="monitor" && <div style={{marginTop:18}}>
         <MarketEnvironmentBanner metrics={s.metrics} watchlistAll={watchlistAll} stockQuotes={s.stockQuotes} top5={todayTop5}/>
+        <TodayEventsWidget events={marketEvents} heldItems={heldItems} onOpen={()=>setTab("eventDashboard")}/>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
           <div className="sec-head">日次モニター</div>
           <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
@@ -5540,6 +5768,7 @@ function App(){
 
       {/* ===== イベント（PHASE 3：EVENT/EARNINGS INTELLIGENCE） ===== */}
       {tab==="events" && <EventsPanel events={marketEvents} onReload={loadMarketEvents}/>}
+      {tab==="eventDashboard" && <EventDashboardPanel events={marketEvents} allWatch={allWatch} heldItems={heldItems}/>}
 
 
       {/* ===== 決算分析（日本市場・アメリカ市場の登録銘柄テーブルの「決算」ボタンで追加） ===== */}
