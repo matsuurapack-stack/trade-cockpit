@@ -407,6 +407,36 @@ CREATE TABLE IF NOT EXISTS market_events (
     UNIQUE (user_id, event_date, title)
 );
 CREATE INDEX IF NOT EXISTS idx_market_events_user_date ON market_events(user_id, event_date);
+
+-- v3-9続き（2026-09-05・PHASE 4 NEWS/CATALYST INTELLIGENCE）：ニュース本体（Google News RSS/
+-- TDnet）は引き続きserver.pyが都度取得するだけで保存しない。このテーブルはそれとは別に、
+-- ChatGPT等で構造化された「カタログ情報」（マクロ・セクター・銘柄材料や指数採用・資金フロー等）
+-- を保存する専用テーブル。既存news_feedback（「不要」フィードバックのログのみ）とは役割が異なり
+-- 重複しない。market_eventsと同じくJSON貼り付けimport・upsert・verification_status必須の設計を
+-- 踏襲する。catalyst_date＝このカタリストが報じられた日（freshness＝TODAY/3D/7D/OLDの基準）、
+-- event_date＝指数採用・決算等、効力が発生する日（あれば、この日まで重要性を維持する。任意）。
+CREATE TABLE IF NOT EXISTS news_catalysts (
+    id                    SERIAL PRIMARY KEY,
+    user_id               TEXT NOT NULL,
+    catalyst_date         DATE NOT NULL,
+    event_date            DATE,
+    title                 TEXT NOT NULL,
+    category              TEXT NOT NULL DEFAULT 'OTHER',  -- MACRO|SECTOR_CATALYST|STOCK_CATALYST|INDEX_REBALANCE|FUND_FLOW|EARNINGS|CAPITAL_POLICY|REGULATION_POLICY|GEOPOLITICAL|PRODUCT_CATALYST|OTHER
+    importance            TEXT,
+    summary               TEXT,
+    affected_markets      JSONB,
+    affected_sectors      JSONB,
+    affected_stocks       JSONB,
+    source                TEXT,
+    source_type           TEXT,     -- IMAGE|TEXT|MANUAL等
+    verification_status   TEXT NOT NULL DEFAULT 'UNVERIFIED',  -- IMAGE_DERIVED|UNVERIFIED|VERIFIED
+    notes                 TEXT,
+    raw_payload           JSONB,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, catalyst_date, title)
+);
+CREATE INDEX IF NOT EXISTS idx_news_catalysts_user_date ON news_catalysts(user_id, catalyst_date);
 """
 
 
@@ -1571,6 +1601,106 @@ def delete_market_event(database_url, user_id, event_id):
         return
     with pool.connection() as conn:
         conn.execute("DELETE FROM market_events WHERE user_id = %s AND id = %s", [user_id, event_id])
+        conn.commit()
+
+
+# v3-9続き（2026-09-05・PHASE 4 NEWS/CATALYST INTELLIGENCE）：news_catalysts。market_eventsと
+# 全く同じ「JSON貼り付け→1件ずつupsert」の考え方を踏襲する。catalyst_date・titleが必須キー
+# （UNIQUE制約もこの2つ）、event_date（発効日）は任意。
+_NEWS_CATALYST_COLS = ["event_date", "category", "importance", "summary", "affected_markets",
+                        "affected_sectors", "affected_stocks", "source", "source_type",
+                        "verification_status", "notes", "raw_payload"]
+_NEWS_CATALYST_JSONB_COLS = {"affected_markets", "affected_sectors", "affected_stocks", "raw_payload"}
+
+
+def _upsert_news_catalyst_conn(conn, user_id, cat):
+    """1件のカタリストdictをupsertする。catalyst_date・titleは必須（無ければFalseを返し
+    呼び出し側でカウントしない）。categoryは未指定ならOTHER、verification_statusは未指定なら
+    UNVERIFIED（画像由来等を確定情報として扱わない、既定の安全側）。"""
+    catalyst_date = cat.get("catalyst_date") or cat.get("date")
+    title = cat.get("title")
+    if not catalyst_date or not title:
+        return False
+    cols = ["catalyst_date", "title"] + [c for c in _NEWS_CATALYST_COLS if c in cat or c in ("category", "verification_status")]
+    values = []
+    for c in cols:
+        if c == "catalyst_date":
+            values.append(catalyst_date)
+        elif c == "title":
+            values.append(title)
+        elif c == "category":
+            values.append(cat.get("category") or "OTHER")
+        elif c == "verification_status":
+            values.append(cat.get("verification_status") or "UNVERIFIED")
+        elif c in _NEWS_CATALYST_JSONB_COLS:
+            values.append(json.dumps(cat.get(c), ensure_ascii=False) if cat.get(c) is not None else None)
+        else:
+            values.append(cat.get(c))
+    update_cols = [c for c in cols if c not in ("catalyst_date", "title")]
+    conn.execute(
+        f"INSERT INTO news_catalysts (user_id, {', '.join(cols)}) "
+        f"VALUES (%s, {', '.join(['%s::jsonb' if c in _NEWS_CATALYST_JSONB_COLS else '%s' for c in cols])}) "
+        f"ON CONFLICT (user_id, catalyst_date, title) DO UPDATE SET "
+        f"{', '.join(c + ' = EXCLUDED.' + c for c in update_cols)}, updated_at = now()",
+        [user_id] + values,
+    )
+    return True
+
+
+def import_news_catalysts(database_url, user_id, catalysts):
+    """catalysts（dictのリスト、JSON貼り付けのimport想定）を1件ずつupsertする。
+    戻り値: {"imported": N, "skipped": M}（catalyst_date/titleが無い行はskip）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return {"imported": 0, "skipped": len(catalysts)}
+    imported = skipped = 0
+    with pool.connection() as conn:
+        for cat in catalysts:
+            if not isinstance(cat, dict):
+                skipped += 1
+                continue
+            ok = _upsert_news_catalyst_conn(conn, user_id, cat)
+            if ok:
+                imported += 1
+            else:
+                skipped += 1
+        conn.commit()
+    return {"imported": imported, "skipped": skipped}
+
+
+def list_news_catalysts(database_url, user_id, from_date=None, to_date=None, category=None, limit=300):
+    """user_idのカタリストをcatalyst_date降順（新しいもの優先）で返す。from_date/to_dateは
+    catalyst_dateへのISO日付フィルタ（両端含む）。categoryで絞り込み可能。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = ["user_id = %s"], [user_id]
+    if from_date:
+        where.append("catalyst_date >= %s")
+        params.append(from_date)
+    if to_date:
+        where.append("catalyst_date <= %s")
+        params.append(to_date)
+    if category:
+        where.append("category = %s")
+        params.append(category)
+    params.append(limit)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT * FROM news_catalysts WHERE {' AND '.join(where)} "
+                f"ORDER BY catalyst_date DESC LIMIT %s",
+                params,
+            )
+            return [_row_to_json(r) for r in cur.fetchall()]
+
+
+def delete_news_catalyst(database_url, user_id, catalyst_id):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return
+    with pool.connection() as conn:
+        conn.execute("DELETE FROM news_catalysts WHERE user_id = %s AND id = %s", [user_id, catalyst_id])
         conn.commit()
 
 
