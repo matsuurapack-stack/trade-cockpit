@@ -4249,6 +4249,10 @@ class Handler(SimpleHTTPRequestHandler):
             # e_api_private_key.pem・secrets.json)への直接アクセスを防ぐため。2026-08-20
             # 発覚：SimpleHTTPRequestHandlerはデフォルトでフォルダ内の全ファイルを静的配信・
             # 一覧表示してしまうため、必要なファイル1つだけを明示的に許可するホワイトリスト方式にした）。
+        elif self.path.split("?", 1)[0] in ("/manifest.json", "/trade_icon_512.png"):
+            # v3-9続き（2026-09-05・PHASE 7 MOBILE/PWA）：manifest.json・アイコンだけ追加で
+            # ホワイトリスト許可する（上と同じ「必要なファイルだけ明示許可」方針を維持）。
+            super().do_GET()
         else:
             self.send_response(404)
             self.end_headers()

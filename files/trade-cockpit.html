@@ -2,8 +2,18 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>トレード・コックピット</title>
+<!-- v3-9続き（2026-09-05・PHASE 7 MOBILE/PWA）：追加料金なしの最低限PWA対応。
+     manifest.jsonのみ（service workerは今回入れない＝株価・ポジション等の最新データを
+     古いキャッシュから誤表示する事故を避けるため。ユーザー指定：「複雑になるなら
+     manifest中心でもよい」）。Basic Auth（server.py _authorized()）は今回変更しない。 -->
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#FFFFFF">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="TradeCockpit">
 <style>
 /* ===== デザイントークン（design_renewal_instruction.md）=====
    ムームー証券アプリを参考にした鮮やかな配色・タイポグラフィ・ダークモード対応。
@@ -33,7 +43,15 @@
 *{box-sizing:border-box}
 html{background-color:var(--paper)}
 body{margin:0;background-color:var(--paper);color:var(--ink);font-size:15px;min-height:100vh;
-  font-family:'Segoe UI','Hiragino Sans','Hiragino Kaku Gothic ProN','Yu Gothic',Meiryo,Arial,sans-serif}
+  font-family:'Segoe UI','Hiragino Sans','Hiragino Kaku Gothic ProN','Yu Gothic',Meiryo,Arial,sans-serif;
+  overflow-wrap:break-word}
+/* PHASE 7 MOBILE/PWA：.wrap自身にoverflow指定が無いため、子要素の未折返しテキスト1つが
+   document全体に隠れた横スクロールを伝播させ得る（STEP1監査で発見。実例：ExpertViewsPanelの
+   説明文中のUSER_PROVIDED_TRANSCRIPT等の長い識別子）。html/bodyへのoverflow-x:hiddenは
+   position:sticky（メインナビ）を破壊する副作用があったため採用せず、根本原因である
+   長い未分割トークンの側をoverflow-wrapで折り返す方式にした（.sec-note・body両方に適用）。
+   ページ本体の横スクロールだけ明示的に止める（縦は許可、個別の意図的な横スクロール
+   コンテナ＝.tabs/.watch-table-desktop等はoverflow-x:autoのまま機能する）。
 .mono{font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
 .wrap{max-width:980px;margin:0 auto;padding:22px 18px 46px}
 .head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;flex-wrap:wrap;
@@ -54,7 +72,11 @@ h1{margin:3px 0 0;font-size:28px;font-weight:700;line-height:1.2;letter-spacing:
 .tab:hover{color:var(--ink)}
 .tab.on{color:var(--ink);border-bottom-color:var(--accent);font-weight:800}
 .sec-head{font-size:22px;font-weight:600;line-height:1.3;margin:0 0 4px}
-.sec-note{font-size:13px;color:var(--inkSoft);margin-bottom:10px}
+/* PHASE 7 MOBILE/PWA・STEP1監査で発見：USER_PROVIDED_TRANSCRIPT等の長い英語識別子を含む説明文が
+   狭い画面で折り返されず、ページ全体に隠れた横スクロールを発生させていた（.wrap自体には
+   overflow指定が無いため、子要素の未折返しテキストがdocument全体のscrollWidthまで伝播する）。
+   overflow-wrapで強制的に折り返す。 */
+.sec-note{font-size:13px;color:var(--inkSoft);margin-bottom:10px;overflow-wrap:break-word;word-break:break-word}
 .card{border:none;background:var(--card);border-radius:14px;padding:14px 16px 16px;
   box-shadow:var(--shadow);transition:background-color .2s ease,border-color .2s ease}
 .card-t{font-size:18px;font-weight:600;line-height:1.4}
@@ -144,6 +166,35 @@ td{padding:7px 10px;vertical-align:middle}
 /* 10-5章：重要ニュース通知バナー（ページ最上部に常設、オン/オフ切り替え可。4-6章：warning系に統一） */
 .notify-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;
   background:var(--alarm);color:var(--alarmText);border:2px solid var(--alarmEdge);border-radius:8px;padding:10px 14px;margin-bottom:12px}
+
+/* ===== v3-9続き（2026-09-05・PHASE 7 MOBILE/PWA）=====
+   単一HTML+React/Babel構成を維持したまま@mediaで分離する。既存のPCレイアウト
+   （.wrap/.tabs/.card/.grid等）・enrichWatchRow等の判定ロジックは一切変更せず、
+   以下のブレークポイントで表示だけを調整する（STEP17：PC版保護）。
+   iPhone Safe Area（PWA standalone時、ホームインジケータ等とUIが重ならないように）は
+   env()が未対応の環境では0として無視されるため、常時適用して問題ない。 */
+body{padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
+.watch-table-mobile{display:none}
+@media (max-width:768px){
+  .wrap{padding-left:12px;padding-right:12px}
+  /* メインナビ（TAB_GROUPS第1階層）だけをsticky化する。第2階層（グループ内サブタブ、
+     同じ.tabsクラスだが.tabs-mainを持たない）は重なり防止のためsticky化しない
+     （STEP13：sticky要素が重なって画面上部を占有しすぎないようにする）。 */
+  .tabs-main{position:sticky;top:0;z-index:15;background:var(--paper);box-shadow:0 2px 6px rgba(0,0,0,.08)}
+  .tab{padding:10px 14px;min-height:22px}
+  /* 今日の監視銘柄：横長テーブルではなく専用compact card表示に切り替える（STEP4）。 */
+  .watch-table-desktop{display:none}
+  .watch-table-mobile{display:block}
+  /* ポジション新規登録フォーム：固定px幅グリッドのままだと横スクロールが発生するため
+     2カラムに畳む（STEP8、STEP1監査で発見）。 */
+  .position-add-grid-1,.position-add-grid-2{grid-template-columns:1fr 1fr !important}
+}
+@media (max-width:430px){
+  .position-add-grid-1,.position-add-grid-2{grid-template-columns:1fr !important}
+  h1{font-size:22px}
+  .sec-head{font-size:18px}
+  .card{padding:12px 12px 14px}
+}
 </style>
 </head>
 <body>
@@ -2579,6 +2630,11 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
     window.addEventListener("click",close);
     return ()=>window.removeEventListener("click",close);
   },[openMenuFor]);
+  // v3-9続き（2026-09-05・PHASE 7 MOBILE/PWA）：390px前後のスマホでは横長テーブルをそのまま
+  // 縮小せず、専用compact card表示に切り替える（.watch-table-desktop/.watch-table-mobileの
+  // CSS @media切り替え、下部参照）。詳細情報（対市場/対セクター/セクター/理由）はタップで
+  // 展開する。既存のenrichWatchRow等の判定ロジックには一切触れず、表示だけの追加。
+  const [expandedCode,setExpandedCode]=useState(null);
 
   return <div style={{marginTop:18}}>
     <div style={{display:"flex",alignItems:"center",gap:6}}>
@@ -2606,9 +2662,12 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
               const actionMeta=ENTRY_STRATEGY_META[action];
               const qt=stockQuotes[w.code]||{};
               const cur=num(qt.t);
+              {/* v3-9続き（PHASE 7 MOBILE/PWA・STEP1監査で発見）：flex:1のreason要素は
+                  デフォルトのmin-width:autoにより、狭い画面で他の固定幅要素を押しのけて
+                  横スクロールを発生させていた。flexWrap+minWidth:0で折り返し・省略を機能させる。 */}
               return <div key={w.code} onClick={()=>onOpenAnalysis(w.code)}
                 style={{display:"flex",alignItems:"center",gap:10,padding:"7px 8px",borderRadius:4,cursor:"pointer",
-                  background:"var(--bg)",border:"1px solid var(--rule)"}}
+                  background:"var(--bg)",border:"1px solid var(--rule)",flexWrap:"wrap"}}
                 title="クリックでトレード分析へ">
                 <div style={{fontSize:13,fontWeight:800,color:"var(--inkFaint)",width:16,textAlign:"center"}}>{i+1}</div>
                 <div style={{width:56,fontSize:11.5,color:"var(--inkSoft)"}} className="mono">{w.code}</div>
@@ -2619,7 +2678,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                 </div>
                 {grade && <span style={{fontSize:11,fontWeight:800,color:GRADE_COLOR[grade],border:`1px solid ${GRADE_COLOR[grade]}`,borderRadius:3,padding:"1px 6px"}}>{grade}</span>}
                 {actionMeta && <span style={{fontSize:10.5,fontWeight:700,color:actionMeta.color,border:`1px solid ${actionMeta.color}`,borderRadius:3,padding:"1px 6px",whiteSpace:"nowrap"}}>{actionMeta.label}</span>}
-                <div style={{flex:1,fontSize:11,color:"var(--inkSoft)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{lightweightReason(w)}</div>
+                <div style={{flex:"1 1 140px",minWidth:0,fontSize:11,color:"var(--inkSoft)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{lightweightReason(w)}</div>
               </div>;
             })}
           </div>}
@@ -2629,7 +2688,9 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         v3-6：Primary Status（強さ）とAction Status（今入れるか）を分けて集計する。 */}
     {/* v3-9：🐒 MOMENTUM DAY。「リアルタイムデータを反映」ボタンと同じく明示クリック時だけ実行
         （東証全体スキャンは重いため自動実行しない）。結果サマリーは調整の判断材料として簡潔に表示。 */}
-    <div style={{display:"flex",alignItems:"center",gap:8,marginTop:10}}>
+    {/* v3-9続き（PHASE 7 MOBILE/PWA・STEP5）：AUTOスキャンボタン5個が横並びのまま折り返さず
+        390px等で右にはみ出していた（STEP1監査で発見）。flexWrapで2段以内に収める。 */}
+    <div style={{display:"flex",alignItems:"center",gap:8,marginTop:10,flexWrap:"wrap"}}>
       <button className="action-btn" style={{fontSize:12}} disabled={momentumScanning} onClick={onMomentumScan}>
         {momentumScanning?"🐒 スキャン中…（数分かかります）":"🐒 MOMENTUM DAYスキャン"}
       </button>
@@ -2783,7 +2844,8 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13}}>
           {items.length===0?"監視銘柄はまだありません。「日本市場」タブの一覧で「監視銘柄」ボタンを押すと、ここに追加されます。":"条件に一致する銘柄はありません。"}
         </div> :
-        <div style={{overflowX:"auto",maxHeight:620,overflowY:"auto"}}>
+        <>
+        <div className="watch-table-desktop" style={{overflowX:"auto",maxHeight:620,overflowY:"auto"}}>
         <table className="watch-table" style={{width:"100%"}}>
           <colgroup>
             <col style={{width:150}}/><col style={{width:54}}/><col style={{width:56}}/><col/>
@@ -2878,7 +2940,65 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                 </div>}
               </td>
             </tr>;})}</tbody>
-        </table></div>}
+        </table></div>
+        {/* v3-9続き（PHASE 7 MOBILE/PWA）：390px前後のスマホ用compact card表示。
+            CSS（.watch-table-mobile、@media (max-width:768px)）でデスクトップ版と排他的に
+            切り替える。既存のenrichWatchRow等の判定結果（w.status/actionStatus/rsScore等）を
+            そのまま流用し、新しい判定ロジックは追加しない。 */}
+        <div className="watch-table-mobile">
+          {displayed.map((w)=>{
+            const qt=stockQuotes[w.code]||{};
+            const ct=num(qt.t),cp=num(qt.p);
+            const pct=w.pct;
+            const fg=pct==null||pct===0?"var(--ink)":(pct>0?"var(--up)":"var(--down)");
+            const meta=PRIMARY_STATUS_META[w.status];
+            const actionMeta=ACTION_STATUS_META[w.actionStatus];
+            const reasonList=w.actionStatus==="RISK"?w.riskReasons.map(r=>RISK_REASON_META[r])
+              :w.actionStatus==="WAIT"?w.waitReasons.map(r=>WAIT_REASON_META[r]):[];
+            const rsFg=w.rsScore==null?"var(--ink)":w.rsScore>=75?"var(--up)":w.rsScore<25?"var(--down)":"var(--ink)";
+            const isOpen=expandedCode===w.code;
+            const mb=deriveMomentumBadge(w),bb=deriveBreakBadge(w),rb=deriveRsBadge(w),sb=deriveSectorLeaderBadge(w),pb=derivePullbackBadge(w);
+            const inAnalysis=analysisTargets.includes(w.code);
+            return <div key={w.code} style={{padding:"10px 12px",borderTop:"1px solid var(--ruleSoft)",
+                borderLeft:`3px solid ${meta.color}`,cursor:"pointer"}}
+              onClick={()=>setExpandedCode(v=>v===w.code?null:w.code)}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+                <div style={{minWidth:0}}>
+                  <div style={{fontWeight:700,fontSize:15,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{w.name}</div>
+                  <div className="mono" style={{fontSize:12,color:"var(--inkSoft)"}}>{w.code}</div>
+                </div>
+                <div style={{textAlign:"right",flex:"none"}}>
+                  <div className="mono" style={{fontWeight:700,fontSize:15,color:fg}}>{ct!=null?ct.toLocaleString():"—"}</div>
+                  <div className="mono" style={{fontSize:13,fontWeight:600,color:fg}}>{pct!=null?(pct>0?"+":"")+pct.toFixed(2)+"%":"—"}</div>
+                </div>
+              </div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:6,alignItems:"center"}}>
+                <span style={{fontWeight:700,fontSize:11.5,color:meta.color}}>{meta.icon} {meta.label}</span>
+                {actionMeta.label && <span style={{fontWeight:700,fontSize:11,color:actionMeta.color}}>{actionMeta.icon} {actionMeta.label}</span>}
+                <span className="mono" style={{fontWeight:700,fontSize:12,color:rsFg,marginLeft:"auto"}}>RS {w.rsScore!=null?w.rsScore:"—"}</span>
+              </div>
+              {(mb||bb||rb||sb||pb) && <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:4}}>
+                {mb && <span style={{fontSize:10.5,fontWeight:700,color:mb.meta.color}}>{mb.meta.icon} {mb.meta.label}</span>}
+                {bb && <span style={{fontSize:10.5,fontWeight:700,color:bb.meta.color}}>{bb.meta.icon} {bb.meta.label}</span>}
+                {rb && <span style={{fontSize:10.5,fontWeight:700,color:rb.meta.color}}>{rb.meta.icon} {rb.meta.label}</span>}
+                {sb && <span style={{fontSize:10.5,fontWeight:700,color:sb.meta.color}}>{sb.meta.icon} {sb.meta.label}</span>}
+                {pb && <span style={{fontSize:10.5,fontWeight:700,color:pb.meta.color}}>{pb.meta.icon} {pb.meta.label}</span>}
+              </div>}
+              {isOpen && <div style={{marginTop:8,paddingTop:8,borderTop:"1px dashed var(--ruleSoft)",fontSize:12,
+                  color:"var(--inkSoft)",display:"flex",flexDirection:"column",gap:5}} onClick={e=>e.stopPropagation()}>
+                <div>セクター：{w.sector||"—"}</div>
+                <div>対市場：{fmtPt(w.marketRS)}　対セクター：{fmtPt(w.sectorRS)}</div>
+                {reasonList.length>0 && <div>{actionMeta.label}理由：{reasonList.filter(Boolean).join("・")}</div>}
+                <div style={{display:"flex",gap:10,flexWrap:"wrap",marginTop:4}}>
+                  <button className="action-btn" onClick={()=>onOpenChart(w)}>チャート</button>
+                  <button className={"action-btn"+(inAnalysis?" on":"")} onClick={()=>onToggleAnalysis(w.code)}>{inAnalysis?"✓ 分析中":"分析"}</button>
+                  <button className="action-btn" onClick={()=>onRemove(w.code)}>監視解除</button>
+                </div>
+              </div>}
+            </div>;
+          })}
+        </div>
+        </>}
       {!showAll&&filtered.length>TOP_N && <button className="action-btn" style={{display:"block",width:"100%",padding:"8px",borderTop:"1px solid var(--ruleSoft)"}}
         onClick={()=>setShowAll(true)}>すべて表示（残り{filtered.length-TOP_N}件）</button>}
       {showAll&&filtered.length>TOP_N && <button className="action-btn" style={{display:"block",width:"100%",padding:"8px",borderTop:"1px solid var(--ruleSoft)"}}
@@ -3278,7 +3398,7 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
       <div style={{fontWeight:700,color:"var(--ink)",fontSize:13}}>保有株（portfolio）</div>
       <span style={{fontSize:11,color:"var(--inkFaint)"}}>{items.length}銘柄</span>
     </div>
-    <div style={{display:"grid",gridTemplateColumns:"70px 1fr 55px 90px 70px 90px 110px",gap:6,marginBottom:6}}>
+    <div className="position-add-grid-1" style={{display:"grid",gridTemplateColumns:"70px 1fr 55px 90px 70px 90px 110px",gap:6,marginBottom:6}}>
       <input placeholder="コード" value={draft.code} onChange={e=>setDraft({...draft,code:e.target.value})} style={fieldStyle}/>
       <input placeholder="銘柄名" value={draft.name} onChange={e=>setDraft({...draft,name:e.target.value})} style={fieldStyle}/>
       <select value={draft.market} onChange={e=>setDraft({...draft,market:e.target.value})} style={fieldStyle}>
@@ -3292,7 +3412,7 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
       <input placeholder="平均取得単価（実際の約定単価）" value={draft.average_price} onChange={e=>setDraft({...draft,average_price:e.target.value})} style={fieldStyle}/>
       <input type="date" value={draft.acquired_at} onChange={e=>setDraft({...draft,acquired_at:e.target.value})} style={fieldStyle}/>
     </div>
-    <div style={{display:"grid",gridTemplateColumns:"90px 90px 90px 1fr auto auto",gap:6,marginBottom:10,alignItems:"center"}}>
+    <div className="position-add-grid-2" style={{display:"grid",gridTemplateColumns:"90px 90px 90px 1fr auto auto",gap:6,marginBottom:10,alignItems:"center"}}>
       <input placeholder="初期SL" value={draft.initial_stop} onChange={e=>setDraft({...draft,initial_stop:e.target.value})} style={fieldStyle}/>
       <input placeholder="利確①" value={draft.target_1} onChange={e=>setDraft({...draft,target_1:e.target.value})} style={fieldStyle}/>
       <input placeholder="利確②" value={draft.target_2} onChange={e=>setDraft({...draft,target_2:e.target.value})} style={fieldStyle}/>
@@ -5619,7 +5739,7 @@ function App(){
           に変更。第1階層＝グループ（監視銘柄／市場／トレード分析／ポジション／記録／ニュース）、
           第2階層＝グループ内の既存タブ（グループ内が1つだけなら省略）。既存のtabキー・各パネルの
           render条件（{tab==="xxx" && ...}）は一切変更していない。 */}
-      <div className="tabs">
+      <div className="tabs tabs-main">
         {TAB_GROUPS.map(g=>
           <button key={g.key} className={"tab"+(g.tabs.some(t=>t.key===tab)?" on":"")}
             onClick={()=>setTab(g.tabs.some(t=>t.key===tab)?tab:g.tabs[0].key)}>{g.label}</button>)}

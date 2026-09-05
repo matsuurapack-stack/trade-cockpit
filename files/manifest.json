@@ -1,0 +1,18 @@
+{
+  "name": "Trade Cockpit",
+  "short_name": "TradeCockpit",
+  "description": "個人用の株価・指数・為替・ニュースダッシュボード（判断材料の整理用ツール）",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#FFFFFF",
+  "theme_color": "#FFFFFF",
+  "icons": [
+    {
+      "src": "/trade_icon_512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
