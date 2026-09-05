@@ -437,6 +437,48 @@ CREATE TABLE IF NOT EXISTS news_catalysts (
     UNIQUE (user_id, catalyst_date, title)
 );
 CREATE INDEX IF NOT EXISTS idx_news_catalysts_user_date ON news_catalysts(user_id, catalyst_date);
+
+-- v3-9続き（2026-09-05・PHASE 5 EXPERT INTELLIGENCE）：YouTube/インタビュー/セミナー/記事/SNS
+-- での有識者見解を「見通し（outlook）／根拠（thesis）／確認条件（confirmations）／無効化条件
+-- （invalidation_conditions）」に分けて保存する。ユーザーがChatGPTで要約→JSON化して貼り付ける
+-- 想定（有料AI APIは使わない）。売買シグナルへ直接変換せず、Primary/Action Statusにも
+-- AUTOロジックにも一切干渉しない、あくまで分析画面・ポジション画面の参考情報。
+-- 重複判定キーは(expert_name, source_title, published_at)（ユーザー指定）。source_titleは
+-- 省略可のため、無指定行同士はPostgresの仕様上「別物」として扱われる（NULLは重複判定されない）。
+-- confidenceは有識者本人の自信度ではなく、Trade Cockpit側で見た「情報の明確さ・条件の具体性」
+-- として扱う（ユーザー指定の考え方）。
+CREATE TABLE IF NOT EXISTS expert_views (
+    id                      SERIAL PRIMARY KEY,
+    user_id                 TEXT NOT NULL,
+    expert_name             TEXT NOT NULL,
+    source_title            TEXT,
+    source_url              TEXT,
+    source_type             TEXT NOT NULL DEFAULT 'OTHER',  -- YOUTUBE|INTERVIEW|SEMINAR|ARTICLE|SNS|OTHER
+    published_at            DATE NOT NULL,
+    captured_at             DATE,
+    topic                   TEXT,
+    time_horizon            TEXT,     -- INTRADAY|SHORT_TERM|SWING|MEDIUM_TERM|LONG_TERM（自由記述も許容）
+    market                  TEXT,     -- JP|US等。stocks/sectorが空の場合、この市場全体への言及として扱う
+    sector                  TEXT,
+    stocks                  JSONB,    -- ["7203","9984"]等
+    outlook                 TEXT,
+    confidence              TEXT,     -- LOW|MEDIUM|HIGH（本人の自信度ではなく情報の明確さ・条件の具体性）
+    risk_window_start       DATE,
+    risk_window_end         DATE,
+    thesis                  TEXT,
+    confirmations           JSONB,
+    invalidation_conditions JSONB,
+    key_points              JSONB,
+    source_summary          TEXT,
+    verification_status     TEXT NOT NULL DEFAULT 'UNVERIFIED',  -- USER_PROVIDED_TRANSCRIPT|TRANSCRIPT_DERIVED|SUMMARY_ONLY|VERIFIED|UNVERIFIED
+    effective_from          DATE,
+    effective_until         DATE,
+    raw_payload             JSONB,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, expert_name, source_title, published_at)
+);
+CREATE INDEX IF NOT EXISTS idx_expert_views_user_date ON expert_views(user_id, published_at);
 """
 
 
@@ -1701,6 +1743,120 @@ def delete_news_catalyst(database_url, user_id, catalyst_id):
         return
     with pool.connection() as conn:
         conn.execute("DELETE FROM news_catalysts WHERE user_id = %s AND id = %s", [user_id, catalyst_id])
+        conn.commit()
+
+
+# v3-9続き（2026-09-05・PHASE 5 EXPERT INTELLIGENCE）：expert_views。market_events/news_catalysts
+# と同じ「JSON貼り付け→1件ずつupsert」の考え方を踏襲する。重複判定キーはexpert_name・
+# source_title・published_at（ユーザー指定）。expert_name・published_atは必須（無ければFalseを
+# 返し呼び出し側でカウントしない）。
+_EXPERT_VIEW_OPTIONAL_COLS = ["source_url", "source_type", "captured_at", "topic", "time_horizon",
+                               "market", "sector", "stocks", "outlook", "confidence",
+                               "risk_window_start", "risk_window_end", "thesis", "confirmations",
+                               "invalidation_conditions", "key_points", "source_summary",
+                               "verification_status", "effective_from", "effective_until", "raw_payload"]
+_EXPERT_VIEW_JSONB_COLS = {"stocks", "confirmations", "invalidation_conditions", "key_points", "raw_payload"}
+
+
+def _upsert_expert_view_conn(conn, user_id, ev):
+    """1件の有識者見解dictをupsertする。expert_name・published_atは必須。source_type未指定なら
+    OTHER、verification_status未指定ならUNVERIFIED（字幕全文や検証済みでない情報を確定情報
+    として扱わない、既定の安全側）。"""
+    expert_name = ev.get("expert_name")
+    published_at = ev.get("published_at") or ev.get("date")
+    if not expert_name or not published_at:
+        return False
+    source_title = ev.get("source_title")
+    cols = ["expert_name", "published_at", "source_title"] + \
+        [c for c in _EXPERT_VIEW_OPTIONAL_COLS if c in ev or c in ("source_type", "verification_status")]
+    values = []
+    for c in cols:
+        if c == "expert_name":
+            values.append(expert_name)
+        elif c == "published_at":
+            values.append(published_at)
+        elif c == "source_title":
+            values.append(source_title)
+        elif c == "source_type":
+            values.append(ev.get("source_type") or "OTHER")
+        elif c == "verification_status":
+            values.append(ev.get("verification_status") or "UNVERIFIED")
+        elif c in _EXPERT_VIEW_JSONB_COLS:
+            values.append(json.dumps(ev.get(c), ensure_ascii=False) if ev.get(c) is not None else None)
+        else:
+            values.append(ev.get(c))
+    update_cols = [c for c in cols if c not in ("expert_name", "published_at", "source_title")]
+    conn.execute(
+        f"INSERT INTO expert_views (user_id, {', '.join(cols)}) "
+        f"VALUES (%s, {', '.join(['%s::jsonb' if c in _EXPERT_VIEW_JSONB_COLS else '%s' for c in cols])}) "
+        f"ON CONFLICT (user_id, expert_name, source_title, published_at) DO UPDATE SET "
+        f"{', '.join(c + ' = EXCLUDED.' + c for c in update_cols)}, updated_at = now()",
+        [user_id] + values,
+    )
+    return True
+
+
+def import_expert_views(database_url, user_id, views):
+    """views（dictのリスト、JSON貼り付けのimport想定）を1件ずつupsertする。
+    戻り値: {"imported": N, "skipped": M}（expert_name/published_atが無い行はskip）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return {"imported": 0, "skipped": len(views)}
+    imported = skipped = 0
+    with pool.connection() as conn:
+        for ev in views:
+            if not isinstance(ev, dict):
+                skipped += 1
+                continue
+            ok = _upsert_expert_view_conn(conn, user_id, ev)
+            if ok:
+                imported += 1
+            else:
+                skipped += 1
+        conn.commit()
+    return {"imported": imported, "skipped": skipped}
+
+
+def list_expert_views(database_url, user_id, expert=None, from_date=None, to_date=None, market=None, stock=None, limit=200):
+    """user_idの有識者見解をpublished_at降順（新しいもの優先）で返す。expert=有識者名、
+    from_date/to_date=published_atのISO日付フィルタ（両端含む）、market=市場、
+    stock=stocks配列に含まれる銘柄コードで絞り込み可能。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = ["user_id = %s"], [user_id]
+    if expert:
+        where.append("expert_name = %s")
+        params.append(expert)
+    if from_date:
+        where.append("published_at >= %s")
+        params.append(from_date)
+    if to_date:
+        where.append("published_at <= %s")
+        params.append(to_date)
+    if market:
+        where.append("market = %s")
+        params.append(market)
+    if stock:
+        where.append("stocks ? %s")
+        params.append(stock)
+    params.append(limit)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT * FROM expert_views WHERE {' AND '.join(where)} "
+                f"ORDER BY published_at DESC LIMIT %s",
+                params,
+            )
+            return [_row_to_json(r) for r in cur.fetchall()]
+
+
+def delete_expert_view(database_url, user_id, view_id):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return
+    with pool.connection() as conn:
+        conn.execute("DELETE FROM expert_views WHERE user_id = %s AND id = %s", [user_id, view_id])
         conn.commit()
 
 

@@ -4179,6 +4179,18 @@ class Handler(SimpleHTTPRequestHandler):
             category = params.get("category", [None])[0]
             catalysts = investment_db.list_news_catalysts(DATABASE_URL, self.current_user, from_date=from_date, to_date=to_date, category=category) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"catalysts": catalysts})
+        elif self.path.startswith("/api/expert-views"):
+            # v3-9続き（PHASE 5 EXPERT INTELLIGENCE）：?expert=&from=&to=（published_atのISO日付）・
+            # ?market=&stock=で絞り込み可能。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            expert = params.get("expert", [None])[0]
+            from_date = params.get("from", [None])[0]
+            to_date = params.get("to", [None])[0]
+            market = params.get("market", [None])[0]
+            stock = params.get("stock", [None])[0]
+            views = investment_db.list_expert_views(DATABASE_URL, self.current_user, expert=expert, from_date=from_date, to_date=to_date, market=market, stock=stock) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"views": views})
         elif self.path.startswith("/api/trade-candidates"):
             candidates = investment_db.list_trade_candidates(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"candidates": candidates})
@@ -4473,6 +4485,27 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             body = self._read_json_body()
             investment_db.delete_news_catalyst(DATABASE_URL, self.current_user, body.get("id"))
+            self._send_json({"ok": True})
+        elif self.path == "/api/expert-views/import":
+            # v3-9続き（PHASE 5 EXPERT INTELLIGENCE）：ChatGPTでYouTube/インタビュー等を要約した
+            # 有識者見解一覧を貼り付けてimportする。body: {"views": [{expert_name,published_at,...}, ...]}。
+            # 売買シグナルへ直接変換しない・AUTOロジックを書き換えない設計のため、importしても
+            # Primary/Action Statusやスコア計算には一切影響しない。verification_status未指定は
+            # UNVERIFIEDになる（investment_db.import_expert_views側の既定）。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            views = body.get("views")
+            if not isinstance(views, list):
+                self._send_json({"error": "viewsは配列で指定してください"})
+                return
+            result = investment_db.import_expert_views(DATABASE_URL, self.current_user, views)
+            self._send_json(result)
+        elif self.path == "/api/expert-views/delete":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            investment_db.delete_expert_view(DATABASE_URL, self.current_user, body.get("id"))
             self._send_json({"ok": True})
         elif self.path == "/api/watchlist/migrate":
             # 既存ユーザーのlocalStorage watchlistを1回だけNeonへ取り込む（investmentLogMigratedと

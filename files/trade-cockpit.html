@@ -1533,6 +1533,38 @@ function catalystFreshnessLabel(catalystDate){
   return"OLD";
 }
 const CATALYST_FRESHNESS_LABEL={TODAY:"本日",_3D:"3日以内","3D":"3日以内","7D":"1週間以内",OLD:"やや古い情報"};
+// v3-9続き（2026-09-05・PHASE 5 EXPERT INTELLIGENCE）：expert_views用のマッチング・鮮度判定。
+// stocks（銘柄コード配列）に一致、またはsectorが一致、またはstocks/sectorが両方空でmarketだけ
+// 一致（＝市場全体への言及）のいずれかで「関連する」と判定する。risk_window_end／
+// effective_untilが過去に確定していれば「もう有効でない」として除外する（無指定なら鮮度で
+// 除外しない＝発言ログとしては残り続けるが、複数該当時はpublished_at降順で最新を優先する）。
+function isExpertViewActive(v){
+  const todayStr=new Date().toISOString().slice(0,10);
+  if(v.risk_window_end)return v.risk_window_end>=todayStr;
+  if(v.effective_until)return v.effective_until>=todayStr;
+  return true;
+}
+function expertViewMatches(v,code,sector,market){
+  const stocks=v.stocks||[];
+  if(code&&stocks.includes(code))return true;
+  if(sector&&v.sector&&v.sector===sector)return true;
+  if(market&&v.market&&v.market===market&&!stocks.length&&!v.sector)return true;
+  return false;
+}
+// 銘柄コード・セクター・市場に関連する有識者見解のうち、まだ有効なものの最新1件を返す。
+// EXPERT VIEWはあくまで参考情報であり、Primary/Action StatusやAUTOロジックには一切使わない
+// （ユーザー指定の優先順位：EXPERT VIEW→実市場データ→AUTO SIGNALS→Entry/Position判断）。
+function nextExpertViewForCode(views,code,sector,market){
+  if(!views||!views.length)return null;
+  const relevant=views.filter(v=>expertViewMatches(v,code,sector,market)&&isExpertViewActive(v));
+  if(!relevant.length)return null;
+  return relevant.sort((a,b)=>(b.published_at||"").localeCompare(a.published_at||""))[0];
+}
+const EXPERT_VERIFICATION_LABEL={
+  USER_PROVIDED_TRANSCRIPT:"字幕全文提供",TRANSCRIPT_DERIVED:"文字起こし由来",
+  SUMMARY_ONLY:"要約のみ・未検証",VERIFIED:"検証済み",UNVERIFIED:"未検証",
+};
+
 // 銘柄コード・セクターに関連するカタリストのうち、参考にすべきもの（新しい情報、または
 // event_date＝発効日がまだ先のもの）を1件返す。発効日が迫っているものを優先し、無ければ
 // 最新のカタリストを優先する。
@@ -1610,6 +1642,32 @@ function CatalystNote({catalysts,code,sector}){
     {c.verification_status==="UNVERIFIED"&&" （未検証）"}
     {c.verification_status==="IMAGE_DERIVED"&&" （画像由来・要確認）"}
     {c.summary&&<div style={{marginTop:2,color:"var(--inkFaint)"}}>{c.summary}</div>}
+  </div>;
+}
+
+// v3-9続き（PHASE 5 EXPERT INTELLIGENCE）：見通し（outlook）・根拠（thesis）・確認条件・
+// 無効化条件を分けて表示する。compact=trueならポジションカード用の一行要約（ユーザー指定の
+// モックアップ「🎓 有識者見解／円高リスク警戒 AI半導体悪抜け待ち」に合わせる）、falseなら
+// 銘柄分析カード用の詳細表示。あくまで参考情報でありPrimary/Action Statusには一切干渉しない。
+function ExpertViewNote({views,code,sector,market,compact}){
+  const v=useMemo(()=>nextExpertViewForCode(views,code,sector,market),[views,code,sector,market]);
+  if(!v)return null;
+  const verifyLabel=EXPERT_VERIFICATION_LABEL[v.verification_status]||v.verification_status;
+  const titleAttr=`情報源：${v.source_title||v.source_url||"—"}（${v.source_type||"OTHER"}）／`+
+    `検証状態：${verifyLabel}（要約・断片情報を確定情報として扱わない）`;
+  if(compact){
+    return <div style={{fontSize:11,color:"var(--inkSoft)",background:"var(--band)",
+        border:"1px solid var(--rule)",borderRadius:4,padding:"4px 8px",marginBottom:8}} title={titleAttr}>
+      🎓 有識者見解　{v.expert_name}：{v.outlook||v.thesis||"—"}
+    </div>;
+  }
+  return <div style={{fontSize:11,color:"var(--inkSoft)",background:"var(--band)",
+      border:"1px solid var(--rule)",borderRadius:4,padding:"6px 8px",marginBottom:8}} title={titleAttr}>
+    <div style={{fontWeight:700,color:"var(--ink)"}}>🎓 EXPERT VIEW　{v.expert_name}</div>
+    {v.outlook && <div style={{marginTop:2}}>{v.time_horizon?`${v.time_horizon}：`:""}{v.outlook}</div>}
+    {v.confirmations && v.confirmations.length>0 && <div style={{marginTop:2,color:"var(--inkFaint)"}}>確認：{v.confirmations.join(" / ")}</div>}
+    {v.invalidation_conditions && v.invalidation_conditions.length>0 && <div style={{color:"var(--inkFaint)"}}>無効化：{v.invalidation_conditions.join(" / ")}</div>}
+    {v.verification_status!=="VERIFIED" && <div style={{marginTop:2,color:"var(--inkFaint)"}}>（{verifyLabel}）</div>}
   </div>;
 }
 
@@ -1785,6 +1843,97 @@ function CatalystsPanel({catalysts,onReload}){
         {old.slice(0,30).map(c=><div key={c.id} style={{fontSize:11.5,color:"var(--inkFaint)"}}>{c.catalyst_date} {c.title}</div>)}
       </div>
     </details>}
+  </div>;
+}
+
+// v3-9続き（PHASE 5 EXPERT INTELLIGENCE）：有識者見解一覧タブ。EventsPanel/CatalystsPanelと
+// 全く同じ「貼り付け→保存→リロード」パターン。重複判定キー（expert_name/source_title/
+// published_at）はサーバー側のupsertで保証されるため、ここではimportして結果を表示するだけ。
+function ExpertViewsPanel({views,onReload}){
+  const [pasteText,setPasteText]=useState("");
+  const [importing,setImporting]=useState(false);
+  const [importMsg,setImportMsg]=useState("");
+  const [expertFilter,setExpertFilter]=useState("ALL");
+  const doImport=async()=>{
+    let parsed;
+    try{parsed=JSON.parse(pasteText);}catch(e){setImportMsg("JSONの形式が正しくありません: "+e.message);return;}
+    const list=Array.isArray(parsed)?parsed:(parsed&&parsed.views)||[];
+    if(!Array.isArray(list)||!list.length){setImportMsg("views配列が見つかりません（[...]または{\"views\":[...]}の形式で貼り付けてください）");return;}
+    setImporting(true);
+    try{
+      const r=await fetch("/api/expert-views/import",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({views:list})});
+      if(r.ok){
+        const d=await r.json();
+        setImportMsg(`取り込み完了：${d.imported}件（不備でスキップ${d.skipped}件）`);
+        setPasteText("");
+        onReload();
+      }else{
+        setImportMsg("取り込みに失敗しました");
+      }
+    }catch(e){setImportMsg("通信エラー: "+e.message);}
+    setImporting(false);
+  };
+  const removeView=async(id)=>{
+    if(!confirm("この有識者見解を削除しますか？"))return;
+    try{
+      await fetch("/api/expert-views/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});
+      onReload();
+    }catch(e){}
+  };
+  const experts=useMemo(()=>[...new Set(views.map(v=>v.expert_name).filter(Boolean))],[views]);
+  const filtered=useMemo(()=>expertFilter==="ALL"?views:views.filter(v=>v.expert_name===expertFilter),[views,expertFilter]);
+  const sorted=useMemo(()=>[...filtered].sort((a,b)=>(b.published_at||"").localeCompare(a.published_at||"")),[filtered]);
+  return <div style={{marginTop:18}}>
+    <div className="sec-head">有識者</div>
+    <div className="sec-note" style={{fontSize:13}}>
+      YouTube・インタビュー・セミナー・記事・SNS等の有識者見解を「見通し／根拠／確認条件／無効化条件」に分けてJSONで貼り付けてimportします（ChatGPTで要約→JSON化する運用を想定、有料AI APIは使用しません）。
+      見通しを売買シグナルへ直接変換することはなく、Primary/Action StatusにもAUTOロジックにも一切干渉しません（実市場データ・AUTO SIGNALSが優先、EXPERT VIEWが最終判断を上書きすることはありません）。
+      字幕全文が無い断片情報・要約のみの情報は確定情報として扱わず、verification_status（USER_PROVIDED_TRANSCRIPT/TRANSCRIPT_DERIVED/SUMMARY_ONLY/VERIFIED/UNVERIFIED）を必ず保存します。
+    </div>
+    <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 12px",marginBottom:14}}>
+      <textarea value={pasteText} onChange={e=>setPasteText(e.target.value)} rows={8}
+        placeholder={'例: [{"expert_name":"○○○○","source_title":"○○チャンネル 9/4配信","source_type":"YOUTUBE","published_at":"2026-09-04","time_horizon":"SHORT_TERM","market":"JP","outlook":"9月〜10月上旬は警戒","risk_window_start":"2026-09-01","risk_window_end":"2026-10-10","thesis":"テクニカル過熱・円高・金融政策が短期逆風","confirmations":["円高一服","日銀QT議論"],"invalidation_conditions":["原油急騰","円高加速"],"verification_status":"USER_PROVIDED_TRANSCRIPT"}]'}
+        style={{width:"100%",fontSize:12,padding:8,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",fontFamily:"monospace",boxSizing:"border-box"}}/>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8}}>
+        <button className="btn primary" disabled={importing||!pasteText.trim()} onClick={doImport}>{importing?"取り込み中…":"JSONを取り込む"}</button>
+        {importMsg && <span style={{fontSize:12,color:"var(--inkSoft)"}}>{importMsg}</span>}
+      </div>
+    </div>
+    {experts.length>0 && <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,flexWrap:"wrap"}}>
+      <span style={{fontSize:12,color:"var(--inkSoft)"}}>有識者:</span>
+      <select value={expertFilter} onChange={e=>setExpertFilter(e.target.value)}
+        style={{fontSize:12,padding:"3px 6px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}>
+        <option value="ALL">すべて</option>
+        {experts.map(e=><option key={e} value={e}>{e}</option>)}
+      </select>
+    </div>}
+    <div className="sec-head" style={{fontSize:13}}>登録済みの見解（{sorted.length}件）</div>
+    {sorted.length===0
+      ? <div style={{padding:16,color:"var(--inkFaint)",fontSize:13}}>登録されている有識者見解はありません。</div>
+      : <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          {sorted.map(v=>{
+            const verifyLabel=EXPERT_VERIFICATION_LABEL[v.verification_status]||v.verification_status;
+            const active=isExpertViewActive(v);
+            return <div key={v.id} style={{padding:"8px 10px",border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)",fontSize:12.5,opacity:active?1:0.6}}>
+              <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                <span style={{fontWeight:700}}>🎓 {v.expert_name}</span>
+                <span className="mono" style={{color:"var(--inkSoft)"}}>{v.published_at}</span>
+                {v.source_type && <span style={{fontSize:10.5,color:"var(--inkFaint)",border:"1px solid var(--rule)",borderRadius:3,padding:"1px 5px"}}>{v.source_type}</span>}
+                {v.time_horizon && <span style={{fontSize:10.5,color:"var(--inkFaint)"}}>{v.time_horizon}</span>}
+                {(v.market||v.sector) && <span style={{fontSize:10.5,color:"var(--inkFaint)"}}>{[v.market,v.sector].filter(Boolean).join("・")}</span>}
+                {v.stocks && v.stocks.length>0 && <span style={{fontSize:11,color:"var(--inkFaint)"}}>{v.stocks.join("・")}</span>}
+                <span style={{fontSize:10.5,color:"var(--inkFaint)",border:"1px solid var(--rule)",borderRadius:3,padding:"1px 5px"}}>{verifyLabel}</span>
+                <button className="iconbtn" style={{marginLeft:"auto"}} title="削除" onClick={()=>removeView(v.id)}>×</button>
+              </div>
+              {v.outlook && <div style={{marginTop:4}}>見通し：{v.outlook}</div>}
+              {(v.risk_window_start||v.risk_window_end) && <div style={{color:"var(--inkFaint)"}}>リスク期間：{v.risk_window_start||"—"}〜{v.risk_window_end||"—"}</div>}
+              {v.thesis && <div style={{color:"var(--inkFaint)"}}>根拠：{v.thesis}</div>}
+              {v.confirmations && v.confirmations.length>0 && <div style={{color:"var(--inkFaint)"}}>確認：{v.confirmations.join(" / ")}</div>}
+              {v.invalidation_conditions && v.invalidation_conditions.length>0 && <div style={{color:"var(--inkFaint)"}}>無効化：{v.invalidation_conditions.join(" / ")}</div>}
+            </div>;
+          })}
+        </div>}
   </div>;
 }
 
@@ -2790,7 +2939,7 @@ function deriveTrailingStatus(currentStop,initialStop,avgPrice,current){
 // 直接編集・保存できる。stockQuotes（現在値）・analysisData（トレード分析タブのentry/stop/
 // target/fullExitTargetのスナップショット）を新たにpropsで受け取り、既存の取得済みデータを
 // 再利用する（新規リクエストは追加しない）。
-function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEvents,newsCatalysts}){
+function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEvents,newsCatalysts,expertViews}){
   const [items,setItems]=useState([]);
   const [loading,setLoading]=useState(true);
   // v3-8（ポジション管理ロジック再設計 Step1）：取引タイプ（DAY/SWING）を新規登録時に必須化。
@@ -3070,6 +3219,9 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
                 <EventRiskNote events={marketEvents} code={it.code} sector={it.sector} tradeStyle={it.trade_style}/>
                 {/* v3-9続き（PHASE 4）：カタリスト接近（参考情報のみ、Statusには不干渉）。 */}
                 <CatalystNote catalysts={newsCatalysts} code={it.code} sector={it.sector}/>
+                {/* v3-9続き（PHASE 5）：EXPERT VIEW（参考情報のみ、ポジション判定ロジックには使わない）。
+                    ユーザー指定のモックアップに合わせ、ポジションカードでは一行要約（compact）で表示する。 */}
+                <ExpertViewNote views={expertViews} code={it.code} sector={it.sector} market={it.market} compact/>
 
                 {/* ⑧ 操作・参考情報・メモ */}
                 <div style={{display:"flex",alignItems:"center",gap:6,marginTop:8,flexWrap:"wrap"}}>
@@ -4322,6 +4474,13 @@ function App(){
     fetch("/api/news-catalysts").then(r=>r.ok?r.json():null).then(d=>{if(d)setNewsCatalysts(d.catalysts||[]);}).catch(()=>{});
   };
   useEffect(()=>{loadNewsCatalysts();},[]);
+  // v3-9続き（PHASE 5 EXPERT INTELLIGENCE）：expert_views。marketEvents/newsCatalystsと同じ
+  // パターン（ページ表示時に1回だけ取得、ExpertViewsPanelでimport後は明示的にリロード）。
+  const [expertViews,setExpertViews]=useState([]);
+  const loadExpertViews=()=>{
+    fetch("/api/expert-views").then(r=>r.ok?r.json():null).then(d=>{if(d)setExpertViews(d.views||[]);}).catch(()=>{});
+  };
+  useEffect(()=>{loadExpertViews();},[]);
   const masterUS=useMemo(()=>MASTER.filter(m=>m.market==="US"),[]);
 
   // 12章：分析タブの対象銘柄（日本市場・アメリカ市場どちらの登録銘柄からも追加され得る）
@@ -5328,6 +5487,7 @@ function App(){
                           <RelevantMarketSummary w={w} metrics={s.metrics}/>
                           <EventRiskNote events={marketEvents} code={w.code} sector={w.sector}/>
                           <CatalystNote catalysts={newsCatalysts} code={w.code} sector={w.sector}/>
+                          <ExpertViewNote views={expertViews} code={w.code} sector={w.sector} market={w.market}/>
                           {/* ===== Trade Cockpit v2 Phase2：総合判断・8軸・Entry Conditions・Falling Knife/Chase Risk ===== */}
                           {a.assessment && enr && <AssessmentCard assessment={a.assessment} marginBadge={a.tradeRules?.marginBadge} marginRatio={a.tradeRules?.marginRatio} enr={enr} sectorRank={sectorRankMap.get(w.sector)}/>}
                           {enr && <StatusReasonPanel enr={enr} a={a}/>}
@@ -5700,7 +5860,7 @@ function App(){
       {tab==="position" && <div style={{marginTop:18}}>
         <div className="sec-head">ポジション</div>
         <div className="sec-note">保有中の建玉のみを表示します。売買記録・振り返りは「記録」タブへ。</div>
-        <PortfolioPanel stockQuotes={s.stockQuotes} analysisData={s.analysisData} analysisEnrichedMap={analysisEnrichedMap} marketEvents={marketEvents} newsCatalysts={newsCatalysts}/>
+        <PortfolioPanel stockQuotes={s.stockQuotes} analysisData={s.analysisData} analysisEnrichedMap={analysisEnrichedMap} marketEvents={marketEvents} newsCatalysts={newsCatalysts} expertViews={expertViews}/>
       </div>}
 
       {/* ===== 投資判断ログ（2026-09-02新規） ===== */}
@@ -5726,31 +5886,34 @@ function App(){
           {key:"registered",label:"登録銘柄"},
           {key:"disclosure",label:"適時開示"},
           {key:"catalyst",label:"カタリスト"},
+          {key:"expert",label:"有識者"},
         ];
-        // v3-9続き（PHASE 4）：「カタリスト」サブタブだけはニュース本体（RSS/TDnet）ではなく
-        // news_catalysts（構造化カタログ情報）を表示する。サブタブchip barは他タブと共通の
-        // ままにして、コンテンツ部分だけ切り替える（chip barを早期returnで消すと元のサブタブへ
-        // 戻る手段が無くなるため）。
+        // v3-9続き（PHASE 4・PHASE 5）：「カタリスト」「有識者」サブタブだけはニュース本体
+        // （RSS/TDnet）ではなく、それぞれnews_catalysts／expert_views（構造化情報）を表示する。
+        // サブタブchip barは他タブと共通のままにして、コンテンツ部分だけ切り替える
+        // （chip barを早期returnで消すと元のサブタブへ戻る手段が無くなるため）。
         const isCatalyst=newsSubTab==="catalyst";
-        let listFor=isCatalyst?[]:{summary:newsSummary,domestic:s.macroNewsDomestic,overseas:overseasAll,registered:stockNameNewsAll,disclosure:disclosureAll}[newsSubTab];
+        const isExpert=newsSubTab==="expert";
+        const isStructured=isCatalyst||isExpert;
+        let listFor=isStructured?[]:{summary:newsSummary,domestic:s.macroNewsDomestic,overseas:overseasAll,registered:stockNameNewsAll,disclosure:disclosureAll}[newsSubTab];
         const showCode=newsSubTab==="summary"||newsSubTab==="disclosure"||newsSubTab==="registered";
         // Trade Cockpit v2 Phase4（設計案30番）：銘柄コードを持つニュース一覧は、保有＞今日の候補＞
         // 監視銘柄＞テーマ一致＞その他 の順に並べ替える（Array.sortは安定ソートのため、同じ優先度内
         // では元の並び＝取得順を保つ）。
         if(showCode)listFor=[...listFor].sort((a,b)=>newsPriorityRank(a.code)-newsPriorityRank(b.code));
-        const hasImportant=!isCatalyst&&listFor.some(it=>isImportantNews(it.title));
+        const hasImportant=!isStructured&&listFor.some(it=>isImportantNews(it.title));
         return <div style={{marginTop:18}}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
             <div className="sec-head">ニュース</div>
             <span style={{fontSize:11,color:"var(--inkSoft)"}}>{newsFetching?"更新中…":newsMsg?newsMsg+"（1時間おき自動更新）":"1時間おきに自動更新"}</span>
           </div>
-          <div className="sec-note">1時間おきに自動更新します。日本株は銘柄コードで確実に関連付けられる立花証券APIのニュース（NQN等）を優先し、報道の少ない銘柄だけGoogleニュースで補完します（広告・野球結果等は除外済み）。「サマリー」「海外市況」「登録銘柄」「適時開示」にはアメリカ市場（ダウ30社）のニュースも含みます。「適時開示」は日本の登録銘柄について当日を含む直近10日分のTDnet開示を種類を問わず（決算・上方修正・下方修正・新株予約権発行など）全件表示します（アメリカ株はTDnet対象外のためGoogleニュースのIR関連キーワードで近似）。「登録銘柄」は社名またはNQNの銘柄コードでの一致で拾ったニュース全般（優先度上位の銘柄まで）です。見出しをクリックすると元記事が開きます（NQN等、元記事URLの無い速報はクリックできません）。「カタリスト」はChatGPT等で構造化したカタログ情報の別枠（都度取得のRSS/TDnetとは別テーブル）です。</div>
+          <div className="sec-note">1時間おきに自動更新します。日本株は銘柄コードで確実に関連付けられる立花証券APIのニュース（NQN等）を優先し、報道の少ない銘柄だけGoogleニュースで補完します（広告・野球結果等は除外済み）。「サマリー」「海外市況」「登録銘柄」「適時開示」にはアメリカ市場（ダウ30社）のニュースも含みます。「適時開示」は日本の登録銘柄について当日を含む直近10日分のTDnet開示を種類を問わず（決算・上方修正・下方修正・新株予約権発行など）全件表示します（アメリカ株はTDnet対象外のためGoogleニュースのIR関連キーワードで近似）。「登録銘柄」は社名またはNQNの銘柄コードでの一致で拾ったニュース全般（優先度上位の銘柄まで）です。見出しをクリックすると元記事が開きます（NQN等、元記事URLの無い速報はクリックできません）。「カタリスト」「有識者」はChatGPT等で構造化した情報の別枠（都度取得のRSS/TDnetとは別テーブル）です。</div>
           <div className="subtabs">
             {NEWS_SUBTABS.map(t=><button key={t.key} className={"chip"+(newsSubTab===t.key?" on":"")} onClick={()=>{setNewsSubTab(t.key);setNewsShowCount(NEWS_PAGE_SIZE);}}>{t.label}</button>)}
           </div>
-          {isCatalyst
-            ? <CatalystsPanel catalysts={newsCatalysts} onReload={loadNewsCatalysts}/>
-            : <>
+          {isCatalyst && <CatalystsPanel catalysts={newsCatalysts} onReload={loadNewsCatalysts}/>}
+          {isExpert && <ExpertViewsPanel views={expertViews} onReload={loadExpertViews}/>}
+          {!isStructured && <>
                 {hasImportant && <div style={{display:"flex",alignItems:"center",gap:10,background:"var(--upBg)",border:"1px solid var(--up)",borderRadius:4,padding:"10px 14px",marginBottom:12}}>
                   <span style={{fontSize:13,fontWeight:700,color:"var(--up)"}}>⚠ 重要ニュースを含みます</span>
                   <span style={{fontSize:12,color:"var(--inkSoft)"}}>サプライズ決算・戦争紛争・パンデミック・大規模災害・株価暴落に関連する見出しに印を付けています。</span>
