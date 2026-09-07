@@ -3194,6 +3194,289 @@ def run_reversal_scan(database_url, user_id, force=False):
     }
 
 
+# ============================================================
+# v3-9続き（2026-09-07・AUTO_VOLUME）：「出来高が多い銘柄を拾う」のではなく「通常時と比べて
+# 異常に資金が流入している銘柄」を、価格方向・売買代金・RS・高値維持と合わせて検出するエンジン。
+# 既存Stage1共有キャッシュ・CURRENT/SEEN・manual_registered保護・auto_signal_eventsをそのまま
+# 再利用し、新しい全市場スキャンは追加しない。
+# 最重要課題：日中出来高の時間帯依存。取引時間中の途中出来高を過去の1日平均出来高と単純比較
+# すると朝ほどvolRatioが低くなる（AUTO_REVERSAL実データ検証で0.05〜0.1という値が出た問題と
+# 同根）。_market_time_progress_ratio()で「今の時刻までに通常1日の何%程度出来高が進むはずか」
+# を東証の前場(09:00-11:30)・昼休み(11:30-12:30、出来高進行を止める)・後場(12:30-15:30)を
+# 区別して算出し、timeAdjustedVolumeRatio（時間帯補正後）とrawVolumeRatio（補正前の生の倍率、
+# 大引け後の最終確定値として使う）を両方保持する。
+# ============================================================
+VOLUME_LITE_MAX_CANDIDATES = 150
+VOLUME_SCORE_THRESHOLD = 50  # 実データを見て調整する前提の初期値（他エンジンと同じ運用）
+VOLUME_MAX_REGISTER = 15
+VOLUME_TAG_EXPIRE_DAYS = 2
+VOLUME_STAGE2_WORKERS = 10
+VOLUME_HIGH_LOOKBACK_DAYS = 63  # distanceFromHigh・break statusの参照期間（AUTO_PULLBACKの
+                                 # BREAKOUT_LOOKBACK_DAYSと同じ3か月＝既存の考え方を踏襲）
+
+
+def _market_time_progress_ratio(now_jst=None):
+    """東京市場の取引時間（前場09:00-11:30・昼休み11:30-12:30は進行停止・後場12:30-15:30、
+    合計330分）を基準に、「現在時刻までに通常1日の出来高の何%程度が形成されるはずか」を返す
+    （0.0〜1.0）。09:00より前は0.0（未寄り付き）、15:30以降は1.0（大引け後＝rawVolumeRatioが
+    そのまま最終確定値として使える）。前場・後場をそれぞれ線形補間し、昼休みは前場終了時点の
+    値のまま据え置く（単純な一日全体の線形補間にしない、ユーザー指示）。"""
+    if now_jst is None:
+        jst = datetime.timezone(datetime.timedelta(hours=9))
+        now_jst = datetime.datetime.now(jst)
+    t = now_jst.time()
+    morning_start, morning_end = datetime.time(9, 0), datetime.time(11, 30)
+    lunch_end, afternoon_end = datetime.time(12, 30), datetime.time(15, 30)
+    morning_minutes, afternoon_minutes = 150, 180
+    total_minutes = morning_minutes + afternoon_minutes
+    if t < morning_start:
+        return 0.0
+    if t <= morning_end:
+        elapsed = (t.hour * 60 + t.minute) - (morning_start.hour * 60 + morning_start.minute)
+        return max(0.0, min(1.0, elapsed / total_minutes))
+    if t <= lunch_end:
+        return morning_minutes / total_minutes  # 昼休み中は前場終了時点の進行度で据え置く
+    if t <= afternoon_end:
+        elapsed_pm = (t.hour * 60 + t.minute) - (lunch_end.hour * 60 + lunch_end.minute)
+        return min(1.0, (morning_minutes + elapsed_pm) / total_minutes)
+    return 1.0  # 大引け後
+
+
+def _volume_lite_score(row):
+    """Stage1だけでの一次選定：売買代金・当日騰落率の絶対値・高値維持率・対市場/対セクターで
+    広く拾う（精密な出来高倍率はStage2の責務、ユーザー指示：Stage1では必須にしない）。"""
+    turnover = row.get("turnover")
+    if turnover is None or turnover < 3e8:
+        return None  # 売買代金3億円未満は資金流入の議論に値しないレベルとして除外
+    chg = row.get("changePct")
+    score = 0.0
+    score += _scale_score(turnover, 3e8, 1e10, 30)
+    score += _scale_score(abs(chg) if chg is not None else 0, 0, 8, 25)
+    score += _scale_score(row.get("highRetention"), 0.7, 0.99, 15)
+    score += _scale_score(abs(row.get("marketRS")) if row.get("marketRS") is not None else 0, 0, 5, 15)
+    score += _scale_score(abs(row.get("sectorRS")) if row.get("sectorRS") is not None else 0, 0, 3, 15)
+    score *= _liquidity_multiplier(turnover)
+    return round(score, 1)
+
+
+def select_volume_stage1_candidates(stage1):
+    scored = []
+    for code, row in stage1["rows"].items():
+        s = _volume_lite_score(row)
+        if s is not None:
+            scored.append((s, code, row))
+    scored.sort(key=lambda x: -x[0])
+    return scored[:VOLUME_LITE_MAX_CANDIDATES]
+
+
+def _volume_stage2_detail(code, stage1_row):
+    """日足履歴から過去20営業日平均出来高（avgVolume20）・当日出来高との倍率（生・時間帯補正後
+    の両方）・売買代金倍率・直近高値からの乖離（distanceFromHigh）・break status等を算出する。"""
+    arrays = _tachibana_daily_arrays(code)
+    if not arrays:
+        return None
+    closes, opens, highs, lows, volumes = arrays
+    if len(closes) < 25 or len(volumes) < 21:
+        return None
+    current = stage1_row.get("current") if stage1_row.get("current") is not None else closes[-1]
+
+    avg_volume20 = sum(volumes[-21:-1]) / 20
+    current_volume = volumes[-1]
+    raw_volume_ratio = (current_volume / avg_volume20) if avg_volume20 else None
+
+    progress = _market_time_progress_ratio()
+    is_intraday = progress < 1.0
+    expected_volume_so_far = avg_volume20 * progress if avg_volume20 else None
+    time_adjusted_volume_ratio = (current_volume / expected_volume_so_far) if expected_volume_so_far else raw_volume_ratio
+
+    # 売買代金倍率（可能なら）：過去20営業日平均売買代金との比較。当日売買代金はStage1のturnover
+    # （current×当日出来高）をそのまま使う（新規API不要）。
+    avg_turnover20 = None
+    turnover_ratio = None
+    if avg_volume20:
+        # 過去20日分の終値×出来高の平均で近似（日次の高値/安値までは使わず、既存データだけで
+        # 完結させる）。
+        past_turnovers = [closes[i] * volumes[i] for i in range(-21, -1)]
+        avg_turnover20 = sum(past_turnovers) / len(past_turnovers) if past_turnovers else None
+        turnover = stage1_row.get("turnover")
+        turnover_ratio = (turnover / avg_turnover20) if (turnover and avg_turnover20) else None
+
+    # distanceFromHigh・break status：AUTO_PULLBACKと同じ3か月（VOLUME_HIGH_LOOKBACK_DAYS）の
+    # 戻り高値を参照する。
+    lookback_window = highs[-(VOLUME_HIGH_LOOKBACK_DAYS + 1):-1] if len(highs) >= VOLUME_HIGH_LOOKBACK_DAYS + 1 else highs[:-1]
+    recent_high = max(lookback_window) if lookback_window else highs[-2]
+    distance_from_high_pct = ((current - recent_high) / recent_high * 100) if recent_high else None
+    above_recent_high = bool(recent_high and current > recent_high)
+
+    # Falling Knife/REVERSAL同様の「当日安値更新中」「強いgap down」判定（NEGATIVE_VOLUME判定に使う）。
+    recent_low_window = lows[-21:-1]
+    making_new_low_today = bool(recent_low_window and lows[-1] <= min(recent_low_window))
+    gap_down = bool(len(closes) >= 2 and closes[-2] and opens[-1] < closes[-2] * 0.97 and current < closes[-2])
+
+    return {"avgVolume20": round(avg_volume20, 0) if avg_volume20 else None,
+            "currentVolume": current_volume,
+            "rawVolumeRatio": round(raw_volume_ratio, 2) if raw_volume_ratio is not None else None,
+            "timeAdjustedVolumeRatio": round(time_adjusted_volume_ratio, 2) if time_adjusted_volume_ratio is not None else None,
+            "isIntradayVolume": is_intraday, "timeProgressRatio": round(progress, 3),
+            "avgTurnover20": round(avg_turnover20, 0) if avg_turnover20 else None,
+            "turnoverRatio": round(turnover_ratio, 2) if turnover_ratio is not None else None,
+            "distanceFromHighPct": round(distance_from_high_pct, 2) if distance_from_high_pct is not None else None,
+            "aboveRecentHigh": above_recent_high,
+            "makingNewLowToday": making_new_low_today, "gapDown": gap_down}
+
+
+def _volume_type(stage2, row):
+    """出来高急増を伴う資金の向きを分類する。POSITIVE_VOLUME（資金流入を伴う上昇）／
+    NEGATIVE_VOLUME（出来高急増を伴う下落）／CLIMAX_UP・CLIMAX_DOWN（極端な出来高急増＋
+    急騰/急落）／NEUTRAL_VOLUME（出来高は増えているが方向不明）。出来高増加＝買い、ではない
+    というユーザー方針を反映する。"""
+    day_change = row.get("changePct")
+    tavr = stage2.get("timeAdjustedVolumeRatio")
+    if day_change is None or tavr is None:
+        return "NEUTRAL_VOLUME"
+    if day_change >= 10 and tavr >= 5:
+        return "CLIMAX_UP"
+    if day_change <= -8 and tavr >= 3:
+        return "CLIMAX_DOWN"
+    if (day_change < -3 and tavr >= 1.5) or (stage2.get("makingNewLowToday") and tavr >= 1.5) or (stage2.get("gapDown") and tavr >= 1.5):
+        return "NEGATIVE_VOLUME"
+    if day_change > 1 and tavr >= 1.3:
+        return "POSITIVE_VOLUME"
+    return "NEUTRAL_VOLUME"
+
+
+def _volume_final_score(row, stage2):
+    """VOLUME_SCORE（100点満点、初期配点）：
+      Time-adjusted Volume Ratio   最大30点（1.0倍で0点、3.0倍以上で満点）
+      Turnover/Liquidity           最大20点
+      Price Direction              最大15点（上昇のみ加点、下落は0点＝下のNEGATIVE_VOLUME
+                                    判定と合わせて二重に評価する）
+      High Retention               最大15点（0.7未満で0点、0.99以上で満点）
+      Market RS                    最大10点
+      Sector RS                    最大10点
+    NEGATIVE_VOLUME／CLIMAX_DOWNは「出来高急増を伴う下落」であり買い候補ではないため、
+    CURRENT登録対象から除外する（Noneを返す。ただしStage1候補には残るためallCandidatesには
+    出ない＝ユーザー指示の「異常出来高としての警戒タグ表示」は将来拡張として見送り、今回は
+    除外のみ実装）。"""
+    if stage2 is None:
+        return None
+    volume_type = _volume_type(stage2, row)
+    if volume_type in ("NEGATIVE_VOLUME", "CLIMAX_DOWN"):
+        return None
+    tavr = stage2.get("timeAdjustedVolumeRatio")
+    score = 0.0
+    score += _scale_score(tavr, 1.0, 3.0, 30)
+    score += _scale_score(row.get("turnover"), 3e8, 1e10, 20)
+    day_change = row.get("changePct")
+    if day_change is not None and day_change > 0:
+        score += _scale_score(day_change, 0, 8, 15)
+    score += _scale_score(row.get("highRetention"), 0.7, 0.99, 15)
+    score += _scale_score(row.get("marketRS"), 0, 5, 10)
+    score += _scale_score(row.get("sectorRS"), 0, 3, 10)
+    score *= _liquidity_multiplier(row.get("turnover"))
+    return round(score, 1)
+
+
+def run_volume_scan(database_url, user_id, force=False):
+    """Stage1（キャッシュ共有）→VOLUME候補選定→Stage2（並列、他エンジンと同じ構成）→
+    VOLUME_SCORE確定（NEGATIVE_VOLUME/CLIMAX_DOWNは除外）→閾値を満たした上位
+    VOLUME_MAX_REGISTER件を「AUTO_VOLUME_CURRENT」として登録、新TOP外に落ちた旧CURRENTは
+    「AUTO_VOLUME_SEEN」へ降格。"""
+    stage1 = run_momentum_stage1(force=force)
+    candidates = select_volume_stage1_candidates(stage1)
+    t_stage2_start = time.time()
+
+    stage2_results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=VOLUME_STAGE2_WORKERS) as ex:
+        futures = {ex.submit(_volume_stage2_detail, code, row): code for _, code, row in candidates}
+        for fut in concurrent.futures.as_completed(futures):
+            code = futures[fut]
+            try:
+                stage2_results[code] = fut.result()
+            except Exception as e:
+                print("  VOLUME Stage2詳細取得失敗", code, e)
+                stage2_results[code] = None
+    stage2_duration = round(time.time() - t_stage2_start, 1)
+
+    details = []
+    for lite_score, code, row in candidates:
+        stage2 = stage2_results.get(code)
+        final_score = _volume_final_score(row, stage2)
+        if final_score is None:
+            continue
+        details.append({"code": code, "name": row.get("name"), "sector": row.get("sector"),
+                         "changePct": row.get("changePct"), "highRetention": row.get("highRetention"),
+                         "marketRS": row.get("marketRS"), "sectorRS": row.get("sectorRS"),
+                         "turnover": row.get("turnover"), "liteScore": lite_score,
+                         "current": row.get("current"),
+                         "finalScore": final_score, "stage2": stage2,
+                         "volumeType": _volume_type(stage2, row)})
+    details.sort(key=lambda d: -d["finalScore"])
+    to_register = [d for d in details if d["finalScore"] >= VOLUME_SCORE_THRESHOLD][:VOLUME_MAX_REGISTER]
+
+    registered, demoted = [], []
+    if database_url and investment_db is not None:
+        old_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_VOLUME_CURRENT", market="JP")
+        old_seen = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_VOLUME_SEEN", market="JP")
+        new_current_codes = {d["code"] for d in to_register}
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        expires_at = (now_dt + datetime.timedelta(days=VOLUME_TAG_EXPIRE_DAYS)).isoformat()
+
+        for d in to_register:
+            tag_value = {"score": d["finalScore"], "volumeType": d["volumeType"],
+                         "rawVolumeRatio": d["stage2"].get("rawVolumeRatio"),
+                         "timeAdjustedVolumeRatio": d["stage2"].get("timeAdjustedVolumeRatio"),
+                         "isIntradayVolume": d["stage2"].get("isIntradayVolume"),
+                         "addedAt": now_dt.isoformat(), "expiresAt": expires_at}
+            try:
+                ok = investment_db.auto_register_or_tag_watchlist_item(
+                    database_url, user_id, d["code"], "JP", "AUTO_VOLUME_CURRENT", tag_value,
+                    item_fields={"name": d["name"], "sector": d["sector"], "source": "auto_volume"})
+                investment_db.remove_auto_tag_key(database_url, user_id, d["code"], "JP", "AUTO_VOLUME_SEEN")
+            except Exception as e:
+                print("  AUTO_VOLUME登録（CURRENT）失敗", d["code"], e)
+                ok = False
+            if ok:
+                registered.append(d)
+
+        for code in old_current - new_current_codes:
+            try:
+                investment_db.auto_register_or_tag_watchlist_item(
+                    database_url, user_id, code, "JP", "AUTO_VOLUME_SEEN",
+                    {"addedAt": now_dt.isoformat(), "expiresAt": expires_at})
+                investment_db.remove_auto_tag_key(database_url, user_id, code, "JP", "AUTO_VOLUME_CURRENT")
+                demoted.append(code)
+            except Exception as e:
+                print("  AUTO_VOLUME降格（SEEN化）失敗", code, e)
+
+        def _volume_metadata(d):
+            s2 = d["stage2"]
+            return {"rawVolumeRatio": s2.get("rawVolumeRatio"), "timeAdjustedVolumeRatio": s2.get("timeAdjustedVolumeRatio"),
+                    "avgVolume20": s2.get("avgVolume20"), "currentVolume": s2.get("currentVolume"),
+                    "turnover": d.get("turnover"), "turnoverRatio": s2.get("turnoverRatio"),
+                    "highRetention": d.get("highRetention"), "dayChangePct": d.get("changePct"),
+                    "distanceFromHighPct": s2.get("distanceFromHighPct"), "aboveRecentHigh": s2.get("aboveRecentHigh"),
+                    "volumeType": d["volumeType"], "isIntradayVolume": s2.get("isIntradayVolume"),
+                    "timeProgressRatio": s2.get("timeProgressRatio")}
+        _record_signal_transitions(database_url, user_id, "VOLUME", "JP",
+            to_register, old_current, old_seen, demoted, metadata_fn=_volume_metadata)
+    return {
+        "stage1CodesScanned": stage1["codesScanned"], "stage1PricesReturned": stage1["pricesReturned"],
+        "stage1DurationSec": stage1["durationSec"], "stage1RequestCount": stage1["requestCount"],
+        "stage1CacheAgeSec": round(time.time() - stage1["builtAt"], 1) if stage1["builtAt"] else None,
+        "stage1BuiltAtJst": _jst_time_str(stage1["builtAt"]),
+        "stage1ScanFailed": stage1.get("scanFailed", False), "stage1UsedStaleCache": stage1.get("usedStaleCache", False),
+        "stage1CandidateCount": len(candidates),
+        "stage2ValidCount": len(details),
+        "stage2DurationSec": stage2_duration,
+        "demotedToSeenCount": len(demoted), "demotedToSeen": demoted,
+        "registeredCount": len(registered),
+        "registered": registered,
+        "allCandidates": details,
+        "marketTimeProgressRatio": round(_market_time_progress_ratio(), 3),
+    }
+
+
 def analyze_stock(w, market_env=None):
     """12-1章・technical_analysis_rules.md：ローソク足パターン・移動平均線の並び／クロス・
     ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
@@ -4514,6 +4797,17 @@ class Handler(SimpleHTTPRequestHandler):
             print(f"  Stage1 {result['stage1CodesScanned']}銘柄スキャン（{result['stage1DurationSec']}秒）→ "
                   f"反転候補{result['stage2ValidCount']}件→自動登録{result['registeredCount']}件"
                   f"（降格{result['demotedToSeenCount']}件）")
+            self._send_json(result)
+        elif self.path.startswith("/api/volume-scan"):
+            # v3-9続き（2026-09-07・AUTO_VOLUME）：🔥 異常な資金流入の検出。Stage1共有・
+            # 他Stage2エンジンと同じ並列構成。時間帯補正（timeAdjustedVolumeRatio）を含む。
+            qs = urllib.parse.urlparse(self.path).query
+            force = urllib.parse.parse_qs(qs).get("force", ["0"])[0] == "1"
+            print(f"[取得] AUTO_VOLUMEスキャン開始（force={force}）…")
+            result = run_volume_scan(DATABASE_URL, self.current_user, force=force)
+            print(f"  Stage1 {result['stage1CodesScanned']}銘柄スキャン（{result['stage1DurationSec']}秒）→ "
+                  f"出来高候補{result['stage2ValidCount']}件→自動登録{result['registeredCount']}件"
+                  f"（降格{result['demotedToSeenCount']}件・時間進行度{result['marketTimeProgressRatio']}）")
             self._send_json(result)
         elif self.path.startswith("/api/auto-signal-events"):
             # v3-9続き（PHASE 1 AUTO SIGNAL LOG）：検証・確認用の閲覧API。?code=・?signal_type=で絞り込み可能。

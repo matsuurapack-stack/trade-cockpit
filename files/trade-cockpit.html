@@ -1509,6 +1509,30 @@ function deriveReversalBadge(w){
   if(seen)return {tier:"seen",meta:REVERSAL_BADGE_META.SEEN,score:seen.score};
   return null;
 }
+
+// v3-9続き（2026-09-07・AUTO_VOLUME）：🔥 専用バッジ。「出来高が多い＝買い」ではなく「通常時と
+// 比べて異常な資金流入」の検出であることを踏まえ、サーバー側でNEGATIVE_VOLUME/CLIMAX_DOWN
+// （出来高急増を伴う下落）は既にCURRENT登録対象から除外済み（買い候補としては出てこない）。
+// CLIMAX_UPは「強いが過熱の可能性」としてtooltipで明示するのみに留める（Action Statusの
+// 上書きはしない）。
+const VOLUME_BADGE_META={
+  ACTIVE:    {icon:"🔥",label:"AUTO VOLUME",color:"#b45309"},
+  WEAKENING: {icon:"🔥",label:"VOLUME WEAKENING",color:"var(--down)"},
+  SEEN:      {icon:"🔥",label:"VOLUME履歴(圏外)",color:"var(--inkFaint)"},
+};
+const VOLUME_TYPE_LABEL={POSITIVE_VOLUME:"資金流入",CLIMAX_UP:"急騰・過熱注意",NEUTRAL_VOLUME:"方向不明"};
+function deriveVolumeBadge(w){
+  const cur=w.auto_tags?.AUTO_VOLUME_CURRENT;
+  const seen=w.auto_tags?.AUTO_VOLUME_SEEN;
+  if(cur){
+    const weakening=w.status==="WEAK"||w.actionStatus==="RISK";
+    return {tier:"current",meta:weakening?VOLUME_BADGE_META.WEAKENING:VOLUME_BADGE_META.ACTIVE,
+      score:cur.score,volumeType:cur.volumeType,rawVolumeRatio:cur.rawVolumeRatio,
+      timeAdjustedVolumeRatio:cur.timeAdjustedVolumeRatio,isIntradayVolume:cur.isIntradayVolume};
+  }
+  if(seen)return {tier:"seen",meta:VOLUME_BADGE_META.SEEN,score:seen.score};
+  return null;
+}
 // RISK/WAITの具体的な理由コード→短い日本語ラベル（一覧のtooltip・詳細表示用）。
 const RISK_REASON_META = {
   CHASE_UP:      "急騰(高値圏)",
@@ -2431,7 +2455,7 @@ function rankTop5(enriched,stockQuotes){
     .slice(0,5);
 }
 
-function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan}){
+function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan}){
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
 
@@ -2484,7 +2508,9 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
       if(w.auto_tags?.AUTO_PULLBACK_CURRENT)c.pullbackCurrent=(c.pullbackCurrent||0)+1;
       if(w.auto_tags?.AUTO_PULLBACK_SEEN)c.pullbackSeen=(c.pullbackSeen||0)+1;
       if(w.auto_tags?.AUTO_REVERSAL_CURRENT)c.reversalCurrent=(c.reversalCurrent||0)+1;
-      if(w.auto_tags?.AUTO_REVERSAL_SEEN)c.reversalSeen=(c.reversalSeen||0)+1;});
+      if(w.auto_tags?.AUTO_REVERSAL_SEEN)c.reversalSeen=(c.reversalSeen||0)+1;
+      if(w.auto_tags?.AUTO_VOLUME_CURRENT)c.volumeCurrent=(c.volumeCurrent||0)+1;
+      if(w.auto_tags?.AUTO_VOLUME_SEEN)c.volumeSeen=(c.volumeSeen||0)+1;});
     return c;
   },[enriched]);
   const [statusFilters,setStatusFilters]=useState(new Set()); // Primary Status。空集合＝フィルタなし
@@ -2502,6 +2528,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
   const [sectorLeaderFilter,setSectorLeaderFilter]=useState(""); // ""|"current"|"history"（AUTO_SECTOR_LEADER版）
   const [pullbackFilter,setPullbackFilter]=useState(""); // ""|"current"|"history"（AUTO_PULLBACK版）
   const [reversalFilter,setReversalFilter]=useState(""); // ""|"current"|"history"（AUTO_REVERSAL版）
+  const [volumeFilter,setVolumeFilter]=useState(""); // ""|"current"|"history"（AUTO_VOLUME版）
   const [showAll,setShowAll]=useState(false);
   const toggleStatusFilter=(st)=>setStatusFilters(prev=>{const n=new Set(prev);n.has(st)?n.delete(st):n.add(st);return n;});
   const toggleActionFilter=(st)=>setActionFilters(prev=>{const n=new Set(prev);n.has(st)?n.delete(st):n.add(st);return n;});
@@ -2531,10 +2558,13 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
     &&(!reversalFilter||(reversalFilter==="current"
         ?!!w.auto_tags?.AUTO_REVERSAL_CURRENT
         :!!(w.auto_tags?.AUTO_REVERSAL_CURRENT||w.auto_tags?.AUTO_REVERSAL_SEEN)))
-  ),[sorted,statusFilters,actionFilters,rsFilter,marketRsFilter,pctFilter,sectorFilter,momentumFilter,breakFilter,rsAutoFilter,sectorLeaderFilter,pullbackFilter,reversalFilter]);
+    &&(!volumeFilter||(volumeFilter==="current"
+        ?!!w.auto_tags?.AUTO_VOLUME_CURRENT
+        :!!(w.auto_tags?.AUTO_VOLUME_CURRENT||w.auto_tags?.AUTO_VOLUME_SEEN)))
+  ),[sorted,statusFilters,actionFilters,rsFilter,marketRsFilter,pctFilter,sectorFilter,momentumFilter,breakFilter,rsAutoFilter,sectorLeaderFilter,pullbackFilter,reversalFilter,volumeFilter]);
   const TOP_N=10;
   const displayed=showAll?filtered:filtered.slice(0,TOP_N);
-  const hasFilter=statusFilters.size>0||actionFilters.size>0||rsFilter||marketRsFilter||!!pctFilter||!!sectorFilter||!!momentumFilter||!!breakFilter||!!rsAutoFilter||!!sectorLeaderFilter||!!pullbackFilter||!!reversalFilter;
+  const hasFilter=statusFilters.size>0||actionFilters.size>0||rsFilter||marketRsFilter||!!pctFilter||!!sectorFilter||!!momentumFilter||!!breakFilter||!!rsAutoFilter||!!sectorLeaderFilter||!!pullbackFilter||!!reversalFilter||!!volumeFilter;
 
   // 今日の候補（trade_candidates。8番）
   const [candidates,setCandidates]=useState([]);
@@ -2787,6 +2817,20 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
           　⚠ 市場スキャン更新失敗・{reversalResult.stage1UsedStaleCache?"直近データ使用":"データなし"}
         </span>}
       </span>}
+      {/* v3-9続き（AUTO_VOLUME）：「出来高が多い銘柄」ではなく「異常な資金流入」の検出。
+          出来高急増を伴う下落（NEGATIVE_VOLUME/CLIMAX_DOWN）はサーバー側で買い候補から除外済み。
+          日中は時間帯補正後のtimeAdjustedVolumeRatioを使う（朝ほど生の倍率が低くなる問題に対応）。 */}
+      <button className="action-btn" style={{fontSize:12}} disabled={volumeScanning} onClick={onVolumeScan}>
+        {volumeScanning?"🔥 スキャン中…（数分かかります）":"🔥 AUTO VOLUMEスキャン"}
+      </button>
+      {volumeResult && !volumeScanning && <span style={{fontSize:11,color:"var(--inkFaint)"}}>
+        候補{volumeResult.stage2ValidCount}件→自動登録{volumeResult.registeredCount}件（降格{volumeResult.demotedToSeenCount}件・
+        時間進行度{Math.round((volumeResult.marketTimeProgressRatio||0)*100)}%・
+        直近スキャン：{volumeResult.stage1BuiltAtJst}）
+        {volumeResult.stage1ScanFailed && <span style={{color:"var(--down)",fontWeight:700}}>
+          　⚠ 市場スキャン更新失敗・{volumeResult.stage1UsedStaleCache?"直近データ使用":"データなし"}
+        </span>}
+      </span>}
     </div>
     <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:10,fontSize:12}}>
       <span style={{fontWeight:700}}>今日の監視銘柄 {items.length}</span>
@@ -2874,7 +2918,15 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         title="過去にAUTO_REVERSALで拾われた銘柄（現在は圏外のSEENも含む）">
         🔄 REVERSAL履歴 {(summary.reversalCurrent||0)+(summary.reversalSeen||0)}
       </button>
-      {hasFilter && <button className="iconbtn" style={{fontSize:11}} onClick={()=>{setStatusFilters(new Set());setActionFilters(new Set());setRsFilter(false);setMarketRsFilter(false);setPctFilter("");setSectorFilter("");setMomentumFilter("");setBreakFilter("");setRsAutoFilter("");setSectorLeaderFilter("");setPullbackFilter("");setReversalFilter("");}}>フィルタ解除</button>}
+      {/* v3-9続き：AUTO_VOLUME版。 */}
+      <button className={"chip"+(volumeFilter==="current"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+        onClick={()=>setVolumeFilter(v=>v==="current"?"":"current")}>🔥 AUTO VOLUME {summary.volumeCurrent||0}</button>
+      <button className={"chip"+(volumeFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+        onClick={()=>setVolumeFilter(v=>v==="history"?"":"history")}
+        title="過去にAUTO_VOLUMEで拾われた銘柄（現在は圏外のSEENも含む）">
+        🔥 VOLUME履歴 {(summary.volumeCurrent||0)+(summary.volumeSeen||0)}
+      </button>
+      {hasFilter && <button className="iconbtn" style={{fontSize:11}} onClick={()=>{setStatusFilters(new Set());setActionFilters(new Set());setRsFilter(false);setMarketRsFilter(false);setPctFilter("");setSectorFilter("");setMomentumFilter("");setBreakFilter("");setRsAutoFilter("");setSectorLeaderFilter("");setPullbackFilter("");setReversalFilter("");setVolumeFilter("");}}>フィルタ解除</button>}
       <label style={{fontSize:12,color:"var(--inkSoft)",marginLeft:"auto"}}>並び順：
         <select value={sortKey} onChange={e=>setSortKey(e.target.value)} style={{fontSize:12,padding:"3px 6px",marginLeft:4}}>
           <option value="priority">今日注目すべき順（既定）</option>
@@ -2962,6 +3014,11 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                     title={`REVERSAL_SCORE ${rvb.score}${rvb.currentFromRecentLowPct!=null?`／直近安値からの上昇率+${rvb.currentFromRecentLowPct}%`:""}${rvb.higherLow?"／安値切り上げ確認":""}${rvb.reversalTypes?.length?`／${rvb.reversalTypes.join("・")}`:""}（監視登録理由であり、買い推奨ではありません）`}>
                     {rvb.meta.icon} {rvb.meta.label}
                   </div>;})()}
+                {(()=>{const vlb=deriveVolumeBadge(w);if(!vlb)return null;
+                  return <div style={{fontWeight:700,fontSize:10,color:vlb.meta.color,whiteSpace:"nowrap",marginTop:1}}
+                    title={`VOLUME_SCORE ${vlb.score}${vlb.volumeType?`／${VOLUME_TYPE_LABEL[vlb.volumeType]||vlb.volumeType}`:""}${vlb.timeAdjustedVolumeRatio!=null?`／時間帯補正後出来高倍率${vlb.timeAdjustedVolumeRatio}倍`:""}${vlb.isIntradayVolume?"（日中未確定）":""}（監視登録理由であり、買い推奨ではありません）`}>
+                    {vlb.meta.icon} {vlb.meta.label}
+                  </div>;})()}
               </td>
               <td className="mono" style={{fontWeight:800,fontSize:15,textAlign:"right",paddingLeft:10,color:rsFg}}>{w.rsScore!=null?w.rsScore:"—"}</td>
               <td className="mono" style={{fontWeight:700,fontSize:13}}>{w.code}</td>
@@ -3010,7 +3067,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
               :w.actionStatus==="WAIT"?w.waitReasons.map(r=>WAIT_REASON_META[r]):[];
             const rsFg=w.rsScore==null?"var(--ink)":w.rsScore>=75?"var(--up)":w.rsScore<25?"var(--down)":"var(--ink)";
             const isOpen=expandedCode===w.code;
-            const mb=deriveMomentumBadge(w),bb=deriveBreakBadge(w),rb=deriveRsBadge(w),sb=deriveSectorLeaderBadge(w),pb=derivePullbackBadge(w),rvb=deriveReversalBadge(w);
+            const mb=deriveMomentumBadge(w),bb=deriveBreakBadge(w),rb=deriveRsBadge(w),sb=deriveSectorLeaderBadge(w),pb=derivePullbackBadge(w),rvb=deriveReversalBadge(w),vlb=deriveVolumeBadge(w);
             const inAnalysis=analysisTargets.includes(w.code);
             return <div key={w.code} style={{padding:"10px 12px",borderTop:"1px solid var(--ruleSoft)",
                 borderLeft:`3px solid ${meta.color}`,cursor:"pointer"}}
@@ -3030,13 +3087,14 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                 {actionMeta.label && <span style={{fontWeight:700,fontSize:11,color:actionMeta.color}}>{actionMeta.icon} {actionMeta.label}</span>}
                 <span className="mono" style={{fontWeight:700,fontSize:12,color:rsFg,marginLeft:"auto"}}>RS {w.rsScore!=null?w.rsScore:"—"}</span>
               </div>
-              {(mb||bb||rb||sb||pb||rvb) && <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:4}}>
+              {(mb||bb||rb||sb||pb||rvb||vlb) && <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:4}}>
                 {mb && <span style={{fontSize:10.5,fontWeight:700,color:mb.meta.color}}>{mb.meta.icon} {mb.meta.label}</span>}
                 {bb && <span style={{fontSize:10.5,fontWeight:700,color:bb.meta.color}}>{bb.meta.icon} {bb.meta.label}</span>}
                 {rb && <span style={{fontSize:10.5,fontWeight:700,color:rb.meta.color}}>{rb.meta.icon} {rb.meta.label}</span>}
                 {sb && <span style={{fontSize:10.5,fontWeight:700,color:sb.meta.color}}>{sb.meta.icon} {sb.meta.label}</span>}
                 {pb && <span style={{fontSize:10.5,fontWeight:700,color:pb.meta.color}}>{pb.meta.icon} {pb.meta.label}</span>}
                 {rvb && <span style={{fontSize:10.5,fontWeight:700,color:rvb.meta.color}}>{rvb.meta.icon} {rvb.meta.label}</span>}
+                {vlb && <span style={{fontSize:10.5,fontWeight:700,color:vlb.meta.color}}>{vlb.meta.icon} {vlb.meta.label}</span>}
               </div>}
               {isOpen && <div style={{marginTop:8,paddingTop:8,borderTop:"1px dashed var(--ruleSoft)",fontSize:12,
                   color:"var(--inkSoft)",display:"flex",flexDirection:"column",gap:5}} onClick={e=>e.stopPropagation()}>
@@ -5540,6 +5598,33 @@ function App(){
     setReversalScanning(false);
   };
 
+  // v3-9続き（2026-09-07・AUTO_VOLUME）：🔥 同じくStage1キャッシュを共有、Stage2あり。
+  // 「出来高が多い銘柄」ではなく「通常時と比べて異常な資金流入」を検出するエンジン
+  // （出来高急増を伴う下落＝NEGATIVE_VOLUME/CLIMAX_DOWNはサーバー側で買い候補から除外済み）。
+  const [volumeScanning,setVolumeScanning]=useState(false);
+  const [volumeResult,setVolumeResult]=useState(null);
+  const runVolumeScan=async()=>{
+    setVolumeScanning(true);
+    setVolumeResult(null);
+    try{
+      const r=await fetch("/api/volume-scan");
+      if(r.ok){
+        const d=await r.json();
+        setVolumeResult(d);
+        const jr=await fetch("/api/watchlist?market=JP");
+        if(jr.ok){
+          const jd=await jr.json();
+          if(Array.isArray(jd.items)){
+            const registeredCodes=(d.registered||[]).map(x=>x.code);
+            setS(p=>({...p,watchlist:jd.items,
+              watchTargets:[...new Set([...p.watchTargets,...registeredCodes])]}));
+          }
+        }
+      }
+    }catch(e){}
+    setVolumeScanning(false);
+  };
+
   // 売買記録（トレードジャーナル）：銘柄分析カードの「記録に追加」ボタンから、そのカードの
   // entry/stop/target/marketEnv/entryReasonを初期値にしたドラフトを開き、「記録」タブへ遷移する。
   // 保存するまでs.journalには追加しない（下書き段階ではjournalDraft stateのみで保持）。
@@ -5932,7 +6017,8 @@ function App(){
         rsScanning={rsScanning} rsScanResult={rsScanResult} onRsScan={runRsScan}
         sectorLeaderScanning={sectorLeaderScanning} sectorLeaderResult={sectorLeaderResult} onSectorLeaderScan={runSectorLeaderScan}
         pullbackScanning={pullbackScanning} pullbackResult={pullbackResult} onPullbackScan={runPullbackScan}
-        reversalScanning={reversalScanning} reversalResult={reversalResult} onReversalScan={runReversalScan}/>}
+        reversalScanning={reversalScanning} reversalResult={reversalResult} onReversalScan={runReversalScan}
+        volumeScanning={volumeScanning} volumeResult={volumeResult} onVolumeScan={runVolumeScan}/>}
 
       {/* ===== BRIEFING（日本市場） ===== */}
       {tab==="briefing" && <div>
