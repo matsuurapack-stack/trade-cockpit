@@ -1667,6 +1667,35 @@ function nextEventForCode(events,code,sector,withinDays=45){
   if(!relevant.length)return null;
   return relevant.sort((a,b)=>a.event_date.localeCompare(b.event_date))[0];
 }
+// 2026-09-07新規（複数重要イベント表示）：nextEventForCode()の「1件だけ」を、重要度HIGH
+// 優先・同重要度なら近い日付順で最大3件に拡張したもの。マッチング（affected_stocks/
+// affected_sectors）・過去イベント除外・businessDaysUntil()は既存nextEventForCodeと
+// 同じロジックをそのまま再利用する。DAY/SWINGで表示ウィンドウを変える
+// （DAY＝当日〜翌営業日のみ強めに表示、SWING・未指定＝10営業日以内）。
+// Primary/Action Status・AUTOスコアへの新しい減点ルールは追加していない
+// （あくまで表示用の抽出・並び替えで、判定ロジックには一切関与しない）。
+function relevantEventsForCode(events,code,sector,tradeStyle,maxCount=3){
+  if(!events||!events.length)return[];
+  const todayStr=todayISO();
+  const windowDays=tradeStyle==="DAY"?1:10;
+  const IMPORTANCE_RANK={HIGH:0,MEDIUM:1,LOW:2};
+  const relevant=events.filter(ev=>{
+    if(!ev.event_date||ev.event_date<todayStr)return false; // 過去イベントは除外
+    const stocks=ev.affected_stocks||[];
+    const sectors=ev.affected_sectors||[];
+    const matches=stocks.includes(code)||(sector&&sectors.includes(sector));
+    if(!matches)return false;
+    const days=businessDaysUntil(ev.event_date);
+    return days!=null&&days<=windowDays;
+  });
+  return relevant.sort((a,b)=>{
+    // 重要度HIGHを優先、同じ重要度なら近い日付順（ユーザー指示）
+    const ai=IMPORTANCE_RANK[normalizeEventImportance(a.importance)]??3;
+    const bi=IMPORTANCE_RANK[normalizeEventImportance(b.importance)]??3;
+    if(ai!==bi)return ai-bi;
+    return a.event_date.localeCompare(b.event_date);
+  }).slice(0,maxCount);
+}
 const EVENT_TYPE_ICON={ECONOMIC:"📊",CENTRAL_BANK:"🏦",EARNINGS:"📅",INDEX_REBALANCE:"📈",
   POLITICAL:"🏛",GEOPOLITICAL:"🌐",PRODUCT_EVENT:"🚀",OTHER:"📌"};
 // 2026-09-07新規：イベント一覧（EventDashboardCard）でevent_typeの生コード（"EARNINGS"等）
@@ -1813,25 +1842,33 @@ function nextCatalystForCode(catalysts,code,sector){
 // ポジションタブから渡された場合だけ、DAY/SWINGで扱いを変える注記を添える（ユーザー要望：
 // イベント接近を機械的にRISKへ変更せず、DAY/SWINGで参考情報の出し方だけを変える）。
 function EventRiskNote({events,code,sector,tradeStyle}){
-  const ev=useMemo(()=>nextEventForCode(events,code,sector),[events,code,sector]);
-  if(!ev)return null;
-  const days=businessDaysUntil(ev.event_date);
-  const icon=EVENT_TYPE_ICON[ev.event_type]||EVENT_TYPE_ICON.OTHER;
-  const dayLabel=days===0?"本日":days===1?"1営業日後":`${days}営業日後`;
-  const importanceHot=ev.importance==="HIGH"||ev.importance==="高";
+  // 2026-09-07更新（複数重要イベント表示）：最大3件を重要度HIGH優先・同重要度なら近い日付順で
+  // 縦に並べる（relevantEventsForCode、上記参照）。DAY/SWINGの注記は従来通り最も近い1件
+  // （evs[0]）を基準に判定する（既存の閾値・文言は無変更）。
+  const evs=useMemo(()=>relevantEventsForCode(events,code,sector,tradeStyle),[events,code,sector,tradeStyle]);
+  if(!evs.length)return null;
+  const nearestDays=businessDaysUntil(evs[0].event_date);
   let styleNote=null;
   if(tradeStyle==="DAY"){
     styleNote="DAY：当日引けまでに手仕舞うなら影響は限定的";
-  }else if(tradeStyle==="SWING"&&days!=null&&days<=10){
+  }else if(tradeStyle==="SWING"&&nearestDays!=null&&nearestDays<=10){
     styleNote="SWING：このイベントをまたぐ可能性＝重要なリスク";
   }
-  return <div style={{fontSize:11,color:importanceHot?"var(--down)":"var(--inkSoft)",
-      background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"4px 8px",marginBottom:8}}
-    title={`情報源：${ev.source||"—"}／検証状態：${ev.verification_status}（画像由来の情報は確定情報として扱わない）`}>
-    {icon} {ev.title}まで{dayLabel}
-    {importanceHot&&" ⚠重要度高"}
-    {ev.verification_status==="UNVERIFIED"&&" （未検証）"}
-    {ev.verification_status==="IMAGE_DERIVED"&&" （画像由来・要確認）"}
+  return <div style={{fontSize:11,background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>
+    {evs.length>1 && <div style={{fontWeight:700,color:"var(--inkSoft)",marginBottom:2}}>📅 重要イベント</div>}
+    {evs.map((ev,i)=>{
+      const days=businessDaysUntil(ev.event_date);
+      const icon=EVENT_TYPE_ICON[ev.event_type]||EVENT_TYPE_ICON.OTHER;
+      const dayLabel=days===0?"本日":days===1?"1営業日後":`${days}営業日後`;
+      const importanceHot=ev.importance==="HIGH"||ev.importance==="高";
+      return <div key={ev.id} style={{marginTop:i>0?2:0,fontWeight:i===0?700:400,color:importanceHot?"var(--down)":"var(--inkSoft)"}}
+        title={`情報源：${ev.source||"—"}／検証状態：${ev.verification_status}（画像由来の情報は確定情報として扱わない）`}>
+        {icon} {ev.title}まで{dayLabel}
+        {importanceHot&&" ⚠重要度高"}
+        {ev.verification_status==="UNVERIFIED"&&" （未検証）"}
+        {ev.verification_status==="IMAGE_DERIVED"&&" （画像由来・要確認）"}
+      </div>;
+    })}
     {styleNote&&<div style={{marginTop:2,color:"var(--inkFaint)"}}>{styleNote}</div>}
   </div>;
 }
