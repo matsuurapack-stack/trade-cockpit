@@ -323,6 +323,12 @@ const SHOW_ANALYSIS_CHECKLISTS = false;
 const toHiragana = (str) => String(str||"").replace(/[ァ-ヶ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60));
 const normKana = (str) => toHiragana(String(str||"").toLowerCase());
 const todayISO = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; };
+// 2026-09-07新規（イベント表示のタイムゾーンバグ修正）：todayISO()と同じ「端末のローカル日付
+// （このアプリは日本国内利用前提のためJSTとして扱う）」基準でN日後の日付文字列を返す。
+// new Date().toISOString()はUTC基準のため、JSTの00:00〜08:59は前日の日付になってしまう
+// バグが複数箇所にあった（イベント・カタリスト・有識者見解の「今日」判定）。todayISO()と
+// このaddDaysISO()に統一する。
+const addDaysISO = (days) => { const d = new Date(); d.setDate(d.getDate()+days); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; };
 const WD = ["日","月","火","水","木","金","土"];
 const MAX = 300;
 const KEY = "trade-cockpit-v1";
@@ -1648,7 +1654,7 @@ function businessDaysUntil(dateStr){
 // 銘柄コード・セクターに関連するイベントのうち、直近のもの（未来のみ、withinDays日以内）を返す。
 function nextEventForCode(events,code,sector,withinDays=45){
   if(!events||!events.length)return null;
-  const todayStr=new Date().toISOString().slice(0,10);
+  const todayStr=todayISO();
   const relevant=events.filter(ev=>{
     if(!ev.event_date||ev.event_date<todayStr)return false;
     const stocks=ev.affected_stocks||[];
@@ -1663,6 +1669,10 @@ function nextEventForCode(events,code,sector,withinDays=45){
 }
 const EVENT_TYPE_ICON={ECONOMIC:"📊",CENTRAL_BANK:"🏦",EARNINGS:"📅",INDEX_REBALANCE:"📈",
   POLITICAL:"🏛",GEOPOLITICAL:"🌐",PRODUCT_EVENT:"🚀",OTHER:"📌"};
+// 2026-09-07新規：イベント一覧（EventDashboardCard）でevent_typeの生コード（"EARNINGS"等）
+// ではなく日本語ラベルで表示するための対応表。値の意味自体は変更しない、表示のみ。
+const EVENT_TYPE_LABEL={ECONOMIC:"経済",CENTRAL_BANK:"中央銀行",EARNINGS:"決算",
+  INDEX_REBALANCE:"指数",POLITICAL:"地政学",GEOPOLITICAL:"地政学",PRODUCT_EVENT:"企業",OTHER:"その他"};
 // v3-9続き（2026-09-05・EVENT DASHBOARD）：market_events（PHASE 3で導入済み）を新しい判定
 // ロジックを追加せずに「見やすく集約」するための表示専用ヘルパー群。既存のEventRiskNote・
 // EventsPanelのロジックには一切触れない。
@@ -1697,7 +1707,7 @@ function eventDateJpLabel(dateStr){
 // 当日はevent_time（自由書式"21:30"等）があれば残り時間、無ければ「本日」。翌日以降はカレンダー
 // 日数が近ければ「N日後」、離れていれば営業日数を併記する（businessDaysUntilは既存関数を再利用）。
 function eventCountdownLabel(ev){
-  const todayStr=new Date().toISOString().slice(0,10);
+  const todayStr=todayISO();
   if(!ev.event_date)return"";
   if(ev.event_date<todayStr)return"終了";
   if(ev.event_date===todayStr){
@@ -1713,7 +1723,7 @@ function eventCountdownLabel(ev){
     }
     return"⏳ 本日";
   }
-  const tomorrowStr=new Date(Date.now()+86400000).toISOString().slice(0,10);
+  const tomorrowStr=addDaysISO(1);
   if(ev.event_date===tomorrowStr)return"⏳ 明日";
   const calDays=Math.round((new Date(ev.event_date+"T00:00:00+09:00")-new Date(todayStr+"T00:00:00+09:00"))/86400000);
   if(calDays<=3)return`⏳ ${calDays}日後`;
@@ -1749,7 +1759,7 @@ const CATALYST_FRESHNESS_LABEL={TODAY:"本日",_3D:"3日以内","3D":"3日以内
 // effective_untilが過去に確定していれば「もう有効でない」として除外する（無指定なら鮮度で
 // 除外しない＝発言ログとしては残り続けるが、複数該当時はpublished_at降順で最新を優先する）。
 function isExpertViewActive(v){
-  const todayStr=new Date().toISOString().slice(0,10);
+  const todayStr=todayISO();
   if(v.risk_window_end)return v.risk_window_end>=todayStr;
   if(v.effective_until)return v.effective_until>=todayStr;
   return true;
@@ -1780,7 +1790,7 @@ const EXPERT_VERIFICATION_LABEL={
 // 最新のカタリストを優先する。
 function nextCatalystForCode(catalysts,code,sector){
   if(!catalysts||!catalysts.length)return null;
-  const todayStr=new Date().toISOString().slice(0,10);
+  const todayStr=todayISO();
   const relevant=catalysts.filter(c=>{
     const stocks=c.affected_stocks||[];
     const sectors=c.affected_sectors||[];
@@ -1834,7 +1844,7 @@ function CatalystNote({catalysts,code,sector}){
   if(!c)return null;
   const icon=CATALYST_CATEGORY_ICON[c.category]||CATALYST_CATEGORY_ICON.OTHER;
   const fresh=catalystFreshnessLabel(c.catalyst_date);
-  const todayStr=new Date().toISOString().slice(0,10);
+  const todayStr=todayISO();
   const pending=c.event_date&&c.event_date>=todayStr;
   const importanceHot=c.importance==="HIGH"||c.importance==="高";
   let dateNote;
@@ -1916,7 +1926,7 @@ function EventsPanel({events,onReload}){
     }catch(e){}
   };
   const sorted=useMemo(()=>[...events].sort((a,b)=>(a.event_date||"").localeCompare(b.event_date||"")),[events]);
-  const todayStr=new Date().toISOString().slice(0,10);
+  const todayStr=todayISO();
   const upcoming=sorted.filter(e=>e.event_date>=todayStr);
   const past=sorted.filter(e=>e.event_date<todayStr);
   return <div style={{marginTop:18}}>
@@ -1997,7 +2007,7 @@ function CatalystsPanel({catalysts,onReload}){
       onReload();
     }catch(e){}
   };
-  const todayStr=new Date().toISOString().slice(0,10);
+  const todayStr=todayISO();
   const filtered=useMemo(()=>categoryFilter==="ALL"?catalysts:catalysts.filter(c=>c.category===categoryFilter),[catalysts,categoryFilter]);
   const sorted=useMemo(()=>[...filtered].sort((a,b)=>(b.catalyst_date||"").localeCompare(a.catalyst_date||"")),[filtered]);
   const isRelevant=c=>catalystFreshnessLabel(c.catalyst_date)!=="OLD"||(c.event_date&&c.event_date>=todayStr);
@@ -2166,7 +2176,7 @@ function EventDashboardCard({ev,heldRelated,watchedRelated,relatedNames}){
     </div>
     <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:6,fontSize:11,color:"var(--inkFaint)"}}>
       {ev.country && <span style={{border:"1px solid var(--rule)",borderRadius:3,padding:"1px 5px"}}>{ev.country}</span>}
-      <span style={{border:"1px solid var(--rule)",borderRadius:3,padding:"1px 5px"}}>{ev.event_type}</span>
+      <span style={{border:"1px solid var(--rule)",borderRadius:3,padding:"1px 5px"}}>{EVENT_TYPE_LABEL[ev.event_type]||ev.event_type}</span>
       <span style={{border:"1px solid var(--rule)",borderRadius:3,padding:"1px 5px"}} title="画像由来・未検証の情報を確定情報として扱わない">{verifyIcon} {ev.verification_status}</span>
       {heldRelated && <span style={{color:"var(--up)",fontWeight:700}}>📌 保有銘柄関連</span>}
       {!heldRelated && watchedRelated && <span style={{color:"var(--accent)",fontWeight:700}}>📌 監視銘柄関連</span>}
@@ -2187,8 +2197,8 @@ function EventDashboardPanel({events,allWatch,heldItems}){
   const [importanceFilter,setImportanceFilter]=useState("HIGH_MEDIUM"); // HIGH|HIGH_MEDIUM|ALL
   const [categoryFilter,setCategoryFilter]=useState("ALL");
 
-  const todayStr=new Date().toISOString().slice(0,10);
-  const endDateStr=new Date(Date.now()+rangeDays*86400000).toISOString().slice(0,10);
+  const todayStr=todayISO();
+  const endDateStr=addDaysISO(rangeDays);
   const heldByCode=useMemo(()=>new Map((heldItems||[]).map(h=>[h.code,h])),[heldItems]);
   const watchedByCode=useMemo(()=>new Map((allWatch||[]).map(w=>[w.code,w])),[allWatch]);
   const isHeldRelated=useCallback(ev=>(ev.affected_stocks||[]).some(c=>heldByCode.has(c)),[heldByCode]);
@@ -2239,6 +2249,25 @@ function EventDashboardPanel({events,allWatch,heldItems}){
   const rangeOptions=[{v:0,label:"今日"},{v:3,label:"3日"},{v:7,label:"7日"},{v:14,label:"14日"}];
   const importanceOptions=[{v:"HIGH",label:"HIGHのみ"},{v:"HIGH_MEDIUM",label:"HIGH+MEDIUM"},{v:"ALL",label:"すべて"}];
 
+  // 2026-09-07新規（「登録済みイベントが表示されない」不具合調査用）：DB総件数→期間内→種別
+  // 通過→重要度通過→最終表示、の各段階の件数を確認できるようにする（既定は非表示、
+  // 「デバッグ」ボタンで開閉）。新しい判定ロジックではなく、既存filteredの内訳を
+  // 可視化するだけ。
+  const [debugOpen,setDebugOpen]=useState(false);
+  const debugCounts=useMemo(()=>{
+    const all=events||[];
+    const inRange=all.filter(ev=>ev.event_date&&ev.event_date>=todayStr&&ev.event_date<=endDateStr);
+    const catPass=inRange.filter(ev=>!categoryDef||!categoryDef.types||categoryDef.types.includes(ev.event_type));
+    const impPass=catPass.filter(ev=>{
+      if(isHeldRelated(ev))return true;
+      const n=normalizeEventImportance(ev.importance);
+      if(importanceFilter==="HIGH")return n==="HIGH";
+      if(importanceFilter==="HIGH_MEDIUM")return n==="HIGH"||n==="MEDIUM";
+      return true;
+    });
+    return{total:all.length,inRange:inRange.length,catPass:catPass.length,impPass:impPass.length,final:filtered.length};
+  },[events,todayStr,endDateStr,categoryDef,importanceFilter,isHeldRelated,filtered]);
+
   return<div style={{marginTop:18}}>
     <div className="sec-head">📅 イベント</div>
     <div className="sec-note" style={{fontSize:13}}>
@@ -2264,12 +2293,22 @@ function EventDashboardPanel({events,allWatch,heldItems}){
         </div>
       </div>
     </div>
-    <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:16}}>
+    <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginBottom:8}}>
       {EVENT_CATEGORY_FILTERS.map(c=><button key={c.key} className={"chip"+(categoryFilter===c.key?" on":"")} onClick={()=>setCategoryFilter(c.key)}>{c.label}</button>)}
+      <button className="iconbtn" style={{fontSize:10.5,marginLeft:"auto"}} onClick={()=>setDebugOpen(v=>!v)}>デバッグ {debugOpen?"▲":"▼"}</button>
     </div>
+    {debugOpen && <div style={{fontSize:11,color:"var(--inkFaint)",background:"var(--band)",padding:"6px 10px",borderRadius:4,marginBottom:10}}>
+      DB取得件数 {debugCounts.total} → 期間内（{todayStr}〜{endDateStr}） {debugCounts.inRange} → 種別通過 {debugCounts.catPass} → 重要度通過 {debugCounts.impPass} → 最終表示 {debugCounts.final}
+    </div>}
     {grouped.length===0
       ? <div style={{padding:24,textAlign:"center",color:"var(--inkFaint)",fontSize:13,border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)"}}>
           該当する期間・条件のイベントはありません。
+          <div style={{marginTop:10,fontSize:11.5,color:"var(--inkFaint)"}}>
+            期間：{rangeOptions.find(o=>o.v===rangeDays)?.label}（{todayStr}〜{endDateStr}）／
+            重要度：{importanceOptions.find(o=>o.v===importanceFilter)?.label}／
+            種別：{categoryDef?.label}／基準日：{todayStr}
+            {debugCounts.total===0 && <div style={{marginTop:4}}>※ そもそも登録済みイベント自体が0件です（「市場」タブ内「イベント登録」から貼り付けimportが必要です）。</div>}
+          </div>
         </div>
       : grouped.map(g=><div key={g.date} style={{marginBottom:16}}>
           <div style={{fontWeight:700,fontSize:13,marginBottom:6,borderBottom:"1px solid var(--ruleSoft)",paddingBottom:4}}>{eventDateJpLabel(g.date)}</div>
@@ -2286,7 +2325,7 @@ function EventDashboardPanel({events,allWatch,heldItems}){
 // ため、EventDashboardPanelの絞り込みロジック（EVENT_CATEGORY_FILTERS等）は使わず、
 // 「今日・重要 or 保有銘柄関連」だけのごく単純な抽出に留める。クリックで「イベント」タブへ。
 function TodayEventsWidget({events,heldItems,onOpen}){
-  const todayStr=new Date().toISOString().slice(0,10);
+  const todayStr=todayISO();
   const heldCodes=useMemo(()=>new Set((heldItems||[]).map(h=>h.code)),[heldItems]);
   const todayItems=useMemo(()=>(events||[])
     .filter(ev=>ev.event_date===todayStr&&
