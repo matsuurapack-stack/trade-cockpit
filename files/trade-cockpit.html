@@ -1520,7 +1520,10 @@ const VOLUME_BADGE_META={
   WEAKENING: {icon:"🔥",label:"VOLUME WEAKENING",color:"var(--down)"},
   SEEN:      {icon:"🔥",label:"VOLUME履歴(圏外)",color:"var(--inkFaint)"},
 };
-const VOLUME_TYPE_LABEL={POSITIVE_VOLUME:"資金流入",CLIMAX_UP:"急騰・過熱注意",NEUTRAL_VOLUME:"方向不明"};
+const VOLUME_TYPE_LABEL={POSITIVE_VOLUME:"資金流入",CLIMAX_UP:"急騰・過熱注意",NEUTRAL_VOLUME:"方向不明",
+  // 2026-09-07追加（ポジション・リアルタイム売却判断）：既存3種に加え、保有中の警戒判断に必要な
+  // 下落側の2種も表示できるようにする（AUTO_VOLUMEの登録除外ロジック自体は変更しない、表示名のみ）。
+  NEGATIVE_VOLUME:"出来高急増を伴う下落",CLIMAX_DOWN:"急落・投げ売り注意"};
 function deriveVolumeBadge(w){
   const cur=w.auto_tags?.AUTO_VOLUME_CURRENT;
   const seen=w.auto_tags?.AUTO_VOLUME_SEEN;
@@ -3504,8 +3507,13 @@ function PositionExitModal({position,currentPrice,onClose,onSaved}){
       {!confirming ? <>
         <div style={{fontWeight:700,fontSize:16,marginBottom:2}}>{position.name||position.code}</div>
         <div className="mono" style={{fontSize:12,color:"var(--inkSoft)",marginBottom:10}}>{position.code}</div>
-        <div style={{fontSize:12,color:"var(--inkSoft)",marginBottom:10}}>
-          保有 {num(position.quantity)?.toLocaleString()}株　平均取得 {avg?avg.toLocaleString():"—"}円
+        {/* v3-9続き（2026-09-07・リアルタイム売却判断 Phase1）：item13「取得単価・現在値を同時表示」。
+            currentPriceは呼び出し元（PortfolioPanelの一覧行、またはリアルタイム詳細エリア展開時は
+            その最新取得値）からそのまま受け取るだけで、この画面自体は新規に価格取得しない。 */}
+        <div style={{fontSize:12,color:"var(--inkSoft)",marginBottom:10,display:"flex",gap:14,flexWrap:"wrap"}}>
+          <span>保有 <span className="mono" style={{fontWeight:700,color:"var(--ink)"}}>{num(position.quantity)?.toLocaleString()}</span>株</span>
+          <span>取得 <span className="mono" style={{fontWeight:700,color:"var(--ink)"}}>{avg?avg.toLocaleString():"—"}</span>円</span>
+          <span>現在 <span className="mono" style={{fontWeight:700,color:"var(--ink)"}}>{currentPrice!=null?Math.round(currentPrice).toLocaleString():"—"}</span>円</span>
         </div>
         <label style={{display:"block",fontSize:12,color:"var(--inkSoft)"}}>売値
           <input type="number" value={price} onChange={e=>setPrice(e.target.value)} style={inputStyle}/>
@@ -3513,6 +3521,22 @@ function PositionExitModal({position,currentPrice,onClose,onSaved}){
         <label style={{display:"block",fontSize:12,color:"var(--inkSoft)",marginTop:10}}>売却枚数
           <input type="number" value={shares} onChange={e=>setShares(e.target.value)} style={inputStyle}/>
         </label>
+        {/* item14/15：株数ショートカット。押しただけでは確定せず、あくまで入力欄に値をセットするのみ
+            （従来通り「入力→確認画面→確定」の2段階は維持）。単元株数（JP=100株・US=1株）にfloor
+            丸め。丸めた結果0株になる場合（例：保有100株＝1単元のみで25%を選ぶと0株になる）は、
+            誤って「全株売却」に化けさせると事故の元になるため、フォールバックはせずボタン自体を
+            disabledにする（実際に選択可能な株数だけを提示する）。 */}
+        <div style={{display:"flex",gap:6,marginTop:8,flexWrap:"wrap"}}>
+          {[0.25,0.5,0.75,1].map(pct=>{
+            const total=Number(position.quantity||0);
+            const lotSize=position.market==="JP"?100:1;
+            const sug=pct===1?total:Math.floor(total*pct/lotSize)*lotSize;
+            const disabled=!(sug>0);
+            return <button key={pct} type="button" className="ghost" disabled={disabled}
+              style={{fontSize:11,padding:"3px 9px",opacity:disabled?0.4:1,cursor:disabled?"default":"pointer"}}
+              onClick={()=>!disabled&&setShares(String(sug))}>{pct===1?"全株":`${pct*100}%`}</button>;
+          })}
+        </div>
         {errMsg && <div style={{fontSize:12,color:"var(--down)",marginTop:10}}>{errMsg}</div>}
         <div style={{display:"flex",gap:8,marginTop:14}}>
           <button className="btn primary" onClick={goConfirm}>次へ（確認）</button>
@@ -3537,6 +3561,93 @@ function PositionExitModal({position,currentPrice,onClose,onSaved}){
         </div>
       </>}
     </div>
+  </div>;
+}
+
+// 2026-09-07新規（ポジション→リアルタイム売却判断画面 Phase1）：ポジションカードの「リアルタイム」
+// 展開エリア。展開している間だけ/api/position-liveを一定間隔でポーリングする（既存の全銘柄一括
+// stockQuotesポーリングとは完全に別経路。閉じれば即座にpollingが止まり、他の監視銘柄・ポジションの
+// 更新頻度には一切影響しない）。ここでは新しい売買ロジックは作らず、売却は既存のPositionExitModal
+// （onOpenExit経由で親から渡される）をそのまま呼ぶだけ。
+const POSITION_LIVE_POLL_MS=12000; // 展開中のみ12秒間隔（yfinance/立花証券APIとも常時ポーリング前提のAPIではないため控えめにする）
+function PositionLiveDetail({item,onOpenExit}){
+  const [detail,setDetail]=useState(null);
+  const [err,setErr]=useState("");
+  const [loading,setLoading]=useState(true);
+  useEffect(()=>{
+    let cancelled=false;
+    const load=async()=>{
+      try{
+        const r=await fetch(`/api/position-live?code=${encodeURIComponent(item.code)}&market=${encodeURIComponent(item.market||"JP")}`);
+        const d=await r.json();
+        if(cancelled)return;
+        if(d.error){setErr(d.error);}else{setDetail(d);setErr("");}
+      }catch(e){if(!cancelled)setErr("通信エラー: "+e.message);}
+      if(!cancelled)setLoading(false);
+    };
+    load();
+    const timer=setInterval(load,POSITION_LIVE_POLL_MS);
+    return ()=>{cancelled=true;clearInterval(timer);};
+  },[item.code,item.market]);
+
+  const rowStyle={display:"flex",justifyContent:"space-between",fontSize:12,padding:"2px 0"};
+  if(loading&&!detail)return <div style={{fontSize:11,color:"var(--inkFaint)",padding:"8px 2px"}}>リアルタイム情報を取得中…</div>;
+  if(err&&!detail)return <div style={{fontSize:11,color:"var(--down)",padding:"8px 2px"}}>{err}</div>;
+  if(!detail)return null;
+
+  const avg=num(item.average_price);
+  const cur=num(detail.t),prev=num(detail.p),open=num(detail.open),high=num(detail.high),low=num(detail.low);
+  const changeAmt=(cur!=null&&prev!=null)?cur-prev:null;
+  const changePct=(cur!=null&&prev)?(cur-prev)/prev*100:null;
+  const buildDiff=(avg!=null&&cur!=null)?cur-avg:null;
+  const buildDiffPct=(avg&&cur!=null)?(cur-avg)/avg*100:null;
+  const fromHighPct=(high&&cur!=null)?(cur-high)/high*100:null;
+  const fromLowPct=(low&&cur!=null)?(cur-low)/low*100:null;
+  // 当日レンジバー用の位置（0〜100%）。high===lowのような異常値では中央固定にする。
+  const rangePos=(high!=null&&low!=null&&high>low&&cur!=null)?Math.max(0,Math.min(100,(cur-low)/(high-low)*100)):null;
+  const vd=detail.volumeDetail;
+
+  return <div style={{marginTop:8,padding:"10px 10px",background:"var(--card)",border:"1px solid var(--rule)",borderRadius:5}}>
+    {/* item3：建値基準の情報を上部に常時表示 */}
+    <div style={{display:"flex",gap:16,flexWrap:"wrap",alignItems:"baseline",marginBottom:8}}>
+      <div><span style={{fontSize:10.5,color:"var(--inkSoft)"}}>取得 </span><span className="mono" style={{fontSize:13}}>{avg!=null?avg.toLocaleString():"—"}</span></div>
+      <div><span style={{fontSize:10.5,color:"var(--inkSoft)"}}>現在 </span><span className="mono" style={{fontSize:13,fontWeight:800}}>{cur!=null?cur.toLocaleString():"—"}</span></div>
+      {buildDiff!=null && <div className="mono" style={{fontSize:13,fontWeight:800,color:buildDiff>0?"var(--up)":buildDiff<0?"var(--down)":"var(--inkSoft)"}}>
+        {buildDiff>0?"+":""}{buildDiff.toLocaleString()}（{buildDiffPct>0?"+":""}{buildDiffPct.toFixed(2)}%）
+      </div>}
+      <button className="action-btn" style={{fontSize:11,marginLeft:"auto"}} onClick={()=>onOpenExit(item,cur)}>💰 売却</button>
+    </div>
+
+    {/* item2：リアルタイム株価の主要項目 */}
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(100px,1fr))",gap:"2px 10px",marginBottom:8}}>
+      <div style={rowStyle}><span style={{color:"var(--inkSoft)"}}>前日比</span><span className="mono" style={{fontWeight:700,color:changeAmt>0?"var(--up)":changeAmt<0?"var(--down)":"var(--inkSoft)"}}>{changeAmt!=null?`${changeAmt>0?"+":""}${changeAmt.toLocaleString()}（${changePct>0?"+":""}${changePct.toFixed(2)}%）`:"—"}</span></div>
+      <div style={rowStyle}><span style={{color:"var(--inkSoft)"}}>始値</span><span className="mono">{open!=null?open.toLocaleString():"—"}</span></div>
+      <div style={rowStyle}><span style={{color:"var(--inkSoft)"}}>高値</span><span className="mono">{high!=null?high.toLocaleString():"—"}</span></div>
+      <div style={rowStyle}><span style={{color:"var(--inkSoft)"}}>安値</span><span className="mono">{low!=null?low.toLocaleString():"—"}</span></div>
+      <div style={rowStyle}><span style={{color:"var(--inkSoft)"}}>出来高</span><span className="mono">{detail.volume!=null?Math.round(detail.volume).toLocaleString():"—"}</span></div>
+      <div style={rowStyle}><span style={{color:"var(--inkSoft)"}}>更新</span><span className="mono">{detail.fetchedAtJst||"—"}</span></div>
+    </div>
+
+    {/* item4：当日レンジバー */}
+    {rangePos!=null && <div style={{marginBottom:8}}>
+      <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:"var(--inkFaint)",marginBottom:2}}>
+        <span>安値 {low.toLocaleString()}</span><span>高値 {high.toLocaleString()}</span>
+      </div>
+      <div style={{position:"relative",height:6,background:"var(--ruleSoft)",borderRadius:3}}>
+        <div style={{position:"absolute",left:`${rangePos}%`,top:-3,width:2,height:12,background:"var(--ink)",transform:"translateX(-1px)"}} title={`現在値 ${cur.toLocaleString()}`}/>
+      </div>
+      <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:"var(--inkFaint)",marginTop:2}}>
+        <span>高値から {fromHighPct>0?"+":""}{fromHighPct?.toFixed(2)}%</span>
+        <span>安値から {fromLowPct>0?"+":""}{fromLowPct?.toFixed(2)}%</span>
+      </div>
+    </div>}
+
+    {/* item10：出来高評価（AUTO_VOLUMEのロジックを単一銘柄向けに再利用、売買損益機能とは別枠の参考情報） */}
+    {vd && <div style={{fontSize:11,color:"var(--inkSoft)",display:"flex",gap:10,flexWrap:"wrap",alignItems:"center"}}>
+      <span>出来高比 <span className="mono" style={{fontWeight:700}}>{vd.timeAdjustedVolumeRatio!=null?`${vd.timeAdjustedVolumeRatio}x`:"—"}</span></span>
+      {vd.volumeType && <span style={{fontWeight:700}}>{VOLUME_TYPE_LABEL[vd.volumeType]||vd.volumeType}</span>}
+    </div>}
+    {err && <div style={{fontSize:10.5,color:"var(--down)",marginTop:6}}>※直近の更新に失敗しました（表示は前回取得値）：{err}</div>}
   </div>;
 }
 
@@ -3601,8 +3712,17 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
   // 監視銘柄→ポジション連携の「買い増し」／保有カードの「売却」モーダル状態。
   const [entryModalFor,setEntryModalFor]=useState(null); // {code,name,market}
   const [exitModalFor,setExitModalFor]=useState(null); // portfolio 1件
+  const [exitPriceOverride,setExitPriceOverride]=useState(null); // リアルタイム詳細から開いた場合の最新現在値
   const afterEntrySaved=()=>{load();};
   const afterExitSaved=()=>{load();loadTotals();loadTrades();};
+  // item12/13：リアルタイム詳細エリアの「💰 売却」から開く場合は、そこで取得した最新の現在値を
+  // 売値の初期値に使う（一覧の一括stockQuotesより新しいことが多いため）。通常の一覧行から開く
+  // 場合は従来通りstockQuotesを使う（openExitの第2引数省略）。売却処理自体はどちらもこの同じ
+  // PositionExitModal・同じ/api/portfolio/exitのみを使う（新しい売却経路は作らない）。
+  const openExit=(it,liveCurrent)=>{setExitModalFor(it);setExitPriceOverride(liveCurrent??null);};
+  // v3-9続き（2026-09-07・リアルタイム売却判断画面 Phase1）：詳細展開は同時に1銘柄のみ
+  // （item17のAPI負荷対策として推奨されている方式を採用。展開を閉じれば即ポーリング停止）。
+  const [expandedLiveCode,setExpandedLiveCode]=useState(null);
 
   // v3-4：入力中のコードがトレード分析タブで既に「分析」済みなら、その時点のstop/target/
   // fullExitTargetを初期SL・利確①②の下書きに流し込むショートカット（既存analysisDataの
@@ -3902,13 +4022,24 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
                     ユーザー指定のモックアップに合わせ、ポジションカードでは一行要約（compact）で表示する。 */}
                 <ExpertViewNote views={expertViews} code={it.code} sector={it.sector} market={it.market} compact/>
 
+                {/* ⑨ リアルタイム売却判断エリア（Phase1）。「リアルタイム」ボタンで展開している
+                    ポジションのみ、PositionLiveDetailが/api/position-liveを一定間隔でポーリングする。
+                    同時に1銘柄のみ展開可能（expandedLiveCode、item17のAPI負荷対策）。 */}
+                <div style={{marginTop:8}}>
+                  <button className="ghost" style={{fontSize:11}}
+                    onClick={()=>setExpandedLiveCode(k=>k===(it.code+it.market)?null:(it.code+it.market))}>
+                    {expandedLiveCode===(it.code+it.market)?"リアルタイム ▲":"リアルタイム ▼"}
+                  </button>
+                  {expandedLiveCode===(it.code+it.market) && <PositionLiveDetail item={it} onOpenExit={openExit}/>}
+                </div>
+
                 {/* ⑧ 操作・参考情報・メモ */}
                 <div style={{display:"flex",alignItems:"center",gap:6,marginTop:8,flexWrap:"wrap"}}>
                   {positionConsultMsg && <span style={{fontSize:10.5,color:"var(--accent)",fontWeight:700}}>{positionConsultMsg}</span>}
                   <button className="action-btn" style={{fontSize:11}} onClick={()=>copyPositionConsult(it)}>🤖 利確・損切り相談</button>
                   {/* v3-9続き（2026-09-07）：売却・買い増し。実現損益の自動計算・通算実現損益の
                       更新・全株売却時の自動削除はサーバー側（add_position_exit）が行う。 */}
-                  <button className="action-btn" style={{fontSize:11}} onClick={()=>setExitModalFor(it)}>💰 売却</button>
+                  <button className="action-btn" style={{fontSize:11}} onClick={()=>openExit(it)}>💰 売却</button>
                   <button className="action-btn" style={{fontSize:11}} onClick={()=>setEntryModalFor({code:it.code,name:it.name,market:it.market})}>➕ 買い増し</button>
                 </div>
                 {enr && <div style={{fontSize:10,color:"var(--inkFaint)",marginTop:4}}>
@@ -3922,8 +4053,9 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
     </div>
     {entryModalFor && <PositionEntryModal code={entryModalFor.code} name={entryModalFor.name} market={entryModalFor.market}
       needsTradeStyle={false} onClose={()=>setEntryModalFor(null)} onSaved={afterEntrySaved}/>}
-    {exitModalFor && <PositionExitModal position={exitModalFor} currentPrice={num(stockQuotes?.[exitModalFor.code]?.t)}
-      onClose={()=>setExitModalFor(null)} onSaved={afterExitSaved}/>}
+    {exitModalFor && <PositionExitModal position={exitModalFor}
+      currentPrice={exitPriceOverride??num(stockQuotes?.[exitModalFor.code]?.t)}
+      onClose={()=>{setExitModalFor(null);setExitPriceOverride(null);}} onSaved={afterExitSaved}/>}
   </>;
 }
 

@@ -222,13 +222,16 @@ def get_stock_quotes(watchlist):
             p = round(float(closes.iloc[-2]), 2) if len(closes) >= 2 else None
             highs = h["High"].dropna()
             lows = h["Low"].dropna()
+            opens = h["Open"].dropna()  # 2026-09-07新規（ポジション・リアルタイム売却判断）：当日始値。
             volumes = h["Volume"].dropna()
             turnover = float(t) * float(volumes.iloc[-1]) if len(volumes) and t is not None else None
             spark = [round(float(x), 2) for x in closes.tolist()[-20:]]  # 10-1章：カードUIのミニスパークライン用
             out[code] = {
                 "t": t, "p": p,
+                "open": round(float(opens.iloc[-1]), 2) if len(opens) else None,
                 "high": round(float(highs.iloc[-1]), 2) if len(highs) else None,
                 "low": round(float(lows.iloc[-1]), 2) if len(lows) else None,
+                "volume": float(volumes.iloc[-1]) if len(volumes) else None,
                 "turnover": turnover,
                 "spark": spark,
             }
@@ -261,6 +264,8 @@ def _overlay_tachibana_prices(out, watchlist):
         out[code]["t"] = v["t"]
         if v.get("p") is not None:
             out[code]["p"] = v["p"]
+        if v.get("open") is not None:  # 2026-09-07新規（ポジション・リアルタイム売却判断）
+            out[code]["open"] = v["open"]
         if v.get("high") is not None:
             out[code]["high"] = v["high"]
         if v.get("low") is not None:
@@ -3477,6 +3482,41 @@ def run_volume_scan(database_url, user_id, force=False):
     }
 
 
+# 2026-09-07新規（ポジション→リアルタイム売却判断画面 Phase1）：ポジション詳細エリアを開いた
+# 1銘柄だけをオンデマンドで取得する専用API。既存のget_stock_quotes（yfinance＋立花証券API
+# オーバーレイ、新規取得ロジックなし）と、AUTO_VOLUMEの_volume_stage2_detail/_volume_type
+# （出来高の方向判定、新規スキャンなし・Stage1キャッシュも使わず単体銘柄のみ計算）をそのまま
+# 再利用する。ポジション本体（entries/trade_history/実現損益）には一切書き込まない、
+# 読み取り専用の参考情報API。失敗しても売買機能自体には影響しない設計にする。
+def get_position_live_detail(code, market="JP"):
+    quotes = get_stock_quotes([{"code": code, "market": market}])
+    quote = quotes.get(code)
+    if not quote:
+        return {"error": "現在値を取得できませんでした（データ取得中か、対象外銘柄の可能性があります）"}
+    result = dict(quote)
+    result["code"] = code
+    result["market"] = market
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    result["fetchedAtJst"] = datetime.datetime.now(jst).strftime("%H:%M:%S")
+    if market == "JP":
+        try:
+            t, p = quote.get("t"), quote.get("p")
+            change_pct = ((t - p) / p * 100) if (t is not None and p) else None
+            row = {"changePct": change_pct, "turnover": quote.get("turnover"),
+                   "highRetention": None, "marketRS": None, "sectorRS": None}
+            stage2 = _volume_stage2_detail(code, row)
+            if stage2:
+                result["volumeDetail"] = {
+                    "avgVolume20": stage2.get("avgVolume20"),
+                    "rawVolumeRatio": stage2.get("rawVolumeRatio"),
+                    "timeAdjustedVolumeRatio": stage2.get("timeAdjustedVolumeRatio"),
+                    "volumeType": _volume_type(stage2, row),
+                }
+        except Exception as e:
+            print("  ポジション・リアルタイム：出来高詳細の取得に失敗（現在値表示は継続）", code, e)
+    return result
+
+
 def analyze_stock(w, market_env=None):
     """12-1章・technical_analysis_rules.md：ローソク足パターン・移動平均線の並び／クロス・
     ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
@@ -4884,6 +4924,19 @@ class Handler(SimpleHTTPRequestHandler):
             # 2026-09-07新規：通算実現損益（初期値＋trade_history合計、毎回再計算）。
             totals = investment_db.get_investment_totals(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else {"initialRealizedPnl":0,"totalRealizedPnl":0}
             self._send_json(totals)
+        elif self.path.startswith("/api/position-live"):
+            # 2026-09-07新規（ポジション→リアルタイム売却判断画面 Phase1）：ポジションカードの
+            # 「リアルタイム」展開エリアを開いている間だけ、その1銘柄だけをオンデマンドで取得する。
+            # 既存の全銘柄一括ポーリング（stockQuotes）とは完全に別経路にすることで、展開していない
+            # ポジションや監視銘柄まで巻き込んだ高頻度リクエストにならないようにする。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            code = (params.get("code", [""])[0] or "").strip()
+            market = params.get("market", ["JP"])[0] or "JP"
+            if not code:
+                self._send_json({"error": "codeは必須です"})
+            else:
+                self._send_json(get_position_live_detail(code, market))
         elif self.path == "/" or self.path == "":
             self.send_response(302)
             self.send_header("Location", "/trade-cockpit.html")
