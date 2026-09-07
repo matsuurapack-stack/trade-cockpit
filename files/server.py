@@ -2862,6 +2862,338 @@ def run_pullback_scan(database_url, user_id, force=False):
     }
 
 
+# ============================================================
+# v3-9続き（2026-09-07・AUTO_REVERSAL）：「下落中の銘柄を拾う」のではなく「下落後に反転が
+# 確認できた銘柄」を発見するエンジン。既存のStage1共有キャッシュ（run_momentum_stage1）・
+# CURRENT/SEEN・manual_registered保護・auto_signal_events・_record_signal_transitionsを
+# そのまま再利用し、新しい全市場スキャンは追加しない（Stage2は他エンジンと同様、候補銘柄
+# ごとに日足履歴を取得するだけ）。
+# AUTO_PULLBACKとの違い：PULLBACKは「上昇トレンド中の浅い調整」（current>MA25が前提）、
+# REVERSALは「下落・弱含みからの反転」（MA25割れ状態からの回復途上も対象）。両者は排他にせず、
+# 重複登録があっても禁止しない（ユーザー指示）が、判定の入口（トレンド継続 vs 下落後の反転）が
+# 異なるため通常は別銘柄になる想定。
+# 最重要原則：「落ちるナイフは掴まない」。_reversal_falling_knife()に該当する銘柄は
+# スコア計算そのものを行わずNoneを返し、CURRENT登録対象から完全に除外する。
+# ============================================================
+REVERSAL_LOW_LOOKBACK_DAYS = 20  # 「直近安値」を探す範囲（直近5〜20営業日、ユーザー指示の上限）
+REVERSAL_LITE_MAX_CANDIDATES = 100
+REVERSAL_SCORE_THRESHOLD = 50  # 実データを見て調整する前提の初期値（他エンジンと同じ運用）
+REVERSAL_MAX_REGISTER = 15
+REVERSAL_TAG_EXPIRE_DAYS = 2
+REVERSAL_STAGE2_WORKERS = 10
+
+
+def _reversal_lite_score(row):
+    """Stage1だけでの一次選定：まだ大幅下落中の当日（chg<-8%）はStage2に回さない（反転どころか
+    パニック売りの最中である可能性が高い）。当日安値付近に張り付いたまま（day_bounce_pct<25%）
+    の銘柄も「戻りが無い」として除外する。それ以外は対市場・対セクター・売買代金で広く拾い、
+    反転構造の確定判定（higherLow・MA reclaim・抵抗突破等）はStage2（日足履歴）に委ねる。"""
+    chg = row.get("changePct")
+    if chg is None or chg < -8:
+        return None
+    current, low, high = row.get("current"), row.get("low"), row.get("high")
+    if current is not None and low is not None and high is not None and high > low:
+        day_bounce_pct = (current - low) / (high - low) * 100
+        if day_bounce_pct < 25:
+            return None
+    score = 0.0
+    score += _scale_score(row.get("marketRS"), -2, 5, 25)
+    score += _scale_score(row.get("sectorRS"), -2, 3, 15)
+    score += _scale_score(row.get("turnover"), 1e9, 1e10, 20)
+    score *= _liquidity_multiplier(row.get("turnover"))
+    return round(score, 1)
+
+
+def select_reversal_stage1_candidates(stage1):
+    scored = []
+    for code, row in stage1["rows"].items():
+        s = _reversal_lite_score(row)
+        if s is not None:
+            scored.append((s, code, row))
+    scored.sort(key=lambda x: -x[0])
+    return scored[:REVERSAL_LITE_MAX_CANDIDATES]
+
+
+def _tachibana_daily_history_with_dates(code):
+    """_tachibana_daily_arrays()と同じ日足取得・当日分合成ロジックだが、AUTO_REVERSAL専用に
+    date配列とopens配列も返す（recentLowDate算出・gap down判定に使う）。既存5エンジンが使う
+    _tachibana_daily_arrays()は返り値のタプル数が異なる既存呼び出し元を壊さないよう変更せず、
+    この専用関数を別途新設する（新しいAPI呼び出しは増やさない＝同じget_daily_history()を
+    1回呼ぶだけ、他エンジンのStage2と同じコスト）。"""
+    if tachibana_api is None or not code:
+        return None
+    try:
+        hist = tachibana_api.get_daily_history(code)
+    except Exception as e:
+        print(f"  立花証券API 日足取得失敗（AUTO_REVERSAL・{code}）", e)
+        return None
+    if len(hist) < 30:
+        return None
+    hist = hist[-400:]
+    dates = [r["date"] for r in hist]
+    opens = [r["open"] for r in hist]
+    highs = [r["high"] for r in hist]
+    lows = [r["low"] for r in hist]
+    closes = [r["close"] for r in hist]
+    volumes = [r["volume"] for r in hist]
+
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    today_str = datetime.datetime.now(jst).strftime("%Y-%m-%d")
+    if dates[-1] != today_str:
+        try:
+            live = tachibana_api.get_market_price([code]).get(code)
+        except Exception:
+            live = None
+        if live and live.get("t") is not None and live.get("open") is not None:
+            dates.append(today_str)
+            opens.append(live["open"])
+            highs.append(live.get("high") if live.get("high") is not None else live["t"])
+            lows.append(live.get("low") if live.get("low") is not None else live["t"])
+            closes.append(live["t"])
+            volumes.append(live.get("volume") if live.get("volume") is not None else 0)
+    return dates, opens, highs, lows, closes, volumes
+
+
+def _reversal_stage2_detail(code, stage1_row):
+    """日足履歴を使って反転構造を確認する。最低確認項目：recentLow（直近安値の日付・価格）・
+    higherLow（安値切り上げ）・ma5/10/25 reclaim・ma25の傾き・直近戻り高値の突破・出来高倍率。"""
+    data = _tachibana_daily_history_with_dates(code)
+    if not data:
+        return None
+    dates, opens, highs, lows, closes, volumes = data
+    if len(closes) < 30 or len(volumes) < 6:
+        return None
+    current = stage1_row.get("current") if stage1_row.get("current") is not None else closes[-1]
+
+    # 直近安値の探索（当日を除く、直近REVERSAL_LOW_LOOKBACK_DAYS営業日の最安値）。
+    window_lows = lows[-(REVERSAL_LOW_LOOKBACK_DAYS + 1):-1]
+    window_dates = dates[-(REVERSAL_LOW_LOOKBACK_DAYS + 1):-1]
+    window_highs = highs[-(REVERSAL_LOW_LOOKBACK_DAYS + 1):-1]
+    if not window_lows:
+        return None
+    min_idx = min(range(len(window_lows)), key=lambda i: window_lows[i])
+    recent_low_price = window_lows[min_idx]
+    recent_low_date = window_dates[min_idx]
+    recent_low_days_ago = len(window_lows) - min_idx  # 末尾（前営業日）がrecentLowなら1
+
+    today_low = lows[-1]
+    making_new_low_today = today_low <= recent_low_price
+
+    # 安値切り上げ：recentLow形成"後"、当日より前の営業日でrecentLowを再度割っていないか
+    # （0.5%の許容誤差。既存AUTO_PULLBACKのhigherLow判定と同じ考え方）。
+    after_low = window_lows[min_idx + 1:]
+    broke_recent_low_again = any(l < recent_low_price * 0.995 for l in after_low)
+    higher_low = (not broke_recent_low_again) and (not making_new_low_today) and current >= recent_low_price * 0.995
+
+    current_from_low_pct = ((current - recent_low_price) / recent_low_price * 100) if recent_low_price else None
+
+    ma5 = sum(closes[-5:]) / 5
+    ma10 = sum(closes[-10:]) / 10
+    ma25 = sum(closes[-25:]) / 25
+    ma25_prev = sum(closes[-30:-5]) / 25
+    ma25_slope_pct = ((ma25 - ma25_prev) / ma25_prev * 100) if ma25_prev else None
+    ma25_rising = bool(ma25_slope_pct is not None and ma25_slope_pct > 0)
+    ma5_reclaim = bool(current > ma5)
+    ma10_reclaim = bool(current > ma10)
+    ma25_reclaim = bool(current > ma25)
+
+    # 抵抗線＝recentLow形成後の戻り高値（無ければ前日高値で代用）。この水準を上抜けたことを
+    # 「抵抗突破」とする（大局の3か月高値＝AUTO_PULLBACKのrefHighとは別物、あくまで下落からの
+    # 戻りの過程でできた直近の壁）。
+    resistance_window = window_highs[min_idx + 1:]
+    resistance = max(resistance_window) if resistance_window else highs[-2]
+    resistance_break = bool(resistance and current > resistance)
+
+    vol_avg5 = sum(volumes[-6:-1]) / 5
+    vol_ratio = (volumes[-1] / vol_avg5) if vol_avg5 else None
+
+    # 強いgap down継続：当日始値が前日終値から3%以上下に窓を開け、なお前日終値を回復できていない。
+    gap_down = bool(len(closes) >= 2 and closes[-2] and opens[-1] < closes[-2] * 0.97 and current < closes[-2])
+
+    return {"recentLowDate": recent_low_date, "recentLowPrice": round(recent_low_price, 1),
+            "recentLowDaysAgo": recent_low_days_ago,
+            "currentFromRecentLowPct": round(current_from_low_pct, 2) if current_from_low_pct is not None else None,
+            "higherLow": higher_low, "makingNewLowToday": making_new_low_today,
+            "brokeRecentLowAgain": broke_recent_low_again,
+            "ma5": round(ma5, 1), "ma10": round(ma10, 1), "ma25": round(ma25, 1),
+            "ma5Reclaim": ma5_reclaim, "ma10Reclaim": ma10_reclaim, "ma25Reclaim": ma25_reclaim,
+            "ma25SlopePct": round(ma25_slope_pct, 2) if ma25_slope_pct is not None else None,
+            "ma25Rising": ma25_rising,
+            "resistance": round(resistance, 1) if resistance else None, "resistanceBreak": resistance_break,
+            "volRatio": round(vol_ratio, 2) if vol_ratio is not None else None,
+            "gapDown": gap_down, "dayChangePct": stage1_row.get("changePct")}
+
+
+def _reversal_falling_knife(stage2, row):
+    """最重要原則：「落ちるナイフは掴まない」。以下のいずれかに該当すればAUTO_REVERSAL不可
+    （スコア計算自体を行わずNoneを返す＝CURRENT登録対象から完全除外）。
+      1. 当日安値更新中（makingNewLowToday）
+      2. 現在値が直近安値を割っている（＝安値切り下げ）
+      3. MA5/10/25すべて未回復かつMA25も下向き（反転の兆候が一つも無い）
+      4. 直近安値を形成した後、再度その安値を割っている（brokeRecentLowAgain）
+      5. 出来高急増を伴う大幅下落（当日騰落率<-5%かつ出来高1.5倍超）
+      6. 強いgap downが継続（前日終値未回復）"""
+    if stage2 is None:
+        return True
+    if stage2["makingNewLowToday"]:
+        return True
+    current = row.get("current")
+    if current is not None and stage2.get("recentLowPrice") and current < stage2["recentLowPrice"]:
+        return True
+    if not stage2["ma5Reclaim"] and not stage2["ma10Reclaim"] and not stage2["ma25Reclaim"] and not stage2["ma25Rising"]:
+        return True
+    if stage2["brokeRecentLowAgain"]:
+        return True
+    day_change = row.get("changePct")
+    vol_ratio = stage2.get("volRatio")
+    if day_change is not None and day_change < -5 and vol_ratio is not None and vol_ratio > 1.5:
+        return True
+    if stage2.get("gapDown"):
+        return True
+    return False
+
+
+def _reversal_types(stage2):
+    """metadata.reversalTypes：複数の反転根拠を持つ場合はMULTI_CONFIRMATIONも併記する。"""
+    types = []
+    if stage2.get("higherLow"):
+        types.append("HIGHER_LOW")
+    if stage2.get("ma5Reclaim") or stage2.get("ma10Reclaim") or stage2.get("ma25Reclaim"):
+        types.append("MA_RECLAIM")
+    if stage2.get("resistanceBreak"):
+        types.append("RESISTANCE_BREAK")
+    if stage2.get("volRatio") is not None and stage2["volRatio"] >= 1.3:
+        types.append("VOLUME_REVERSAL")
+    if len(types) >= 3:
+        types.append("MULTI_CONFIRMATION")
+    return types
+
+
+def _reversal_final_score(row, stage2):
+    """REVERSAL_SCORE（100点満点、初期配点。実データを見て微調整する前提）：
+      Higher Low                25点（binary）
+      短期MA reclaim            最大20点（MA5回復+10・MA10回復+10）
+      直近戻り高値の抵抗突破     20点（binary）
+      出来高改善                最大15点（1.0倍で0点、1.8倍以上で満点）
+      Market RS                 最大10点
+      Sector RS                 最大10点
+    Falling Knife判定に該当する場合はNone（スコア計算自体を行わない＝AUTO_REVERSAL不可）。"""
+    if stage2 is None:
+        return None
+    if _reversal_falling_knife(stage2, row):
+        return None
+    score = 0.0
+    if stage2["higherLow"]:
+        score += 25
+    ma_reclaim_pts = (10 if stage2["ma5Reclaim"] else 0) + (10 if stage2["ma10Reclaim"] else 0)
+    score += min(ma_reclaim_pts, 20)
+    if stage2["resistanceBreak"]:
+        score += 20
+    if stage2.get("volRatio") is not None:
+        score += _scale_score(stage2["volRatio"], 1.0, 1.8, 15)
+    score += _scale_score(row.get("marketRS"), 0, 5, 10)
+    score += _scale_score(row.get("sectorRS"), 0, 3, 10)
+    score *= _liquidity_multiplier(row.get("turnover"))
+    return round(score, 1)
+
+
+def run_reversal_scan(database_url, user_id, force=False):
+    """Stage1（キャッシュ共有）→REVERSAL候補選定→Stage2（並列、他エンジンと同じ構成）→
+    REVERSAL_SCORE確定（Falling Knife該当は除外）→閾値を満たした上位REVERSAL_MAX_REGISTER件を
+    「AUTO_REVERSAL_CURRENT」として登録、新TOP外に落ちた旧CURRENTは「AUTO_REVERSAL_SEEN」へ降格。"""
+    stage1 = run_momentum_stage1(force=force)
+    candidates = select_reversal_stage1_candidates(stage1)
+    t_stage2_start = time.time()
+
+    stage2_results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=REVERSAL_STAGE2_WORKERS) as ex:
+        futures = {ex.submit(_reversal_stage2_detail, code, row): code for _, code, row in candidates}
+        for fut in concurrent.futures.as_completed(futures):
+            code = futures[fut]
+            try:
+                stage2_results[code] = fut.result()
+            except Exception as e:
+                print("  REVERSAL Stage2詳細取得失敗", code, e)
+                stage2_results[code] = None
+    stage2_duration = round(time.time() - t_stage2_start, 1)
+
+    details = []
+    for lite_score, code, row in candidates:
+        stage2 = stage2_results.get(code)
+        final_score = _reversal_final_score(row, stage2)
+        if final_score is None:
+            continue
+        details.append({"code": code, "name": row.get("name"), "sector": row.get("sector"),
+                         "changePct": row.get("changePct"), "highRetention": row.get("highRetention"),
+                         "marketRS": row.get("marketRS"), "sectorRS": row.get("sectorRS"),
+                         "turnover": row.get("turnover"), "liteScore": lite_score,
+                         "current": row.get("current"),
+                         "finalScore": final_score, "stage2": stage2})
+    details.sort(key=lambda d: -d["finalScore"])
+    to_register = [d for d in details if d["finalScore"] >= REVERSAL_SCORE_THRESHOLD][:REVERSAL_MAX_REGISTER]
+
+    registered, demoted = [], []
+    if database_url and investment_db is not None:
+        old_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_REVERSAL_CURRENT", market="JP")
+        old_seen = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_REVERSAL_SEEN", market="JP")
+        new_current_codes = {d["code"] for d in to_register}
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        expires_at = (now_dt + datetime.timedelta(days=REVERSAL_TAG_EXPIRE_DAYS)).isoformat()
+
+        for d in to_register:
+            tag_value = {"score": d["finalScore"], "higherLow": d["stage2"]["higherLow"],
+                         "currentFromRecentLowPct": d["stage2"].get("currentFromRecentLowPct"),
+                         "reversalTypes": _reversal_types(d["stage2"]),
+                         "addedAt": now_dt.isoformat(), "expiresAt": expires_at}
+            try:
+                ok = investment_db.auto_register_or_tag_watchlist_item(
+                    database_url, user_id, d["code"], "JP", "AUTO_REVERSAL_CURRENT", tag_value,
+                    item_fields={"name": d["name"], "sector": d["sector"], "source": "auto_reversal"})
+                investment_db.remove_auto_tag_key(database_url, user_id, d["code"], "JP", "AUTO_REVERSAL_SEEN")
+            except Exception as e:
+                print("  AUTO_REVERSAL登録（CURRENT）失敗", d["code"], e)
+                ok = False
+            if ok:
+                registered.append(d)
+
+        for code in old_current - new_current_codes:
+            try:
+                investment_db.auto_register_or_tag_watchlist_item(
+                    database_url, user_id, code, "JP", "AUTO_REVERSAL_SEEN",
+                    {"addedAt": now_dt.isoformat(), "expiresAt": expires_at})
+                investment_db.remove_auto_tag_key(database_url, user_id, code, "JP", "AUTO_REVERSAL_CURRENT")
+                demoted.append(code)
+            except Exception as e:
+                print("  AUTO_REVERSAL降格（SEEN化）失敗", code, e)
+
+        def _reversal_metadata(d):
+            s2 = d["stage2"]
+            return {"recentLowDate": s2.get("recentLowDate"), "recentLowPrice": s2.get("recentLowPrice"),
+                    "recentLowDaysAgo": s2.get("recentLowDaysAgo"),
+                    "currentFromRecentLowPct": s2.get("currentFromRecentLowPct"),
+                    "higherLow": s2.get("higherLow"),
+                    "ma5Reclaim": s2.get("ma5Reclaim"), "ma10Reclaim": s2.get("ma10Reclaim"),
+                    "ma25Reclaim": s2.get("ma25Reclaim"), "ma25Slope": s2.get("ma25SlopePct"),
+                    "resistanceBreak": s2.get("resistanceBreak"), "volumeRatio": s2.get("volRatio"),
+                    "reversalTypes": _reversal_types(s2)}
+        _record_signal_transitions(database_url, user_id, "REVERSAL", "JP",
+            to_register, old_current, old_seen, demoted, metadata_fn=_reversal_metadata)
+    return {
+        "stage1CodesScanned": stage1["codesScanned"], "stage1PricesReturned": stage1["pricesReturned"],
+        "stage1DurationSec": stage1["durationSec"], "stage1RequestCount": stage1["requestCount"],
+        "stage1CacheAgeSec": round(time.time() - stage1["builtAt"], 1) if stage1["builtAt"] else None,
+        "stage1BuiltAtJst": _jst_time_str(stage1["builtAt"]),
+        "stage1ScanFailed": stage1.get("scanFailed", False), "stage1UsedStaleCache": stage1.get("usedStaleCache", False),
+        "stage1CandidateCount": len(candidates),
+        "stage2ValidCount": len(details),
+        "stage2DurationSec": stage2_duration,
+        "demotedToSeenCount": len(demoted), "demotedToSeen": demoted,
+        "registeredCount": len(registered),
+        "registered": registered,
+        "allCandidates": details,
+    }
+
+
 def analyze_stock(w, market_env=None):
     """12-1章・technical_analysis_rules.md：ローソク足パターン・移動平均線の並び／クロス・
     ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
@@ -4170,6 +4502,17 @@ class Handler(SimpleHTTPRequestHandler):
             result = run_pullback_scan(DATABASE_URL, self.current_user, force=force)
             print(f"  Stage1 {result['stage1CodesScanned']}銘柄スキャン（{result['stage1DurationSec']}秒）→ "
                   f"押し目候補{result['stage2ValidCount']}件→自動登録{result['registeredCount']}件"
+                  f"（降格{result['demotedToSeenCount']}件）")
+            self._send_json(result)
+        elif self.path.startswith("/api/reversal-scan"):
+            # v3-9続き（2026-09-07・AUTO_REVERSAL）：🔄 下落後の反転確認。Stage1共有・
+            # AUTO_PULLBACKと同じくStage2あり（日足履歴）。
+            qs = urllib.parse.urlparse(self.path).query
+            force = urllib.parse.parse_qs(qs).get("force", ["0"])[0] == "1"
+            print(f"[取得] AUTO_REVERSALスキャン開始（force={force}）…")
+            result = run_reversal_scan(DATABASE_URL, self.current_user, force=force)
+            print(f"  Stage1 {result['stage1CodesScanned']}銘柄スキャン（{result['stage1DurationSec']}秒）→ "
+                  f"反転候補{result['stage2ValidCount']}件→自動登録{result['registeredCount']}件"
                   f"（降格{result['demotedToSeenCount']}件）")
             self._send_json(result)
         elif self.path.startswith("/api/auto-signal-events"):
