@@ -4836,9 +4836,17 @@ function convertDetailedChatGptPayload(obj){
     reviewParts.push("【デイトレ監視上位】\n"+wlText);
   }else missing.push("daytrade_watchlist（review用）");
 
+  // 2026-09-08追加（「NEONへ保存」失敗の調査）：detailed形式の実サンプルにはtype/summary/
+  // market_sentiment等はあってもトップレベルにdateが無いケースがあり得ることが分かった
+  // （実際に検証用サンプルで再現）。dateが無いとvalidateChatGptPayloadで弾かれ保存に進めない
+  // ため、無ければ「本日」をデフォルト値として補う（既存のフラット形式でdateを明示している
+  // 場合はそちらを優先、ここで上書きはしない）。捏造ではなく、日次チェックJSONという性質上
+  // 「今日の日付」が最も妥当な既定値という判断。
+  if(!obj.date)missing.push("date（未指定のため本日の日付を既定値として使用）");
+
   return{
     converted:{
-      date:obj.date,
+      date:obj.date||todayISO(),
       market:{condition,summary:marketSummary,strong_sectors:strongSectors,weak_sectors:weakSectors},
       watchlist:Array.isArray(obj.daytrade_watchlist)
         ?obj.daytrade_watchlist.map(w=>({code:w.code,name:w.name,status:w.status||"WATCH",reason:w.reason||w.note||""})).filter(w=>w.code)
@@ -4937,19 +4945,43 @@ function ChatGptImportPanel({journal,activeRules}){
   const updateRuleUpdate=(idx,value)=>setParsed(p=>({...p,rule_updates:(p.rule_updates||[]).map((r,i)=>i===idx?value:r)}));
   const removeRuleUpdate=(idx)=>setParsed(p=>({...p,rule_updates:(p.rule_updates||[]).filter((_,i)=>i!==idx)}));
 
+  // 2026-09-08更新（「NEONへ保存」失敗調査）：以前はどんな失敗でも一律「サーバーが起動して
+  // いるか確認してください」としか表示せず、実際のHTTPステータス・サーバー側のエラー内容が
+  // 分からなかった。res.ok・実際のbody文字列（fetchJsonSafeと同じ考え方）・サーバー側で
+  // 新設したfatalErrorキー（想定外の例外）を見て、可能な限り具体的な原因を表示し、
+  // console.errorにも詳細を出すようにした。
   const save=async(force)=>{
     setSaving(true);setSaveMsg("");setDupInfo(null);
+    let res,text;
     try{
-      const r=await fetch("/api/chatgpt-import/save",{method:"POST",headers:{"Content-Type":"application/json"},
+      res=await fetch("/api/chatgpt-import/save",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({payload:parsed,force:!!force})});
-      const d=await r.json();
-      if(d.errors){setSaveMsg("保存失敗：\n・"+d.errors.join("\n・"));}
-      else if(d.error){setDupInfo(d);}
-      else{
-        setSaveMsg(`保存しました（daily_log ID ${d.dailyLogId}・銘柄評価 ${d.judgments}件・追加ルール ${d.rulesAdded}件）`);
-        setRawText("");setParsed(null);setParseErrors([]);setConversionInfo(null);loadImports();
-      }
-    }catch(e){setSaveMsg("保存に失敗しました。サーバーが起動しているか確認してください。");}
+    }catch(e){
+      console.error("[ChatGPT保存] fetch自体が失敗:",e);
+      setSaveMsg(`保存に失敗しました（通信エラー）：${e.message}\n・server.pyが起動しているか\n・Wi-Fi/Tailscale等の接続状況\nをご確認ください。`);
+      setSaving(false);return;
+    }
+    try{text=await res.text();}catch(e){text="";}
+    console.log(`[ChatGPT保存] HTTP ${res.status} ${res.statusText}`,text);
+    if(!res.ok){
+      setSaveMsg(`保存に失敗しました（HTTP ${res.status}）。${text?`応答: ${text.slice(0,300)}`:"応答本文が空でした。"}`);
+      setSaving(false);return;
+    }
+    let d;
+    try{d=JSON.parse(text);}catch(e){
+      console.error("[ChatGPT保存] レスポンスがJSONではありません:",text);
+      setSaveMsg(`保存に失敗しました。サーバーの応答がJSON形式ではありません（詳細はブラウザのコンソールをご確認ください）。`);
+      setSaving(false);return;
+    }
+    if(d.fatalError){
+      console.error("[ChatGPT保存] サーバー側で例外:",d.fatalError);
+      setSaveMsg(`保存に失敗しました（サーバーエラー）：${d.fatalError}`);
+    }else if(d.errors){setSaveMsg("保存失敗：\n・"+d.errors.join("\n・"));}
+    else if(d.error){setDupInfo(d);}
+    else{
+      setSaveMsg(`保存しました（daily_log ID ${d.dailyLogId}・銘柄評価 ${d.judgments}件・追加ルール ${d.rulesAdded}件）`);
+      setRawText("");setParsed(null);setParseErrors([]);setConversionInfo(null);loadImports();
+    }
     setSaving(false);
   };
 

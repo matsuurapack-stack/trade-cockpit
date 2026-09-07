@@ -5199,17 +5199,29 @@ class Handler(SimpleHTTPRequestHandler):
         # ---- ChatGPT連携（2026-09-02新規、Phase1）：有料AI APIは使わず、ChatGPTが出力した
         # 投資ログJSONを手動貼り付けで取り込む。 ----
         elif self.path == "/api/chatgpt-import/save":
+            # 2026-09-08追加（「NEONへ保存」失敗の調査）：想定外の例外がこのルート内で発生すると、
+            # 従来はレスポンスを一切送らないまま接続が切れ、フロント側は「サーバーが起動して
+            # いるか確認してください」という誤解を招く一律のメッセージしか出せなかった
+            # （実際にはサーバーは動いていて、保存処理の途中で例外が起きていただけのケースを
+            # 区別できなかった）。想定外の例外を捕まえて必ずJSONで実際のエラー内容を返すように
+            # した（fatalErrorキーで既存のerrors/error（バリデーション・重複）とは区別する）。
             if not self._investment_db_ready():
                 return
-            body = self._read_json_body()
-            payload = body.get("payload")
-            force = bool(body.get("force"))
-            errors = investment_db.validate_chatgpt_payload(payload)
-            if errors:
-                self._send_json({"errors": errors})
-                return
-            result = investment_db.save_chatgpt_import(DATABASE_URL, self.current_user, payload, force=force)
-            self._send_json(result)
+            try:
+                body = self._read_json_body()
+                payload = body.get("payload")
+                force = bool(body.get("force"))
+                errors = investment_db.validate_chatgpt_payload(payload)
+                if errors:
+                    self._send_json({"errors": errors})
+                    return
+                result = investment_db.save_chatgpt_import(DATABASE_URL, self.current_user, payload, force=force)
+                self._send_json(result)
+            except Exception as e:
+                import traceback
+                print("  /api/chatgpt-import/save 想定外のエラー")
+                traceback.print_exc()
+                self._send_json({"fatalError": f"{type(e).__name__}: {e}"})
         elif self.path == "/api/chatgpt-daily/import":
             # v3-9続き（PHASE 6 DAILY CHATGPT JSON IMPORT）：STEP1「Import（履歴保存）」のみ。
             # updates=[]でもinvestment_rules等には一切書き込まない（apply_status='NO_UPDATES'
