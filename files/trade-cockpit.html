@@ -1717,6 +1717,27 @@ const EVENT_CATEGORY_FILTERS=[
   {key:"PRODUCT_EVENT",label:"企業",types:["PRODUCT_EVENT"]},
   {key:"GEOPOLITICAL",label:"地政学",types:["GEOPOLITICAL","POLITICAL"]},
 ];
+// 2026-09-07新規：legacy/ChatGPT入力形式のevent_type（小文字・独自命名）を、カテゴリfilter用に
+// 既存カテゴリキーへ「表示上」だけmappingする。DB保存値（ev.event_type）自体は書き換えない
+// （EVENT_TYPE_LABEL等の個別表示は従来通り生値にフォールバックする）。ここに無いevent_type
+// （新規のもの含む）は「すべて」でのみ表示され、他カテゴリには出ない＝データを失わない。
+const LEGACY_EVENT_TYPE_CATEGORY={
+  macro:"ECONOMIC",bond_auction:"ECONOMIC",market_holiday:"ECONOMIC",
+  central_bank:"CENTRAL_BANK",
+  earnings:"EARNINGS",
+  market_structure:"INDEX_REBALANCE",
+  corporate_event:"PRODUCT_EVENT",corporate_macro:"PRODUCT_EVENT",
+  political_event:"GEOPOLITICAL",
+  calendar:"OTHER",
+};
+// カテゴリfilter（EVENT_CATEGORY_FILTERSの1件）にイベントが一致するか判定する。既存の
+// types配列との完全一致に加え、LEGACY_EVENT_TYPE_CATEGORYによるmappingも見る
+// （どちらのロジックも変更前の挙動を包含するだけなので、既存の標準event_typeの判定は不変）。
+function eventMatchesCategory(ev,categoryDef){
+  if(!categoryDef||!categoryDef.types)return true; // 「すべて」
+  if(categoryDef.types.includes(ev.event_type))return true;
+  return LEGACY_EVENT_TYPE_CATEGORY[ev.event_type]===categoryDef.key;
+}
 const EVENT_IMPORTANCE_META={HIGH:{icon:"🔴",label:"HIGH",color:"var(--down)"},
   MEDIUM:{icon:"🟡",label:"MEDIUM",color:"var(--accent)"},LOW:{icon:"⚪",label:"LOW",color:"var(--inkFaint)"}};
 const EVENT_VERIFICATION_ICON={VERIFIED:"✅",IMAGE_DERIVED:"⚠",UNVERIFIED:"？"};
@@ -1978,7 +1999,15 @@ function EventsPanel({events,onReload}){
         // 0件（＝実質何も保存されなかった）の場合は成功扱いにしない（テキストも消さない）。
         const imported=d.imported||0,updated=d.updated||0,skipped=d.skipped||0,errors=d.errors||0;
         const success=(imported+updated)>0;
-        setImportMsg(`イベント取込${success?"完了":"失敗"}\n新規 ${imported}件\n更新 ${updated}件\nスキップ ${skipped}件${errors?`\nエラー ${errors}件`:""}`);
+        // 2026-09-07追加：「スキップ20件」とだけ出て原因が分からない、を防ぐため、
+        // サーバーが返すskipped_details/error_details（先頭数件のindex/title/reason）を
+        // メッセージに併記する。件数だけの表示だった以前の仕様は残しつつ追記するだけ。
+        const detailLines=[
+          ...(d.error_details||[]).slice(0,5).map(x=>`  #${x.index+1} ${x.title||"(タイトル不明)"}：${x.reason}`),
+          ...(d.skipped_details||[]).slice(0,5).map(x=>`  #${x.index+1} ${x.title||"(タイトル不明)"}：${x.reason}`),
+        ];
+        const detailText=detailLines.length?`\n${detailLines.join("\n")}`:"";
+        setImportMsg(`イベント取込${success?"完了":"失敗"}\n新規 ${imported}件\n更新 ${updated}件\nスキップ ${skipped}件${errors?`\nエラー ${errors}件`:""}${detailText}`);
         setImportOk(success);
         if(success){setPasteText("");onReload();}
       }else{
@@ -2282,7 +2311,7 @@ function EventDashboardPanel({events,allWatch,heldItems,onOpenManage}){
   const filtered=useMemo(()=>{
     return(events||[]).filter(ev=>{
       if(!ev.event_date||ev.event_date<todayStr||ev.event_date>endDateStr)return false;
-      if(categoryDef&&categoryDef.types&&!categoryDef.types.includes(ev.event_type))return false;
+      if(!eventMatchesCategory(ev,categoryDef))return false;
       if(isHeldRelated(ev))return true; // 保有銘柄の決算等はimportanceに関係なく表示（ユーザー指定）
       const impNorm=normalizeEventImportance(ev.importance);
       if(importanceFilter==="HIGH"&&impNorm!=="HIGH")return false;
@@ -2327,7 +2356,7 @@ function EventDashboardPanel({events,allWatch,heldItems,onOpenManage}){
   const debugCounts=useMemo(()=>{
     const all=events||[];
     const inRange=all.filter(ev=>ev.event_date&&ev.event_date>=todayStr&&ev.event_date<=endDateStr);
-    const catPass=inRange.filter(ev=>!categoryDef||!categoryDef.types||categoryDef.types.includes(ev.event_type));
+    const catPass=inRange.filter(ev=>eventMatchesCategory(ev,categoryDef));
     const impPass=catPass.filter(ev=>{
       if(isHeldRelated(ev))return true;
       const n=normalizeEventImportance(ev.importance);

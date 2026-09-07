@@ -1913,15 +1913,86 @@ _MARKET_EVENT_COLS = ["event_time", "timezone", "country", "event_type", "import
 _MARKET_EVENT_JSONB_COLS = {"affected_markets", "affected_sectors", "affected_stocks", "impact_channels", "raw_payload"}
 
 
+_MARKET_EVENT_IMPORTANCE_LEGACY = {5: "HIGH", 4: "HIGH", 3: "MEDIUM", 2: "LOW", 1: "LOW"}
+
+
+def _normalize_market_event(ev):
+    """2026-09-07追加：ChatGPT等から従来受け取っていたlegacy形式（date/event/type/note、
+    importanceが1〜5の整数、time_jstが"26:00"等の24時超表現）を、market_events標準形式
+    （event_date/title/event_type/notes、importanceがHIGH/MEDIUM/LOW、event_timeが
+    00:00〜23:59）に変換する。標準形式のキーが既に入っている場合はそちらを優先し、
+    値を上書きしない（既存の標準JSON形式を壊さないため、あくまで「無い場合の補完」）。
+    event_typeは値をそのまま通す（許可リストによる制限はしない。未知のevent_typeでも
+    Dashboardの「すべて」フィルタで表示できることを優先する）。
+    24時超のevent_time（例："26:00"）はevent_dateを+1日し00:00〜23:59に収めて正規化する。
+    正規化できない場合はValueErrorを送出し、呼び出し側（import_market_events）で
+    この1件だけをエラー扱いにする（他の行を巻き添えにしない設計、SAVEPOINTと対）。"""
+    ev = dict(ev)  # 呼び出し元の元dictは書き換えない
+
+    if not ev.get("event_date") and ev.get("date"):
+        ev["event_date"] = ev["date"]
+    if not ev.get("title") and ev.get("event"):
+        ev["title"] = ev["event"]
+    if not ev.get("event_type") and ev.get("type"):
+        ev["event_type"] = ev["type"]
+    if not ev.get("notes") and ev.get("note"):
+        ev["notes"] = ev["note"]
+    if not ev.get("event_time"):
+        legacy_time = ev.get("time_jst") or ev.get("event_time_jst")
+        if legacy_time:
+            ev["event_time"] = legacy_time
+
+    imp = ev.get("importance")
+    imp_int = None
+    if isinstance(imp, bool):
+        imp_int = None
+    elif isinstance(imp, (int, float)):
+        imp_int = int(imp)
+    elif isinstance(imp, str) and imp.strip().isdigit():
+        imp_int = int(imp.strip())
+    if imp_int is not None and imp_int in _MARKET_EVENT_IMPORTANCE_LEGACY:
+        ev["importance"] = _MARKET_EVENT_IMPORTANCE_LEGACY[imp_int]
+
+    et = ev.get("event_time")
+    if et:
+        m = re.match(r"^(\d{1,3}):(\d{2})$", str(et).strip())
+        if not m:
+            raise ValueError(f"event_time（{et}）の形式が不正です（HH:MM形式で指定してください）")
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if mm > 59:
+            raise ValueError(f"event_time（{et}）の形式が不正です（分が59を超えています）")
+        if hh >= 24:
+            extra_days, hh = divmod(hh, 24)
+            d = ev.get("event_date")
+            if not d:
+                raise ValueError(f"event_time（{et}）が24時超ですがevent_dateが無いため正規化できません")
+            try:
+                base = datetime.date.fromisoformat(str(d)[:10])
+            except ValueError:
+                raise ValueError(f"event_date（{d}）の形式が不正なためevent_time（{et}）を正規化できません")
+            ev["event_date"] = (base + datetime.timedelta(days=extra_days)).isoformat()
+            ev["event_time"] = f"{hh:02d}:{mm:02d}"
+    return ev
+
+
+def _event_display_title(ev):
+    """スキップ/エラー理由をユーザーに表示する際、どの行の話か分かるようにするための
+    参考タイトル。正規化前後どちらのキーでも拾えるようにevent/titleの両方を見る
+    （normalize自体が失敗した行でも表示できるようにするため）。"""
+    if not isinstance(ev, dict):
+        return None
+    return ev.get("title") or ev.get("event") or None
+
+
 def _upsert_market_event_conn(conn, user_id, ev):
-    """1件のイベントdictをupsertする。event_date・titleは必須（無ければNoneを返し呼び出し側で
-    カウントしない）。verification_statusは未指定ならUNVERIFIED（画像由来等を確定情報として
-    扱わない、既定の安全側）。戻り値：新規作成ならTrue、既存行の更新ならFalse、
-    event_date/titleが無く保存できない場合はNone（呼び出し側でスキップ扱い）。
+    """正規化済み（_normalize_market_event適用後）のイベント1件をupsertする。
+    event_date・titleが無い場合はNoneを返す（呼び出し側でスキップ扱い）。
+    verification_statusは未指定ならUNVERIFIED（画像由来等を確定情報として扱わない、
+    既定の安全側）。戻り値：新規作成ならTrue、既存行の更新ならFalse、保存不可ならNone。
     2026-09-07追加（STEP4：新規/更新の件数を分けて報告できるようにする）：
     `RETURNING (xmax = 0) AS is_insert`は、そのUPSERTが実際にINSERTだったか
     （ON CONFLICTでのUPDATEではなかったか）をPostgreSQL内部列xmaxから判定する定石。"""
-    event_date = ev.get("event_date") or ev.get("date")
+    event_date = ev.get("event_date")
     title = ev.get("title")
     if not event_date or not title:
         return None
@@ -1954,19 +2025,48 @@ def _upsert_market_event_conn(conn, user_id, ev):
 
 def import_market_events(database_url, user_id, events):
     """events（dictのリスト、JSON貼り付けのimport想定）を1件ずつupsertする。
-    戻り値: {"imported": N（新規作成）, "updated": M（既存行の上書き）, "skipped": K
-    （event_date/titleが無い等で保存不可）, "errors": E（想定外の例外）}。
+    2026-09-07更新（legacy JSON互換）：各行について
+    「抽出（呼び出し側のextractEventsArray）→正規化（_normalize_market_event）→
+    validation（event_date/title必須チェック）→DB upsert」の順で処理する
+    （以前はupsert直前で正規化していたため、正規化結果を見てvalidationするという
+    順序になっていなかった）。
+    戻り値: {"imported": N（新規作成）, "updated": M（既存行の上書き）,
+    "skipped": K（event_date/titleが無い等で保存不可）, "errors": E（正規化/DBの例外）,
+    "skipped_details"/"error_details": [{"index","title","reason"}, ...]（最大10件、
+    UIで「原因が分からない」を防ぐため）}。
     2026-09-07更新（STEP4）：新規/更新/スキップ/エラーを分けて報告できるようにした
     （以前はimported=新規+更新の合計だった）。1件の例外で全体を失敗させないよう
     1件ずつtry/exceptする。"""
+    _DETAIL_LIMIT = 10
     pool = _get_pool(database_url)
     if pool is None:
-        return {"imported": 0, "updated": 0, "skipped": len(events), "errors": 0}
+        details = [{"index": i, "title": _event_display_title(e), "reason": "DB_NOT_CONFIGURED"}
+                   for i, e in enumerate(events)][:_DETAIL_LIMIT]
+        return {"imported": 0, "updated": 0, "skipped": len(events), "errors": 0,
+                "skipped_details": details, "error_details": []}
     imported = updated = skipped = errors = 0
+    skipped_details = []
+    error_details = []
     with pool.connection() as conn:
-        for ev in events:
+        for i, ev in enumerate(events):
             if not isinstance(ev, dict):
                 skipped += 1
+                if len(skipped_details) < _DETAIL_LIMIT:
+                    skipped_details.append({"index": i, "title": None, "reason": "NOT_AN_OBJECT"})
+                continue
+            raw_title = _event_display_title(ev)
+            try:
+                norm = _normalize_market_event(ev)
+            except ValueError as e:
+                errors += 1
+                if len(error_details) < _DETAIL_LIMIT:
+                    error_details.append({"index": i, "title": raw_title, "reason": str(e)})
+                continue
+            if not norm.get("event_date") or not norm.get("title"):
+                skipped += 1
+                if len(skipped_details) < _DETAIL_LIMIT:
+                    reason = "MISSING_EVENT_DATE" if not norm.get("event_date") else "MISSING_TITLE"
+                    skipped_details.append({"index": i, "title": raw_title, "reason": reason})
                 continue
             try:
                 # 2026-09-07追加：1行のエラーで残り全件を巻き添えにしないためのSAVEPOINT。
@@ -1975,18 +2075,23 @@ def import_market_events(database_url, user_id, events):
                 # トランザクション全体がabortedになるため、素のtry/exceptだけでは以降の行も
                 # 全て失敗してしまう＝この対策が無いと確認できた実際の落とし穴）。
                 with conn.transaction():
-                    is_insert = _upsert_market_event_conn(conn, user_id, ev)
-            except Exception:
+                    is_insert = _upsert_market_event_conn(conn, user_id, norm)
+            except Exception as e:
                 errors += 1
+                if len(error_details) < _DETAIL_LIMIT:
+                    error_details.append({"index": i, "title": raw_title, "reason": str(e)})
                 continue
             if is_insert is None:
                 skipped += 1
+                if len(skipped_details) < _DETAIL_LIMIT:
+                    skipped_details.append({"index": i, "title": raw_title, "reason": "DB_UPSERT_SKIPPED"})
             elif is_insert:
                 imported += 1
             else:
                 updated += 1
         conn.commit()
-    return {"imported": imported, "updated": updated, "skipped": skipped, "errors": errors}
+    return {"imported": imported, "updated": updated, "skipped": skipped, "errors": errors,
+            "skipped_details": skipped_details, "error_details": error_details}
 
 
 def list_market_events(database_url, user_id, from_date=None, to_date=None, limit=200):
