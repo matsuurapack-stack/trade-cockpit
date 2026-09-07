@@ -3564,6 +3564,84 @@ function PositionExitModal({position,currentPrice,onClose,onSaved}){
   </div>;
 }
 
+// 2026-09-07新規（ポジション→リアルタイム売却判断画面 Phase2）：当日5分足チャート。
+// 既存のJP個別株チャート（LightweightCharts、5-2章）と全く同じライブラリ・同じ配色規約を再利用
+// する。データ取得（ローソク足・出来高）とライン描画（建値・SL・TP・現在値）を別のuseEffectに
+// 分離しているのは、現在値が数秒〜十数秒おきに変わるたびにチャート本体を作り直す（ズーム位置が
+// リセットされる等）のを避けるため——チャート自体の作成・データの定期取得はitem.code/marketが
+// 変わらない限り実行されず、水平線だけを値の変化に応じて引き直す。既存の売却処理・
+// derivePositionStatus等のポジションSSoTには一切関与しない、表示専用の追加コンポーネント。
+const POSITION_CHART_POLL_MS=45000; // 5分足データの再取得間隔（yfinanceの分足はTachibana現在値ほど頻繁に叩く想定のAPIではないため、価格ティッカーより控えめにする）
+function PositionIntradayChart({item,currentPrice}){
+  const containerRef=useRef(null);
+  const apiRef=useRef(null); // {chart,series,volSeries,lines}
+  const [msg,setMsg]=useState("読み込み中…");
+
+  // チャート本体の作成・5分足OHLCVの定期取得。item.code/marketが変わった時だけ作り直す。
+  useEffect(()=>{
+    let cancelled=false;
+    const el=containerRef.current;
+    if(!el)return;
+    if(typeof LightweightCharts==="undefined"){setMsg("チャート描画ライブラリの読み込みに失敗しました。通信環境をご確認ください。");return;}
+    el.innerHTML="";
+    const chart=LightweightCharts.createChart(el,{width:el.clientWidth||600,height:280,
+      layout:{background:{color:"transparent"},textColor:"#565A52"},
+      grid:{vertLines:{color:"#D6D8CF"},horzLines:{color:"#D6D8CF"}},
+      timeScale:{borderColor:"#C6C8BF",timeVisible:true,secondsVisible:false},
+      rightPriceScale:{borderColor:"#C6C8BF"}});
+    const series=chart.addCandlestickSeries({upColor:"#AE3A34",downColor:"#2C6A48",borderVisible:false,
+      wickUpColor:"#AE3A34",wickDownColor:"#2C6A48"}); // 日本の相場慣習に合わせ赤=上昇・緑=下落（既存JPチャートと同一配色）
+    const volSeries=chart.addHistogramSeries({priceFormat:{type:"volume"},priceScaleId:"volPane",color:"#8a8f80"});
+    volSeries.priceScale().applyOptions({scaleMargins:{top:0.82,bottom:0}});
+    apiRef.current={chart,series,volSeries,lines:[]};
+
+    const loadBars=async()=>{
+      try{
+        const r=await fetch(`/api/position-intraday-chart?code=${encodeURIComponent(item.code)}&market=${encodeURIComponent(item.market||"JP")}`);
+        const d=await r.json();
+        if(cancelled)return;
+        const bars=d.bars||[];
+        if(bars.length===0){setMsg(d.error||"当日の5分足データを取得できませんでした。");return;}
+        setMsg("");
+        series.setData(bars.map(b=>({time:b.time,open:b.open,high:b.high,low:b.low,close:b.close})));
+        volSeries.setData(bars.map(b=>({time:b.time,value:b.volume,color:b.close>=b.open?"rgba(174,58,52,.5)":"rgba(44,106,72,.5)"})));
+        chart.timeScale().fitContent();
+      }catch(e){if(!cancelled)setMsg("取得に失敗しました: "+e.message);}
+    };
+    loadBars();
+    const timer=setInterval(loadBars,POSITION_CHART_POLL_MS);
+    const ro=new ResizeObserver(entries=>{const w=entries[0]?.contentRect?.width;if(w)chart.applyOptions({width:Math.floor(w)});});
+    ro.observe(el);
+    return ()=>{cancelled=true;clearInterval(timer);ro.disconnect();chart.remove();apiRef.current=null;};
+  },[item.code,item.market]);
+
+  // 建値・初期SL・現在SL・TP1・TP2・現在値の水平線。item21〜7の要件：値が変わった時だけ
+  // 引き直す（チャート自体・ズーム位置は保持したまま）。
+  useEffect(()=>{
+    const api=apiRef.current;
+    if(!api||typeof LightweightCharts==="undefined")return;
+    const {series}=api;
+    (api.lines||[]).forEach(pl=>{try{series.removePriceLine(pl);}catch(e){}});
+    const lines=[];
+    const addLine=(price,color,title)=>{
+      if(price==null)return;
+      lines.push(series.createPriceLine({price,color,lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title}));
+    };
+    addLine(item.average_price,"#3A6EA5","建値");
+    addLine(item.initial_stop,"#AE3A34","初期SL");
+    addLine(item.current_stop,"#D98C3F","現在SL");
+    addLine(item.target_1,"#2C6A48","TP1");
+    addLine(item.target_2,"#1F8F5F","TP2");
+    addLine(currentPrice,"#565A52","現在値");
+    api.lines=lines;
+  },[item.average_price,item.initial_stop,item.current_stop,item.target_1,item.target_2,currentPrice]);
+
+  return <div style={{marginTop:8}}>
+    {msg && <div style={{fontSize:11,color:"var(--inkFaint)",marginBottom:4}}>{msg}</div>}
+    <div ref={containerRef} style={{width:"100%",minHeight:280}}/>
+  </div>;
+}
+
 // 2026-09-07新規（ポジション→リアルタイム売却判断画面 Phase1）：ポジションカードの「リアルタイム」
 // 展開エリア。展開している間だけ/api/position-liveを一定間隔でポーリングする（既存の全銘柄一括
 // stockQuotesポーリングとは完全に別経路。閉じれば即座にpollingが止まり、他の監視銘柄・ポジションの
@@ -3641,6 +3719,9 @@ function PositionLiveDetail({item,onOpenExit}){
         <span>安値から {fromLowPct>0?"+":""}{fromLowPct?.toFixed(2)}%</span>
       </div>
     </div>}
+
+    {/* item5〜7：当日5分足チャート＋建値/SL/TP/現在値ライン */}
+    <PositionIntradayChart item={item} currentPrice={cur}/>
 
     {/* item10：出来高評価（AUTO_VOLUMEのロジックを単一銘柄向けに再利用、売買損益機能とは別枠の参考情報） */}
     {vd && <div style={{fontSize:11,color:"var(--inkSoft)",display:"flex",gap:10,flexWrap:"wrap",alignItems:"center"}}>

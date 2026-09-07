@@ -1402,6 +1402,37 @@ def _fetch_intraday(tk, interval):
         return None
 
 
+# 2026-09-07新規（ポジション→リアルタイム売却判断画面 Phase2）：5分足チャート専用の取得関数。
+# 既存の_fetch_intraday()はanalyze_stock()のエントリー判定ロジックが「closes/highs/lows/volumes」
+# の配列だけを前提に使っており、そちらを変更するとentry_pattern等の既存判断が壊れるリスクが
+# あるため、Open値・時刻（LightweightChartsが必要とするUNIXタイムスタンプ秒）が必要な
+# チャート用途向けに別関数として新設した（既存呼び出し元・既存ロジックへの影響ゼロ）。
+def _fetch_intraday_bars(symbol, interval="5m"):
+    """当日の5分足OHLCVをローソク足チャート用の形式（古い順のリスト、要素は
+    {time, open, high, low, close, volume}、timeはUNIX秒）で返す。市場時間外・取得失敗時は
+    空リストを返す（推測値・補完値は作らない）。"""
+    try:
+        tk = yf.Ticker(symbol)
+        h = tk.history(period="1d", interval=interval)
+        if h is None or h.empty:
+            return []
+        h = h.dropna(subset=["Open", "High", "Low", "Close"])
+        bars = []
+        for idx, row in h.iterrows():
+            bars.append({
+                "time": int(idx.timestamp()),
+                "open": round(float(row["Open"]), 2),
+                "high": round(float(row["High"]), 2),
+                "low": round(float(row["Low"]), 2),
+                "close": round(float(row["Close"]), 2),
+                "volume": float(row["Volume"]) if row["Volume"] == row["Volume"] else 0,  # NaN!=NaNを利用（pandas未importのため）
+            })
+        return bars
+    except Exception as e:
+        print("  5分足チャート取得失敗", symbol, e)
+        return []
+
+
 def _vwap(closes, volumes):
     """出来高加重平均価格（当日の分足から算出する、ザラ場でよく見る節目の一つ）。"""
     total_vol = sum(volumes)
@@ -3517,6 +3548,18 @@ def get_position_live_detail(code, market="JP"):
     return result
 
 
+# 2026-09-07新規（ポジション→リアルタイム売却判断画面 Phase2）：ポジション詳細エリアの
+# 5分足チャート専用API。get_position_live_detailとは別関数にし、価格・出来高判定（Phase1）と
+# チャート取得（Phase2）を分離したまま呼び出せるようにする（フロント側も個別にpollingできる）。
+def get_position_intraday_chart(code, market="JP", interval="5m"):
+    symbol = _yf_symbol({"code": code, "market": market})
+    bars = _fetch_intraday_bars(symbol, interval)
+    if not bars:
+        return {"bars": [], "interval": interval,
+                "error": "当日の5分足データを取得できませんでした（市場時間外、または対象外銘柄の可能性があります）"}
+    return {"bars": bars, "interval": interval}
+
+
 def analyze_stock(w, market_env=None):
     """12-1章・technical_analysis_rules.md：ローソク足パターン・移動平均線の並び／クロス・
     ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
@@ -4937,6 +4980,20 @@ class Handler(SimpleHTTPRequestHandler):
                 self._send_json({"error": "codeは必須です"})
             else:
                 self._send_json(get_position_live_detail(code, market))
+        elif self.path.startswith("/api/position-intraday-chart"):
+            # 2026-09-07新規（ポジション→リアルタイム売却判断画面 Phase2）：展開中の1銘柄だけの
+            # 当日5分足チャート。/api/position-liveとは別経路・別ポーリング間隔にする
+            # （チャートはyfinance側のレート制限がより厳しいため、価格ティッカーより低頻度で
+            # フロント側がポーリングする設計）。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            code = (params.get("code", [""])[0] or "").strip()
+            market = params.get("market", ["JP"])[0] or "JP"
+            interval = params.get("interval", ["5m"])[0] or "5m"
+            if not code:
+                self._send_json({"error": "codeは必須です"})
+            else:
+                self._send_json(get_position_intraday_chart(code, market, interval))
         elif self.path == "/" or self.path == "":
             self.send_response(302)
             self.send_header("Location", "/trade-cockpit.html")
