@@ -216,6 +216,34 @@ body{padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bot
 const { useState, useEffect, useRef, useMemo, useCallback } = React;
 
 const num = (v) => (v === "" || v == null || isNaN(+v) ? null : +v);
+// 2026-09-07新規（ポジション→リアルタイム売却判断画面・実機バグ修正）：res.json()を無条件に
+// 呼ぶと、サーバー側が404（ルート未実装＝server.py再起動漏れ）や500等で空bodyやHTMLエラー
+// ページを返した場合に「Unexpected end of JSON input」で例外が飛び、分かりにくい「通信エラー」
+// 表示になってしまう不具合を実機で確認した。res.ok・実際のbody文字列を確認してからJSON.parse
+// することで、何が返ってきても呼び出し元は必ず{error:"..."}かパース済みオブジェクトのどちらか
+// を受け取れるようにする（例外を投げない）。/api/position-live・/api/position-intraday-chart
+// から使用。
+async function fetchJsonSafe(url){
+  let res;
+  try{
+    res=await fetch(url);
+  }catch(e){
+    return {error:`通信に失敗しました: ${e.message}`};
+  }
+  let text="";
+  try{text=await res.text();}catch(e){}
+  if(!res.ok){
+    return {error:`サーバーエラー（HTTP ${res.status}）。server.pyが最新版で起動しているかご確認ください（start.batの再起動が必要な場合があります）。${text?` 応答: ${text.slice(0,200)}`:""}`};
+  }
+  if(!text){
+    return {error:"サーバーから空の応答が返りました。server.pyが最新版で起動しているかご確認ください（start.batの再起動が必要な場合があります）。"};
+  }
+  try{
+    return JSON.parse(text);
+  }catch(e){
+    return {error:`応答がJSON形式ではありません: ${text.slice(0,200)}`};
+  }
+}
 // Trade Cockpit v2 Phase6（ChatGPT双方向連携）：相談用テキストのクリップボードコピー共通処理。
 // 有料AI APIは使わず、テキストを生成してコピーするだけ（貼り付け先はChatGPT側で人間が操作）。
 // Clipboard APIが使えない環境（http接続・古いブラウザ等）向けにexecCommandへのフォールバックを用意。
@@ -3603,17 +3631,14 @@ function PositionIntradayChart({item,currentPrice}){
     apiRef.current={chart,series,volSeries,lines:[]};
 
     const loadBars=async()=>{
-      try{
-        const r=await fetch(`/api/position-intraday-chart?code=${encodeURIComponent(item.code)}&market=${encodeURIComponent(item.market||"JP")}`);
-        const d=await r.json();
-        if(cancelled)return;
-        const bars=d.bars||[];
-        if(bars.length===0){setMsg(d.error||"当日の5分足データを取得できませんでした。");return;}
-        setMsg("");
-        series.setData(bars.map(b=>({time:b.time,open:b.open,high:b.high,low:b.low,close:b.close})));
-        volSeries.setData(bars.map(b=>({time:b.time,value:b.volume,color:b.close>=b.open?"rgba(174,58,52,.5)":"rgba(44,106,72,.5)"})));
-        chart.timeScale().fitContent();
-      }catch(e){if(!cancelled)setMsg("取得に失敗しました: "+e.message);}
+      const d=await fetchJsonSafe(`/api/position-intraday-chart?code=${encodeURIComponent(item.code)}&market=${encodeURIComponent(item.market||"JP")}`);
+      if(cancelled)return;
+      const bars=d.bars||[];
+      if(bars.length===0){setMsg(d.error||"当日の5分足データを取得できませんでした。");return;}
+      setMsg("");
+      series.setData(bars.map(b=>({time:b.time,open:b.open,high:b.high,low:b.low,close:b.close})));
+      volSeries.setData(bars.map(b=>({time:b.time,value:b.volume,color:b.close>=b.open?"rgba(174,58,52,.5)":"rgba(44,106,72,.5)"})));
+      chart.timeScale().fitContent();
     };
     loadBars();
     const timer=setInterval(loadBars,POSITION_CHART_POLL_MS);
@@ -3754,12 +3779,9 @@ function PositionLiveDetail({item,onOpenExit,posFlags,posIndicators,enrStatus}){
   useEffect(()=>{
     let cancelled=false;
     const load=async()=>{
-      try{
-        const r=await fetch(`/api/position-live?code=${encodeURIComponent(item.code)}&market=${encodeURIComponent(item.market||"JP")}`);
-        const d=await r.json();
-        if(cancelled)return;
-        if(d.error){setErr(d.error);}else{setDetail(d);setErr("");}
-      }catch(e){if(!cancelled)setErr("通信エラー: "+e.message);}
+      const d=await fetchJsonSafe(`/api/position-live?code=${encodeURIComponent(item.code)}&market=${encodeURIComponent(item.market||"JP")}`);
+      if(cancelled)return;
+      if(d.error){setErr(d.error);}else{setDetail(d);setErr("");}
       if(!cancelled)setLoading(false);
     };
     load();
@@ -3768,8 +3790,8 @@ function PositionLiveDetail({item,onOpenExit,posFlags,posIndicators,enrStatus}){
   },[item.code,item.market]);
 
   const rowStyle={display:"flex",justifyContent:"space-between",fontSize:12,padding:"2px 0"};
-  if(loading&&!detail)return <div style={{fontSize:11,color:"var(--inkFaint)",padding:"8px 2px"}}>リアルタイム情報を取得中…</div>;
-  if(err&&!detail)return <div style={{fontSize:11,color:"var(--down)",padding:"8px 2px"}}>{err}</div>;
+  if(loading&&!detail)return <div style={{marginTop:8,padding:"10px 10px",background:"var(--card)",border:"2px solid var(--accent)",borderRadius:5,fontSize:12,color:"var(--inkFaint)"}}>📊 リアルタイム売却判断 — 取得中…</div>;
+  if(err&&!detail)return <div style={{marginTop:8,padding:"10px 10px",background:"var(--card)",border:"2px solid var(--down)",borderRadius:5,fontSize:12,color:"var(--down)"}}>📊 リアルタイム売却判断 — {err}</div>;
   if(!detail)return null;
 
   const avg=num(item.average_price);
@@ -3784,7 +3806,12 @@ function PositionLiveDetail({item,onOpenExit,posFlags,posIndicators,enrStatus}){
   const rangePos=(high!=null&&low!=null&&high>low&&cur!=null)?Math.max(0,Math.min(100,(cur-low)/(high-low)*100)):null;
   // 出来高評価（vd）はPhase3でPositionJudgmentPanel側に統合したため、ここでは保持しない。
 
-  return <div style={{marginTop:8,padding:"10px 10px",background:"var(--card)",border:"1px solid var(--rule)",borderRadius:5}}>
+  return <div style={{marginTop:8,padding:"10px 10px",background:"var(--card)",border:"2px solid var(--accent)",borderRadius:5}}>
+    {/* 2026-09-07追加（実機フィードバック）：既存カードに埋もれず「新しい機能だ」と一目で
+        分かるよう、accent色の枠＋明確な見出しを付けた。 */}
+    <div style={{fontSize:13,fontWeight:800,color:"var(--accent)",marginBottom:8,display:"flex",alignItems:"center",gap:6}}>
+      📊 リアルタイム売却判断
+    </div>
     {/* item3：建値基準の情報を上部に常時表示 */}
     <div style={{display:"flex",gap:16,flexWrap:"wrap",alignItems:"baseline",marginBottom:8}}>
       <div><span style={{fontSize:10.5,color:"var(--inkSoft)"}}>取得 </span><span className="mono" style={{fontSize:13}}>{avg!=null?avg.toLocaleString():"—"}</span></div>
@@ -4202,13 +4229,15 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
                     ユーザー指定のモックアップに合わせ、ポジションカードでは一行要約（compact）で表示する。 */}
                 <ExpertViewNote views={expertViews} code={it.code} sector={it.sector} market={it.market} compact/>
 
-                {/* ⑨ リアルタイム売却判断エリア（Phase1）。「リアルタイム」ボタンで展開している
+                {/* ⑨ リアルタイム売却判断エリア（Phase1〜3）。「リアルタイム」ボタンで展開している
                     ポジションのみ、PositionLiveDetailが/api/position-liveを一定間隔でポーリングする。
-                    同時に1銘柄のみ展開可能（expandedLiveCode、item17のAPI負荷対策）。 */}
+                    同時に1銘柄のみ展開可能（expandedLiveCode、item17のAPI負荷対策）。
+                    2026-09-07追加（実機フィードバック）：既存カードに埋もれて新機能だと分からない
+                    という指摘を受け、トグルボタンをaccent色・フル幅にして視認性を上げた。 */}
                 <div style={{marginTop:8}}>
-                  <button className="ghost" style={{fontSize:11}}
+                  <button className="btn" style={{fontSize:12,width:"100%",background:"var(--accent)",color:"#fff",border:"none"}}
                     onClick={()=>setExpandedLiveCode(k=>k===(it.code+it.market)?null:(it.code+it.market))}>
-                    {expandedLiveCode===(it.code+it.market)?"リアルタイム ▲":"リアルタイム ▼"}
+                    {expandedLiveCode===(it.code+it.market)?"📊 リアルタイム売却判断 ▲ 閉じる":"📊 リアルタイム売却判断を開く ▼"}
                   </button>
                   {expandedLiveCode===(it.code+it.market) && <PositionLiveDetail item={it} onOpenExit={openExit}
                     posFlags={posFlags} posIndicators={posIndicators} enrStatus={enr?.status}/>}

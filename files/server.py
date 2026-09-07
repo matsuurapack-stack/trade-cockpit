@@ -4979,7 +4979,15 @@ class Handler(SimpleHTTPRequestHandler):
             if not code:
                 self._send_json({"error": "codeは必須です"})
             else:
-                self._send_json(get_position_live_detail(code, market))
+                # 2026-09-07追加（実機バグ修正）：関数内の想定外の例外で空bodyのまま接続が切れると、
+                # フロント側のres.json()が「Unexpected end of JSON input」で落ちる不具合が実機で
+                # 発生したため、想定外の例外もここで捕まえて必ずJSONを返す（get_position_live_detail
+                # 自体は既に個別のtry/exceptを持つが、その外側の想定外エラーに対する保険）。
+                try:
+                    self._send_json(get_position_live_detail(code, market))
+                except Exception as e:
+                    print("  /api/position-live 想定外のエラー", code, e)
+                    self._send_json({"error": f"サーバー内部エラー: {e}"})
         elif self.path.startswith("/api/position-intraday-chart"):
             # 2026-09-07新規（ポジション→リアルタイム売却判断画面 Phase2）：展開中の1銘柄だけの
             # 当日5分足チャート。/api/position-liveとは別経路・別ポーリング間隔にする
@@ -4993,7 +5001,11 @@ class Handler(SimpleHTTPRequestHandler):
             if not code:
                 self._send_json({"error": "codeは必須です"})
             else:
-                self._send_json(get_position_intraday_chart(code, market, interval))
+                try:
+                    self._send_json(get_position_intraday_chart(code, market, interval))
+                except Exception as e:
+                    print("  /api/position-intraday-chart 想定外のエラー", code, e)
+                    self._send_json({"error": f"サーバー内部エラー: {e}", "bars": []})
         elif self.path == "/" or self.path == "":
             self.send_response(302)
             self.send_header("Location", "/trade-cockpit.html")
