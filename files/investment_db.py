@@ -1916,11 +1916,15 @@ _MARKET_EVENT_JSONB_COLS = {"affected_markets", "affected_sectors", "affected_st
 def _upsert_market_event_conn(conn, user_id, ev):
     """1件のイベントdictをupsertする。event_date・titleは必須（無ければNoneを返し呼び出し側で
     カウントしない）。verification_statusは未指定ならUNVERIFIED（画像由来等を確定情報として
-    扱わない、既定の安全側）。"""
+    扱わない、既定の安全側）。戻り値：新規作成ならTrue、既存行の更新ならFalse、
+    event_date/titleが無く保存できない場合はNone（呼び出し側でスキップ扱い）。
+    2026-09-07追加（STEP4：新規/更新の件数を分けて報告できるようにする）：
+    `RETURNING (xmax = 0) AS is_insert`は、そのUPSERTが実際にINSERTだったか
+    （ON CONFLICTでのUPDATEではなかったか）をPostgreSQL内部列xmaxから判定する定石。"""
     event_date = ev.get("event_date") or ev.get("date")
     title = ev.get("title")
     if not event_date or not title:
-        return False
+        return None
     cols = ["event_date", "title"] + [c for c in _MARKET_EVENT_COLS if c in ev or c == "verification_status"]
     values = []
     for c in cols:
@@ -1935,35 +1939,54 @@ def _upsert_market_event_conn(conn, user_id, ev):
         else:
             values.append(ev.get(c))
     update_cols = [c for c in cols if c not in ("event_date", "title")]
-    conn.execute(
-        f"INSERT INTO market_events (user_id, {', '.join(cols)}) "
-        f"VALUES (%s, {', '.join(['%s::jsonb' if c in _MARKET_EVENT_JSONB_COLS else '%s' for c in cols])}) "
-        f"ON CONFLICT (user_id, event_date, title) DO UPDATE SET "
-        f"{', '.join(c + ' = EXCLUDED.' + c for c in update_cols)}, updated_at = now()",
-        [user_id] + values,
-    )
-    return True
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            f"INSERT INTO market_events (user_id, {', '.join(cols)}) "
+            f"VALUES (%s, {', '.join(['%s::jsonb' if c in _MARKET_EVENT_JSONB_COLS else '%s' for c in cols])}) "
+            f"ON CONFLICT (user_id, event_date, title) DO UPDATE SET "
+            f"{', '.join(c + ' = EXCLUDED.' + c for c in update_cols)}, updated_at = now() "
+            f"RETURNING (xmax = 0) AS is_insert",
+            [user_id] + values,
+        )
+        row = cur.fetchone()
+    return bool(row and row.get("is_insert"))
 
 
 def import_market_events(database_url, user_id, events):
     """events（dictのリスト、JSON貼り付けのimport想定）を1件ずつupsertする。
-    戻り値: {"imported": N, "skipped": M}（event_date/titleが無い行はskip）。"""
+    戻り値: {"imported": N（新規作成）, "updated": M（既存行の上書き）, "skipped": K
+    （event_date/titleが無い等で保存不可）, "errors": E（想定外の例外）}。
+    2026-09-07更新（STEP4）：新規/更新/スキップ/エラーを分けて報告できるようにした
+    （以前はimported=新規+更新の合計だった）。1件の例外で全体を失敗させないよう
+    1件ずつtry/exceptする。"""
     pool = _get_pool(database_url)
     if pool is None:
-        return {"imported": 0, "skipped": len(events)}
-    imported = skipped = 0
+        return {"imported": 0, "updated": 0, "skipped": len(events), "errors": 0}
+    imported = updated = skipped = errors = 0
     with pool.connection() as conn:
         for ev in events:
             if not isinstance(ev, dict):
                 skipped += 1
                 continue
-            ok = _upsert_market_event_conn(conn, user_id, ev)
-            if ok:
+            try:
+                # 2026-09-07追加：1行のエラーで残り全件を巻き添えにしないためのSAVEPOINT。
+                # psycopg3のconn.transaction()は既存トランザクション内ではSAVEPOINTとして
+                # 動作し、例外時はこの1行分だけロールバックする（PostgreSQLは1文でも失敗すると
+                # トランザクション全体がabortedになるため、素のtry/exceptだけでは以降の行も
+                # 全て失敗してしまう＝この対策が無いと確認できた実際の落とし穴）。
+                with conn.transaction():
+                    is_insert = _upsert_market_event_conn(conn, user_id, ev)
+            except Exception:
+                errors += 1
+                continue
+            if is_insert is None:
+                skipped += 1
+            elif is_insert:
                 imported += 1
             else:
-                skipped += 1
+                updated += 1
         conn.commit()
-    return {"imported": imported, "skipped": skipped}
+    return {"imported": imported, "updated": updated, "skipped": skipped, "errors": errors}
 
 
 def list_market_events(database_url, user_id, from_date=None, to_date=None, limit=200):

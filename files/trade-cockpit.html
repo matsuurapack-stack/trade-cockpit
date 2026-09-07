@@ -1384,13 +1384,16 @@ const ENTRY_STRATEGY_META={
 // stats/position）・各パネルの内部ロジックは一切変更せず、上部ナビゲーションの見せ方だけを
 // グループ化する（第1階層＝グループボタン、第2階層＝グループ内サブタブ）。
 // v3-9続き（2026-09-05・EVENT DASHBOARD）：新規メインタブ「📅 イベント」を独立グループとして
-// 追加（ニュース内のサブタブにはしない＝日々の売買判断に使う重要情報のため）。既存の
-// 市場>イベント（EventsPanel、JSON貼り付けimport用の管理画面）とラベルが重複しないよう、
-// こちらは「イベント登録」に改称する（tabキー"events"自体は変更しない＝既存コードへの影響なし）。
+// 追加（ニュース内のサブタブにはしない＝日々の売買判断に使う重要情報のため）。
+// 2026-09-07更新（イベント閲覧・登録の一元化）：以前は「市場」グループ内に「イベント登録」
+// （EventsPanel、JSON貼り付けimport用の管理画面）が別居しており分かりにくかったため、
+// 「イベント」グループの第2階層（カレンダー／イベント登録）へ移動した。tabキー"events"・
+// "eventDashboard"自体は変更していない（tab状態はlocalStorageに永続化されないuseStateのため
+// 移行処理は不要、既存コードへの影響なし）。EventsPanelコンポーネント自体は無変更・再利用。
 const TAB_GROUPS=[
   {key:"watch",label:"監視銘柄",tabs:[{key:"watch",label:"監視銘柄"}]},
-  {key:"market",label:"市場",tabs:[{key:"monitor",label:"概況"},{key:"briefing",label:"日本株一覧"},{key:"us",label:"米国株一覧"},{key:"events",label:"イベント登録"}]},
-  {key:"eventDashboard",label:"イベント",tabs:[{key:"eventDashboard",label:"イベント"}]},
+  {key:"market",label:"市場",tabs:[{key:"monitor",label:"概況"},{key:"briefing",label:"日本株一覧"},{key:"us",label:"米国株一覧"}]},
+  {key:"eventDashboard",label:"イベント",tabs:[{key:"eventDashboard",label:"カレンダー"},{key:"events",label:"イベント登録"}]},
   {key:"tradeAnalysis",label:"トレード分析",tabs:[{key:"analysis",label:"分析"},{key:"earnings",label:"決算"}]},
   {key:"position",label:"ポジション",tabs:[{key:"position",label:"ポジション"}]},
   {key:"record",label:"記録",tabs:[{key:"journal",label:"記録"},{key:"investlog",label:"投資判断ログ"},{key:"chatgptimport",label:"ChatGPT取込"},{key:"stats",label:"統計"}]},
@@ -1931,28 +1934,58 @@ function ExpertViewNote({views,code,sector,market,compact}){
 // v3-9続き（PHASE 3）：イベント一覧タブ。ChatGPT等で画像→JSON化したイベント情報をコピー
 // 貼り付けでimportする（有料AI APIは使わない）。既存のwatchlist import等と同じ
 // 「貼り付け→保存→リロード」パターン。
+// 2026-09-07新規（STEP3：JSON parserの堅牢化）：貼り付けられたJSONから「イベント配列」を
+// 取り出す。既存の[...]／{"events":[...]}に加え、ChatGPT等が別のラッパーキーで生成してくる
+// 場合（{"market_events":[...]}等）にも対応する。曖昧な文章からイベントを勝手に生成する
+// ことはせず、あくまで「どのキーに配列が入っているか」を探すだけ（フィールドの意味を
+// 推測して作り変えることはしない）。見つからない場合はnullを返し、呼び出し側で実際に
+// 見つかったトップレベルキーを表示してユーザーが原因を判断できるようにする。
+function extractEventsArray(parsed){
+  if(Array.isArray(parsed))return parsed;
+  if(!parsed||typeof parsed!=="object")return null;
+  for(const key of["events","market_events","marketEvents","items","data"]){
+    if(Array.isArray(parsed[key]))return parsed[key];
+  }
+  // 上記の既知キーに無い場合、トップレベルで配列を値に持つプロパティが1つだけなら
+  // それを使う（ラッパーキー名だけが想定外だったケースを安全に救う）。複数ある場合は
+  // どれを使うべきか機械的に判断できないため諦める（推測で選ばない）。
+  const arrayKeys=Object.keys(parsed).filter(k=>Array.isArray(parsed[k]));
+  if(arrayKeys.length===1)return parsed[arrayKeys[0]];
+  return null;
+}
 function EventsPanel({events,onReload}){
   const [pasteText,setPasteText]=useState("");
   const [importing,setImporting]=useState(false);
   const [importMsg,setImportMsg]=useState("");
+  const [importOk,setImportOk]=useState(true); // メッセージの色分け（成功=通常色／失敗=警告色）
   const doImport=async()=>{
     let parsed;
-    try{parsed=JSON.parse(pasteText);}catch(e){setImportMsg("JSONの形式が正しくありません: "+e.message);return;}
-    const list=Array.isArray(parsed)?parsed:(parsed&&parsed.events)||[];
-    if(!Array.isArray(list)||!list.length){setImportMsg("events配列が見つかりません（[...]または{\"events\":[...]}の形式で貼り付けてください）");return;}
+    try{parsed=JSON.parse(pasteText);}catch(e){setImportMsg("JSONの形式が正しくありません: "+e.message);setImportOk(false);return;}
+    const list=extractEventsArray(parsed);
+    if(!Array.isArray(list)||!list.length){
+      const topKeys=parsed&&typeof parsed==="object"&&!Array.isArray(parsed)?Object.keys(parsed).join("、"):"（トップレベルが配列でもオブジェクトでもありません）";
+      setImportMsg(`イベント配列が見つかりません（[...]、{"events":[...]}、{"market_events":[...]}等の形式で貼り付けてください）。検出したトップレベルのキー：${topKeys}`);
+      setImportOk(false);
+      return;
+    }
     setImporting(true);
     try{
       const r=await fetch("/api/market-events/import",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({events:list})});
-      if(r.ok){
-        const d=await r.json();
-        setImportMsg(`取り込み完了：${d.imported}件（不備でスキップ${d.skipped}件）`);
-        setPasteText("");
-        onReload();
+      const d=await r.json().catch(()=>null);
+      if(r.ok&&d&&!d.error){
+        // 2026-09-07更新（STEP4）：新規/更新/スキップ/エラーを分けて表示する。imported+updatedが
+        // 0件（＝実質何も保存されなかった）の場合は成功扱いにしない（テキストも消さない）。
+        const imported=d.imported||0,updated=d.updated||0,skipped=d.skipped||0,errors=d.errors||0;
+        const success=(imported+updated)>0;
+        setImportMsg(`イベント取込${success?"完了":"失敗"}\n新規 ${imported}件\n更新 ${updated}件\nスキップ ${skipped}件${errors?`\nエラー ${errors}件`:""}`);
+        setImportOk(success);
+        if(success){setPasteText("");onReload();}
       }else{
-        setImportMsg("取り込みに失敗しました");
+        setImportMsg("取り込みに失敗しました"+(d&&d.error?`：${d.error}`:""));
+        setImportOk(false);
       }
-    }catch(e){setImportMsg("通信エラー: "+e.message);}
+    }catch(e){setImportMsg("通信エラー: "+e.message);setImportOk(false);}
     setImporting(false);
   };
   const removeEvent=async(id)=>{
@@ -1967,7 +2000,7 @@ function EventsPanel({events,onReload}){
   const upcoming=sorted.filter(e=>e.event_date>=todayStr);
   const past=sorted.filter(e=>e.event_date<todayStr);
   return <div style={{marginTop:18}}>
-    <div className="sec-head">イベント</div>
+    <div className="sec-head">イベント登録</div>
     <div className="sec-note" style={{fontSize:13}}>
       経済指標・決算・中央銀行会合等の予定をJSONで貼り付けてimportします。ChatGPT等で画像から作成したJSONもそのまま使えます（有料AI APIは使用しません）。
       画像由来の情報は確定情報として扱わず、verification_status（IMAGE_DERIVED/UNVERIFIED/VERIFIED）を必ず保存します。
@@ -1979,7 +2012,7 @@ function EventsPanel({events,onReload}){
         style={{width:"100%",fontSize:12,padding:8,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",fontFamily:"monospace",boxSizing:"border-box"}}/>
       <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8}}>
         <button className="btn primary" disabled={importing||!pasteText.trim()} onClick={doImport}>{importing?"取り込み中…":"JSONを取り込む"}</button>
-        {importMsg && <span style={{fontSize:12,color:"var(--inkSoft)"}}>{importMsg}</span>}
+        {importMsg && <span style={{fontSize:12,whiteSpace:"pre-line",color:importOk?"var(--up)":"var(--down)",fontWeight:importOk?400:700}}>{importMsg}</span>}
       </div>
     </div>
     <div className="sec-head" style={{fontSize:13}}>今後のイベント（{upcoming.length}件）</div>
@@ -2229,7 +2262,7 @@ function EventDashboardCard({ev,heldRelated,watchedRelated,relatedNames}){
 // 判定ロジックは追加しない＝Primary/Action Status・AUTOスコア・Position Statusには一切影響
 // しない。EventRiskNote（銘柄分析・ポジションカード）はこのタブとは独立して従来通り動作する
 // （このタブはEventRiskNoteの元データを一覧で見せる役割）。
-function EventDashboardPanel({events,allWatch,heldItems}){
+function EventDashboardPanel({events,allWatch,heldItems,onOpenManage}){
   const [rangeDays,setRangeDays]=useState(7);
   const [importanceFilter,setImportanceFilter]=useState("HIGH_MEDIUM"); // HIGH|HIGH_MEDIUM|ALL
   const [categoryFilter,setCategoryFilter]=useState("ALL");
@@ -2306,9 +2339,14 @@ function EventDashboardPanel({events,allWatch,heldItems}){
   },[events,todayStr,endDateStr,categoryDef,importanceFilter,isHeldRelated,filtered]);
 
   return<div style={{marginTop:18}}>
-    <div className="sec-head">📅 イベント</div>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+      <div className="sec-head" style={{marginBottom:0}}>📅 イベント</div>
+      {/* 2026-09-07新規：カレンダーからそのまま「イベント登録」サブタブへ移動できるボタン
+          （見る→登録する→確認する を同じ場所で完結させる）。 */}
+      {onOpenManage && <button className="action-btn" onClick={onOpenManage}>＋ イベント登録へ</button>}
+    </div>
     <div className="sec-note" style={{fontSize:13}}>
-      既存の市場イベント（market_events、「市場」タブ内「イベント登録」から貼り付けimport）を期間・重要度・種別で絞り込んで一覧表示するだけの参照画面です。新しい判定ロジックは追加しておらず、Primary/Action Status・AUTOスコア・Position Statusには一切影響しません。保有銘柄に関係するイベント（決算等）は重要度フィルタに関係なく常に表示します。
+      既存の市場イベント（market_events、上の「イベント登録」タブから貼り付けimport）を期間・重要度・種別で絞り込んで一覧表示するだけの参照画面です。新しい判定ロジックは追加しておらず、Primary/Action Status・AUTOスコア・Position Statusには一切影響しません。保有銘柄に関係するイベント（決算等）は重要度フィルタに関係なく常に表示します。
     </div>
     {todayHigh.length>0 && <div style={{background:"var(--upBg)",border:"1px solid var(--up)",borderRadius:4,padding:"10px 14px",marginBottom:14}}>
       <div style={{fontSize:13,fontWeight:700,color:"var(--up)"}}>⚠ 本日の重要イベント {todayHigh.length}件</div>
@@ -2339,12 +2377,18 @@ function EventDashboardPanel({events,allWatch,heldItems}){
     </div>}
     {grouped.length===0
       ? <div style={{padding:24,textAlign:"center",color:"var(--inkFaint)",fontSize:13,border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)"}}>
-          該当する期間・条件のイベントはありません。
+          {debugCounts.total===0
+            ? <>
+                登録済みイベントがありません。
+                {onOpenManage
+                  ? <>［<button className="iconbtn" style={{fontSize:13,color:"var(--accent)",textDecoration:"underline"}} onClick={onOpenManage}>イベント登録</button>］からJSONを取り込んでください。</>
+                  : "「イベント登録」タブからJSONを取り込んでください。"}
+              </>
+            : "該当する期間・条件のイベントはありません。"}
           <div style={{marginTop:10,fontSize:11.5,color:"var(--inkFaint)"}}>
             期間：{rangeOptions.find(o=>o.v===rangeDays)?.label}（{todayStr}〜{endDateStr}）／
             重要度：{importanceOptions.find(o=>o.v===importanceFilter)?.label}／
             種別：{categoryDef?.label}／基準日：{todayStr}
-            {debugCounts.total===0 && <div style={{marginTop:4}}>※ そもそも登録済みイベント自体が0件です（「市場」タブ内「イベント登録」から貼り付けimportが必要です）。</div>}
           </div>
         </div>
       : grouped.map(g=><div key={g.date} style={{marginBottom:16}}>
@@ -6975,7 +7019,7 @@ function App(){
 
       {/* ===== イベント（PHASE 3：EVENT/EARNINGS INTELLIGENCE） ===== */}
       {tab==="events" && <EventsPanel events={marketEvents} onReload={loadMarketEvents}/>}
-      {tab==="eventDashboard" && <EventDashboardPanel events={marketEvents} allWatch={allWatch} heldItems={heldItems}/>}
+      {tab==="eventDashboard" && <EventDashboardPanel events={marketEvents} allWatch={allWatch} heldItems={heldItems} onOpenManage={()=>setTab("events")}/>}
 
 
       {/* ===== 決算分析（日本市場・アメリカ市場の登録銘柄テーブルの「決算」ボタンで追加） ===== */}
