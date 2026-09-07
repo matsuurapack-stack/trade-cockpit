@@ -503,6 +503,37 @@ ALTER TABLE chatgpt_imports ADD COLUMN IF NOT EXISTS apply_status TEXT;
 ALTER TABLE chatgpt_imports ADD COLUMN IF NOT EXISTS apply_result JSONB;
 ALTER TABLE chatgpt_imports ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_chatgpt_imports_kind ON chatgpt_imports(user_id, kind, imported_at DESC);
+
+-- 2026-09-07新規（監視銘柄→ポジション連携・売買損益管理）：既存portfolio（保有株、
+-- 2026-09-03新設、既にuser_idスコープ済み）へ「買い増しの来歴」を追加するだけの列。
+-- quantity/average_priceは引き続き「現在の合算値」のSSoTとして使い、entriesは監査用の
+-- 追記専用ログ（買い増しのたびに1件追加、既存の値は書き換えない）。
+ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS entries JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+-- 売却確定時に1行だけ追加する取引履歴。既存journal（ユーザーが手動で振り返りを書く売買記録
+-- タブ）とは役割が異なるため新設する：journalは自由記述の主観的な記録、trade_historyは
+-- 「取得単価×売却単価×枚数」から機械的に確定する実現損益の恒久ログ（削除しない）。
+-- user_idスコープのため他ユーザーへは一切共有されない（監視銘柄=watchlistも実は既に
+-- user_idスコープ済みで現状共有されていない、PHASE8監査で確認済み）。
+CREATE TABLE IF NOT EXISTS trade_history (
+    id            SERIAL PRIMARY KEY,
+    user_id       TEXT NOT NULL,
+    code          TEXT NOT NULL,
+    name          TEXT,
+    market        TEXT NOT NULL DEFAULT 'JP',
+    entry_price   NUMERIC NOT NULL,
+    exit_price    NUMERIC NOT NULL,
+    shares        NUMERIC NOT NULL,
+    pnl           NUMERIC NOT NULL,
+    closed_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_trade_history_user ON trade_history(user_id, closed_at DESC);
+
+-- 通算実現損益の初期値（ユーザーが最初に手入力する既存の通算損益）。既存investment_profile
+-- （1ユーザー1行、2026-09-02新設・未使用のまま残っていた）へ列を1つ足すだけで済ませる
+-- （新規テーブルを増やさない）。表示時は毎回 initial_realized_pnl + trade_history.pnl合計
+-- を再計算する（保存値をキャッシュせず、データ破損に強い構造にする＝ユーザー指示）。
+ALTER TABLE investment_profile ADD COLUMN IF NOT EXISTS initial_realized_pnl NUMERIC NOT NULL DEFAULT 0;
 """
 
 
@@ -2257,4 +2288,167 @@ def delete_portfolio_item(database_url, user_id, code, market=None):
             conn.execute("DELETE FROM portfolio WHERE user_id = %s AND code = %s AND market = %s", [user_id, code, market])
         else:
             conn.execute("DELETE FROM portfolio WHERE user_id = %s AND code = %s", [user_id, code])
+        conn.commit()
+
+
+# ---- 監視銘柄→ポジション連携・売買損益管理（2026-09-07新規） ----
+# 既存のportfolio（保有株、user_idスコープ済み）をそのまま使い、quantity/average_priceを
+# 「現在の合算値」のSSoTとして維持しつつ、買い増しのたびにentries（追記専用の来歴）を積む。
+# 売却はtrade_history（新設）へ1行記録し、全株売却でportfolioの行自体を削除する
+# （trade_historyは削除しない＝取引履歴は消さない、というユーザー指示）。
+
+def add_position_entry(database_url, user_id, code, name, market, price, shares, trade_style=None):
+    """買い/買い増し。既存ポジション（同一user_id・code・market）があれば加重平均で合算し、
+    無ければ新規作成する。price/sharesは正の数であることをここでも確認する（不正な値は保存
+    しない）。戻り値：更新後のportfolio 1行（dict）、または失敗時None。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    try:
+        price = float(price)
+        shares = float(shares)
+    except (TypeError, ValueError):
+        return None
+    if not code or price <= 0 or shares <= 0:
+        return None
+    market = market or "JP"
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    entry = {"price": price, "shares": shares, "timestamp": now_iso}
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM portfolio WHERE user_id = %s AND code = %s AND market = %s AND active = true",
+                [user_id, code, market],
+            )
+            row = cur.fetchone()
+        if row:
+            old_qty = float(row["quantity"] or 0)
+            old_avg = float(row["average_price"] or 0)
+            new_qty = old_qty + shares
+            new_avg = ((old_avg * old_qty) + (price * shares)) / new_qty if new_qty else price
+            entries = list(row.get("entries") or []) + [entry]
+            conn.execute(
+                "UPDATE portfolio SET quantity = %s, average_price = %s, entries = %s::jsonb, updated_at = now() "
+                "WHERE user_id = %s AND code = %s AND market = %s",
+                [new_qty, new_avg, json.dumps(entries, ensure_ascii=False), user_id, code, market],
+            )
+        else:
+            conn.execute(
+                "INSERT INTO portfolio (user_id, code, name, market, quantity, average_price, "
+                "trade_style, entries, active, acquired_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, true, now())",
+                [user_id, code, name, market, shares, price, trade_style, json.dumps([entry], ensure_ascii=False)],
+            )
+        conn.commit()
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM portfolio WHERE user_id = %s AND code = %s AND market = %s", [user_id, code, market])
+            updated = cur.fetchone()
+    if not updated:
+        return None
+    d = _row_to_json(updated)
+    d.pop("user_id", None)
+    return d
+
+
+def add_position_exit(database_url, user_id, code, market, exit_price, shares):
+    """売却確定。(exit_price - average_price) * sharesを実現損益としてtrade_historyへ1行記録
+    する。一部売却の場合、残った建玉のaverage_priceは変更しない（ユーザー指示）。残り枚数が
+    0以下ならportfolioの行を削除する（trade_historyは削除しない）。保有枚数を超える売却・
+    0以下の売値/枚数は拒否する。戻り値：{"trade":{...},"remainingShares":..,"closed":bool}
+    または{"error":...}。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return {"error": "DB未設定（DATABASE_URLが未設定、またはpsycopg未インストール）"}
+    try:
+        exit_price = float(exit_price)
+        shares = float(shares)
+    except (TypeError, ValueError):
+        return {"error": "売値・売却枚数は数値で指定してください"}
+    if exit_price <= 0 or shares <= 0:
+        return {"error": "売値・売却枚数は正の数で指定してください"}
+    market = market or "JP"
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM portfolio WHERE user_id = %s AND code = %s AND market = %s AND active = true",
+                [user_id, code, market],
+            )
+            row = cur.fetchone()
+        if not row:
+            return {"error": "保有ポジションが見つかりません"}
+        remaining = float(row["quantity"] or 0)
+        if shares > remaining + 1e-9:
+            return {"error": f"保有枚数（{remaining:g}株）を超える売却はできません"}
+        avg_price = float(row["average_price"] or 0)
+        pnl = (exit_price - avg_price) * shares
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "INSERT INTO trade_history (user_id, code, name, market, entry_price, exit_price, shares, pnl) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
+                [user_id, code, row.get("name"), market, avg_price, exit_price, shares, pnl],
+            )
+            trade = cur.fetchone()
+        new_remaining = remaining - shares
+        closed = new_remaining <= 1e-9
+        if closed:
+            conn.execute("DELETE FROM portfolio WHERE user_id = %s AND code = %s AND market = %s", [user_id, code, market])
+        else:
+            conn.execute(
+                "UPDATE portfolio SET quantity = %s, updated_at = now() WHERE user_id = %s AND code = %s AND market = %s",
+                [new_remaining, user_id, code, market],
+            )
+        conn.commit()
+    trade_json = _row_to_json(trade)
+    trade_json.pop("user_id", None)
+    return {"trade": trade_json, "remainingShares": 0 if closed else new_remaining, "closed": closed}
+
+
+def list_trade_history(database_url, user_id, limit=200):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM trade_history WHERE user_id = %s ORDER BY closed_at DESC LIMIT %s",
+                [user_id, limit],
+            )
+            out = []
+            for r in cur.fetchall():
+                d = _row_to_json(r)
+                d.pop("user_id", None)
+                out.append(d)
+            return out
+
+
+def get_investment_totals(database_url, user_id):
+    """通算実現損益 = investment_profile.initial_realized_pnl + trade_historyのpnl合計。
+    保存済みの合計値をキャッシュせず毎回再計算する（データ破損防止、ユーザー指示）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return {"initialRealizedPnl": 0.0, "totalRealizedPnl": 0.0}
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT initial_realized_pnl FROM investment_profile WHERE user_id = %s", [user_id])
+            row = cur.fetchone()
+            initial = float(row["initial_realized_pnl"]) if row and row.get("initial_realized_pnl") is not None else 0.0
+            cur.execute("SELECT COALESCE(SUM(pnl), 0) AS total FROM trade_history WHERE user_id = %s", [user_id])
+            trades_sum = float(cur.fetchone()["total"] or 0)
+    return {"initialRealizedPnl": initial, "totalRealizedPnl": initial + trades_sum}
+
+
+def set_initial_realized_pnl(database_url, user_id, value):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return
+    with pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO investment_profile (user_id, initial_realized_pnl, updated_at) VALUES (%s, %s, now()) "
+            "ON CONFLICT (user_id) DO UPDATE SET initial_realized_pnl = EXCLUDED.initial_realized_pnl, updated_at = now()",
+            [user_id, value],
+        )
         conn.commit()

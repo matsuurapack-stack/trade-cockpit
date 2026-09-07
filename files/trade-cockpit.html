@@ -2693,6 +2693,9 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
   // CSS @media切り替え、下部参照）。詳細情報（対市場/対セクター/セクター/理由）はタップで
   // 展開する。既存のenrichWatchRow等の判定ロジックには一切触れず、表示だけの追加。
   const [expandedCode,setExpandedCode]=useState(null);
+  // v3-9続き（2026-09-07・監視銘柄→ポジション連携）：「ポジション追加」モーダル。監視銘柄は
+  // そのまま残し、portfolioへコピーするだけ（watchlistからの削除・移動はしない）。
+  const [positionEntryFor,setPositionEntryFor]=useState(null); // {code,name,market}
 
   return <div style={{marginTop:18}}>
     <div style={{display:"flex",alignItems:"center",gap:6}}>
@@ -3043,6 +3046,9 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                     </select>
                   </div>
                   <button onClick={()=>{saveCandidate(w);setOpenMenuFor(null);}}>候補に追加</button>
+                  {/* v3-9続き（2026-09-07・監視銘柄→ポジション連携）：監視銘柄はそのまま残し
+                      （watchlistから削除・移動しない）、portfolioへコピーするだけの挙動。 */}
+                  <button onClick={()=>{setPositionEntryFor({code:w.code,name:w.name,market:w.market});setOpenMenuFor(null);}}>➕ ポジション追加</button>
                   <button onClick={()=>{virtualEntry(w);setOpenMenuFor(null);}}>仮想IN</button>
                   <button onClick={()=>{recordToLog(w);setOpenMenuFor(null);}}>記録</button>
                   <button onClick={()=>{copyConsult(w);setOpenMenuFor(null);}}>🤖 相談用コピー</button>
@@ -3147,6 +3153,9 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
               </div>)}
             </div>}
     </div>
+    {positionEntryFor && <PositionEntryModal code={positionEntryFor.code} name={positionEntryFor.name} market={positionEntryFor.market}
+      needsTradeStyle={true} onClose={()=>setPositionEntryFor(null)}
+      onSaved={()=>setConsultMsg("ポジションに追加しました（ポジションタブで確認できます）")}/>}
   </div>;
 }
 
@@ -3390,6 +3399,136 @@ function deriveTrailingStatus(currentStop,initialStop,avgPrice,current){
 // 直接編集・保存できる。stockQuotes（現在値）・analysisData（トレード分析タブのentry/stop/
 // target/fullExitTargetのスナップショット）を新たにpropsで受け取り、既存の取得済みデータを
 // 再利用する（新規リクエストは追加しない）。
+// v3-9続き（2026-09-07・監視銘柄→ポジション連携・売買損益管理）：買い/買い増しの共通モーダル。
+// 監視銘柄カードの「ポジション追加」（新規、needsTradeStyle=true）と、保有カードの「買い増し」
+// （既存ポジション、needsTradeStyle=false）の両方から使う。サーバー側（add_position_entry）が
+// 既存ポジションの有無を見て加重平均で合算するか新規作成するかを判断するため、呼び出し側の
+// 分岐はneedsTradeStyleの有無だけで済む。
+function PositionEntryModal({code,name,market,needsTradeStyle,onClose,onSaved}){
+  const [price,setPrice]=useState("");
+  const [shares,setShares]=useState("");
+  const [tradeStyle,setTradeStyle]=useState("");
+  const [saving,setSaving]=useState(false);
+  const [errMsg,setErrMsg]=useState("");
+  const inputStyle={display:"block",width:"100%",marginTop:4,fontSize:15,padding:"6px 8px",
+    border:"1px solid var(--rule)",borderRadius:4,background:"var(--bg)",color:"var(--ink)",boxSizing:"border-box"};
+  const submit=async()=>{
+    const p=num(price),s=num(shares);
+    if(!(p>0)){setErrMsg("買値は正の数で入力してください");return;}
+    if(!(s>0)){setErrMsg("枚数は正の数で入力してください");return;}
+    if(needsTradeStyle&&!tradeStyle){setErrMsg("取引タイプ（DAY/SWING）を選択してください");return;}
+    setSaving(true);setErrMsg("");
+    try{
+      const r=await fetch("/api/portfolio/add-entry",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({code,name,market,price:p,shares:s,trade_style:tradeStyle||undefined})});
+      const d=await r.json();
+      if(d.error){setErrMsg(d.error);}
+      else{onSaved&&onSaved(d.position);onClose();}
+    }catch(e){setErrMsg("通信エラー: "+e.message);}
+    setSaving(false);
+  };
+  return <div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(0,0,0,.5)",zIndex:30,
+      display:"flex",alignItems:"center",justifyContent:"center",padding:18}}>
+    <div onClick={e=>e.stopPropagation()} style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:12,
+        width:"100%",maxWidth:360,padding:20,boxShadow:"var(--shadowLg)"}}>
+      <div style={{fontWeight:700,fontSize:16,marginBottom:2}}>{name||code}</div>
+      <div className="mono" style={{fontSize:12,color:"var(--inkSoft)",marginBottom:14}}>{code}</div>
+      <label style={{display:"block",fontSize:12,color:"var(--inkSoft)"}}>買値
+        <input type="number" value={price} onChange={e=>setPrice(e.target.value)} style={inputStyle}/>
+      </label>
+      <label style={{display:"block",fontSize:12,color:"var(--inkSoft)",marginTop:10}}>枚数
+        <input type="number" value={shares} onChange={e=>setShares(e.target.value)} style={inputStyle}/>
+      </label>
+      {needsTradeStyle && <label style={{display:"block",fontSize:12,color:"var(--inkSoft)",marginTop:10}}>取引タイプ*
+        <select value={tradeStyle} onChange={e=>setTradeStyle(e.target.value)}
+          style={{...inputStyle,fontSize:14,color:tradeStyle?"var(--ink)":"var(--down)"}}>
+          <option value="">選択してください</option>
+          <option value="DAY">DAY（デイトレ）</option>
+          <option value="SWING">SWING（スイング）</option>
+        </select>
+      </label>}
+      {errMsg && <div style={{fontSize:12,color:"var(--down)",marginTop:10}}>{errMsg}</div>}
+      <div style={{display:"flex",gap:8,marginTop:14}}>
+        <button className="btn primary" disabled={saving} onClick={submit}>{saving?"保存中…":"ポジション追加"}</button>
+        <button className="ghost" onClick={onClose}>キャンセル</button>
+      </div>
+    </div>
+  </div>;
+}
+
+// v3-9続き：売却モーダル。誤操作防止のため「入力」→「確認（損益プレビュー）」の2段階にする
+// （ユーザー指示：売却単価・売却枚数・実現損益を確定前に必ず確認できること）。
+function PositionExitModal({position,currentPrice,onClose,onSaved}){
+  const [price,setPrice]=useState(currentPrice!=null?String(Math.round(currentPrice)):"");
+  const [shares,setShares]=useState(position.quantity!=null?String(position.quantity):"");
+  const [confirming,setConfirming]=useState(false);
+  const [saving,setSaving]=useState(false);
+  const [errMsg,setErrMsg]=useState("");
+  const p=num(price),s=num(shares);
+  const avg=num(position.average_price)||0;
+  const pnl=(p!=null&&p>0&&s!=null&&s>0)?(p-avg)*s:null;
+  const inputStyle={display:"block",width:"100%",marginTop:4,fontSize:15,padding:"6px 8px",
+    border:"1px solid var(--rule)",borderRadius:4,background:"var(--bg)",color:"var(--ink)",boxSizing:"border-box"};
+  const goConfirm=()=>{
+    if(!(p>0)){setErrMsg("売値は正の数で入力してください");return;}
+    if(!(s>0)){setErrMsg("売却枚数は正の数で入力してください");return;}
+    if(s>Number(position.quantity||0)+1e-9){setErrMsg(`保有枚数（${num(position.quantity)?.toLocaleString()}株）を超える売却はできません`);return;}
+    setErrMsg("");setConfirming(true);
+  };
+  const submit=async()=>{
+    setSaving(true);setErrMsg("");
+    try{
+      const r=await fetch("/api/portfolio/exit",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({code:position.code,market:position.market,exitPrice:p,shares:s})});
+      const d=await r.json();
+      if(d.error){setErrMsg(d.error);setConfirming(false);}
+      else{onSaved&&onSaved(d);onClose();}
+    }catch(e){setErrMsg("通信エラー: "+e.message);}
+    setSaving(false);
+  };
+  return <div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(0,0,0,.5)",zIndex:30,
+      display:"flex",alignItems:"center",justifyContent:"center",padding:18}}>
+    <div onClick={e=>e.stopPropagation()} style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:12,
+        width:"100%",maxWidth:380,padding:20,boxShadow:"var(--shadowLg)"}}>
+      {!confirming ? <>
+        <div style={{fontWeight:700,fontSize:16,marginBottom:2}}>{position.name||position.code}</div>
+        <div className="mono" style={{fontSize:12,color:"var(--inkSoft)",marginBottom:10}}>{position.code}</div>
+        <div style={{fontSize:12,color:"var(--inkSoft)",marginBottom:10}}>
+          保有 {num(position.quantity)?.toLocaleString()}株　平均取得 {avg?avg.toLocaleString():"—"}円
+        </div>
+        <label style={{display:"block",fontSize:12,color:"var(--inkSoft)"}}>売値
+          <input type="number" value={price} onChange={e=>setPrice(e.target.value)} style={inputStyle}/>
+        </label>
+        <label style={{display:"block",fontSize:12,color:"var(--inkSoft)",marginTop:10}}>売却枚数
+          <input type="number" value={shares} onChange={e=>setShares(e.target.value)} style={inputStyle}/>
+        </label>
+        {errMsg && <div style={{fontSize:12,color:"var(--down)",marginTop:10}}>{errMsg}</div>}
+        <div style={{display:"flex",gap:8,marginTop:14}}>
+          <button className="btn primary" onClick={goConfirm}>次へ（確認）</button>
+          <button className="ghost" onClick={onClose}>キャンセル</button>
+        </div>
+      </> : <>
+        <div style={{fontWeight:700,fontSize:15,marginBottom:12}}>売却確認</div>
+        <div style={{fontSize:13,marginBottom:6}}>{position.name||position.code} <span className="mono" style={{color:"var(--inkSoft)"}}>{position.code}</span></div>
+        <div style={{fontSize:12.5,color:"var(--inkSoft)",display:"flex",flexDirection:"column",gap:2,marginBottom:12}}>
+          <div>取得単価　{avg.toLocaleString()}円</div>
+          <div>売却単価　{p.toLocaleString()}円</div>
+          <div>売却枚数　{s.toLocaleString()}株</div>
+        </div>
+        <div style={{fontSize:11,color:"var(--inkFaint)",marginBottom:2}}>実現損益</div>
+        <div style={{fontSize:19,fontWeight:800,color:pnl>=0?"var(--up)":"var(--down)",marginBottom:16}}>
+          {pnl>=0?"+":""}{Math.round(pnl).toLocaleString()}円
+        </div>
+        {errMsg && <div style={{fontSize:12,color:"var(--down)",marginBottom:10}}>{errMsg}</div>}
+        <div style={{display:"flex",gap:8}}>
+          <button className="btn primary" disabled={saving} onClick={submit}>{saving?"確定中…":"確定"}</button>
+          <button className="ghost" onClick={()=>setConfirming(false)}>戻る</button>
+        </div>
+      </>}
+    </div>
+  </div>;
+}
+
 function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEvents,newsCatalysts,expertViews}){
   const [items,setItems]=useState([]);
   const [loading,setLoading]=useState(true);
@@ -3409,6 +3548,45 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
     setLoading(false);
   };
   useEffect(()=>{load();},[]);
+
+  // v3-9続き（2026-09-07・監視銘柄→ポジション連携・売買損益管理）：通算実現損益（初期値＋
+  // trade_history合計、サーバー側で毎回再計算）と取引履歴。既存portfolio（含み損益・保有中）
+  // とは完全に別枠で表示する（実現損益と含み損益を混同しない、というユーザー指示）。
+  const [totals,setTotals]=useState({initialRealizedPnl:0,totalRealizedPnl:0});
+  const [trades,setTrades]=useState([]);
+  const [initialPnlDraft,setInitialPnlDraft]=useState("");
+  const [editingInitialPnl,setEditingInitialPnl]=useState(false);
+  const loadTotals=async()=>{
+    try{
+      const r=await fetch("/api/investment-totals");
+      if(r.ok){const d=await r.json();setTotals(d);}
+    }catch(e){}
+  };
+  const loadTrades=async()=>{
+    try{
+      const r=await fetch("/api/trade-history");
+      if(r.ok){const d=await r.json();setTrades(Array.isArray(d.trades)?d.trades:[]);}
+    }catch(e){}
+  };
+  useEffect(()=>{loadTotals();loadTrades();},[]);
+  const saveInitialPnl=async()=>{
+    const v=num(initialPnlDraft);
+    if(v==null)return;
+    try{
+      const r=await fetch("/api/investment-totals/set-initial",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({value:v})});
+      if(r.ok){setTotals(await r.json());}
+    }catch(e){}
+    setEditingInitialPnl(false);
+  };
+  const todayStr=todayISO();
+  const todaysTrades=useMemo(()=>trades.filter(t=>(t.closed_at||"").slice(0,10)===todayStr),[trades,todayStr]);
+
+  // 監視銘柄→ポジション連携の「買い増し」／保有カードの「売却」モーダル状態。
+  const [entryModalFor,setEntryModalFor]=useState(null); // {code,name,market}
+  const [exitModalFor,setExitModalFor]=useState(null); // portfolio 1件
+  const afterEntrySaved=()=>{load();};
+  const afterExitSaved=()=>{load();loadTotals();loadTrades();};
 
   // v3-4：入力中のコードがトレード分析タブで既に「分析」済みなら、その時点のstop/target/
   // fullExitTargetを初期SL・利確①②の下書きに流し込むショートカット（既存analysisDataの
@@ -3505,7 +3683,41 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
 
   const fieldStyle={fontSize:12.5,padding:"5px 7px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",boxSizing:"border-box"};
 
-  return <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14}}>
+  return <>
+    {/* v3-9続き（2026-09-07）：通算実現損益。含み損益（下の保有カード）とは完全に別枠で表示する
+        （実現損益＝売却済みの累積、通算実現損益にはこの含み損益を含めない、というユーザー指示）。 */}
+    <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:10}}>
+      <div style={{fontSize:11,color:"var(--inkSoft)"}}>通算実現損益</div>
+      {editingInitialPnl
+        ? <div style={{display:"flex",gap:8,alignItems:"center",marginTop:4}}>
+            <input type="number" autoFocus value={initialPnlDraft} onChange={e=>setInitialPnlDraft(e.target.value)}
+              placeholder="現在の通算損益" style={{fontSize:15,padding:"5px 8px",border:"1px solid var(--rule)",borderRadius:4,background:"var(--bg)",color:"var(--ink)",width:160}}/>
+            <button className="action-btn" onClick={saveInitialPnl}>設定</button>
+            <button className="ghost" onClick={()=>setEditingInitialPnl(false)}>キャンセル</button>
+          </div>
+        : <div style={{display:"flex",alignItems:"baseline",gap:10,marginTop:2}}>
+            <span className="mono" style={{fontSize:22,fontWeight:800,
+                color:totals.totalRealizedPnl>0?"var(--up)":totals.totalRealizedPnl<0?"var(--down)":"var(--inkSoft)"}}>
+              {totals.totalRealizedPnl>0?"+":""}{Math.round(totals.totalRealizedPnl).toLocaleString()}円
+            </span>
+            <button className="iconbtn" style={{fontSize:11}} title="通算損益の初期値を設定"
+              onClick={()=>{setInitialPnlDraft(String(totals.initialRealizedPnl||""));setEditingInitialPnl(true);}}>編集</button>
+          </div>}
+      {todaysTrades.length>0 && <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid var(--ruleSoft)"}}>
+        <div style={{fontSize:11,fontWeight:700,color:"var(--inkSoft)",marginBottom:4}}>本日の取引</div>
+        <div style={{display:"flex",flexDirection:"column",gap:4}}>
+          {todaysTrades.map(t=><div key={t.id} style={{fontSize:12,display:"flex",flexWrap:"wrap",gap:8,alignItems:"center"}}>
+            <span style={{fontWeight:700}}>{t.name||t.code}</span>
+            <span className="mono" style={{color:"var(--inkSoft)"}}>{num(t.entry_price)?.toLocaleString()} → {num(t.exit_price)?.toLocaleString()}</span>
+            <span className="mono" style={{color:"var(--inkSoft)"}}>{num(t.shares)?.toLocaleString()}株</span>
+            <span className="mono" style={{fontWeight:700,color:t.pnl>0?"var(--up)":t.pnl<0?"var(--down)":"var(--inkSoft)"}}>
+              {t.pnl>0?"+":""}{Math.round(t.pnl).toLocaleString()}円
+            </span>
+          </div>)}
+        </div>
+      </div>}
+    </div>
+    <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14}}>
     <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
       <div style={{fontWeight:700,color:"var(--ink)",fontSize:13}}>保有株（portfolio）</div>
       <span style={{fontSize:11,color:"var(--inkFaint)"}}>{items.length}銘柄</span>
@@ -3678,6 +3890,10 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
                 <div style={{display:"flex",alignItems:"center",gap:6,marginTop:8,flexWrap:"wrap"}}>
                   {positionConsultMsg && <span style={{fontSize:10.5,color:"var(--accent)",fontWeight:700}}>{positionConsultMsg}</span>}
                   <button className="action-btn" style={{fontSize:11}} onClick={()=>copyPositionConsult(it)}>🤖 利確・損切り相談</button>
+                  {/* v3-9続き（2026-09-07）：売却・買い増し。実現損益の自動計算・通算実現損益の
+                      更新・全株売却時の自動削除はサーバー側（add_position_exit）が行う。 */}
+                  <button className="action-btn" style={{fontSize:11}} onClick={()=>setExitModalFor(it)}>💰 売却</button>
+                  <button className="action-btn" style={{fontSize:11}} onClick={()=>setEntryModalFor({code:it.code,name:it.name,market:it.market})}>➕ 買い増し</button>
                 </div>
                 {enr && <div style={{fontSize:10,color:"var(--inkFaint)",marginTop:4}}>
                   （参考・新規エントリー判断用の指標であり保有判断には使用していません：銘柄分析 {PRIMARY_STATUS_META[enr.status]?.label||enr.status}
@@ -3687,7 +3903,12 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
               </div>;
             })}
           </div>}
-  </div>;
+    </div>
+    {entryModalFor && <PositionEntryModal code={entryModalFor.code} name={entryModalFor.name} market={entryModalFor.market}
+      needsTradeStyle={false} onClose={()=>setEntryModalFor(null)} onSaved={afterEntrySaved}/>}
+    {exitModalFor && <PositionExitModal position={exitModalFor} currentPrice={num(stockQuotes?.[exitModalFor.code]?.t)}
+      onClose={()=>setExitModalFor(null)} onSaved={afterExitSaved}/>}
+  </>;
 }
 
 // 投資判断ログタブ（2026-09-02新規）：日次の相場観＋銘柄ごとの評価をサーバーDB（Neon）に保存する。

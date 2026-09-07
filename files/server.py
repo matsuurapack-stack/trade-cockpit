@@ -4876,6 +4876,14 @@ class Handler(SimpleHTTPRequestHandler):
             # v3-2新規：portfolio（保有株、localStorageに無かった新規機能）
             items = investment_db.list_portfolio(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"items": items})
+        elif self.path.startswith("/api/trade-history"):
+            # 2026-09-07新規：売却確定で自動記録される取引履歴（journalとは別、機械的な実現損益ログ）。
+            trades = investment_db.list_trade_history(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"trades": trades})
+        elif self.path.startswith("/api/investment-totals"):
+            # 2026-09-07新規：通算実現損益（初期値＋trade_history合計、毎回再計算）。
+            totals = investment_db.get_investment_totals(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else {"initialRealizedPnl":0,"totalRealizedPnl":0}
+            self._send_json(totals)
         elif self.path == "/" or self.path == "":
             self.send_response(302)
             self.send_header("Location", "/trade-cockpit.html")
@@ -5218,6 +5226,36 @@ class Handler(SimpleHTTPRequestHandler):
             body = self._read_json_body()
             investment_db.delete_portfolio_item(DATABASE_URL, self.current_user, body.get("code"), body.get("market"))
             self._send_json({"ok": True})
+        elif self.path == "/api/portfolio/add-entry":
+            # 2026-09-07新規（監視銘柄→ポジション連携）：監視銘柄カードの「ポジション追加」/
+            # 保有カードの「買い増し」から呼ぶ。既存ポジションがあれば加重平均で合算する。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            updated = investment_db.add_position_entry(
+                DATABASE_URL, self.current_user, body.get("code"), body.get("name"),
+                body.get("market") or "JP", body.get("price"), body.get("shares"), body.get("trade_style"))
+            if updated is None:
+                self._send_json({"error": "買値・枚数は正の数で指定してください"})
+                return
+            self._send_json({"position": updated})
+        elif self.path == "/api/portfolio/exit":
+            # 2026-09-07新規：保有カードの「売却」確定から呼ぶ。実現損益を計算しtrade_historyへ
+            # 記録、全株売却ならportfolioの行を削除する（取引履歴は削除しない）。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            result = investment_db.add_position_exit(
+                DATABASE_URL, self.current_user, body.get("code"), body.get("market") or "JP",
+                body.get("exitPrice"), body.get("shares"))
+            self._send_json(result)
+        elif self.path == "/api/investment-totals/set-initial":
+            # 2026-09-07新規：通算実現損益の初期値をユーザーが最初に手入力するためのAPI。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            investment_db.set_initial_realized_pnl(DATABASE_URL, self.current_user, body.get("value"))
+            self._send_json(investment_db.get_investment_totals(DATABASE_URL, self.current_user))
         elif self.path == "/api/investment-log/quick-judgment":
             # 監視銘柄タブからのワンクリック記録（2026-09-02新規、Trade Cockpit v2 Phase5・設計案39番）。
             # 当日のdaily_logが無ければ自動作成し、stock_judgmentを1件追加する。
