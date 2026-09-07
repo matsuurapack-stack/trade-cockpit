@@ -3464,6 +3464,14 @@ function PositionExitModal({position,currentPrice,onClose,onSaved}){
   const [confirming,setConfirming]=useState(false);
   const [saving,setSaving]=useState(false);
   const [errMsg,setErrMsg]=useState("");
+  // v3-9追加（2026-09-07・ユーザーフィードバック→実機テストで発覚した修正）：確定ボタンの
+  // 連打・通信遅延によるtrade_historyへの二重登録防止ガード。当初はuseState(saving)を
+  // submit()冒頭でチェックしていたが、同一イベントループtick内での連続クリック
+  // （btn.click();btn.click();のような極端な連打）ではReactのstate更新が間に合わず、
+  // 2回目の呼び出しも「submitが定義された時点のsaving=false」を見たままガードが効かない
+  // ケースを実機検証で確認したため、レンダーを跨いでも同期的に共有されるuseRefへ変更した
+  // （このrefはReactの再描画を待たずその場で読み書きできるため、同tick内の連打にも耐える）。
+  const savingRef=useRef(false);
   const p=num(price),s=num(shares);
   const avg=num(position.average_price)||0;
   const pnl=(p!=null&&p>0&&s!=null&&s>0)?(p-avg)*s:null;
@@ -3476,6 +3484,8 @@ function PositionExitModal({position,currentPrice,onClose,onSaved}){
     setErrMsg("");setConfirming(true);
   };
   const submit=async()=>{
+    if(savingRef.current)return;
+    savingRef.current=true;
     setSaving(true);setErrMsg("");
     try{
       const r=await fetch("/api/portfolio/exit",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -3484,6 +3494,7 @@ function PositionExitModal({position,currentPrice,onClose,onSaved}){
       if(d.error){setErrMsg(d.error);setConfirming(false);}
       else{onSaved&&onSaved(d);onClose();}
     }catch(e){setErrMsg("通信エラー: "+e.message);}
+    savingRef.current=false;
     setSaving(false);
   };
   return <div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(0,0,0,.5)",zIndex:30,
@@ -3521,8 +3532,8 @@ function PositionExitModal({position,currentPrice,onClose,onSaved}){
         </div>
         {errMsg && <div style={{fontSize:12,color:"var(--down)",marginBottom:10}}>{errMsg}</div>}
         <div style={{display:"flex",gap:8}}>
-          <button className="btn primary" disabled={saving} onClick={submit}>{saving?"確定中…":"確定"}</button>
-          <button className="ghost" onClick={()=>setConfirming(false)}>戻る</button>
+          <button className="btn primary" disabled={saving} style={saving?{pointerEvents:"none",opacity:.6}:undefined} onClick={submit}>{saving?"確定中…":"確定"}</button>
+          <button className="ghost" disabled={saving} onClick={()=>setConfirming(false)}>戻る</button>
         </div>
       </>}
     </div>
@@ -3569,9 +3580,14 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
     }catch(e){}
   };
   useEffect(()=>{loadTotals();loadTrades();},[]);
+  // v3-9追加（2026-09-07・ユーザーフィードバック）：入力ミス修正のため、通常時は編集不可
+  // 表示のまま「修正」を押した時だけ入力欄を出し、確定前に「初期通算損益を変更すると通算損益が
+  // 再計算されます」という確認を必ず挟む（trade_history自体は一切変更しない・再計算対象は
+  // 表示上のtotalRealizedPnlのみ）。既存remove()のconfirm()パターンを踏襲。
   const saveInitialPnl=async()=>{
     const v=num(initialPnlDraft);
     if(v==null)return;
+    if(!confirm(`初期通算損益を${v.toLocaleString()}円に修正します。\n通算実現損益（初期値＋売買履歴の合計）が再計算されます。売買履歴（trade_history）自体は変更されません。\nよろしいですか？`))return;
     try{
       const r=await fetch("/api/investment-totals/set-initial",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({value:v})});
@@ -3691,8 +3707,8 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
       {editingInitialPnl
         ? <div style={{display:"flex",gap:8,alignItems:"center",marginTop:4}}>
             <input type="number" autoFocus value={initialPnlDraft} onChange={e=>setInitialPnlDraft(e.target.value)}
-              placeholder="現在の通算損益" style={{fontSize:15,padding:"5px 8px",border:"1px solid var(--rule)",borderRadius:4,background:"var(--bg)",color:"var(--ink)",width:160}}/>
-            <button className="action-btn" onClick={saveInitialPnl}>設定</button>
+              placeholder="修正後の初期通算損益" style={{fontSize:15,padding:"5px 8px",border:"1px solid var(--rule)",borderRadius:4,background:"var(--bg)",color:"var(--ink)",width:160}}/>
+            <button className="action-btn" onClick={saveInitialPnl}>修正を確定</button>
             <button className="ghost" onClick={()=>setEditingInitialPnl(false)}>キャンセル</button>
           </div>
         : <div style={{display:"flex",alignItems:"baseline",gap:10,marginTop:2}}>
@@ -3700,8 +3716,8 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
                 color:totals.totalRealizedPnl>0?"var(--up)":totals.totalRealizedPnl<0?"var(--down)":"var(--inkSoft)"}}>
               {totals.totalRealizedPnl>0?"+":""}{Math.round(totals.totalRealizedPnl).toLocaleString()}円
             </span>
-            <button className="iconbtn" style={{fontSize:11}} title="通算損益の初期値を設定"
-              onClick={()=>{setInitialPnlDraft(String(totals.initialRealizedPnl||""));setEditingInitialPnl(true);}}>編集</button>
+            <button className="iconbtn" style={{fontSize:11}} title="入力ミス修正など、初期通算損益を修正する場合のみ使用"
+              onClick={()=>{setInitialPnlDraft(String(totals.initialRealizedPnl||""));setEditingInitialPnl(true);}}>修正</button>
           </div>}
       {todaysTrades.length>0 && <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid var(--ruleSoft)"}}>
         <div style={{fontSize:11,fontWeight:700,color:"var(--inkSoft)",marginBottom:4}}>本日の取引</div>

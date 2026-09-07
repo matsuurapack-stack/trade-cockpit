@@ -12,6 +12,12 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["C:/Users/MATSUURA/OneDrive/デスクトップ/claude関連/files/server.py"],
       "port": 8765
+    },
+    {
+      "name": "trade-cockpit-static",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8898", "--directory", "C:/Users/MATSUURA/OneDrive/デスクトップ/claude関連/files"],
+      "port": 8898
     }
   ]
 }
