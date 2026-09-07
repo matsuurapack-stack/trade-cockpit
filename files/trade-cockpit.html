@@ -2581,6 +2581,13 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
   const [reversalFilter,setReversalFilter]=useState(""); // ""|"current"|"history"（AUTO_REVERSAL版）
   const [volumeFilter,setVolumeFilter]=useState(""); // ""|"current"|"history"（AUTO_VOLUME版）
   const [showAll,setShowAll]=useState(false);
+  // 2026-09-07新規（監視銘柄画面・情報整理）：スキャンボタン・詳細フィルタ・AUTOシグナル・
+  // 履歴を通常は折りたたむ。既存の状態・フィルタ・スキャンのロジックは一切変更せず、
+  // JSXの表示/非表示を切り替えるだけ（機能削除ではなく階層化）。
+  const [scanOpen,setScanOpen]=useState(false);
+  const [filterOpen,setFilterOpen]=useState(false);
+  const [autoOpen,setAutoOpen]=useState(false);
+  const [historyOpen,setHistoryOpen]=useState(false);
   const toggleStatusFilter=(st)=>setStatusFilters(prev=>{const n=new Set(prev);n.has(st)?n.delete(st):n.add(st);return n;});
   const toggleActionFilter=(st)=>setActionFilters(prev=>{const n=new Set(prev);n.has(st)?n.delete(st):n.add(st);return n;});
   const sectorOptions=useMemo(()=>[...new Set(enriched.map(w=>w.sector).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'ja')),[enriched]);
@@ -2796,13 +2803,73 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
           </div>}
     </div>
 
-    {/* サマリー（v3設計案19番）：46銘柄を読ませる前にまず件数だけで状況を把握できるようにする。
-        v3-6：Primary Status（強さ）とAction Status（今入れるか）を分けて集計する。 */}
-    {/* v3-9：🐒 MOMENTUM DAY。「リアルタイムデータを反映」ボタンと同じく明示クリック時だけ実行
-        （東証全体スキャンは重いため自動実行しない）。結果サマリーは調整の判断材料として簡潔に表示。 */}
-    {/* v3-9続き（PHASE 7 MOBILE/PWA・STEP5）：AUTOスキャンボタン5個が横並びのまま折り返さず
-        390px等で右にはみ出していた（STEP1監査で発見）。flexWrapで2段以内に収める。 */}
-    <div style={{display:"flex",alignItems:"center",gap:8,marginTop:10,flexWrap:"wrap"}}>
+    {/* 2026-09-07更新（監視銘柄画面・情報整理/UI整理のみ、ロジック無変更）：②今日の状況／
+        ③今すぐ入れるかの2カード＋[絞り込み][セクター][並び順][スキャン]の1行に整理。
+        既存のsummary集計・フィルタ状態・スキャンハンドラは一切変更せず、JSXの配置と
+        表示/非表示（折りたたみ）だけを変える。0件の項目は原則非表示にする（item14）。 */}
+    <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:12}}>
+      {/* ②今日の状況：主要5項目（監視数・HOT・ACTIVE・WATCH・WEAK・RS70+）は0件でも常時表示、
+          WEAK BREAK/FAILED BREAKは1件以上の時だけ補足表示する（item4・item14）。クリックで
+          既存のtoggleStatusFilter/setRsFilterをそのまま呼ぶ（表示と絞り込みを兼ねる）。 */}
+      <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:6,padding:"10px 12px",flex:"1 1 220px"}}>
+        <div style={{fontSize:11,fontWeight:700,color:"var(--inkSoft)",marginBottom:6}}>今日の状況</div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:6,fontSize:12}}>
+          <span style={{fontWeight:700}}>監視 {items.length}</span>
+          <button className={"chip"+(statusFilters.has("HOT")?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>toggleStatusFilter("HOT")}>🔥 HOT {summary.HOT||0}</button>
+          <button className={"chip"+(statusFilters.has("ACTIVE_BREAK")?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>toggleStatusFilter("ACTIVE_BREAK")}>⚡ ACTIVE {summary.ACTIVE_BREAK||0}</button>
+          <button className={"chip"+(statusFilters.has("WATCH")?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>toggleStatusFilter("WATCH")}>👀 WATCH {summary.WATCH||0}</button>
+          <button className={"chip"+(statusFilters.has("WEAK")?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>toggleStatusFilter("WEAK")}>💤 WEAK {summary.WEAK||0}</button>
+          <button className={"chip"+(rsFilter?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>setRsFilter(v=>!v)}>RS70+ {summary.rs70||0}</button>
+          {(summary.WEAK_BREAK||0)>0 && <button className={"chip"+(statusFilters.has("WEAK_BREAK")?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>toggleStatusFilter("WEAK_BREAK")}>⚡ WEAK BREAK {summary.WEAK_BREAK}</button>}
+          {(summary.FAILED_BREAK||0)>0 && <button className={"chip"+(statusFilters.has("FAILED_BREAK")?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>toggleStatusFilter("FAILED_BREAK")}>⚡ FAILED BREAK {summary.FAILED_BREAK}</button>}
+        </div>
+      </div>
+      {/* ③今すぐ入れるか：item5・item15＝最優先で強調表示。クリックで即フィルタ。 */}
+      <div style={{background:"var(--card)",border:"2px solid var(--accent)",borderRadius:6,padding:"10px 12px",flex:"1 1 220px"}}>
+        <div style={{fontSize:11,fontWeight:700,color:"var(--accent)",marginBottom:6}}>今すぐ入れるか</div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+          {["ENTRY_READY","WAIT","RISK"].map(st=>{const meta=ACTION_STATUS_META[st];return <button key={st}
+            className={"chip"+(actionFilters.has(st)?" on":"")} style={{fontSize:13,fontWeight:700,padding:"5px 10px",cursor:"pointer"}}
+            onClick={()=>toggleActionFilter(st)}>{meta.icon} {meta.label} {summary[st]||0}</button>;})}
+        </div>
+      </div>
+    </div>
+
+    {/* [絞り込み▼][セクター▼][並び順▼][スキャン▼] の1行（item7・item10）。デフォルトは
+        全て折りたたみ、既存のstatusFilters/actionFilters等・スキャンハンドラは無変更。 */}
+    <div style={{display:"flex",flexWrap:"wrap",gap:8,alignItems:"center",marginTop:10}}>
+      <button className={"chip"+(filterOpen?" on":"")} style={{fontSize:12,cursor:"pointer"}} onClick={()=>setFilterOpen(v=>!v)}>絞り込み {filterOpen?"▲":"▼"}</button>
+      <select value={sectorFilter} onChange={e=>setSectorFilter(e.target.value)} style={{fontSize:12,padding:"3px 6px"}}>
+        <option value="">セクター（すべて）</option>
+        {sectorOptions.map(s=><option key={s} value={s}>{s}</option>)}
+      </select>
+      <label style={{fontSize:12,color:"var(--inkSoft)"}}>並び順：
+        <select value={sortKey} onChange={e=>setSortKey(e.target.value)} style={{fontSize:12,padding:"3px 6px",marginLeft:4}}>
+          <option value="priority">今日注目すべき順（既定）</option>
+          <option value="rsScore">RS Score</option>
+          <option value="pct">前日比</option>
+          <option value="sector">セクター</option>
+          <option value="current">現在値</option>
+          <option value="status">Status</option>
+        </select>
+      </label>
+      <button className={"chip"+(scanOpen?" on":"")} style={{fontSize:12,cursor:"pointer"}} onClick={()=>setScanOpen(v=>!v)}>スキャン {scanOpen?"▲":"▼"}</button>
+      {hasFilter && <button className="iconbtn" style={{fontSize:11}} onClick={()=>{setStatusFilters(new Set());setActionFilters(new Set());setRsFilter(false);setMarketRsFilter(false);setPctFilter("");setSectorFilter("");setMomentumFilter("");setBreakFilter("");setRsAutoFilter("");setSectorLeaderFilter("");setPullbackFilter("");setReversalFilter("");setVolumeFilter("");}}>すべて解除</button>}
+    </div>
+
+    {/* item6：詳細フィルタ（展開時のみ）。WEAK BREAK/FAILED BREAK/WEAKは②のチップと重複する
+        操作だが、②は該当件数がある時しか出ないため、ここでは常時（0件でも）押せるようにする。 */}
+    {filterOpen && <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:8,padding:"8px 10px",background:"var(--card)",border:"1px solid var(--ruleSoft)",borderRadius:4}}>
+      {["WEAK_BREAK","FAILED_BREAK","WEAK"].map(st=>{const meta=PRIMARY_STATUS_META[st];return <button key={st}
+        className={"chip"+(statusFilters.has(st)?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+        onClick={()=>toggleStatusFilter(st)}>{meta.icon} {meta.label}</button>;})}
+      <button className={"chip"+(marketRsFilter?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>setMarketRsFilter(v=>!v)}>Market RS +2以上</button>
+      <button className={"chip"+(pctFilter==="up"?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>setPctFilter(v=>v==="up"?"":"up")}>前日比+</button>
+      <button className={"chip"+(pctFilter==="down"?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>setPctFilter(v=>v==="down"?"":"down")}>前日比-</button>
+    </div>}
+
+    {/* item3：7個のスキャンボタン。機能は削除せず、展開時のみ表示する。 */}
+    {scanOpen && <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8,padding:"8px 10px",background:"var(--card)",border:"1px solid var(--ruleSoft)",borderRadius:4,flexWrap:"wrap"}}>
       <button className="action-btn" style={{fontSize:12}} disabled={momentumScanning} onClick={onMomentumScan}>
         {momentumScanning?"🐒 スキャン中…（数分かかります）":"🐒 MOMENTUM DAYスキャン"}
       </button>
@@ -2814,8 +2881,6 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
           　⚠ 市場スキャン更新失敗・{momentumResult.stage1UsedStaleCache?"直近データ使用":"データなし"}
         </span>}
       </span>}
-      {/* v3-9続き：🚀 AUTO_BREAK。Stage1はサーバー側で共有キャッシュのため、直近でMOMENTUM DAY
-          スキャン済みなら市場全体の再取得は起きずStage2（ブレイク判定）だけで済む。 */}
       <button className="action-btn" style={{fontSize:12}} disabled={breakScanning} onClick={onBreakScan}>
         {breakScanning?"🚀 スキャン中…（数分かかります）":"🚀 AUTO BREAKスキャン"}
       </button>
@@ -2826,7 +2891,6 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
           　⚠ 市場スキャン更新失敗・{breakResult.stage1UsedStaleCache?"直近データ使用":"データなし"}
         </span>}
       </span>}
-      {/* v3-9続き：📈 AUTO_RS。Stage2を持たないため他の2つより高速。 */}
       <button className="action-btn" style={{fontSize:12}} disabled={rsScanning} onClick={onRsScan}>
         {rsScanning?"📈 スキャン中…":"📈 AUTO RSスキャン"}
       </button>
@@ -2837,7 +2901,6 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
           　⚠ 市場スキャン更新失敗・{rsScanResult.stage1UsedStaleCache?"直近データ使用":"データなし"}
         </span>}
       </span>}
-      {/* v3-9続き：🏆 AUTO_SECTOR_LEADER。Stage2を持たないため高速。 */}
       <button className="action-btn" style={{fontSize:12}} disabled={sectorLeaderScanning} onClick={onSectorLeaderScan}>
         {sectorLeaderScanning?"🏆 スキャン中…":"🏆 SECTOR LEADERスキャン"}
       </button>
@@ -2848,7 +2911,6 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
           　⚠ 市場スキャン更新失敗・{sectorLeaderResult.stage1UsedStaleCache?"直近データ使用":"データなし"}
         </span>}
       </span>}
-      {/* v3-9続き：🌊 AUTO_PULLBACK。AUTO_BREAKと同じくStage2ありのため数十秒〜数分かかる。 */}
       <button className="action-btn" style={{fontSize:12}} disabled={pullbackScanning} onClick={onPullbackScan}>
         {pullbackScanning?"🌊 スキャン中…（数分かかります）":"🌊 AUTO PULLBACKスキャン"}
       </button>
@@ -2859,8 +2921,6 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
           　⚠ 市場スキャン更新失敗・{pullbackResult.stage1UsedStaleCache?"直近データ使用":"データなし"}
         </span>}
       </span>}
-      {/* v3-9続き（AUTO_REVERSAL）：「下落中の銘柄」ではなく「下落後に反転が確認できた銘柄」。
-          落ちるナイフ（Falling Knife）はサーバー側で完全除外済み。PULLBACKと同じくStage2あり。 */}
       <button className="action-btn" style={{fontSize:12}} disabled={reversalScanning} onClick={onReversalScan}>
         {reversalScanning?"🔄 スキャン中…（数分かかります）":"🔄 AUTO REVERSALスキャン"}
       </button>
@@ -2871,9 +2931,6 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
           　⚠ 市場スキャン更新失敗・{reversalResult.stage1UsedStaleCache?"直近データ使用":"データなし"}
         </span>}
       </span>}
-      {/* v3-9続き（AUTO_VOLUME）：「出来高が多い銘柄」ではなく「異常な資金流入」の検出。
-          出来高急増を伴う下落（NEGATIVE_VOLUME/CLIMAX_DOWN）はサーバー側で買い候補から除外済み。
-          日中は時間帯補正後のtimeAdjustedVolumeRatioを使う（朝ほど生の倍率が低くなる問題に対応）。 */}
       <button className="action-btn" style={{fontSize:12}} disabled={volumeScanning} onClick={onVolumeScan}>
         {volumeScanning?"🔥 スキャン中…（数分かかります）":"🔥 AUTO VOLUMEスキャン"}
       </button>
@@ -2885,112 +2942,76 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
           　⚠ 市場スキャン更新失敗・{volumeResult.stage1UsedStaleCache?"直近データ使用":"データなし"}
         </span>}
       </span>}
-    </div>
-    <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:10,fontSize:12}}>
-      <span style={{fontWeight:700}}>今日の監視銘柄 {items.length}</span>
-      <span className="chip" style={{fontSize:11}}>🔥 HOT {summary.HOT||0}</span>
-      <span className="chip" style={{fontSize:11}}>⚡ ACTIVE BREAK {summary.ACTIVE_BREAK||0}</span>
-      <span className="chip" style={{fontSize:11}}>⚡ WEAK BREAK {summary.WEAK_BREAK||0}</span>
-      <span className="chip" style={{fontSize:11}}>⚡ FAILED BREAK {summary.FAILED_BREAK||0}</span>
-      <span className="chip" style={{fontSize:11}}>👀 WATCH {summary.WATCH||0}</span>
-      <span className="chip" style={{fontSize:11}}>💤 WEAK {summary.WEAK||0}</span>
-      <span className="chip" style={{fontSize:11}}>RS70以上 {summary.rs70||0}</span>
-    </div>
-    <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:6,fontSize:12}}>
-      <span style={{color:"var(--inkSoft)"}}>今すぐ入れるか：</span>
-      <span className="chip" style={{fontSize:11}}>✅ ENTRY READY {summary.ENTRY_READY||0}</span>
-      <span className="chip" style={{fontSize:11}}>⏳ WAIT {summary.WAIT||0}</span>
-      <span className="chip" style={{fontSize:11}}>⚠ RISK {summary.RISK||0}</span>
-    </div>
+    </div>}
 
-    {/* フィルタ（v3設計案21番）。v3-6：Primary Status（強さ）とAction Status（今入れるか）を
-        別々のチップ列にする（2軸を排他的に扱わないため）。 */}
-    <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:8}}>
-      {Object.keys(PRIMARY_STATUS_META).map(st=>{const meta=PRIMARY_STATUS_META[st];return <button key={st}
-        className={"chip"+(statusFilters.has(st)?" on":"")} style={{fontSize:11,cursor:"pointer"}}
-        onClick={()=>toggleStatusFilter(st)}>{meta.icon} {meta.label}</button>;})}
-    </div>
-    <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginTop:6}}>
-      {["ENTRY_READY","WAIT","RISK"].map(st=>{const meta=ACTION_STATUS_META[st];return <button key={st}
-        className={"chip"+(actionFilters.has(st)?" on":"")} style={{fontSize:11,cursor:"pointer"}}
-        onClick={()=>toggleActionFilter(st)}>{meta.icon} {meta.label}</button>;})}
-      <button className={"chip"+(rsFilter?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>setRsFilter(v=>!v)}>RS 70以上</button>
-      <button className={"chip"+(marketRsFilter?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>setMarketRsFilter(v=>!v)}>Market RS +2以上</button>
-      <button className={"chip"+(pctFilter==="up"?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>setPctFilter(v=>v==="up"?"":"up")}>前日比+</button>
-      <button className={"chip"+(pctFilter==="down"?" on":"")} style={{fontSize:11,cursor:"pointer"}} onClick={()=>setPctFilter(v=>v==="down"?"":"down")}>前日比-</button>
-      <select value={sectorFilter} onChange={e=>setSectorFilter(e.target.value)} style={{fontSize:11,padding:"2px 4px"}}>
-        <option value="">セクター（すべて）</option>
-        {sectorOptions.map(s=><option key={s} value={s}>{s}</option>)}
-      </select>
-      {/* v3-9改訂：「🐒 MOMENTUM DAY」＝最新TOP15（CURRENT）のみ。過去に強かったが今は外れた
-          銘柄は別チップ「🐒 本日履歴」（CURRENT＋SEEN）でのみ確認する。 */}
-      <button className={"chip"+(momentumFilter==="current"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
-        onClick={()=>setMomentumFilter(v=>v==="current"?"":"current")}>🐒 MOMENTUM DAY {summary.momentumCurrent||0}</button>
-      <button className={"chip"+(momentumFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
-        onClick={()=>setMomentumFilter(v=>v==="history"?"":"history")}
-        title="本日中に一度でも最新TOP15に入った銘柄（現在は外れているSEENも含む）">
-        🐒 本日履歴 {(summary.momentumCurrent||0)+(summary.momentumSeen||0)}
-      </button>
-      {/* v3-9続き：AUTO_BREAK版。「🚀 AUTO BREAK」＝最新TOP（CURRENT）、「🚀 BREAK履歴」＝
-          CURRENT＋SEEN。Primary StatusのACTIVE BREAKチップ（別行、既存）とは別軸。 */}
-      <button className={"chip"+(breakFilter==="current"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
-        onClick={()=>setBreakFilter(v=>v==="current"?"":"current")}>🚀 AUTO BREAK {summary.breakCurrent||0}</button>
-      <button className={"chip"+(breakFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
-        onClick={()=>setBreakFilter(v=>v==="history"?"":"history")}
-        title="過去にAUTO_BREAKで拾われた銘柄（現在は圏外のSEENも含む）">
-        🚀 BREAK履歴 {(summary.breakCurrent||0)+(summary.breakSeen||0)}
-      </button>
-      {/* v3-9続き：AUTO_RS版。「📈 AUTO RS」＝最新TOP（CURRENT）、「📈 RS履歴」＝CURRENT＋SEEN。 */}
-      <button className={"chip"+(rsAutoFilter==="current"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
-        onClick={()=>setRsAutoFilter(v=>v==="current"?"":"current")}>📈 AUTO RS {summary.rsCurrent||0}</button>
-      <button className={"chip"+(rsAutoFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
-        onClick={()=>setRsAutoFilter(v=>v==="history"?"":"history")}
-        title="過去にAUTO_RSで拾われた銘柄（現在は圏外のSEENも含む）">
-        📈 RS履歴 {(summary.rsCurrent||0)+(summary.rsSeen||0)}
-      </button>
-      {/* v3-9続き：AUTO_SECTOR_LEADER版。AUTO_RSと同時に付くことを想定した別軸のフィルター。 */}
-      <button className={"chip"+(sectorLeaderFilter==="current"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
-        onClick={()=>setSectorLeaderFilter(v=>v==="current"?"":"current")}>🏆 SECTOR LEADER {summary.sectorCurrent||0}</button>
-      <button className={"chip"+(sectorLeaderFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
-        onClick={()=>setSectorLeaderFilter(v=>v==="history"?"":"history")}
-        title="過去にAUTO_SECTOR_LEADERで拾われた銘柄（現在は圏外のSEENも含む）">
-        🏆 SECTOR履歴 {(summary.sectorCurrent||0)+(summary.sectorSeen||0)}
-      </button>
-      {/* v3-9続き：AUTO_PULLBACK版。 */}
-      <button className={"chip"+(pullbackFilter==="current"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
-        onClick={()=>setPullbackFilter(v=>v==="current"?"":"current")}>🌊 AUTO PULLBACK {summary.pullbackCurrent||0}</button>
-      <button className={"chip"+(pullbackFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
-        onClick={()=>setPullbackFilter(v=>v==="history"?"":"history")}
-        title="過去にAUTO_PULLBACKで拾われた銘柄（現在は圏外のSEENも含む）">
-        🌊 PULLBACK履歴 {(summary.pullbackCurrent||0)+(summary.pullbackSeen||0)}
-      </button>
-      {/* v3-9続き：AUTO_REVERSAL版。 */}
-      <button className={"chip"+(reversalFilter==="current"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
-        onClick={()=>setReversalFilter(v=>v==="current"?"":"current")}>🔄 AUTO REVERSAL {summary.reversalCurrent||0}</button>
-      <button className={"chip"+(reversalFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
-        onClick={()=>setReversalFilter(v=>v==="history"?"":"history")}
-        title="過去にAUTO_REVERSALで拾われた銘柄（現在は圏外のSEENも含む）">
-        🔄 REVERSAL履歴 {(summary.reversalCurrent||0)+(summary.reversalSeen||0)}
-      </button>
-      {/* v3-9続き：AUTO_VOLUME版。 */}
-      <button className={"chip"+(volumeFilter==="current"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
-        onClick={()=>setVolumeFilter(v=>v==="current"?"":"current")}>🔥 AUTO VOLUME {summary.volumeCurrent||0}</button>
-      <button className={"chip"+(volumeFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
-        onClick={()=>setVolumeFilter(v=>v==="history"?"":"history")}
-        title="過去にAUTO_VOLUMEで拾われた銘柄（現在は圏外のSEENも含む）">
-        🔥 VOLUME履歴 {(summary.volumeCurrent||0)+(summary.volumeSeen||0)}
-      </button>
-      {hasFilter && <button className="iconbtn" style={{fontSize:11}} onClick={()=>{setStatusFilters(new Set());setActionFilters(new Set());setRsFilter(false);setMarketRsFilter(false);setPctFilter("");setSectorFilter("");setMomentumFilter("");setBreakFilter("");setRsAutoFilter("");setSectorLeaderFilter("");setPullbackFilter("");setReversalFilter("");setVolumeFilter("");}}>フィルタ解除</button>}
-      <label style={{fontSize:12,color:"var(--inkSoft)",marginLeft:"auto"}}>並び順：
-        <select value={sortKey} onChange={e=>setSortKey(e.target.value)} style={{fontSize:12,padding:"3px 6px",marginLeft:4}}>
-          <option value="priority">今日注目すべき順（既定）</option>
-          <option value="rsScore">RS Score</option>
-          <option value="pct">前日比</option>
-          <option value="sector">セクター</option>
-          <option value="current">現在値</option>
-          <option value="status">Status</option>
-        </select>
-      </label>
+    {/* item8：AUTOシグナル。通常は件数だけ、1件以上ある種類だけ展開表示（既存CURRENTチップの
+        onClick/フィルタ状態は完全に再利用、削除していない）。 */}
+    {(()=>{
+      const autoEntries=[
+        {key:"momentum",label:"🐒 MOMENTUM DAY",current:summary.momentumCurrent||0,filter:momentumFilter,setFilter:setMomentumFilter},
+        {key:"break",label:"🚀 AUTO BREAK",current:summary.breakCurrent||0,filter:breakFilter,setFilter:setBreakFilter},
+        {key:"rs",label:"📈 AUTO RS",current:summary.rsCurrent||0,filter:rsAutoFilter,setFilter:setRsAutoFilter},
+        {key:"sector",label:"🏆 SECTOR LEADER",current:summary.sectorCurrent||0,filter:sectorLeaderFilter,setFilter:setSectorLeaderFilter},
+        {key:"pullback",label:"🌊 AUTO PULLBACK",current:summary.pullbackCurrent||0,filter:pullbackFilter,setFilter:setPullbackFilter},
+        {key:"reversal",label:"🔄 AUTO REVERSAL",current:summary.reversalCurrent||0,filter:reversalFilter,setFilter:setReversalFilter},
+        {key:"volume",label:"🔥 AUTO VOLUME",current:summary.volumeCurrent||0,filter:volumeFilter,setFilter:setVolumeFilter},
+      ];
+      const autoTotal=autoEntries.reduce((s,e)=>s+e.current,0);
+      return <div style={{marginTop:8,padding:"8px 10px",background:"var(--card)",border:"1px solid var(--ruleSoft)",borderRadius:4}}>
+        <button className="iconbtn" style={{fontSize:12,fontWeight:700}} onClick={()=>setAutoOpen(v=>!v)}>
+          AUTOシグナル　{autoTotal}件 {autoOpen?"▲":"▼"}
+        </button>
+        {autoOpen && <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:6}}>
+          {autoTotal===0
+            ? <span style={{fontSize:11,color:"var(--inkFaint)"}}>現在該当する銘柄はありません。</span>
+            : autoEntries.filter(e=>e.current>0).map(e=><button key={e.key}
+                className={"chip"+(e.filter==="current"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+                onClick={()=>e.setFilter(v=>v==="current"?"":"current")}>{e.label} {e.current}</button>)}
+        </div>}
+      </div>;
+    })()}
+
+    {/* item9：AUTO履歴。既存の「本日履歴/BREAK履歴/RS履歴/SECTOR履歴/PULLBACK履歴/REVERSAL履歴/
+        VOLUME履歴」（CURRENT+SEEN）チップをまとめて折りたたむ。ロジックは完全に既存のまま。 */}
+    <div style={{marginTop:6}}>
+      <button className="iconbtn" style={{fontSize:11}} onClick={()=>setHistoryOpen(v=>!v)}>AUTO履歴 {historyOpen?"▲":"▼"}</button>
+      {historyOpen && <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:6,padding:"8px 10px",background:"var(--card)",border:"1px solid var(--ruleSoft)",borderRadius:4}}>
+        <button className={"chip"+(momentumFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+          onClick={()=>setMomentumFilter(v=>v==="history"?"":"history")}
+          title="本日中に一度でも最新TOP15に入った銘柄（現在は外れているSEENも含む）">
+          🐒 本日履歴 {(summary.momentumCurrent||0)+(summary.momentumSeen||0)}
+        </button>
+        <button className={"chip"+(breakFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+          onClick={()=>setBreakFilter(v=>v==="history"?"":"history")}
+          title="過去にAUTO_BREAKで拾われた銘柄（現在は圏外のSEENも含む）">
+          🚀 BREAK履歴 {(summary.breakCurrent||0)+(summary.breakSeen||0)}
+        </button>
+        <button className={"chip"+(rsAutoFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+          onClick={()=>setRsAutoFilter(v=>v==="history"?"":"history")}
+          title="過去にAUTO_RSで拾われた銘柄（現在は圏外のSEENも含む）">
+          📈 RS履歴 {(summary.rsCurrent||0)+(summary.rsSeen||0)}
+        </button>
+        <button className={"chip"+(sectorLeaderFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+          onClick={()=>setSectorLeaderFilter(v=>v==="history"?"":"history")}
+          title="過去にAUTO_SECTOR_LEADERで拾われた銘柄（現在は圏外のSEENも含む）">
+          🏆 SECTOR履歴 {(summary.sectorCurrent||0)+(summary.sectorSeen||0)}
+        </button>
+        <button className={"chip"+(pullbackFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+          onClick={()=>setPullbackFilter(v=>v==="history"?"":"history")}
+          title="過去にAUTO_PULLBACKで拾われた銘柄（現在は圏外のSEENも含む）">
+          🌊 PULLBACK履歴 {(summary.pullbackCurrent||0)+(summary.pullbackSeen||0)}
+        </button>
+        <button className={"chip"+(reversalFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+          onClick={()=>setReversalFilter(v=>v==="history"?"":"history")}
+          title="過去にAUTO_REVERSALで拾われた銘柄（現在は圏外のSEENも含む）">
+          🔄 REVERSAL履歴 {(summary.reversalCurrent||0)+(summary.reversalSeen||0)}
+        </button>
+        <button className={"chip"+(volumeFilter==="history"?" on":"")} style={{fontSize:11,cursor:"pointer"}}
+          onClick={()=>setVolumeFilter(v=>v==="history"?"":"history")}
+          title="過去にAUTO_VOLUMEで拾われた銘柄（現在は圏外のSEENも含む）">
+          🔥 VOLUME履歴 {(summary.volumeCurrent||0)+(summary.volumeSeen||0)}
+        </button>
+      </div>}
     </div>
 
     <div style={{marginTop:10,border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,overflow:"hidden"}}>
