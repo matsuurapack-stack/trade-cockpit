@@ -57,6 +57,33 @@ def _lan_ip():
         return None
 
 
+# 2026-09-07新規（Tailscale経由の外出先アクセス）：Tailscaleがインストール・接続済みなら
+# `tailscale ip -4`でこのPCのTailscale IP（100.x.x.x、CGNATレンジ）とMagicDNS名を取得できる。
+# サーバー自体は元々HOST="0.0.0.0"で全ネットワークIFに待ち受けているため、Tailscale IPが
+# わかればコード変更なしにそのまま`http://<Tailscale IP>:{PORT}/trade-cockpit.html`でアクセス
+# できる。Tailscale未インストール・未接続・コマンド不在の場合は起動時バナー表示を諦めるだけで
+# サーバー起動自体は妨げない（既存のLAN案内と同じ「機能低下のみで停止しない」方針）。
+def _tailscale_status():
+    """Tailscaleが使える場合は{"ip":"100.x.x.x","dnsName":"pc名.tailnet-xxxx.ts.net"}を返す。
+    使えない・未接続の場合はNone（実際の通信は行わず、ローカルのtailscaleコマンドに問い合わせるのみ）。"""
+    import subprocess
+    try:
+        r = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True,
+                            timeout=3, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if r.returncode != 0 or not r.stdout:
+            return None
+        data = json.loads(r.stdout)
+        self_info = data.get("Self") or {}
+        ips = self_info.get("TailscaleIPs") or []
+        ipv4 = next((ip for ip in ips if "." in ip), None)
+        if not ipv4:
+            return None
+        dns_name = (self_info.get("DNSName") or "").rstrip(".")
+        return {"ip": ipv4, "dnsName": dns_name or None}
+    except Exception:
+        return None
+
+
 # APIキー類はfiles/secrets.json（gitignore済み・未コミット）に置く。ファイルが無い/キー未設定
 # でも動くようにし、その場合は該当機能だけ空データで諦める。
 def _load_secrets():
@@ -5523,6 +5550,14 @@ def main():
             print("  --- スマホ・他PCから使う場合（同じWi-Fiに接続してください） ---")
             print(f"  http://{lan_ip}:{PORT}/trade-cockpit.html")
             print("  ※初回、Windowsのファイアウォール確認画面が出たら「アクセスを許可する」を選んでください。")
+        # 2026-09-07新規：Tailscaleが接続済みならTailscale IP（外出先・別Wi-Fi・4G/5Gからでも
+        # アクセス可能）も案内する。未インストール・未接続なら何も表示しない（起動は妨げない）。
+        ts = _tailscale_status()
+        if ts:
+            print("  --- 外出先（別Wi-Fi・4G/5G）から使う場合（Tailscale接続が必要） ---")
+            print(f"  http://{ts['ip']}:{PORT}/trade-cockpit.html")
+            if ts.get("dnsName"):
+                print(f"  http://{ts['dnsName']}:{PORT}/trade-cockpit.html （MagicDNS）")
         print("  使い終わったら、このウィンドウを閉じてください。")
     print("=" * 52)
     with httpd:
