@@ -3885,6 +3885,125 @@ function validateChatGptPayload(obj){
   return errs;
 }
 
+// v3-9続き（2026-09-07・ChatGPT連携JSON解析改善）：既存のフラット形式
+// {date, market:{condition,summary,strong_sectors,weak_sectors}, watchlist, decisions, review,
+// rule_updates}に加え、ChatGPTが出力する詳細形式（type:"morning_market_check"、summary/
+// market_sentiment/us_market/sox/adr/sector_view/daytrade_watchlist/execution_rules/
+// scenario_plan/morning_conclusion等のネスト構造）を検出し、既存のフラット形式へ自動変換する。
+// 既存のvalidateChatGptPayload・プレビューUI・save()は一切変更せず、parse()の入口だけで
+// 変換を挟むことで「既存のフラットJSON取り込みは壊さない」を担保する。
+function detectChatGptFormat(obj){
+  if(obj&&typeof obj==="object"&&!Array.isArray(obj)){
+    if(obj.type==="morning_market_check")return"detailed";
+    if(obj.market&&typeof obj.market==="object")return"flat";
+    const detailedKeys=["summary","market_sentiment","us_market","sox","adr","sector_view",
+      "daytrade_watchlist","execution_rules","scenario_plan","morning_conclusion"];
+    if(detailedKeys.some(k=>obj[k]!=null))return"detailed";
+  }
+  return"flat";
+}
+// ネストした値を人間が読める1行/複数行の日本語テキストに変換する（値が無ければ空文字を返す
+// だけで、それらしい文言を捏造しない）。
+function _cgSummarizeValue(v){
+  if(v==null||v==="")return"";
+  if(typeof v==="string")return v;
+  if(typeof v==="number"||typeof v==="boolean")return String(v);
+  if(Array.isArray(v))return v.map(_cgSummarizeValue).filter(Boolean).join("・");
+  if(typeof v==="object"){
+    return Object.entries(v).map(([k,val])=>{const s=_cgSummarizeValue(val);return s?`${k}: ${s}`:null;})
+      .filter(Boolean).join("／");
+  }
+  return String(v);
+}
+function _cgBulletize(v){
+  if(v==null||v==="")return"";
+  if(Array.isArray(v))return v.map(item=>"・"+_cgSummarizeValue(item)).filter(s=>s!=="・").join("\n");
+  if(typeof v==="object")return _cgSummarizeValue(v);
+  return"・"+String(v);
+}
+// path（"summary.overall_bias"等）でネストした値を安全に取得する。
+function _cgPick(obj,path){
+  return path.split(".").reduce((cur,p)=>(cur==null?undefined:cur[p]),obj);
+}
+function _cgPickFirst(obj,paths){
+  for(const p of paths){const v=_cgPick(obj,p);if(v!=null&&v!=="")return v;}
+  return undefined;
+}
+// ChatGPT詳細形式（morning_market_check等）を既存のフラット形式へ変換する。戻り値：
+// {converted, missing}。missingは「元のJSONに対応するキーが見つからず空欄になった項目」の
+// 一覧（解析失敗時にどのキーが取得できなかったか表示する、というユーザー指示に対応）。
+function convertDetailedChatGptPayload(obj){
+  const missing=[];
+
+  const overallBias=_cgPickFirst(obj,["summary.overall_bias","summary.bias","market_sentiment.overall_bias"]);
+  const marketType=_cgPickFirst(obj,["morning_conclusion.market_type","scenario_plan.market_type"]);
+  const condition=[overallBias,marketType].filter(Boolean).join("・");
+  if(!condition)missing.push("summary.overall_bias / morning_conclusion.market_type（condition用）");
+
+  const summaryParts=[];
+  const keyMessage=_cgPickFirst(obj,["summary.key_message","summary.message","summary.headline"]);
+  if(keyMessage)summaryParts.push(_cgSummarizeValue(keyMessage));
+  else missing.push("summary.key_message（market_summary用）");
+  if(obj.market_sentiment!=null){
+    const t=_cgSummarizeValue(obj.market_sentiment);
+    if(t)summaryParts.push(`市場心理: ${t}`);
+  }else missing.push("market_sentiment（market_summary用）");
+  const usPoints=_cgPickFirst(obj,["us_market.key_points","us_market.summary","us_market.interpretation"]);
+  if(usPoints)summaryParts.push(`米国株: ${_cgSummarizeValue(usPoints)}`);
+  else missing.push("us_market.key_points（market_summary用）");
+  const soxInterp=_cgPickFirst(obj,["sox.interpretation","sox.summary"]);
+  if(soxInterp)summaryParts.push(`SOX: ${_cgSummarizeValue(soxInterp)}`);
+  else missing.push("sox.interpretation（market_summary用）");
+  const adrInterp=_cgPickFirst(obj,["adr.interpretation","adr.summary"]);
+  if(adrInterp)summaryParts.push(`ADR: ${_cgSummarizeValue(adrInterp)}`);
+  else missing.push("adr.interpretation（market_summary用）");
+  const marketSummary=summaryParts.join("\n");
+
+  const sectorView=Array.isArray(obj.sector_view)?obj.sector_view:[];
+  const strongRatings=["A+","A","B+"];
+  const strongSectors=[],weakSectors=[];
+  if(sectorView.length){
+    sectorView.forEach(sv=>{
+      const name=sv&&(sv.sector||sv.name||sv.sector_name);
+      if(!name)return;
+      const rating=(sv.rating||"").toString().toUpperCase();
+      const stance=(sv.stance||"").toString().toLowerCase();
+      const isLong=/long/.test(stance);
+      const isAvoid=/avoid|low.?priority/.test(stance);
+      if(strongRatings.includes(rating)&&(isLong||!stance))strongSectors.push(name);
+      else if(isAvoid||/^[c-f]/.test(rating))weakSectors.push(name);
+    });
+  }else missing.push("sector_view（strong_sectors/weak_sectors用）");
+
+  const reviewParts=[];
+  if(obj.execution_rules!=null)reviewParts.push("【執行ルール】\n"+_cgBulletize(obj.execution_rules));
+  else missing.push("execution_rules（review用）");
+  if(obj.scenario_plan!=null)reviewParts.push("【シナリオ】\n"+_cgBulletize(obj.scenario_plan));
+  else missing.push("scenario_plan（review用）");
+  const oneLine=_cgPickFirst(obj,["morning_conclusion.one_line","morning_conclusion.summary"]);
+  if(oneLine)reviewParts.push("【結論】"+_cgSummarizeValue(oneLine));
+  else missing.push("morning_conclusion.one_line（review用）");
+  const watchlistTop=Array.isArray(obj.daytrade_watchlist)?obj.daytrade_watchlist.slice(0,5):[];
+  if(watchlistTop.length){
+    const wlText=watchlistTop.map(w=>[w.code,w.name,w.reason||w.note].filter(Boolean).join(" ")).join("\n");
+    reviewParts.push("【デイトレ監視上位】\n"+wlText);
+  }else missing.push("daytrade_watchlist（review用）");
+
+  return{
+    converted:{
+      date:obj.date,
+      market:{condition,summary:marketSummary,strong_sectors:strongSectors,weak_sectors:weakSectors},
+      watchlist:Array.isArray(obj.daytrade_watchlist)
+        ?obj.daytrade_watchlist.map(w=>({code:w.code,name:w.name,status:w.status||"WATCH",reason:w.reason||w.note||""})).filter(w=>w.code)
+        :[],
+      decisions:[],
+      review:reviewParts.join("\n\n"),
+      rule_updates:[],
+    },
+    missing,
+  };
+}
+
 function ChatGptImportPanel({journal,activeRules}){
   const [rawText,setRawText]=useState("");
   const [parsed,setParsed]=useState(null);
@@ -3894,6 +4013,9 @@ function ChatGptImportPanel({journal,activeRules}){
   const [dupInfo,setDupInfo]=useState(null); // {error} が重複だった場合、再送信（force）を促す
   const [imports,setImports]=useState([]);
   const [loadingImports,setLoadingImports]=useState(true);
+  // v3-9続き（ChatGPT連携JSON解析改善）：詳細形式（morning_market_check等）を検出・変換した
+  // 場合の付随情報（{missing:[...]}）。フラット形式そのままの場合はnull。
+  const [conversionInfo,setConversionInfo]=useState(null);
 
   const loadImports=async()=>{
     setLoadingImports(true);
@@ -3941,13 +4063,22 @@ function ChatGptImportPanel({journal,activeRules}){
   };
 
   const parse=()=>{
-    setSaveMsg("");setDupInfo(null);
+    setSaveMsg("");setDupInfo(null);setConversionInfo(null);
     let obj;
     try{ obj=JSON.parse(rawText); }
     catch(e){ setParsed(null);setParseErrors(["JSONとして正しくありません: "+e.message]);return; }
-    const errs=validateChatGptPayload(obj);
+    // v3-9続き（ChatGPT連携JSON解析改善）：詳細形式（type:"morning_market_check"等）を検出したら
+    // 既存のフラット形式へ自動変換してから、既存のvalidateChatGptPayload・プレビューUIへ渡す
+    // （既存のフラットJSON取り込み経路は一切変更しない）。
+    let target=obj;
+    if(detectChatGptFormat(obj)==="detailed"){
+      const{converted,missing}=convertDetailedChatGptPayload(obj);
+      target=converted;
+      setConversionInfo({missing});
+    }
+    const errs=validateChatGptPayload(target);
     setParseErrors(errs);
-    setParsed(errs.length===0?obj:null);
+    setParsed(errs.length===0?target:null);
   };
 
   const updateMarket=(field,value)=>setParsed(p=>({...p,market:{...(p.market||{}),[field]:value}}));
@@ -3969,7 +4100,7 @@ function ChatGptImportPanel({journal,activeRules}){
       else if(d.error){setDupInfo(d);}
       else{
         setSaveMsg(`保存しました（daily_log ID ${d.dailyLogId}・銘柄評価 ${d.judgments}件・追加ルール ${d.rulesAdded}件）`);
-        setRawText("");setParsed(null);setParseErrors([]);loadImports();
+        setRawText("");setParsed(null);setParseErrors([]);setConversionInfo(null);loadImports();
       }
     }catch(e){setSaveMsg("保存に失敗しました。サーバーが起動しているか確認してください。");}
     setSaving(false);
@@ -3983,6 +4114,8 @@ function ChatGptImportPanel({journal,activeRules}){
     <div className="sec-note">
       ChatGPTで相談して作成した投資ログJSONをここへ貼り付けます。有料AI APIはこのアプリからは呼び出しません
       （ChatGPTとのやり取りは従来どおりChatGPT側で行い、その結果のJSONだけをコピー＆ペーストします）。
+      従来のフラット形式（date/market/watchlist/decisions/review/rule_updates）に加え、
+      ChatGPTが出力する詳細形式（type:"morning_market_check"等のネスト構造）も自動検出して変換します。
     </div>
 
     <div style={{marginTop:10,display:"flex",alignItems:"center",gap:8}}>
@@ -4004,6 +4137,18 @@ function ChatGptImportPanel({journal,activeRules}){
       <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:12.5,color:"var(--down)"}}>
         {parseErrors.map((e,i)=><li key={i}>{e}</li>)}
       </ul>
+    </div>}
+
+    {/* v3-9続き（ChatGPT連携JSON解析改善）：詳細形式を検出・変換した場合、対応するキーが
+        見つからず空欄になった項目を明示する（捏造しない・何が取れなかったか分かるようにする）。 */}
+    {conversionInfo && <div className="card" style={{marginTop:12,padding:"10px 14px",border:"1px solid var(--rule)"}}>
+      <div style={{fontSize:12.5}}>ℹ️ ChatGPT詳細形式（type:"morning_market_check"等）として自動変換しました。</div>
+      {conversionInfo.missing.length>0 && <>
+        <b style={{fontSize:12.5,color:"var(--inkSoft)"}}>以下は元のJSONに対応するキーが見つからなかったため空欄です：</b>
+        <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:12,color:"var(--inkSoft)"}}>
+          {conversionInfo.missing.map((m,i)=><li key={i}>{m}</li>)}
+        </ul>
+      </>}
     </div>}
 
     {parsed && <div className="card" style={{marginTop:12,padding:"12px 14px"}}>
