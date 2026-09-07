@@ -216,6 +216,19 @@ body{padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bot
 const { useState, useEffect, useRef, useMemo, useCallback } = React;
 
 const num = (v) => (v === "" || v == null || isNaN(+v) ? null : +v);
+// 2026-09-07新規（通算実現損益を税引後ベースへ変更）：上場株式譲渡益の税率
+// （所得税・復興特別所得税15.315%＋住民税5.000%＝20.315%）。バックエンド側のSSoTは
+// investment_db.pyのSTOCK_CAPITAL_GAINS_TAX_RATE（実際のtrade_history保存・税額計算は
+// そちらが権威）。フロントは別言語のため値を共有できず、売却確認画面のプレビュー表示用に
+// 同名・同値で複製している——この値を変える場合は必ず両方同時に変更すること。
+const STOCK_CAPITAL_GAINS_TAX_RATE = 0.20315;
+// 税引前損益(grossPnl)から{tax, netPnl}を返す。利益の場合のみ税率を掛け円未満切り捨て、
+// 損失の場合は追加で税を引かない（investment_db.py _calc_trade_tax と同じロジック）。
+function calcTradeTax(grossPnl){
+  if(grossPnl==null)return {tax:null,netPnl:null};
+  const tax=grossPnl>0?Math.floor(grossPnl*STOCK_CAPITAL_GAINS_TAX_RATE):0;
+  return {tax,netPnl:grossPnl-tax};
+}
 // 2026-09-07新規（ポジション→リアルタイム売却判断画面・実機バグ修正）：res.json()を無条件に
 // 呼ぶと、サーバー側が404（ルート未実装＝server.py再起動漏れ）や500等で空bodyやHTMLエラー
 // ページを返した場合に「Unexpected end of JSON input」で例外が飛び、分かりにくい「通信エラー」
@@ -3513,6 +3526,7 @@ function PositionExitModal({position,currentPrice,onClose,onSaved}){
   const p=num(price),s=num(shares);
   const avg=num(position.average_price)||0;
   const pnl=(p!=null&&p>0&&s!=null&&s>0)?(p-avg)*s:null;
+  const tradeTax=calcTradeTax(pnl);
   const inputStyle={display:"block",width:"100%",marginTop:4,fontSize:15,padding:"6px 8px",
     border:"1px solid var(--rule)",borderRadius:4,background:"var(--bg)",color:"var(--ink)",boxSizing:"border-box"};
   const goConfirm=()=>{
@@ -3585,9 +3599,23 @@ function PositionExitModal({position,currentPrice,onClose,onSaved}){
           <div>売却単価　{p.toLocaleString()}円</div>
           <div>売却枚数　{s.toLocaleString()}株</div>
         </div>
-        <div style={{fontSize:11,color:"var(--inkFaint)",marginBottom:2}}>実現損益</div>
-        <div style={{fontSize:19,fontWeight:800,color:pnl>=0?"var(--up)":"var(--down)",marginBottom:16}}>
+        {/* 2026-09-07追加（通算実現損益を税引後ベースへ変更）：税引前損益・概算税額・税引後損益を
+            確定前に確認できるようにする。実際に保存されるgross_pnl/tax/net_pnlと同じ計算式
+            （calcTradeTax、SSoTはinvestment_db.py側）を使ってプレビューするだけで、確定処理
+            自体はこれまで通りサーバー側（add_position_exit）が権威を持つ。 */}
+        <div style={{fontSize:11,color:"var(--inkFaint)",marginBottom:2}}>税引前損益</div>
+        <div style={{fontSize:19,fontWeight:800,color:pnl>=0?"var(--up)":"var(--down)",marginBottom:8}}>
           {pnl>=0?"+":""}{Math.round(pnl).toLocaleString()}円
+        </div>
+        <div style={{fontSize:12,color:"var(--inkSoft)",display:"flex",justifyContent:"space-between",marginBottom:2}}>
+          <span>概算税額</span><span className="mono">{tradeTax.tax>0?`-${tradeTax.tax.toLocaleString()}円`:"0円"}</span>
+        </div>
+        <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:8,marginBottom:2}}>税引後損益</div>
+        <div style={{fontSize:19,fontWeight:800,color:tradeTax.netPnl>=0?"var(--up)":"var(--down)",marginBottom:6}}>
+          {tradeTax.netPnl>=0?"+":""}{Math.round(tradeTax.netPnl).toLocaleString()}円
+        </div>
+        <div style={{fontSize:10,color:"var(--inkFaint)",marginBottom:16}}>
+          ※ 税額は概算（{(STOCK_CAPITAL_GAINS_TAX_RATE*100).toFixed(3)}%、損失の場合は0円）です。実際の源泉徴収額は証券会社の損益通算等により異なる場合があります。通算実現損益に反映されるのは税引後損益です。
         </div>
         {errMsg && <div style={{fontSize:12,color:"var(--down)",marginBottom:10}}>{errMsg}</div>}
         <div style={{display:"flex",gap:8}}>
@@ -4030,7 +4058,10 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
     {/* v3-9続き（2026-09-07）：通算実現損益。含み損益（下の保有カード）とは完全に別枠で表示する
         （実現損益＝売却済みの累積、通算実現損益にはこの含み損益を含めない、というユーザー指示）。 */}
     <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:10}}>
-      <div style={{fontSize:11,color:"var(--inkSoft)"}}>通算実現損益</div>
+      {/* 2026-09-07更新（通算実現損益を税引後ベースへ変更）：ラベルに「（税引後）」を明示。
+          initial_realized_pnlはユーザーが既に税引後の値として入力している前提のため、
+          ここへ追加の税計算はかけない（ユーザー指示）。 */}
+      <div style={{fontSize:11,color:"var(--inkSoft)"}}>通算実現損益（税引後）</div>
       {editingInitialPnl
         ? <div style={{display:"flex",gap:8,alignItems:"center",marginTop:4}}>
             <input type="number" autoFocus value={initialPnlDraft} onChange={e=>setInitialPnlDraft(e.target.value)}
@@ -4049,14 +4080,25 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
       {todaysTrades.length>0 && <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid var(--ruleSoft)"}}>
         <div style={{fontSize:11,fontWeight:700,color:"var(--inkSoft)",marginBottom:4}}>本日の取引</div>
         <div style={{display:"flex",flexDirection:"column",gap:4}}>
-          {todaysTrades.map(t=><div key={t.id} style={{fontSize:12,display:"flex",flexWrap:"wrap",gap:8,alignItems:"center"}}>
-            <span style={{fontWeight:700}}>{t.name||t.code}</span>
-            <span className="mono" style={{color:"var(--inkSoft)"}}>{num(t.entry_price)?.toLocaleString()} → {num(t.exit_price)?.toLocaleString()}</span>
-            <span className="mono" style={{color:"var(--inkSoft)"}}>{num(t.shares)?.toLocaleString()}株</span>
-            <span className="mono" style={{fontWeight:700,color:t.pnl>0?"var(--up)":t.pnl<0?"var(--down)":"var(--inkSoft)"}}>
-              {t.pnl>0?"+":""}{Math.round(t.pnl).toLocaleString()}円
-            </span>
-          </div>)}
+          {/* 2026-09-07更新（通算実現損益を税引後ベースへ変更）：税引前・税引後の両方を表示する。
+              net_pnlが無い行（税引後対応前の旧レコード）はgross_pnl/taxも無いため、税引前=既存pnl
+              のみ表示し「税引後」欄は「—」にする（推測値を作らない）。通算損益への反映は
+              net_pnl（無ければpnlを暫定使用、バックエンドのCOALESCEと同じ考え方）。 */}
+          {todaysTrades.map(t=>{
+            const gross=num(t.gross_pnl)??num(t.pnl);
+            const net=num(t.net_pnl);
+            return <div key={t.id} style={{fontSize:12,display:"flex",flexWrap:"wrap",gap:8,alignItems:"center"}}>
+              <span style={{fontWeight:700}}>{t.name||t.code}</span>
+              <span className="mono" style={{color:"var(--inkSoft)"}}>{num(t.entry_price)?.toLocaleString()} → {num(t.exit_price)?.toLocaleString()}</span>
+              <span className="mono" style={{color:"var(--inkSoft)"}}>{num(t.shares)?.toLocaleString()}株</span>
+              <span className="mono" style={{fontSize:11,color:"var(--inkFaint)"}}>
+                税引前 <span style={{fontWeight:700,color:gross>0?"var(--up)":gross<0?"var(--down)":"var(--inkSoft)"}}>{gross!=null?`${gross>0?"+":""}${Math.round(gross).toLocaleString()}円`:"—"}</span>
+              </span>
+              <span className="mono" style={{fontSize:12,fontWeight:700,color:net==null?"var(--inkFaint)":net>0?"var(--up)":net<0?"var(--down)":"var(--inkSoft)"}}>
+                税引後 {net!=null?`${net>0?"+":""}${Math.round(net).toLocaleString()}円`:"—（旧レコード）"}
+              </span>
+            </div>;
+          })}
         </div>
       </div>}
     </div>

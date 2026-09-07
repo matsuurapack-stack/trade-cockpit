@@ -24,6 +24,7 @@
 """
 import re
 import json
+import math
 import uuid
 import hashlib
 import decimal
@@ -534,6 +535,16 @@ CREATE INDEX IF NOT EXISTS idx_trade_history_user ON trade_history(user_id, clos
 -- （新規テーブルを増やさない）。表示時は毎回 initial_realized_pnl + trade_history.pnl合計
 -- を再計算する（保存値をキャッシュせず、データ破損に強い構造にする＝ユーザー指示）。
 ALTER TABLE investment_profile ADD COLUMN IF NOT EXISTS initial_realized_pnl NUMERIC NOT NULL DEFAULT 0;
+
+-- 2026-09-07新規（通算実現損益を税引後ベースへ変更）：既存pnl列（税引前・gross）は意味を
+-- 変えずそのまま残し（後方互換）、税引前/税額/税引後を明示的な列として追加する。
+-- 既存レコード（本番では2026-09-07時点で0件）はgross_pnl/tax/net_pnlがNULLのままになるが、
+-- get_investment_totals側でCOALESCE(net_pnl, pnl)により「税引後値が無い古い行はpnl
+-- （税引前のまま）を暫定的にnetとして扱う」形で読み込み時に吸収し、過去データを書き換える
+-- migrationは行わない（生データを勝手に改変しない、というユーザー方針に合わせた選択）。
+ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS gross_pnl NUMERIC;
+ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS tax NUMERIC;
+ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS net_pnl NUMERIC;
 """
 
 
@@ -2350,6 +2361,30 @@ def add_position_entry(database_url, user_id, code, name, market, price, shares,
     return d
 
 
+# 2026-09-07新規（通算実現損益を税引後ベースへ変更）：上場株式の譲渡益にかかる税率
+# （所得税・復興特別所得税15.315% + 住民税5.000% = 20.315%）。バックエンド（ここ、実際の
+# trade_history保存時の権威ある計算）とフロントエンド（trade-cockpit.htmlの売却確認画面での
+# プレビュー表示）で別々にベタ書きせず、値としてはこの1か所をSSoTとする。フロント側は
+# 別言語のため同じ変数を共有できないが、同名・同値の定数として複製し、コメントで
+# 「ここと同期させること」と明記している（trade-cockpit.html内STOCK_CAPITAL_GAINS_TAX_RATE
+# 参照）。今回は年間の損益通算等を再現する複雑な税務エンジンにはせず、1トレードごとに
+# 「利益なら20.315%控除・損失ならそのまま」という単純な近似計算のみ行う（ユーザー指示）。
+STOCK_CAPITAL_GAINS_TAX_RATE = 0.20315
+
+
+def _calc_trade_tax(gross_pnl):
+    """1トレードの税引前実現損益(gross_pnl)から、概算の税額・税引後損益を返す。
+    利益の場合のみ税率を掛け、円未満は切り捨てる（他の金額表示との丸め方針との整合を優先。
+    このアプリの他の金額表示は円未満を四捨五入/切り捨てで概算表示しており、明確な統一ルールは
+    無かったため、税額は「実際に源泉徴収される額を上回って表示しない」安全側に倒し切り捨てを
+    採用した）。損失の場合は追加で税を引かない（0円）。"""
+    if gross_pnl > 0:
+        tax = math.floor(gross_pnl * STOCK_CAPITAL_GAINS_TAX_RATE)
+    else:
+        tax = 0
+    return tax, gross_pnl - tax
+
+
 def add_position_exit(database_url, user_id, code, market, exit_price, shares):
     """売却確定。(exit_price - average_price) * sharesを実現損益としてtrade_historyへ1行記録
     する。一部売却の場合、残った建玉のaverage_priceは変更しない（ユーザー指示）。残り枚数が
@@ -2380,12 +2415,14 @@ def add_position_exit(database_url, user_id, code, market, exit_price, shares):
         if shares > remaining + 1e-9:
             return {"error": f"保有枚数（{remaining:g}株）を超える売却はできません"}
         avg_price = float(row["average_price"] or 0)
-        pnl = (exit_price - avg_price) * shares
+        pnl = (exit_price - avg_price) * shares  # 税引前（gross）。既存pnl列は意味を変えず維持する。
+        tax, net_pnl = _calc_trade_tax(pnl)
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "INSERT INTO trade_history (user_id, code, name, market, entry_price, exit_price, shares, pnl) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
-                [user_id, code, row.get("name"), market, avg_price, exit_price, shares, pnl],
+                "INSERT INTO trade_history (user_id, code, name, market, entry_price, exit_price, shares, "
+                "pnl, gross_pnl, tax, net_pnl) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
+                [user_id, code, row.get("name"), market, avg_price, exit_price, shares, pnl, pnl, tax, net_pnl],
             )
             trade = cur.fetchone()
         new_remaining = remaining - shares
@@ -2422,8 +2459,12 @@ def list_trade_history(database_url, user_id, limit=200):
 
 
 def get_investment_totals(database_url, user_id):
-    """通算実現損益 = investment_profile.initial_realized_pnl + trade_historyのpnl合計。
-    保存済みの合計値をキャッシュせず毎回再計算する（データ破損防止、ユーザー指示）。"""
+    """通算実現損益（税引後） = investment_profile.initial_realized_pnl（ユーザーが税引後の
+    値として入力している前提、ここでは追加の税計算を一切かけない） + trade_history各行の
+    税引後損益(net_pnl)の合計。net_pnlが無い行（税引後対応前の旧レコード、2026-09-07時点の
+    本番では0件）はCOALESCEで既存pnl（税引前のまま）を暫定的に使う（過去データを勝手に
+    書き換えるmigrationは行わない方針のため）。保存済みの合計値をキャッシュせず毎回
+    再計算する（データ破損防止、ユーザー指示）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return {"initialRealizedPnl": 0.0, "totalRealizedPnl": 0.0}
@@ -2432,7 +2473,7 @@ def get_investment_totals(database_url, user_id):
             cur.execute("SELECT initial_realized_pnl FROM investment_profile WHERE user_id = %s", [user_id])
             row = cur.fetchone()
             initial = float(row["initial_realized_pnl"]) if row and row.get("initial_realized_pnl") is not None else 0.0
-            cur.execute("SELECT COALESCE(SUM(pnl), 0) AS total FROM trade_history WHERE user_id = %s", [user_id])
+            cur.execute("SELECT COALESCE(SUM(COALESCE(net_pnl, pnl)), 0) AS total FROM trade_history WHERE user_id = %s", [user_id])
             trades_sum = float(cur.fetchone()["total"] or 0)
     return {"initialRealizedPnl": initial, "totalRealizedPnl": initial + trades_sum}
 
