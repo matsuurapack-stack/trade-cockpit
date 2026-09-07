@@ -3702,23 +3702,75 @@ function PositionIntradayChart({item,currentPrice}){
   </div>;
 }
 
-// 2026-09-07新規（ポジション→リアルタイム売却判断画面 Phase3）：既存derivePositionStatus()の
-// 8状態（STOP/EXIT/REDUCE/CAUTION/TAKE_PROFIT/TRAIL/HOLD_STRONG/HOLD）を、ユーザー指定の
-// 3段階表示（🟢HOLD/🟡CAUTION/🔴EXIT ALERT）へUI上だけマッピングする。判定ロジック自体
-// （derivePositionStatus）は変更しない、表示のための対応表のみ新設。
-const POSITION_ALERT_TIER={STOP:"EXIT_ALERT",EXIT:"EXIT_ALERT",
-  REDUCE:"CAUTION",CAUTION:"CAUTION",
-  TAKE_PROFIT:"HOLD",TRAIL:"HOLD",HOLD_STRONG:"HOLD",HOLD:"HOLD"};
+// 2026-09-07更新（リアルタイム売却判断のCAUTION改善）：既存derivePositionStatus()（トレード
+// 分析用SSoT、日足・63営業日高値ベースの評価も含む——ここは一切変更しない）はそのまま残し、
+// 「チャート分析タブ」等の既存用途で引き続き使われる。
+// 一方、9984の実データトレースで判明した通り、既存の8状態→3段階マッピングをそのまま
+// リアルタイム売却判断に使うと、evaluateChartBreakdown()内のbreakoutLookbackHigh
+// （直近63営業日＝3か月の"日足"高値。当日の値動きとは無関係にほぼ一定）だけを理由に
+// CAUTIONになってしまう問題があった。STOP・TAKE_PROFITはchart-breakdown評価より前に
+// 確定する“きれいな”判定なのでそのまま信頼するが、CAUTION相当はリアルタイム専用に
+// deriveRealtimeAlert()で作り直す（下記参照、新しい巨大スコアリングは作らず既存の閾値・
+// 既存データを転用するだけ）。
 const POSITION_ALERT_TIER_META={
   HOLD:{icon:"🟢",label:"HOLD",color:"#2C6A48"},
+  TAKE_PROFIT:{icon:"🔵",label:"TAKE PROFIT",color:"#3A6EA5"},
   CAUTION:{icon:"🟡",label:"CAUTION",color:"#D98C3F"},
   EXIT_ALERT:{icon:"🔴",label:"EXIT ALERT",color:"#AE3A34"},
 };
+// 2026-09-07新規（リアルタイム売却判断専用）：既存derivePositionStatus()を1回だけ呼び、
+// STOP（SWING -10%ハードストップ、chart-breakdown評価より前に確定するため汚染されていない）
+// とTAKE_PROFIT（利確①到達、item6：既存SSoTが返した場合のみ使用し新しい利確条件は作らない）
+// はそのまま信頼する。それ以外（REDUCE/CAUTION/TRAIL/HOLD_STRONG/HOLD）は、
+// breakoutLookbackHigh等の日足・中期指標を含むため使わず、当日の値動きだけで独自に
+// 警戒シグナルを数え直す：
+//   ・現在SL割れ／接近（3%以内）…既存deriveTrailingStatusの3%という閾値をそのまま流用
+//   ・建値割れ…新規計算なし（buildDiffの符号を見るだけ）
+//   ・当日高値から-3%以上の失速…既存evaluateChartBreakdown（DAY分岐）と同じ-3%閾値を流用、
+//     ただしindicators.intradayHigh（分析時点の古い値）ではなくdetail.high（リアルタイム）を使う
+//   ・出来高：AUTO_VOLUMEのvolumeType分類（NEGATIVE_VOLUME/CLIMAX_DOWN）をそのまま転用
+//   ・SWINGのみ：positionFlags.swingLowRecent（直近10営業日安値＝中期支持線、
+//     breakoutLookbackHigh＝63営業日高値とは別物）を追加考慮（item5：DAYには効かせない）
+// breakoutLookbackHigh自体は削除せず、CAUTION判定には使わず「中期参考」として表示するのみ
+// にする（item3）。
+function deriveRealtimeAlert({item,detail,cur,posFlags,posIndicators,enrStatus,pnlPct}){
+  const base=derivePositionStatus({avgPrice:item.average_price,tradeStyle:item.trade_style,
+    current:cur,currentStop:item.current_stop,initialStop:item.initial_stop,target1:item.target_1,
+    positionFlags:posFlags,pnlPct,indicators:posIndicators,enrStatus,ask:detail.ask,bid:detail.bid});
+  if(base.status==="STOP")return {tier:"EXIT_ALERT",reasons:base.reasons};
+
+  const avg=num(item.average_price);
+  const currentStop=num(item.current_stop);
+  const high=num(detail.high);
+  const reasons=[];
+  let exitAlert=false;
+
+  if(currentStop!=null&&cur!=null&&currentStop>0){
+    if(cur<currentStop){reasons.push(`現在SL割れ（SL ${currentStop.toLocaleString()}円）`);exitAlert=true;}
+    else if((cur-currentStop)/cur<=0.03){reasons.push(`現在SLに接近（残り${(((cur-currentStop)/cur)*100).toFixed(1)}%）`);}
+  }
+  if(avg!=null&&cur!=null&&cur<avg){reasons.push("建値割れ");}
+  if(high!=null&&cur!=null&&high>0&&(high-cur)/high>=0.03){
+    reasons.push(`当日高値から急反落（-${(((high-cur)/high)*100).toFixed(1)}%）`);
+  }
+  const volType=detail.volumeDetail?.volumeType;
+  if(volType==="NEGATIVE_VOLUME"||volType==="CLIMAX_DOWN"){
+    reasons.push("出来高急増を伴う下落（AUTO_VOLUME判定）");
+  }
+  if(item.trade_style==="SWING"&&posFlags?.swingLowRecent!=null&&cur!=null&&cur<posFlags.swingLowRecent){
+    reasons.push("直近スイング安値割れ（中期支持線）");
+  }
+
+  if(exitAlert)return {tier:"EXIT_ALERT",reasons};
+  if(base.status==="TAKE_PROFIT")return {tier:"TAKE_PROFIT",reasons:["利確①水準に到達",...reasons]};
+  if(reasons.length>=1)return {tier:"CAUTION",reasons};
+  return {tier:"HOLD",reasons:[]};
+}
 
 // 2026-09-07新規（Phase3）：5分足チャートの右側に置く「売却判断」エリア。現在状態
-// （derivePositionStatus・既存SSoTをそのまま呼ぶだけ）・建値との関係・当日高値からの下落率・
-// 出来高評価（AUTO_VOLUME再利用）・最良気配（複数段の板は取得不可のため最良値のみ）を1か所に
-// 集約する。ここでも新しい判定ロジック・新しい売却ロジックは一切作らない（既存関数の呼び出しと
+// （deriveRealtimeAlert・上記参照）・建値との関係・当日高値からの下落率・出来高評価
+// （AUTO_VOLUME再利用）・最良気配（複数段の板は取得不可のため最良値のみ）を1か所に集約する。
+// ここでも新しい判定ロジック・新しい売却ロジックは一切作らない（既存関数の呼び出しと
 // 表示の組み立てのみ）。EXIT ALERTでも自動売却は絶対に行わず、ボタンを押すのはユーザー。
 function PositionJudgmentPanel({item,detail,cur,posFlags,posIndicators,enrStatus,onOpenExit}){
   const avg=num(item.average_price);
@@ -3730,20 +3782,18 @@ function PositionJudgmentPanel({item,detail,cur,posFlags,posIndicators,enrStatus
   const ask=num(detail.ask),bid=num(detail.bid);
   const vd=detail.volumeDetail;
 
-  // 現在状態：既存derivePositionStatus()をそのままSSoTとして呼ぶ。リアルタイム詳細で取得した
-  // 最新のcur/ask/bidを渡すことで、一覧行（stockQuotesベース、手動更新まで変わらない）より
-  // 新しい状態を反映できるようにする（判定関数自体は無変更）。
-  const posResult=derivePositionStatus({avgPrice:item.average_price,tradeStyle:item.trade_style,
-    current:cur,currentStop:item.current_stop,initialStop:item.initial_stop,target1:item.target_1,
-    positionFlags:posFlags,pnlPct,indicators:posIndicators,enrStatus,ask,bid});
-  const tier=POSITION_ALERT_TIER[posResult.status]||"HOLD";
-  const tierMeta=POSITION_ALERT_TIER_META[tier];
+  const alert=deriveRealtimeAlert({item,detail,cur,posFlags,posIndicators,enrStatus,pnlPct});
+  const tierMeta=POSITION_ALERT_TIER_META[alert.tier];
+
+  // item3：63営業日高値は判定には使わず「中期参考」として表示するだけにする。
+  const breakoutHigh=num(posFlags?.breakoutLookbackHigh);
+  const breakoutDiffPct=(breakoutHigh&&cur!=null)?(cur-breakoutHigh)/breakoutHigh*100:null;
 
   return <div style={{padding:"10px 10px",background:"var(--bg)",border:"1px solid var(--rule)",borderRadius:5}}>
-    {/* item2：現在状態（3段階マッピング）＋item3：理由（既存reasonsのみ、最大3件） */}
+    {/* item2：現在状態（HOLD/TAKE PROFIT/CAUTION/EXIT ALERTの4段階）＋item4：理由（最大3件） */}
     <div style={{fontSize:16,fontWeight:800,color:tierMeta.color,marginBottom:4}}>{tierMeta.icon} {tierMeta.label}</div>
-    {posResult.reasons.length>0 && <ul style={{margin:"0 0 10px",paddingLeft:16,fontSize:11.5,color:"var(--inkSoft)"}}>
-      {posResult.reasons.slice(0,3).map((r,i)=><li key={i}>{r}</li>)}
+    {alert.reasons.length>0 && <ul style={{margin:"0 0 10px",paddingLeft:16,fontSize:11.5,color:"var(--inkSoft)"}}>
+      {alert.reasons.slice(0,3).map((r,i)=><li key={i}>{r}</li>)}
     </ul>}
 
     {/* item4：建値との関係（視認性を高くする、専用ブロック） */}
@@ -3770,6 +3820,12 @@ function PositionJudgmentPanel({item,detail,cur,posFlags,posIndicators,enrStatus
         高値から {fromHighPct!=null?`${fromHighPct>0?"+":""}${fromHighPct.toFixed(2)}%`:"—"}
       </div>
     </div>
+
+    {/* item3：63営業日高値（3か月の日足高値）は判定には使わず、中期参考として小さく表示するのみ。
+        トレード分析タブのbreakoutLookbackHigh自体は削除・変更していない。 */}
+    {breakoutHigh!=null && <div style={{fontSize:10.5,color:"var(--inkFaint)",marginBottom:8}}>
+      中期参考　63日高値 {breakoutHigh.toLocaleString()}円　現在値は高値比 {breakoutDiffPct!=null?`${breakoutDiffPct>0?"+":""}${breakoutDiffPct.toFixed(1)}%`:"—"}
+    </div>}
 
     {/* item6：出来高評価（AUTO_VOLUME再利用、Phase1と同じデータをこのブロックへ統合） */}
     {vd && <div style={{fontSize:12,marginBottom:8}}>
