@@ -1072,22 +1072,55 @@ STOCK_NAME_NEWS_NQN_MIN = 2
 # 一般名詞に近い社名で特に多い）②楽天グループ（楽天イーグルス）・ソフトバンクグループ
 # （ソフトバンクホークス）のように社名がプロ野球チーム名と重なる銘柄のスポーツ結果記事。
 # いずれもユーザー要望（2026-07-14「プロ野球の結果やAmazon/Microsoft/Appleの広告が多い」）で追加。
-STOCK_NAME_NEWS_EXCLUDE_KEYWORDS = [
+# 2026-09-08更新：広告系とスポーツ系を別リストに分離した（スポーツ系だけ、経営文脈があれば
+# 除外しない「ビジネスoverride」を適用できるようにするため。指示書4番：球団事業の売却・再編・
+# スポンサー契約・球場関連投資・業績への影響等は除外しない）。
+STOCK_NAME_NEWS_EXCLUDE_KEYWORDS_PROMO = [
     # 広告・セール・商品レビュー・お買い得情報のまとめ記事
     "セール", "プライムデー", "タイムセール", "クーポン", "割引", "％オフ", "%オフ", "ポイント還元",
     "PR", "広告", "キャンペーン", "送料無料", "福袋", "初売り", "ブラックフライデー", "サイバーマンデー",
     "レビュー", "開封", "おすすめ", "ランキング", "まとめ買い", "本日限定", "特価", "お買い得", "特別価格",
     "ベストセラー",
-    # プロ野球・スポーツ結果（楽天イーグルス・ソフトバンクホークス・日本ハムファイターズ・
-    # 鹿島アントラーズ等、社名とチーム名が重なるため。2026-08-21 ユーザー指摘：日本ハム(2282)・
-    # 鹿島(1812)のスポーツニュース混入が残っていたため追加調査のうえ拡充。試合結果記事は見出しに
-    # 「野球」「サッカー」等の一般語を含まないことが多く（例：「日本ハム・清宮虎、移籍後初登板も
-    # サヨナラ負け」）、実際にヒットした見出しから頻出語を拾って追加した。
+]
+# プロ野球・スポーツ結果（楽天イーグルス・ソフトバンクホークス・日本ハムファイターズ・
+# 鹿島アントラーズ等、社名とチーム名が重なるため。2026-08-21 ユーザー指摘：日本ハム(2282)・
+# 鹿島(1812)のスポーツニュース混入が残っていたため追加調査のうえ拡充。試合結果記事は見出しに
+# 「野球」「サッカー」等の一般語を含まないことが多く（例：「日本ハム・清宮虎、移籍後初登板も
+# サヨナラ負け」）、実際にヒットした見出しから頻出語を拾って追加した。
+# 2026-09-08further追加（ユーザー指摘：「9月8日 ソフトバンク―日本ハム23回戦 写真特集」が
+# 2282日本ハムに混入。既存語（野球・ファイターズ・ホークス等）はこの見出しに含まれておらず
+# すり抜けていたため、実際の見出しから頻出語を追加）。
+STOCK_NAME_NEWS_EXCLUDE_KEYWORDS_SPORTS = [
     "プロ野球", "野球", "イーグルス", "ホークス", "ファイターズ", "甲子園", "高校野球",
     "Jリーグ", "J1リーグ", "J2リーグ", "明治安田", "パ・リーグ", "セ・リーグ", "サッカー", "アントラーズ",
     "サヨナラ", "1軍", "2軍", "登板", "先発", "被安打", "ユース", "サンケイスポーツ", "FOOTBALL ZONE",
     "高校サッカードットコム",
+    "試合", "回戦", "写真特集", "投手", "打者", "本塁打", "ホームラン", "勝利", "敗戦", "球場",
 ]
+# 2026-09-08新規（指示書4番）：スポーツキーワード・対戦カード形式に該当しても、経営に関係する
+# 文脈があれば除外しない（球団事業の売却・再編、スポンサー契約、球場関連投資、業績への影響、
+# IR・決算でのスポーツ事業言及等）。あくまでSTOCK_NAME_NEWS_EXCLUDE_KEYWORDS_SPORTS／
+# 対戦カード形式で「スポーツ記事らしい」と判定された場合にだけ働く安全弁（広告系の除外には
+# 適用しない＝セール記事等がこのリストの語を含むだけでは復活しない）。
+STOCK_NAME_NEWS_SPORTS_BUSINESS_OVERRIDE = [
+    "決算", "業績", "IR", "適時開示", "売却", "譲渡", "再編", "スポンサー", "契約", "投資",
+    "子会社", "事業", "黒字", "赤字", "買収", "出資", "上方修正", "下方修正", "説明会",
+]
+
+
+def _is_sports_matchup_title(title, name):
+    """「ソフトバンク―日本ハム」のような対戦カード形式（自社名がダッシュで別の語と直接
+    連結されている）を検出する（指示書3番）。自社名そのものをスポーツ判定の根拠にすると
+    本業ニュースまで誤って除外しかねないため、あくまで「ダッシュで直結されている」という
+    構造だけを見る（相手側の固有名詞は問わない）。通常の企業ニュース見出しで社名の直前・
+    直後にいきなりダッシュが来ることは稀なため、単独では誤検出リスクが低い
+    （STOCK_NAME_NEWS_SPORTS_BUSINESS_OVERRIDEとの併用が前提）。"""
+    if not name or not title:
+        return False
+    norm_title = unicodedata.normalize("NFKC", title)
+    esc = re.escape(unicodedata.normalize("NFKC", name))
+    pattern = rf"(\S[―－ー\-]\s*{esc})|({esc}\s*[―－ー\-]\s*\S)"
+    return re.search(pattern, norm_title) is not None
 
 # 上記キーワードでは拾いきれない、商品お買い得情報まとめを主とするアフィリエイト/SEOブログ媒体・
 # スポーツ専門媒体は出典（媒体名）そのものを除外する（判断材料としての価値が薄いニュースが多いため）。
@@ -1101,12 +1134,12 @@ STOCK_NAME_NEWS_EXCLUDE_SOURCES = [
 ]
 
 
-def _is_promo_news(title, source=""):
+def _is_promo_news(title, source="", name=""):
     # 2026-08-22 ユーザー指摘対応：「Ｊリーグ」のように全角英字で書かれた見出しは、半角の
     # "Jリーグ"キーワードでは一致しないまま素通りしていた。NFKC正規化（全角英数→半角）で
     # 比較してから判定することで、全角/半角どちらの表記でも確実に弾けるようにする。
     norm_title = unicodedata.normalize("NFKC", title)
-    if any(unicodedata.normalize("NFKC", k) in norm_title for k in STOCK_NAME_NEWS_EXCLUDE_KEYWORDS):
+    if any(unicodedata.normalize("NFKC", k) in norm_title for k in STOCK_NAME_NEWS_EXCLUDE_KEYWORDS_PROMO):
         return True
     if any(s == source for s in STOCK_NAME_NEWS_EXCLUDE_SOURCES):
         return True
@@ -1114,7 +1147,20 @@ def _is_promo_news(title, source=""):
     # なり、実際の配信元（東スポWEB・サンケイスポーツ等）は見出し末尾に「（〇〇）」として
     # 埋め込まれるだけのため、上のsource完全一致だけでは弾けない。見出し中にスポーツ媒体名が
     # 含まれていないかも追加でチェックする。
-    return any(unicodedata.normalize("NFKC", s) in norm_title for s in STOCK_NAME_NEWS_EXCLUDE_SOURCES)
+    if any(unicodedata.normalize("NFKC", s) in norm_title for s in STOCK_NAME_NEWS_EXCLUDE_SOURCES):
+        return True
+    # 2026-09-08新規（登録銘柄ニュースの誤紐付け対策）：スポーツキーワード一致、または
+    # 「ソフトバンク―日本ハム」のような対戦カード形式（_is_sports_matchup_title）のいずれかで
+    # 「スポーツ記事らしい」と判定された場合のみ、経営文脈（STOCK_NAME_NEWS_SPORTS_BUSINESS_
+    # OVERRIDE）が無いか確認したうえで除外する。経営文脈があれば除外しない（指示書4番：球団
+    # 事業の売却・再編・スポンサー契約・球場関連投資・業績への影響等）。
+    sports_hit = any(unicodedata.normalize("NFKC", k) in norm_title for k in STOCK_NAME_NEWS_EXCLUDE_KEYWORDS_SPORTS)
+    matchup_hit = _is_sports_matchup_title(title, name)
+    if not (sports_hit or matchup_hit):
+        return False
+    if any(k in norm_title for k in STOCK_NAME_NEWS_SPORTS_BUSINESS_OVERRIDE):
+        return False
+    return True
 
 
 # 立花証券APIのニュースヘッダー機能（NQN＝日経QUICKニュース等の実況速報）。銘柄コードでの
@@ -1161,7 +1207,7 @@ def _tachibana_stock_news(jp_items):
 def build_stock_name_news(watchlist):
     """優先度順（優先→通常→様子見）に上位STOCK_NAME_NEWS_LIMIT銘柄まで、社名そのもので
     Googleニュースを検索し、見出しに社名を含むものだけを返す（IRキーワードでの絞り込みはしない）。
-    セール告知等のPR記事はSTOCK_NAME_NEWS_EXCLUDE_KEYWORDSで除外する。
+    セール告知等のPR記事・スポーツ結果記事（経営文脈が無いもの）は_is_promo_news()で除外する。
     社名単体の検索に加えて "site:nikkei.com" を明示的に組み合わせたクエリも実行し、結果を合流させる。
     日経新聞の記事はGoogleニュースの関連度順検索だけだと他の媒体に埋もれやすいため、業務提携等の
     一般ニュース（三菱重工の協業・フジクラ等）でも日経の記事を積極的に拾えるようにする
@@ -1197,7 +1243,7 @@ def build_stock_name_news(watchlist):
         candidates = (google_news(name, 4, max_age_days=STOCK_NEWS_MAX_AGE_DAYS)
                       + google_news(name + " site:nikkei.com", 5, max_age_days=STOCK_NEWS_MAX_AGE_DAYS))
         matched = [it for it in candidates
-                   if _title_mentions_name(name, it["title"]) and not _is_promo_news(it["title"], it.get("source", ""))]
+                   if _title_mentions_name(name, it["title"]) and not _is_promo_news(it["title"], it.get("source", ""), name)]
         # 2クエリにまたがって同じ記事がヒットすることがあるため、URLで重複除去してから新しい順に整える。
         seen_urls = set()
         deduped = []
