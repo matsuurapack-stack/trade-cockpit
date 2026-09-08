@@ -4205,7 +4205,7 @@ function PositionLiveDetail({item,onOpenExit,posFlags,posIndicators,enrStatus}){
   </div>;
 }
 
-function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEvents,newsCatalysts,expertViews}){
+function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEvents,newsCatalysts,expertViews,candidatesJP,candidatesUS,onAddToWatchlist}){
   const [items,setItems]=useState([]);
   const [loading,setLoading]=useState(true);
   // v3-8（ポジション管理ロジック再設計 Step1）：取引タイプ（DAY/SWING）を新規登録時に必須化。
@@ -4214,6 +4214,58 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
     initial_stop:"",target_1:"",target_2:"",trade_style:""};
   const [draft,setDraft]=useState(emptyDraft);
   const [saving,setSaving]=useState(false);
+  // 2026-09-08新規（ポジション登録機能の改善）：監視銘柄に未登録の銘柄でも、日本市場/米国株一覧が
+  // 既に読み込んでいる銘柄マスタ（candidatesJP＝MASTER+立花証券の東証全銘柄マスタ、
+  // candidatesUS＝MASTER米国株）をそのまま検索対象として再利用する（指示書8番、新規の
+  // 検索API・銘柄マスタは作らない）。コード欄は自由入力も維持しつつ、入力中に候補を出し
+  // クリック/Enterで確定できるようにする。
+  const [codeSearchOpen,setCodeSearchOpen]=useState(false);
+  const [codeActiveIndex,setCodeActiveIndex]=useState(0);
+  const [previewQuote,setPreviewQuote]=useState(null); // {t,p} 選択銘柄の現在値（参考表示のみ、average_priceには入れない）
+  const [selectedSector,setSelectedSector]=useState(""); // 「監視銘柄にも追加」時の業種（候補選択時のみ分かる）
+  const [alsoWatch,setAlsoWatch]=useState(false);
+  const [watchAddMsg,setWatchAddMsg]=useState("");
+  const positionCandidates=useMemo(()=>{
+    const list=draft.market==="US"?(candidatesUS||[]):(candidatesJP||[]);
+    return list.filter(m=>m.market!=="IDX"); // 指数・為替はポジション対象外
+  },[draft.market,candidatesJP,candidatesUS]);
+  const codeMatches=useMemo(()=>{
+    const t=normKana(draft.code.trim());if(!t)return[];
+    return positionCandidates.filter(m=>normKana(m.code).includes(t)||normKana(m.name).includes(t)||normKana(m.kana).includes(t)||normKana(m.sector||"").includes(t)).slice(0,10);
+  },[draft.code,positionCandidates]);
+  useEffect(()=>{setCodeActiveIndex(0);},[draft.code]);
+  // 2026-09-08新規：確定した銘柄コード・市場の現在値を参考表示用に取得する（既存の
+  // /api/stock-quotesをそのまま再利用、新規APIは作らない）。あくまで参考値であり、
+  // average_priceには絶対に自動で入れない（指示書7番）＝実際の約定単価はユーザーが入力する。
+  const fetchPreviewQuote=async(code,market)=>{
+    setPreviewQuote(null);
+    try{
+      const r=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify([{code,market}])});
+      if(r.ok){const d=await r.json();const q=d.quotes?.[code];if(q)setPreviewQuote(q);}
+    }catch(e){}
+  };
+  const selectCandidate=(m)=>{
+    setDraft(d=>({...d,code:m.code,name:m.name,market:m.market}));
+    setSelectedSector(m.sector||"");
+    setCodeSearchOpen(false);
+    fetchPreviewQuote(m.code,m.market);
+  };
+  const onCodeKeyDown=(e)=>{
+    if(!codeSearchOpen||!codeMatches.length)return;
+    if(e.key==="ArrowDown"){e.preventDefault();setCodeActiveIndex(i=>(i+1)%codeMatches.length);}
+    else if(e.key==="ArrowUp"){e.preventDefault();setCodeActiveIndex(i=>(i-1+codeMatches.length)%codeMatches.length);}
+    else if(e.key==="Enter"){e.preventDefault();selectCandidate(codeMatches[codeActiveIndex]);}
+    else if(e.key==="Escape"){e.preventDefault();setCodeSearchOpen(false);}
+  };
+  // 指示書12番：同一銘柄・同一市場が既にポジションにある場合の重複検出（既存の建玉管理仕様＝
+  // add_position_entry()の加重平均合算をそのまま使う。upsert（/api/portfolio/save）で
+  // 上書きすると既存の数量・取得単価が消えてしまうため、重複時だけ既存の「買い増し」と
+  // 同じエンドポイント（/api/portfolio/add-entry）に切り替える）。
+  const duplicatePosition=useMemo(()=>{
+    const code=draft.code.trim();if(!code)return null;
+    return items.find(it=>it.code===code&&(it.market||"JP")===draft.market)||null;
+  },[draft.code,draft.market,items]);
 
   const load=async()=>{
     setLoading(true);
@@ -4290,8 +4342,31 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
       target_2:analysisForDraft.fullExitTarget??d.target_2}));
   };
 
+  const resetDraftExtras=()=>{setDraft(emptyDraft);setPreviewQuote(null);setSelectedSector("");setAlsoWatch(false);setCodeSearchOpen(false);};
   const save=async()=>{
-    if(!draft.code.trim())return;
+    const code=draft.code.trim();
+    if(!code)return;
+    // 2026-09-08追加（指示書12番）：既に同一銘柄・同一市場のポジションがある場合、黙って
+    // 上書き（/api/portfolio/save）せず、既存の建玉管理仕様（加重平均で合算する
+    // add_position_entry、監視銘柄カードの「ポジション追加」「買い増し」と同じロジック）に
+    // 切り替えるかどうかを確認する。
+    if(duplicatePosition){
+      if(!confirm(`${draft.name||code}（${code}）は既にポジションにあります（現在 ${num(duplicatePosition.quantity)?.toLocaleString()}株 @${num(duplicatePosition.average_price)?.toLocaleString()}円）。\n追加建てとして登録しますか？（既存分と加重平均で合算されます）`))return;
+      if(!draft.trade_style){alert("取引タイプ（DAY/SWING）を選択してください");return;}
+      setSaving(true);
+      try{
+        const r=await fetch("/api/portfolio/add-entry",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({code,name:draft.name,market:draft.market,price:num(draft.average_price),shares:num(draft.quantity),trade_style:draft.trade_style})});
+        const d=await r.json();
+        if(d.error){alert(d.error);}
+        else{
+          if(alsoWatch)await addAlsoToWatchlist(code,draft.name,draft.market);
+          resetDraftExtras();load();
+        }
+      }catch(e){}
+      setSaving(false);
+      return;
+    }
     setSaving(true);
     try{
       await fetch("/api/portfolio/save",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -4300,10 +4375,27 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
           initial_stop:num(draft.initial_stop),target_1:num(draft.target_1),target_2:num(draft.target_2),
           // current_stopは新規登録時は初期SLと同じ値で開始する（トレーリング状態＝「初期SL」から始まる）
           current_stop:num(draft.initial_stop)})}); // 空文字はTIMESTAMPTZ列に直接入らないためnullに変換
-      setDraft(emptyDraft);
+      if(alsoWatch)await addAlsoToWatchlist(code,draft.name,draft.market);
+      resetDraftExtras();
       load();
     }catch(e){}
     setSaving(false);
+  };
+  // 指示書4番：「監視にも追加」チェックボックス。監視銘柄への自動追加は行わず、ユーザーが
+  // 明示的にチェックした場合のみ、既存のsetWatchlistJP/US（App側、Neon同期込み）を呼び出す。
+  // 業種は候補選択時に分かっていればそれを使い、フリー入力等で不明な場合のみ既存の
+  // /api/guess-sector（SectorWatchlist.addManual()と同じ、新規APIは作らない）で推定する。
+  const addAlsoToWatchlist=async(code,name,market)=>{
+    let sector=selectedSector;
+    if(!sector){
+      try{
+        const r=await fetch("/api/guess-sector",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({code,market})});
+        if(r.ok){const d=await r.json();sector=d.sector||"";}
+      }catch(e){}
+    }
+    const result=onAddToWatchlist&&onAddToWatchlist({code,name,market,sector});
+    setWatchAddMsg(result==="already"?"（既に監視銘柄に登録済みでした）":result==="max"?"（監視銘柄が上限のため追加できませんでした）":"（監視銘柄にも追加しました）");
+    setTimeout(()=>setWatchAddMsg(""),3500);
   };
   const remove=async(code,market)=>{
     if(!confirm(`${code}を保有株一覧から削除しますか？`))return;
@@ -4426,10 +4518,29 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
       <div style={{fontWeight:700,color:"var(--ink)",fontSize:13}}>保有株（portfolio）</div>
       <span style={{fontSize:11,color:"var(--inkFaint)"}}>{items.length}銘柄</span>
     </div>
-    <div className="position-add-grid-1" style={{display:"grid",gridTemplateColumns:"70px 1fr 55px 90px 70px 90px 110px",gap:6,marginBottom:6}}>
-      <input placeholder="コード" value={draft.code} onChange={e=>setDraft({...draft,code:e.target.value})} style={fieldStyle}/>
+    {/* 2026-09-08更新（ポジション登録機能の改善）：「コード」欄を銘柄検索欄として機能させる。
+        監視銘柄への登録有無に関わらず、日本市場/米国株一覧が既に読み込んでいる銘柄マスタ
+        （candidatesJP/US）から即座に候補を表示する。285Aのような英字混じりコードもcode列は
+        常に文字列のまま扱い、数値変換は一切行わない（指示書9番）。自由入力（候補に無い銘柄を
+        手で打つ）も従来通り可能。 */}
+    <div className="position-add-grid-1" style={{display:"grid",gridTemplateColumns:"110px 1fr 55px 90px 70px 90px 110px",gap:6,marginBottom:6}}>
+      <div style={{position:"relative"}}>
+        <input placeholder="コード/銘柄名で検索" value={draft.code}
+          onChange={e=>{setDraft({...draft,code:e.target.value});setCodeSearchOpen(true);setPreviewQuote(null);setSelectedSector("");}}
+          onFocus={()=>setCodeSearchOpen(true)} onBlur={()=>setTimeout(()=>setCodeSearchOpen(false),150)}
+          onKeyDown={onCodeKeyDown} style={fieldStyle}/>
+        {codeSearchOpen && draft.code.trim() && codeMatches.length>0 && <div className="results" style={{maxHeight:260,overflowY:"auto"}}>
+          {codeMatches.map((m,i)=>
+            <button key={m.code} type="button" className="res-row" style={{background:i===codeActiveIndex?"var(--band)":"transparent"}}
+              onMouseEnter={()=>setCodeActiveIndex(i)} onMouseDown={e=>e.preventDefault()} onClick={()=>selectCandidate(m)}>
+              <span className="mono" style={{fontSize:12,width:56,color:"var(--inkSoft)"}}>{m.code}</span>
+              <span style={{flex:1,fontSize:13,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={m.name}>{m.name}</span>
+              <span style={{fontSize:11,color:"var(--inkSoft)",whiteSpace:"nowrap"}}>{m.sector}</span>
+            </button>)}
+        </div>}
+      </div>
       <input placeholder="銘柄名" value={draft.name} onChange={e=>setDraft({...draft,name:e.target.value})} style={fieldStyle}/>
-      <select value={draft.market} onChange={e=>setDraft({...draft,market:e.target.value})} style={fieldStyle}>
+      <select value={draft.market} onChange={e=>{setDraft({...draft,market:e.target.value});setPreviewQuote(null);setSelectedSector("");}} style={fieldStyle}>
         <option value="JP">JP</option><option value="US">US</option>
       </select>
       {/* v3-8 Step1：取引タイプは新規登録で必須（未選択のプレースホルダーを空値のoptionとして用意）。 */}
@@ -4440,7 +4551,13 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
       <input placeholder="平均取得単価（実際の約定単価）" value={draft.average_price} onChange={e=>setDraft({...draft,average_price:e.target.value})} style={fieldStyle}/>
       <input type="date" value={draft.acquired_at} onChange={e=>setDraft({...draft,acquired_at:e.target.value})} style={fieldStyle}/>
     </div>
-    <div className="position-add-grid-2" style={{display:"grid",gridTemplateColumns:"90px 90px 90px 1fr auto auto",gap:6,marginBottom:10,alignItems:"center"}}>
+    {/* 指示書5・7番：確定した銘柄の現在値を参考表示（average_priceには絶対に自動で入れない）。
+        指示書12番：既に同じ銘柄・市場のポジションがある場合の警告（保存時にも再度confirmする）。 */}
+    {(previewQuote||duplicatePosition) && <div style={{fontSize:11.5,marginBottom:8,display:"flex",flexWrap:"wrap",gap:10,alignItems:"center"}}>
+      {previewQuote && <span style={{color:"var(--inkSoft)"}}>現在値（参考） <span className="mono" style={{fontWeight:700,color:"var(--ink)"}}>{num(previewQuote.t)?.toLocaleString()??"—"}</span>円</span>}
+      {duplicatePosition && <span style={{color:"var(--accent)",fontWeight:700}}>⚠ 既にポジションにあります（{num(duplicatePosition.quantity)?.toLocaleString()}株 @{num(duplicatePosition.average_price)?.toLocaleString()}円）。追加建て（加重平均で合算）として登録されます。</span>}
+    </div>}
+    <div className="position-add-grid-2" style={{display:"grid",gridTemplateColumns:"90px 90px 90px 1fr auto auto",gap:6,marginBottom:6,alignItems:"center"}}>
       <input placeholder="初期SL" value={draft.initial_stop} onChange={e=>setDraft({...draft,initial_stop:e.target.value})} style={fieldStyle}/>
       <input placeholder="利確①" value={draft.target_1} onChange={e=>setDraft({...draft,target_1:e.target.value})} style={fieldStyle}/>
       <input placeholder="利確②" value={draft.target_2} onChange={e=>setDraft({...draft,target_2:e.target.value})} style={fieldStyle}/>
@@ -4448,10 +4565,20 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
       {analysisForDraft && <button className="action-btn" type="button" onClick={applyAnalysisValues} title="トレード分析タブでのこの銘柄のstop/利確①/利確②を下書きに反映します（参考値。実際の取得単価は上の欄に手入力してください）">分析値を使う</button>}
       <button className="btn" onClick={save} disabled={saving||!draft.code.trim()||!draft.trade_style} title={!draft.trade_style?"取引タイプ（DAY/SWING）の選択が必須です":undefined}>追加</button>
     </div>
+    {/* 指示書4番：監視銘柄への自動追加はしない。チェックした場合のみ既存のsetWatchlistJP/US
+        （Neon同期込み）を呼び出す。監視銘柄とポジションは引き続き別データとして管理する。 */}
+    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+      <label style={{fontSize:11.5,color:"var(--inkSoft)",display:"flex",alignItems:"center",gap:5,cursor:"pointer"}}>
+        <input type="checkbox" checked={alsoWatch} onChange={e=>setAlsoWatch(e.target.checked)}/>
+        監視銘柄にも追加する
+      </label>
+      {watchAddMsg && <span style={{fontSize:11,color:"var(--inkSoft)"}}>{watchAddMsg}</span>}
+    </div>
     <div className="sec-note" style={{marginTop:-4,marginBottom:10}}>
       ※ 取引タイプ（DAY/SWING）は新規登録に必須です。SWINGは-10%の絶対損切りルール等、取引タイプに応じた判断が働きます。
       平均取得単価は実際に約定した単価を入力してください（トレード分析タブのentryは参考値で、ポジション管理の基準にはしません）。
       初期SL・利確①②は任意入力で、トレード分析タブで「分析」済みの銘柄なら「分析値を使う」で反映できます。
+      監視銘柄に未登録の銘柄でもコード欄の検索からそのままポジション追加できます。
     </div>
     {loading
       ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>読み込み中…</div>
@@ -6255,6 +6382,22 @@ function App(){
   };
   const setWatchlistJP=(wl)=>{syncWatchlistToNeon(sRef.current.watchlist,wl,"JP");set({watchlist:wl});};
   const setWatchlistUS=(wl)=>{syncWatchlistToNeon(sRef.current.watchlistUS,wl,"US");set({watchlistUS:wl});};
+  // 2026-09-08新規（ポジション登録機能の改善・指示書4番）：ポジション画面の「監視銘柄にも
+  // 追加する」チェックボックスから呼ばれる。既存のsetWatchlistJP/US（Neon同期込み）をそのまま
+  // 使い回すだけで、新しい保存経路は作らない。既に登録済みなら"already"、上限なら"max"、
+  // 追加できたら"ok"を返す（呼び出し元でメッセージ出し分けに使う）。
+  const addToWatchlistDirect=({code,name,market,sector})=>{
+    if(market==="US"){
+      if(s.watchlistUS.some(w=>w.code===code))return "already";
+      if(s.watchlistUS.length>=MAX_US)return "max";
+      setWatchlistUS([...s.watchlistUS,{id:code,code,name:name||code,sector:sector||SECTOR_INDEX,market:"US",tvSymbol:code,watch:"通常",note:"",theme:""}]);
+      return "ok";
+    }
+    if(s.watchlist.some(w=>w.code===code))return "already";
+    if(s.watchlist.length>=MAX)return "max";
+    setWatchlistJP([...s.watchlist,{id:code,code,name:name||code,sector:sector||SECTOR_CHOICES[0],market:"JP",tvSymbol:"TSE:"+code,watch:"通常",note:"",theme:""}]);
+    return "ok";
+  };
   // 2026-08-22 ユーザー要望：「日本市場」タブの検索候補を、日経225中心の手動キュレーション
   // リスト（MASTER、約277社）だけでなく東証上場銘柄全体（約4400社）に広げる。立花証券APIの
   // 株式銘柄マスタをサーバー側でキャッシュ済みの/api/jp-issue-masterから1回だけ取得し、
@@ -7859,7 +8002,8 @@ function App(){
       {tab==="position" && <div style={{marginTop:18}}>
         <div className="sec-head">ポジション</div>
         <div className="sec-note">保有中の建玉のみを表示します。売買記録・振り返りは「記録」タブへ。</div>
-        <PortfolioPanel stockQuotes={s.stockQuotes} analysisData={s.analysisData} analysisEnrichedMap={analysisEnrichedMap} marketEvents={marketEvents} newsCatalysts={newsCatalysts} expertViews={expertViews}/>
+        <PortfolioPanel stockQuotes={s.stockQuotes} analysisData={s.analysisData} analysisEnrichedMap={analysisEnrichedMap} marketEvents={marketEvents} newsCatalysts={newsCatalysts} expertViews={expertViews}
+          candidatesJP={masterJP} candidatesUS={masterUS} onAddToWatchlist={addToWatchlistDirect}/>
       </div>}
 
       {/* ===== 投資判断ログ（2026-09-02新規） ===== */}
