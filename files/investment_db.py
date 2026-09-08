@@ -947,10 +947,12 @@ def validate_chatgpt_payload(payload):
             continue
         if not _CODE_RE_LOOSE.match(str(d.get("code"))):
             errors.append(f"decisions[{i}].code の形式が不正です: {d.get('code')}")
-        execution = d.get("execution")
-        if execution and execution not in ALLOWED_EXECUTION:
-            errors.append(f"decisions[{i}].execution \"{execution}\" は許可された値ではありません"
-                           f"（許可: {', '.join(ALLOWED_EXECUTION)}）")
+        # 2026-09-08更新（ChatGPT連携JSONスキーマ統一、指示書6番）：executionが既知の値
+        # （ALLOWED_EXECUTION）でなくても、もう保存不可のエラーにはしない。execution_status
+        # 列はTEXT型でDB側にCHECK制約は無く、共通スキーマのdecisions[].action（例：
+        # "HOLD_WITH_CAUTION"）のような自由記述の値もそのまま記録できるほうが情報量を
+        # 失わないため（本当に判定不能な場合＝codeが無い場合だけエラーにする、という方針）。
+        # フロント側（validateChatGptPayload）も同様に緩和済み。
     rule_updates = payload.get("rule_updates")
     if rule_updates is not None and not isinstance(rule_updates, list):
         errors.append("rule_updates は配列である必要があります")
@@ -1073,7 +1075,10 @@ def save_chatgpt_import(database_url, user_id, payload, force=False):
 
     n_rules = 0
     for ru in payload.get("rule_updates") or []:
-        text = ru if isinstance(ru, str) else (ru or {}).get("text")
+        # 2026-09-09追記（ChatGPT連携JSONスキーマ統一）：共通スキーマのrule_updatesは
+        # {rule, status}形式（"text"ではなく"rule"キー）。旧形式の{"text":...}も
+        # 引き続き読めるようフォールバックする（後方互換、指示書5番）。
+        text = ru if isinstance(ru, str) else (ru or {}).get("rule") or (ru or {}).get("text")
         if not text:
             continue
         upsert_rule(database_url, user_id, {

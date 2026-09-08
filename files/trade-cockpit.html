@@ -296,8 +296,12 @@ const copyText = async (text) => {
 // JSON（今後Claude Code/ChatGPT双方で扱いやすい構造化データを基本）＋人間が読める見出しを
 // 1つのテキストにしてcopyText()でクリップボードにコピーするだけ。各画面はcontextとdataだけを
 // 渡せばよく、同じような整形処理を画面ごとに重複実装しない。
+// 2026-09-08更新（ChatGPT連携JSONスキーマ統一、指示書8番）：「今日のTOP5を相談」「銘柄分析を
+// 相談」「利確・損切り相談」「朝一分析」等、全ての「相談用にコピー」ボタンが最終的にここを
+// 通るため、date（共通スキーマと同じフィールド名）をここで一括して追加した。各画面のcode/
+// nameフィールド自体は呼び出し側で既にcode/name（symbol等の別名は使っていない）を使っている。
 function buildChatGPTPayload(context,data){
-  return {context,generated_at:new Date().toISOString(),...data};
+  return {context,date:todayISO(),generated_at:new Date().toISOString(),...data};
 }
 function formatChatGPTText(title,payload){
   return `【Trade Cockpit ${title}】${new Date().toLocaleString("ja-JP")}\n`+
@@ -5116,17 +5120,25 @@ function InvestmentLogPanel({marketEnvAuto,usMarketAuto,interestRateAuto,fxAuto,
 // ここへ手動貼り付け」の半自動フローで投資ログをNeonへ蓄積する。JSONの構造検証はまずここ
 // （フロント）で即時に行い、保存はサーバー側（server.py）でも同じ検証をやり直す（二重防御）。
 const CHATGPT_ALLOWED_EXECUTION=["BUY","SELL","WAIT","WATCH","NO_TRADE","MISSED","CANCELLED","STOP_LOSS","TAKE_PROFIT"];
+// 2026-09-08更新（ChatGPT連携JSONスキーマ統一、指示書7番）：サンプルは共通スキーマ
+// （schema_version:"1.0"）に統一。画面ごとに別形式のサンプルは持たせない。
 const CHATGPT_SAMPLE_JSON=`{
+  "schema_version": "1.0",
+  "type": "investment_update",
   "date": "${(()=>{const d=new Date();return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");})()}",
   "market": { "condition": "bearish", "summary": "全面安",
     "strong_sectors": ["shipping"], "weak_sectors": ["banks","semiconductors"] },
-  "watchlist": [ {"code":"9107","name":"川崎汽船","status":"WATCH","reason":"全面安の中で相対的に強い"} ],
-  "decisions": [ {"code":"9107","user_decision":"WAIT","ai_decision":"WAIT","execution":"NO_TRADE",
-    "reason":"地合いが悪いため","mental_state":"calm"} ],
+  "watchlist": [ {"code":"9107","name":"川崎汽船","themes":[],"view":"継続監視","reason":"全面安の中で相対的に強い","priority":"medium"} ],
+  "decisions": [ {"code":"9107","name":"川崎汽船","action":"NO_TRADE","reason":"地合いが悪いため","risk":"","time_horizon":"short"} ],
   "review": "無理に入らず待った",
-  "rule_updates": []
+  "rule_updates": [ {"rule":"地合いが悪い日は無理に新規INしない","status":"recommended"} ],
+  "notes": []
 }`;
 
+// 2026-09-08時点：ChatGptImportPanelのparse()はnormalizeChatGPTPayload()（本ファイル後方、
+// ChatGptImportPanel直前に定義）が返すerrors/warningsを使うようになったため、この関数は
+// 現在どこからも呼ばれていない（削除はせず残置。CHATGPT_ALLOWED_EXECUTIONの厳格チェックを
+// 含む旧仕様の参考として、また将来この形の一括検証が必要になった場合のため）。
 function validateChatGptPayload(obj){
   const errs=[];
   if(typeof obj!=="object"||obj===null||Array.isArray(obj)){errs.push("JSONのトップレベルはオブジェクトである必要があります");return errs;}
@@ -5270,6 +5282,138 @@ function convertDetailedChatGptPayload(obj){
   };
 }
 
+// ============================================================
+// 2026-09-08新規（ChatGPT連携JSONスキーマ統一）：全てのChatGPT取込画面（投資判断ログ・
+// イベント登録・カタリスト・有識者・ポジション相談等）が共通で使う正規化の単一窓口。
+// 「ChatGPTが毎回どの画面用のJSONか意識しなくてよい」を満たすため、以下を標準スキーマとし、
+// 旧形式は全てここで自動変換してから既存の各画面の保存処理（save_chatgpt_import・
+// import_market_events・import_news_catalysts等）へ渡す（内部DBスキーマ自体は無変更）。
+//
+// 標準スキーマ：{schema_version:"1.0", type:"investment_update"（用途別に"morning_market_
+// check"等も許容、9番）, date, market:{condition,summary,strong_sectors,weak_sectors},
+// watchlist[], decisions[], positions[], events[], recent_catalysts[], review,
+// rule_updates[], notes[]}
+//
+// 対応する旧形式（指示書3番の対応表）：
+//   - type:"morning_market_check"等のネスト形式 → 既存convertDetailedChatGptPayload()を
+//     そのまま再利用（新規ロジックの二重実装を避ける）
+//   - 完全フラット形式（date/market/watchlist/decisions/review/rule_updates） → そのまま通す
+//   - strong_sectors/weak_sectorsがmarket内でなくルート直下 → market側へ取り込む
+//   - symbol/ticker/stock_code（code以外の銘柄コード別名） → codeへ正規化
+//   - rule_updatesが文字列配列 → {rule, status:"recommended"}へ変換
+//   - rule_updatesがオブジェクト配列でstatus省略 → "recommended"を既定値として補う
+//   - reviewが配列 → 改行結合して文字列へ
+// ============================================================
+const CHATGPT_CODE_ALIASES=["symbol","ticker","stock_code"]; // 優先度順（codeそのものは別途チェック済み）
+// 銘柄を扱う配列（watchlist/decisions/positions/recent_catalysts）の1件について、
+// code/symbol/ticker/stock_codeのいずれかからcodeを補完する（指示書2番）。補完した場合は
+// warningsへ「〇〇[i].symbol を code として自動変換しました」の形で記録する（指示書6番）。
+function _cgNormalizeCode(item,label,idx,warnings){
+  if(!item||typeof item!=="object")return item;
+  if(item.code!=null&&item.code!=="")return{...item,code:String(item.code)};
+  for(const alt of CHATGPT_CODE_ALIASES){
+    if(item[alt]!=null&&item[alt]!==""){
+      warnings.push(`${label}[${idx}].${alt} を code として自動変換しました`);
+      return{...item,code:String(item[alt])};
+    }
+  }
+  return item;
+}
+function _cgNormalizeRuleUpdate(ru,idx,warnings){
+  if(typeof ru==="string"){
+    warnings.push(`rule_updates[${idx}]（文字列）を {rule, status:"recommended"} 形式へ自動変換しました`);
+    return{rule:ru,status:"recommended"};
+  }
+  if(ru&&typeof ru==="object"&&!Array.isArray(ru)){
+    if(!ru.status){
+      warnings.push(`rule_updates[${idx}].status が無いため既定値 "recommended" を補いました`);
+      return{...ru,status:"recommended"};
+    }
+    return ru;
+  }
+  return ru;
+}
+// 戻り値：{normalized, warnings, errors}。errorsが1件でもあれば保存不可（真に判定不能な場合の
+// み＝銘柄コードが1件も見つからない等）。warningsは自動補完・無視した項目の説明で、保存は
+// 可能（指示書6番：エラーと警告を分ける）。normalizedは常に上記の標準スキーマ形状で返る。
+function normalizeChatGPTPayload(raw){
+  const warnings=[],errors=[];
+  if(typeof raw!=="object"||raw===null||Array.isArray(raw)){
+    errors.push("JSONのトップレベルはオブジェクトである必要があります");
+    return{normalized:null,warnings,errors};
+  }
+  // ネスト形式（morning_market_check等）は既存のconvertDetailedChatGptPayloadでフラット化
+  // してから続きの正規化にかける。events/recent_catalysts/positions等の共通スキーマ項目が
+  // 元のJSON直下にあれば（ネスト形式と併記されていても）そのまま拾えるよう、変換結果を
+  // 元のrawへ上書きマージする（convertedのdate/market/watchlist/decisions/review/
+  // rule_updatesを優先）。
+  let base=raw;
+  if(detectChatGptFormat(raw)==="detailed"){
+    const{converted,missing}=convertDetailedChatGptPayload(raw);
+    base={...raw,...converted};
+    missing.forEach(m=>warnings.push(`（ネスト形式からの変換）${m}が見つからなかったため空欄です`));
+  }
+
+  const date=base.date||todayISO();
+  if(!base.date)warnings.push("date が無いため本日の日付を既定値として使用しました");
+
+  // 指示書4番：strong_sectors/weak_sectorsはmarket.strong_sectors/weak_sectorsが正式形式だが、
+  // ルート直下に来ても取り込む。
+  const marketSrc=(base.market&&typeof base.market==="object"&&!Array.isArray(base.market))?base.market:{};
+  let strongSectors=marketSrc.strong_sectors,weakSectors=marketSrc.weak_sectors;
+  if(!Array.isArray(strongSectors)&&Array.isArray(base.strong_sectors)){
+    warnings.push("strong_sectors（ルート直下）を market.strong_sectors として取り込みました");
+    strongSectors=base.strong_sectors;
+  }
+  if(!Array.isArray(weakSectors)&&Array.isArray(base.weak_sectors)){
+    warnings.push("weak_sectors（ルート直下）を market.weak_sectors として取り込みました");
+    weakSectors=base.weak_sectors;
+  }
+  const market={
+    condition:marketSrc.condition||"",
+    summary:marketSrc.summary||"",
+    strong_sectors:Array.isArray(strongSectors)?strongSectors:[],
+    weak_sectors:Array.isArray(weakSectors)?weakSectors:[],
+  };
+
+  const watchlist=(Array.isArray(base.watchlist)?base.watchlist:[]).map((w,i)=>_cgNormalizeCode(w,"watchlist",i,warnings));
+  watchlist.forEach((w,i)=>{if(!w||!w.code)errors.push(`watchlist[${i}] に code / symbol / ticker / stock_code のいずれも見つかりませんでした`);});
+
+  // 指示書8番：共通スキーマのdecisions[].action（自由記述、例："HOLD_WITH_CAUTION"）は、
+  // 既存の投資判断ログ保存経路（add_stock_judgment）が見ているdecisions[].execution
+  // （旧仕様、CHATGPT_ALLOWED_EXECUTIONの厳格な列挙値）とは別名のため、executionが
+  // 元々無ければactionをそのままexecutionとしてもコピーする（情報を失わないため。
+  // execution_status列はTEXT型でDB側にCHECK制約が無く、自由記述の値もそのまま保存できる。
+  // サーバー側validate_chatgpt_payloadの列挙値チェックも2026-09-08に警告扱いへ緩和済み）。
+  const decisions=(Array.isArray(base.decisions)?base.decisions:[]).map((d,i)=>{
+    const withCode=_cgNormalizeCode(d,"decisions",i,warnings);
+    if(withCode&&withCode.action&&!withCode.execution)return{...withCode,execution:withCode.action};
+    return withCode;
+  });
+  decisions.forEach((d,i)=>{if(!d||!d.code)errors.push(`decisions[${i}] に code / symbol / ticker / stock_code のいずれも見つかりませんでした`);});
+
+  const positions=(Array.isArray(base.positions)?base.positions:[]).map((p,i)=>_cgNormalizeCode(p,"positions",i,warnings));
+  const recentCatalysts=(Array.isArray(base.recent_catalysts)?base.recent_catalysts:[]).map((c,i)=>_cgNormalizeCode(c,"recent_catalysts",i,warnings));
+  const events=Array.isArray(base.events)?base.events:[];
+
+  const reviewRaw=base.review;
+  const review=Array.isArray(reviewRaw)?reviewRaw.join("\n"):(reviewRaw||"");
+
+  const ruleUpdates=(Array.isArray(base.rule_updates)?base.rule_updates:[]).map((ru,i)=>_cgNormalizeRuleUpdate(ru,i,warnings));
+
+  const notes=Array.isArray(base.notes)?base.notes:(base.notes?[base.notes]:[]);
+
+  const normalized={
+    schema_version:base.schema_version||"1.0",
+    // 指示書9番：typeは用途識別用として残すが、基本フィールド構造（このnormalizedの形）は
+    // typeによって変えない。
+    type:base.type||"investment_update",
+    date, market, watchlist, decisions, positions, events,
+    recent_catalysts:recentCatalysts, review, rule_updates:ruleUpdates, notes,
+  };
+  return{normalized,warnings,errors};
+}
+
 function ChatGptImportPanel({journal,activeRules}){
   const [rawText,setRawText]=useState("");
   const [parsed,setParsed]=useState(null);
@@ -5282,6 +5426,12 @@ function ChatGptImportPanel({journal,activeRules}){
   // v3-9続き（ChatGPT連携JSON解析改善）：詳細形式（morning_market_check等）を検出・変換した
   // 場合の付随情報（{missing:[...]}）。フラット形式そのままの場合はnull。
   const [conversionInfo,setConversionInfo]=useState(null);
+  // 2026-09-08新規（ChatGPT連携JSONスキーマ統一、指示書6番）：エラー（保存不可）とは別に、
+  // 自動補完・自動変換した項目を警告として表示する（symbol→code変換・rule_updates文字列→
+  // オブジェクト変換等）。保存自体は可能。
+  const [parseWarnings,setParseWarnings]=useState([]);
+  // positions/events/recent_catalysts等、共通スキーマの追加項目が含まれていた場合の案内。
+  const [extraNote,setExtraNote]=useState("");
 
   const loadImports=async()=>{
     setLoadingImports(true);
@@ -5329,22 +5479,30 @@ function ChatGptImportPanel({journal,activeRules}){
   };
 
   const parse=()=>{
-    setSaveMsg("");setDupInfo(null);setConversionInfo(null);
+    setSaveMsg("");setDupInfo(null);setConversionInfo(null);setParseWarnings([]);setExtraNote("");
     let obj;
     try{ obj=JSON.parse(rawText); }
     catch(e){ setParsed(null);setParseErrors(["JSONとして正しくありません: "+e.message]);return; }
-    // v3-9続き（ChatGPT連携JSON解析改善）：詳細形式（type:"morning_market_check"等）を検出したら
-    // 既存のフラット形式へ自動変換してから、既存のvalidateChatGptPayload・プレビューUIへ渡す
-    // （既存のフラットJSON取り込み経路は一切変更しない）。
-    let target=obj;
-    if(detectChatGptFormat(obj)==="detailed"){
-      const{converted,missing}=convertDetailedChatGptPayload(obj);
-      target=converted;
-      setConversionInfo({missing});
+    // 2026-09-08更新（ChatGPT連携JSONスキーマ統一）：全画面共通のnormalizeChatGPTPayload()を
+    // 必ず最初に通す。旧来の詳細形式検出・変換（convertDetailedChatGptPayload）はこの関数の
+    // 内部で再利用しているだけで、二重実装はしていない（既存のフラットJSON取り込み経路も
+    // このnormalizeを通るだけで動作は変わらない＝後方互換）。
+    const{normalized,warnings,errors}=normalizeChatGPTPayload(obj);
+    const nestedNotes=warnings.filter(w=>w.startsWith("（ネスト形式からの変換）"));
+    if(nestedNotes.length)setConversionInfo({missing:nestedNotes.map(w=>w.replace("（ネスト形式からの変換）",""))});
+    setParseWarnings(warnings);
+    setParseErrors(errors);
+    setParsed(errors.length===0?normalized:null);
+    if(errors.length===0&&normalized){
+      const notes=[];
+      if((normalized.positions||[]).length)
+        notes.push(`ℹ️ ポジション情報${normalized.positions.length}件が含まれていますが、実際の保有株の変更は安全のため自動反映しません。「ポジション」タブから内容をご確認のうえ手動で登録してください。`);
+      if((normalized.events||[]).length)
+        notes.push(`ℹ️ イベント情報${normalized.events.length}件は、保存時に「イベント登録」へも自動で取り込みます。`);
+      if((normalized.recent_catalysts||[]).length)
+        notes.push(`ℹ️ 材料情報${normalized.recent_catalysts.length}件は、保存時に「カタリスト」へも自動で取り込みます。`);
+      setExtraNote(notes.join("\n"));
     }
-    const errs=validateChatGptPayload(target);
-    setParseErrors(errs);
-    setParsed(errs.length===0?target:null);
   };
 
   const updateMarket=(field,value)=>setParsed(p=>({...p,market:{...(p.market||{}),[field]:value}}));
@@ -5390,8 +5548,39 @@ function ChatGptImportPanel({journal,activeRules}){
     }else if(d.errors){setSaveMsg("保存失敗：\n・"+d.errors.join("\n・"));}
     else if(d.error){setDupInfo(d);}
     else{
-      setSaveMsg(`保存しました（daily_log ID ${d.dailyLogId}・銘柄評価 ${d.judgments}件・追加ルール ${d.rulesAdded}件）`);
-      setRawText("");setParsed(null);setParseErrors([]);setConversionInfo(null);loadImports();
+      // 2026-09-08新規（ChatGPT連携JSONスキーマ統一、指示書8番）：同じ共通スキーマ内に
+      // events/recent_catalystsが含まれていれば、既存のEventsPanel/CatalystsPanelと全く
+      // 同じimport API（/api/market-events/import・/api/news-catalysts/import）へも渡す
+      // （内部DBスキーマ・保存処理はそれぞれ既存のまま、二重実装しない）。失敗しても投資
+      // 判断ログ本体の保存は既に成功しているため、ベストエフォートとして扱う（他の連携と
+      // 同じ方針）。positionsは実際の保有株を書き換えるため、安全のため自動反映しない
+      // （parse()時点でその旨を案内済み）。
+      const extraMsgs=[];
+      if((parsed.events||[]).length){
+        try{
+          const evR=await fetch("/api/market-events/import",{method:"POST",headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({events:parsed.events.map(e=>({
+              event_date:e.date,title:e.event||e.title,importance:e.importance,
+              affected_stocks:e.related_codes||e.affected_stocks||[],notes:e.note,
+            }))})});
+          const evD=await evR.json().catch(()=>null);
+          if(evD&&!evD.error)extraMsgs.push(`イベント登録：新規${evD.imported||0}件・更新${evD.updated||0}件`);
+        }catch(e){}
+      }
+      if((parsed.recent_catalysts||[]).length){
+        try{
+          const catR=await fetch("/api/news-catalysts/import",{method:"POST",headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({catalysts:parsed.recent_catalysts.map(c=>({
+              catalyst_date:c.date,title:c.title,summary:c.detail,sentiment:c.sentiment,
+              affected_stocks:c.code?[c.code]:[],source:"ChatGPT連携（共通スキーマ）",
+            }))})});
+          const catD=await catR.json().catch(()=>null);
+          if(catD&&!catD.error)extraMsgs.push(`カタリスト：新規${catD.imported||0}件`);
+        }catch(e){}
+      }
+      setSaveMsg(`保存しました（daily_log ID ${d.dailyLogId}・銘柄評価 ${d.judgments}件・追加ルール ${d.rulesAdded}件）`
+        +(extraMsgs.length?`\n${extraMsgs.join("\n")}`:""));
+      setRawText("");setParsed(null);setParseErrors([]);setConversionInfo(null);setParseWarnings([]);setExtraNote("");loadImports();
     }
     setSaving(false);
   };
@@ -5417,11 +5606,20 @@ function ChatGptImportPanel({journal,activeRules}){
     </div>
 
     {parseErrors.length>0 && <div className="card" style={{marginTop:12,padding:"10px 14px",border:"1px solid var(--down)"}}>
-      <b style={{color:"var(--down)"}}>入力内容にエラーがあります：</b>
+      <b style={{color:"var(--down)"}}>ERROR：このままでは保存できません：</b>
       <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:12.5,color:"var(--down)"}}>
         {parseErrors.map((e,i)=><li key={i}>{e}</li>)}
       </ul>
     </div>}
+    {/* 2026-09-08新規（ChatGPT連携JSONスキーマ統一、指示書6番）：エラー（保存不可）とは別に、
+        自動補完・自動変換した項目を警告として表示する。保存自体は可能。 */}
+    {parseErrors.length===0&&parseWarnings.length>0 && <div className="card" style={{marginTop:12,padding:"10px 14px",border:"1px solid var(--accent)"}}>
+      <b style={{color:"var(--accent)"}}>WARNING：一部項目を自動補完・変換しました（保存は可能です）：</b>
+      <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:12.5,color:"var(--inkSoft)"}}>
+        {parseWarnings.map((w,i)=><li key={i}>{w}</li>)}
+      </ul>
+    </div>}
+    {parsed&&extraNote && <div className="card" style={{marginTop:12,padding:"10px 14px",border:"1px solid var(--rule)",whiteSpace:"pre-wrap",fontSize:12.5,color:"var(--inkSoft)"}}>{extraNote}</div>}
 
     {/* v3-9続き（ChatGPT連携JSON解析改善）：詳細形式を検出・変換した場合、対応するキーが
         見つからず空欄になった項目を明示する（捏造しない・何が取れなかったか分かるようにする）。 */}
