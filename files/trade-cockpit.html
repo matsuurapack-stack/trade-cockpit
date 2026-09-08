@@ -981,7 +981,7 @@ function EarningsProgressChart({trend,latestDetail}){
 
 // 6-1章：銘柄検索・登録＋セクター別アコーディオン表示（2〜5章の仕様）を市場ごとに再利用するための共通コンポーネント。
 // 日本市場・アメリカ市場タブの両方で、このコンポーネントをそのまま使い回すことで「全く同じ仕様・UI」を担保する。
-function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,watchTargets,onToggleWatch,onOpenChart,metrics,breakoutLevels,analysisData,marketRiskLabel}){
+function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,watchTargets,onToggleWatch,onOpenChart,metrics,breakoutLevels,analysisData,marketRiskLabel,onAddPosition}){
   const [q,setQ]=useState("");
   const [manualSector,setManualSector]=useState(SECTOR_CHOICES[0]);
   const [openSectors,setOpenSectors]=useState(()=>new Set());
@@ -1237,6 +1237,10 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                       <button className={inAnalysis?"on":""} onClick={()=>{onToggleAnalysis(w.code);setOpenMenuFor(null);}}>{inAnalysis?"✓ 分析中":"分析"}</button>
                       {market==="JP" && <button className={inWatch?"on":""} onClick={()=>{onToggleWatch(w.code);setOpenMenuFor(null);}}>{inWatch?"✓ 監視銘柄":"監視銘柄に追加"}</button>}
                       {market==="JP" && <button className={inEarnings?"on":""} onClick={()=>{onToggleEarnings(w.code);setOpenMenuFor(null);}}>{inEarnings?"✓ 決算":"決算"}</button>}
+                      {/* 2026-09-08新規：監視銘柄（watchTargets）登録の有無に関わらず、登録銘柄
+                          一覧から直接ポジション追加できるようにする。既存のPositionEntryModal
+                          （監視銘柄タブ・PortfolioPanelと同じもの）をApp側で開くだけ。 */}
+                      {onAddPosition && <button onClick={()=>{onAddPosition(w);setOpenMenuFor(null);}}>➕ ポジションに追加</button>}
                       <button onClick={()=>{editTheme(w);setOpenMenuFor(null);}}>{w.theme?`テーマ編集（${w.theme}）`:"＋テーマ"}</button>
                       <button onClick={()=>{delStock(w.id);setOpenMenuFor(null);}}>登録解除</button>
                     </div>}
@@ -3724,6 +3728,35 @@ function PositionEntryModal({code,name,market,needsTradeStyle,onClose,onSaved}){
   const [tradeStyle,setTradeStyle]=useState("");
   const [saving,setSaving]=useState(false);
   const [errMsg,setErrMsg]=useState("");
+  // 2026-09-08新規（日本市場一覧「⋮」→ポジションに追加、指示書4・5・6番）：
+  // 現在値の参考表示（average_priceには絶対に自動で入れない）と、既に同一銘柄・市場の
+  // ポジションが無いかの確認。既存の/api/stock-quotes・/api/portfolioをそのまま再利用する
+  // だけで、新しいAPIは作らない。needsTradeStyle=false（PortfolioPanelの「買い増し」）は
+  // そもそも既存ポジションへの追記が前提のため、重複確認はneedsTradeStyle=trueの時だけ行う
+  // （買い増しのたびに「既にあります」と聞かれる煩わしさを避ける）。
+  const [previewQuote,setPreviewQuote]=useState(null);
+  const [existingPosition,setExistingPosition]=useState(null);
+  useEffect(()=>{
+    let cancelled=false;
+    (async()=>{
+      try{
+        const r=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify([{code,market}])});
+        if(r.ok){const d=await r.json();if(!cancelled)setPreviewQuote(d.quotes?.[code]||null);}
+      }catch(e){}
+      if(needsTradeStyle){
+        try{
+          const r=await fetch("/api/portfolio");
+          if(r.ok){
+            const d=await r.json();
+            const existing=(d.items||[]).find(it=>it.code===code&&(it.market||"JP")===market&&it.active!==false);
+            if(!cancelled)setExistingPosition(existing||null);
+          }
+        }catch(e){}
+      }
+    })();
+    return ()=>{cancelled=true;};
+  },[code,market,needsTradeStyle]);
   const inputStyle={display:"block",width:"100%",marginTop:4,fontSize:15,padding:"6px 8px",
     border:"1px solid var(--rule)",borderRadius:4,background:"var(--bg)",color:"var(--ink)",boxSizing:"border-box"};
   const submit=async()=>{
@@ -3731,6 +3764,11 @@ function PositionEntryModal({code,name,market,needsTradeStyle,onClose,onSaved}){
     if(!(p>0)){setErrMsg("買値は正の数で入力してください");return;}
     if(!(s>0)){setErrMsg("枚数は正の数で入力してください");return;}
     if(needsTradeStyle&&!tradeStyle){setErrMsg("取引タイプ（DAY/SWING）を選択してください");return;}
+    // 指示書6番：既存ポジションがある場合は単純上書きではなく「追加建て」であることを確認する
+    // （承諾後の保存処理自体は元々add_position_entry＝加重平均合算のため変更不要）。
+    if(existingPosition&&!confirm(
+      `${name||code}（${code}）は既にポジションにあります（現在 ${num(existingPosition.quantity)?.toLocaleString()}株 @${num(existingPosition.average_price)?.toLocaleString()}円）。\n追加建てとして登録しますか？（既存分と加重平均で合算されます）`
+    ))return;
     setSaving(true);setErrMsg("");
     try{
       const r=await fetch("/api/portfolio/add-entry",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -3746,7 +3784,11 @@ function PositionEntryModal({code,name,market,needsTradeStyle,onClose,onSaved}){
     <div onClick={e=>e.stopPropagation()} style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:12,
         width:"100%",maxWidth:360,padding:20,boxShadow:"var(--shadowLg)"}}>
       <div style={{fontWeight:700,fontSize:16,marginBottom:2}}>{name||code}</div>
-      <div className="mono" style={{fontSize:12,color:"var(--inkSoft)",marginBottom:14}}>{code}</div>
+      <div className="mono" style={{fontSize:12,color:"var(--inkSoft)",marginBottom:2}}>{code}{market?`（${market}）`:""}</div>
+      {previewQuote?.t!=null && <div style={{fontSize:11.5,color:"var(--inkSoft)",marginBottom:10}}>現在値（参考） <span className="mono" style={{fontWeight:700,color:"var(--ink)"}}>{num(previewQuote.t)?.toLocaleString()}</span>円</div>}
+      {existingPosition && <div style={{fontSize:11,color:"var(--accent)",fontWeight:700,background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"5px 8px",marginBottom:10}}>
+        ⚠ 既にポジションにあります（{num(existingPosition.quantity)?.toLocaleString()}株 @{num(existingPosition.average_price)?.toLocaleString()}円）。追加建てとして登録できます。
+      </div>}
       <label style={{display:"block",fontSize:12,color:"var(--inkSoft)"}}>買値
         <input type="number" value={price} onChange={e=>setPrice(e.target.value)} style={inputStyle}/>
       </label>
@@ -6127,6 +6169,11 @@ function App(){
   const NEWS_PAGE_SIZE=15; // 「もっと見る」：初期表示件数・1クリックあたりの追加表示件数
   const [newsShowCount,setNewsShowCount]=useState(NEWS_PAGE_SIZE); // サブタブごとにリセットする表示件数
   const [chartModal,setChartModal]=useState(null); // {symbol,name,code,market} 5章：登録銘柄行の「チャート」ボタン用モーダル
+  // 2026-09-08新規（日本市場/米国株一覧「⋮」メニューへのポジション追加）：監視銘柄
+  // （watchTargets）登録の有無に関わらず、登録銘柄（watchlist）一覧の行から直接ポジション
+  // 追加モーダルを開けるようにする。既存のPositionEntryModal・/api/portfolio/add-entryを
+  // そのまま再利用するだけで、新しい保存経路は作らない（指示書8番）。
+  const [sectorPositionEntryFor,setSectorPositionEntryFor]=useState(null); // {code,name,market}
   const [cBB,setCBB]=useState(true),[cRSI,setCRSI]=useState(true),[cMA,setCMA]=useState(false);
   // v3-5：TradingViewチャートの時間足。用途ごとに独立管理し、片方の変更がもう片方の初期表示に
   // 影響しないようにする（日次モニター＝寄り付き〜大引けの当日の動き重視、個別銘柄チャート＝
@@ -7409,7 +7456,8 @@ function App(){
           earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
           watchTargets={s.watchTargets} onToggleWatch={toggleWatchTarget}
           metrics={s.metrics} breakoutLevels={s.breakoutLevels} analysisData={s.analysisData} marketRiskLabel={s.marketRisk?.marketRiskLabel}
-          onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}/>
+          onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}
+          onAddPosition={w=>setSectorPositionEntryFor({code:w.code,name:w.name,market:w.market})}/>
         <p className="foot">※ ニュースはGoogleニュースRSSを利用しています。売買を推奨するものではなく、最終判断はご自身で。</p>
       </div>}
 
@@ -7426,7 +7474,8 @@ function App(){
           earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
           watchTargets={s.watchTargets} onToggleWatch={toggleWatchTarget}
           metrics={s.metrics} breakoutLevels={s.breakoutLevels} analysisData={s.analysisData} marketRiskLabel={s.marketRisk?.marketRiskLabel}
-          onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}/>
+          onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}
+          onAddPosition={w=>setSectorPositionEntryFor({code:w.code,name:w.name,market:w.market})}/>
         <p className="foot" style={{marginTop:16}}>※ 対象は現行のダウ工業株30種平均構成銘柄。業種分類は日本市場と同じ東証33業種の枠組みで統一しています（GICSセクターではありません）。アメリカ市場銘柄のニュース・決算・IRは「ニュース」タブのサマリー・海外市況・適時開示に統合表示しています。</p>
       </div>}
 
@@ -8101,6 +8150,13 @@ function App(){
               </div>}
         </div>
       </div>}
+
+      {/* 2026-09-08新規：日本市場/米国株一覧「⋮」メニューの「ポジションに追加」用。既存の
+          PositionEntryModal（監視銘柄タブの「➕ ポジション追加」・PortfolioPanelの「買い増し」
+          と全く同じコンポーネント）をそのまま再利用するだけで、新しい保存経路は作らない。 */}
+      {sectorPositionEntryFor && <PositionEntryModal code={sectorPositionEntryFor.code} name={sectorPositionEntryFor.name} market={sectorPositionEntryFor.market}
+        needsTradeStyle={true} onClose={()=>setSectorPositionEntryFor(null)}
+        onSaved={()=>{loadHeldItems();}}/>}
 
       <p className="foot" style={{borderTop:"1px solid var(--ruleSoft)",paddingTop:12,marginTop:24}}>
         データはこのブラウザに自動保存されます（同じファイルを同じブラウザで開けば継続）。念のため時々「バックアップ↓」でJSON保存を。<br/>
