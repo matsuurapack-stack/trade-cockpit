@@ -3731,6 +3731,26 @@ def analyze_stock(w, market_env=None):
     lookback = min(60, n)
     support = min(closes[-lookback:])
     resistance = max(closes[-lookback:])
+    # 2026-09-08新規（分析カードUI改善、指示書SHORT_TERM_BREAKOUT_PRICE対応）：上のresistance
+    # （3か月＝60営業日の終値高値）は詳細情報向けの中期参照値としてそのまま維持しつつ、
+    # 短期トレード判断向けに別途「短期ブレイク価格」を算出する。直近5営業日高値から順に
+    # 10営業日・20営業日高値を試し、現在値超〜+10%以内に収まる最も近い候補を採用する
+    # （前日高値・当日高値は必ずこの5〜20営業日の窓に含まれるため別枠で拾う必要はない）。
+    # どの窓でも現在値超の候補が無い、または最も近い候補すら+10%を超える場合はNone
+    # （無理にブレイク価格を作らない、というユーザー指定の方針）。
+    short_term_breakout = None
+    if current and highs:
+        for lb_days in (5, 10, 20):
+            window = highs[-min(lb_days, len(highs)):]
+            if len(window) < 2:
+                continue
+            candidate = max(window)
+            if candidate <= current:
+                continue  # 既にその窓の高値を上抜け済み＝この窓ではブレイク待ちの水準がない
+            deviation_pct = (candidate - current) / current * 100
+            if deviation_pct <= 10:
+                short_term_breakout = candidate
+                break  # 5→10→20の順に試しているため、最初に条件を満たした時点が最も近い候補
     volume_profile_poc = _volume_profile_poc(closes, volumes)
     high52w = max(highs[-min(252, len(highs)):]) if highs else current
     low52w = min(lows[-min(252, len(lows)):]) if lows else current
@@ -4601,6 +4621,9 @@ def analyze_stock(w, market_env=None):
         "stop": round(stop, 2), "stopReason": "・".join(stop_reasons),
         "target": round(target, 2), "targetReason": "・".join(target_reasons),
         "fullExitTarget": round(full_exit_target, 2),
+        # 2026-09-08新規（分析カードUI改善）：短期（5〜20営業日）ブレイク価格。indicators.resistance
+        # （3か月＝60営業日高値、詳細情報向け）とは別の、意思決定カード表示専用の値。
+        "shortTermBreakout": round(short_term_breakout, 1) if short_term_breakout is not None else None,
         "strength": strength,
         "marketEnv": market_env.get("text"),
         "signals": {

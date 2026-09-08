@@ -2750,6 +2750,11 @@ const WAIT_RESOLUTION_META={
   VWAP_NOT_RECLAIMED:"VWAP回復待ち", RANGE_UNCONFIRMED:"下げ止まり確認待ち",
   NEAR_BREAKOUT:"高値更新（ブレイク成立）待ち", SECTOR_WEAK:"セクター全体の回復待ち", MARKET_SOFT:"地合いの回復待ち",
 };
+// 2026-09-08更新（分析カードUI改善：DECISION_FIRST_LAYOUT「重要な理由3件以内」対応）：
+// 表示件数を3件にキャップした。既存のriskReasons/waitReasons自体・describeRiskReason等の
+// 判定ロジックは無変更（あくまで表示件数を絞るだけ、4件目以降が消えるわけではなく単に
+// 一覧に出さないだけ＝データは既存のenrオブジェクトにそのまま残っている）。
+const STATUS_REASON_DISPLAY_LIMIT=3;
 function StatusReasonPanel({enr,a}){
   if(enr.actionStatus!=="RISK"&&enr.actionStatus!=="WAIT")return null;
   const isRisk=enr.actionStatus==="RISK";
@@ -2758,12 +2763,25 @@ function StatusReasonPanel({enr,a}){
   const resolutionMeta=isRisk?RISK_RESOLUTION_META:WAIT_RESOLUTION_META;
   const resolutions=[...new Set(codes.map(c=>resolutionMeta[c]).filter(Boolean))];
   const meta=ACTION_STATUS_META[enr.actionStatus];
+  const shown=codes.slice(0,STATUS_REASON_DISPLAY_LIMIT);
+  const omitted=codes.length-shown.length;
   return <div style={{border:`1px solid ${meta.color}`,borderRadius:4,padding:"8px 10px",marginBottom:8,background:"var(--band)"}}>
     <div style={{fontWeight:800,fontSize:12.5,color:meta.color,marginBottom:4}}>{meta.icon} {meta.label} の理由</div>
     <div style={{display:"flex",flexDirection:"column",gap:2}}>
-      {codes.map(c=><div key={c} style={{fontSize:11.5,color:"var(--ink)"}}>・{describe(c,enr,a)}</div>)}
+      {shown.map(c=><div key={c} style={{fontSize:11.5,color:"var(--ink)"}}>・{describe(c,enr,a)}</div>)}
     </div>
+    {omitted>0 && <div style={{fontSize:10.5,color:"var(--inkFaint)",marginTop:2}}>ほか{omitted}件</div>}
     {resolutions.length>0 && <div style={{fontSize:12,fontWeight:700,color:meta.color,marginTop:6}}>→ {resolutions.join("・")}</div>}
+  </div>;
+}
+// 2026-09-08新規（分析カードUI改善）：押し目候補・短期ブレイク価格・損切り・利確・RR等の
+// 決定的な数値を1項目=1行で見せる共通コンポーネント。旧実装ではIIFE内のローカル関数だった
+// ものを、詳細情報トグル内（利確②）でも再利用するため最上位のコンポーネントとして独立させた。
+function AnalysisRow({label,value,color,note}){
+  return <div>
+    <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>{label}</div>
+    <div className="mono" style={{fontSize:20,fontWeight:800,color,lineHeight:1.3}}>{value}</div>
+    {note && <div style={{color:"var(--inkSoft)",fontSize:11,marginTop:2}}>{note}</div>}
   </div>;
 }
 
@@ -6822,6 +6840,12 @@ function App(){
   // 表示され続けていた不具合の本体）。以前はanalysisTargetsに既に入っている銘柄は「data有り」と
   // 判定されると二度と自動再取得されず、何日前の結果でもそのまま表示され続けていた。
   const [analysisEntering,setAnalysisEntering]=useState(false);
+  // 2026-09-08新規（分析カードUI改善：DECISION_FIRST_LAYOUT/COLLAPSE_SECONDARY_INFORMATION）。
+  // 補助情報（詳細テクニカル・信用残・証金残・ニュース全文等）はデフォルト折りたたみにし、
+  // 銘柄コードごとに開閉状態を保持する（他銘柄のカードには影響しない）。既存の
+  // openMenuFor/expandedCode等と同じ「コードをキーにしたSetで開閉管理」パターンを踏襲。
+  const [analysisDetailOpen,setAnalysisDetailOpen]=useState(()=>new Set());
+  const toggleAnalysisDetail=(code)=>setAnalysisDetailOpen(prev=>{const n=new Set(prev);n.has(code)?n.delete(code):n.add(code);return n;});
   useEffect(()=>{
     if(tab!=="analysis")return;
     const legacySchema=(a)=>!a||a.strength===undefined||a.autoEarningsStars===undefined;
@@ -7875,25 +7899,80 @@ function App(){
                           <EventRiskNote events={marketEvents} code={w.code} sector={w.sector}/>
                           <CatalystNote catalysts={newsCatalysts} code={w.code} sector={w.sector}/>
                           <ExpertViewNote views={expertViews} code={w.code} sector={w.sector} market={w.market}/>
-                          {/* ===== Trade Cockpit v2 Phase2：総合判断・8軸・Entry Conditions・Falling Knife/Chase Risk ===== */}
+                          {/* ===== 2026-09-08刷新（分析カードUI改善：DECISION_FIRST_LAYOUT）=====
+                              指示書のvisible_fields（総合評価・Action Status・Market Risk・RS・
+                              押し目候補・短期ブレイク価格・初期損切り・利確①・RR・重要な理由3件
+                              以内）を最上部に、それ以外（詳細テクニカル・信用残・証金残・
+                              ニュース全文・詳細ファンダ等）は下の「詳細情報」トグルへ移動した。
+                              「分析資料ではなく意思決定カード。3秒で判断できる構成に」という
+                              ユーザー指定の原則に沿う。既存の売買判定ロジック（AUTO_RS・
+                              Market Risk・Primary/Action Status等）自体は一切変更していない。 */}
+                          {/* 総合評価・Action Status・Market Risk・RS（対市場・対セクター）は
+                              既存AssessmentCardが既に1枚でまとめて表示している（新規計算なし）。 */}
                           {a.assessment && enr && <AssessmentCard assessment={a.assessment} marginBadge={a.tradeRules?.marginBadge} marginRatio={a.tradeRules?.marginRatio} enr={enr} sectorRank={sectorRankMap.get(w.sector)}/>}
+                          {/* 重要な理由3件以内：StatusReasonPanel側で表示件数を3件にキャップ済み（既存の
+                              riskReasons/waitReasons自体は無変更、表示だけ絞る）。 */}
                           {enr && <StatusReasonPanel enr={enr} a={a}/>}
-                          {enr && <EntryConditionsChecklist a={a} enr={enr}/>}
                           {a.tradeRules?.watchStatus && <div style={{fontSize:11.5,fontWeight:700,color:"var(--accent)",background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>⏳ {a.tradeRules.watchStatus}</div>}
                           {/* エントリーのタイミングルール（最新版）：初押し／高値ブレイクに該当する最有力タイミング(★5)を強調表示 */}
                           {a.tradeRules?.entryPattern && <div style={{fontSize:11.5,fontWeight:700,color:"var(--up)",background:"var(--upBg)",border:"1px solid var(--up)",borderRadius:4,padding:"4px 8px",marginBottom:8}}>★★★★★ {a.tradeRules.entryPattern.label}</div>}
-                          {/* 決算期待値：発表10日前からカウントダウンを目立つ色で表示。星は過去の上方/下方修正比率・
-                              直近決算の良し悪し・現在の株価の過熱度からサーバー側で自動算出（旧・手動評価は廃止）。 */}
-                          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6,
-                            background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"6px 8px",marginBottom:8}}>
-                            {(a.daysToEarnings!=null && a.daysToEarnings>=0 && a.daysToEarnings<=10)
-                              ? <span style={{fontSize:12.5,fontWeight:700,color:"var(--accent)"}}>📅 決算発表まで あと{a.daysToEarnings}日</span>
-                              : <span style={{fontSize:11,color:"var(--inkSoft)"}}>決算期待値（自動算出）</span>}
-                            <EarningsStars value={a.autoEarningsStars||0}/>
-                          </div>
+                          {/* 決算発表が10日以内に迫っている場合のみ表示（時間的に切迫した短期リスクのため
+                              決定カード側に残す。星評価・「決算期待値（自動算出）」の通常表示は詳細情報側へ）。 */}
+                          {(a.daysToEarnings!=null && a.daysToEarnings>=0 && a.daysToEarnings<=10) &&
+                            <div style={{fontSize:12.5,fontWeight:700,color:"var(--accent)",background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"6px 8px",marginBottom:8}}>📅 決算発表まで あと{a.daysToEarnings}日</div>}
                           {a.tradeRules?.earningsNote && <div style={{fontSize:11.5,color:"var(--ink)",background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"6px 8px",marginBottom:8,lineHeight:1.6}}>📅 {a.tradeRules.earningsNote}</div>}
+                          {/* 押し目候補・短期ブレイク価格・初期損切り・利確①・RR：意思決定に直接使う5項目。
+                              指示書SHORT_TERM_BREAKOUT_PRICE対応：旧「ブレイク価格」はindicators.resistance
+                              （3か月＝60営業日高値）を使っており、現在値から極端に離れた非現実的な水準
+                              （例：現在値57,410円に対し108,700円）になる不具合があった。server.py側で
+                              新設したa.shortTermBreakout（直近5〜20営業日高値、現在値+10%超は候補から
+                              除外、無理に値を作らない）に切り替えた。indicators.resistanceは詳細情報側の
+                              「中期レジスタンス参考」として残す。 */}
+                          {(()=>{
+                            const rr=(a.entry!=null&&a.stop!=null&&a.target!=null&&(a.entry-a.stop)>0)
+                              ?(a.target-a.entry)/(a.entry-a.stop):null;
+                            const pb=a.pullbackEntry;
+                            const pullbackRow=(!pb)
+                              ? <AnalysisRow label="押し目エントリー価格帯" value={a.entry.toLocaleString()} color="var(--ink)" note={a.entryReason}/>
+                              : pb.status==="candidate"
+                                ? <AnalysisRow label="押し目候補" value={`${pb.zoneLow.toLocaleString()}〜${pb.zoneHigh.toLocaleString()}円`} color="var(--ink)"
+                                    note={`${pb.basis}（${pb.zoneLabel}・現在値比-${pb.deviationPct.toFixed(1)}%）`}/>
+                                : pb.status==="no_candidate"
+                                  ? <AnalysisRow label="押し目候補" value="押し目候補なし" color="var(--inkFaint)"
+                                      note="強い銘柄のため浅い押し目（0.5〜2.5%）の候補が見当たりません。現在値付近での判断が中心になります。"/>
+                                  : <AnalysisRow label="押し目候補" value={pb.status==="deep_adjustment"?"深い調整待ち":"トレンド再確認ゾーン"} color="var(--down)"
+                                      note="現在値からの浅い押し目候補（4%以内）が見当たりません。無理に押し目を想定せず、値動きの落ち着きを待つ局面です。"/>;
+                            return <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                              {pullbackRow}
+                              {a.shortTermBreakout!=null
+                                ? <AnalysisRow label="短期ブレイク価格" value={`${a.shortTermBreakout.toLocaleString()}超`} color="var(--ink)" note="直近5〜20営業日高値（現在値+10%以内の候補のみ。この水準を出来高を伴って上抜けたら短期ブレイクとして扱う）"/>
+                                : <div style={{fontSize:11,color:"var(--inkFaint)"}}>短期ブレイク価格：現在値+10%以内に妥当な候補がありません（無理に表示しません）</div>}
+                              <AnalysisRow label="初期損切り" value={a.stop.toLocaleString()} color="var(--down)" note={a.stopReason}/>
+                              <AnalysisRow label="利確①" value={a.target.toLocaleString()} color="var(--up)" note={a.targetReason}/>
+                              {rr!=null && <div style={{fontSize:12.5,fontWeight:700,color:"var(--ink)"}}>RR（リスクリワード）　<span className="mono">1 : {rr.toFixed(2)}</span></div>}
+                              {a.tradeRules?.reboundTargetNote && <div style={{color:"var(--inkSoft)",fontSize:11}}>📈 {a.tradeRules.reboundTargetNote}</div>}
+                            </div>;
+                          })()}
+
+                          {/* ===== ここから下は「詳細情報」トグル（既定は折りたたみ）。指示書
+                              COLLAPSE_SECONDARY_INFORMATIONの対象（詳細テクニカル・MA解説・
+                              取得価格の注意書き・52週高値安値・信用残/証金残詳細・ニュース全文・
+                              詳細ファンダ）に加え、Entry Conditionsチェックリスト全項目・
+                              エントリー/利確タイミングの個別チェックリスト・資金管理ツール・
+                              利確②・中期レジスタンス参考等、意思決定カードのvisible_fieldsに
+                              含まれない項目もまとめてここに収納した。データは一切削除しておらず、
+                              開けばこれまで通りすべて確認できる。 ===== */}
+                          <button type="button" onClick={()=>toggleAnalysisDetail(w.code)}
+                            style={{display:"flex",alignItems:"center",gap:4,width:"100%",marginTop:10,padding:"6px 4px",
+                              background:"transparent",border:"none",borderTop:"1px solid var(--ruleSoft)",cursor:"pointer",
+                              fontSize:11.5,fontWeight:700,color:"var(--inkSoft)",textAlign:"left"}}>
+                            {analysisDetailOpen.has(w.code)?"▾ 詳細情報を隠す":"▸ 詳細情報を表示（テクニカル指標・信用残・ニュース全文など）"}
+                          </button>
+                          {analysisDetailOpen.has(w.code) && <div style={{marginTop:6}}>
+                          {enr && <EntryConditionsChecklist a={a} enr={enr}/>}
+                          {a.fullExitTarget!=null && <AnalysisRow label="利確②（全部利確ライン）" value={a.fullExitTarget.toLocaleString()} color="var(--up)" note="+5〜8%到達で100株すべての利確を検討"/>}
                           {SHOW_ANALYSIS_CHECKLISTS && <>
-                          {a.tradeRules?.ptsNote && <div style={{fontSize:11,color:"var(--inkFaint)",marginBottom:8,lineHeight:1.5}}>ℹ️ {a.tradeRules.ptsNote}</div>}
+                          {a.tradeRules?.ptsNote && <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:8,marginBottom:8,lineHeight:1.5}}>ℹ️ {a.tradeRules.ptsNote}</div>}
                           {a.tradeRules && <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:8}}>
                             {a.tradeRules.entryChecklist.filter(c=>c.pass!=null).map(c=>
                               <span key={c.key} className="chip" style={{fontSize:10.5,display:"inline-block",
@@ -7936,46 +8015,6 @@ function App(){
                             {a.signals.sell.map(sig=><div key={sig.key} className="chip" style={{background:"var(--downBg)",borderColor:"var(--down)",color:"var(--down)",marginRight:4,marginBottom:4,display:"inline-block",fontSize:11}}>▼ {sig.label}</div>)}
                           </div>}
                           </>}
-                          {/* v3-4（UI/UX再設計）：「購入単価(目安)」の単一表示をやめ、押し目価格帯・
-                              ブレイク価格・損切り・利確①②・RRの一覧に置き換える。数値の算出元は
-                              既存のa.entry/a.stop/a.target/a.fullExitTarget/indicators.resistance
-                              のまま（サーバー側ロジックは無変更、表示の組み方だけを変更）。 */}
-                          {(()=>{
-                            const resistance=a.indicators?.resistance;
-                            const rr=(a.entry!=null&&a.stop!=null&&a.target!=null&&(a.entry-a.stop)>0)
-                              ?(a.target-a.entry)/(a.entry-a.stop):null;
-                            const Row=({label,value,color,note})=><div>
-                              <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>{label}</div>
-                              <div className="mono" style={{fontSize:20,fontWeight:800,color,lineHeight:1.3}}>{value}</div>
-                              {note && <div style={{color:"var(--inkSoft)",fontSize:11,marginTop:2}}>{note}</div>}
-                            </div>;
-                            // v3-7（押し目エントリー価格帯の見直し）：単一価格ではなくゾーン表示にし、
-                            // 根拠（VWAP付近／直近ブレイク水準／前日高値／当日押し安値／短期支持線／
-                            // ATR補正）を明示する。深すぎる候補しかない場合は数値を出さず定性的な
-                            // 表示にする（server.py analyze_stock()のpullbackEntry、新規計算はサーバー側で
-                            // 完結・フロントは表示するだけ）。旧形式（pullbackEntry無しの古いキャッシュ）
-                            // との後方互換として、無ければ従来のa.entry単一値表示にフォールバックする。
-                            const pb=a.pullbackEntry;
-                            const pullbackRow=(!pb)
-                              ? <Row label="押し目エントリー価格帯" value={a.entry.toLocaleString()} color="var(--ink)" note={a.entryReason}/>
-                              : pb.status==="candidate"
-                                ? <Row label="押し目候補" value={`${pb.zoneLow.toLocaleString()}〜${pb.zoneHigh.toLocaleString()}円`} color="var(--ink)"
-                                    note={`${pb.basis}（${pb.zoneLabel}・現在値比-${pb.deviationPct.toFixed(1)}%）`}/>
-                                : pb.status==="no_candidate"
-                                  ? <Row label="押し目候補" value="押し目候補なし" color="var(--inkFaint)"
-                                      note="強い銘柄のため浅い押し目（0.5〜2.5%）の候補が見当たりません。現在値付近での判断が中心になります。"/>
-                                  : <Row label="押し目候補" value={pb.status==="deep_adjustment"?"深い調整待ち":"トレンド再確認ゾーン"} color="var(--down)"
-                                      note="現在値からの浅い押し目候補（4%以内）が見当たりません。無理に押し目を想定せず、値動きの落ち着きを待つ局面です。"/>;
-                            return <div style={{display:"flex",flexDirection:"column",gap:10}}>
-                              {pullbackRow}
-                              {resistance!=null && <Row label="ブレイク価格" value={`${resistance.toLocaleString()}超`} color="var(--ink)" note="直近レジスタンス（この水準を出来高を伴って上抜けたら高値ブレイクとして扱う）"/>}
-                              <Row label="初期損切り" value={a.stop.toLocaleString()} color="var(--down)" note={a.stopReason}/>
-                              <Row label="利確①" value={a.target.toLocaleString()} color="var(--up)" note={a.targetReason}/>
-                              {a.fullExitTarget!=null && <Row label="利確②（全部利確ライン）" value={a.fullExitTarget.toLocaleString()} color="var(--up)" note="+5〜8%到達で100株すべての利確を検討"/>}
-                              {rr!=null && <div style={{fontSize:12.5,fontWeight:700,color:"var(--ink)"}}>RR（リスクリワード）　<span className="mono">1 : {rr.toFixed(2)}</span></div>}
-                              {a.tradeRules?.reboundTargetNote && <div style={{color:"var(--inkSoft)",fontSize:11}}>📈 {a.tradeRules.reboundTargetNote}</div>}
-                            </div>;
-                          })()}
                           {a.tradeRules?.profitTakingNote && <div style={{fontSize:11,color:"var(--inkSoft)",marginTop:8}}>⚠️ {a.tradeRules.profitTakingNote}</div>}
                           {a.tradeRules?.entryBasisNote && <div style={{fontSize:10.5,color:"var(--inkFaint)",marginTop:6,lineHeight:1.6}}>ℹ️ {a.tradeRules.entryBasisNote}</div>}
                           {a.tradeRules?.timeHorizonNote && <div style={{fontSize:10.5,color:"var(--inkFaint)",marginTop:6,lineHeight:1.6}}>⏱️ {a.tradeRules.timeHorizonNote}</div>}
@@ -7984,7 +8023,7 @@ function App(){
                             5日線 {a.indicators.ma5Daily??"—"}　25日線 {a.indicators.ma25??"—"}　75日線 {a.indicators.ma75??"—"}　100日線 {a.indicators.ma100??"—"}<br/>
                             RSI14 {a.indicators.rsi??"—"}　RCI26 {a.indicators.rci26??"—"}　ATR14 {a.indicators.atr14??"—"}<br/>
                             BB-2σ {a.indicators.bbLower2??"—"}　BB-3σ {a.indicators.bbLower3??"—"}<br/>
-                            直近サポート {a.indicators.support}　直近レジスタンス {a.indicators.resistance}　価格帯別出来高POC {a.indicators.volumeProfilePOC??"—"}<br/>
+                            直近サポート {a.indicators.support}　中期レジスタンス参考（3か月高値） {a.indicators.resistance}　価格帯別出来高POC {a.indicators.volumeProfilePOC??"—"}<br/>
                             {a.tradeRules?.marginRatio!=null && <>信用倍率(貸借倍率) {a.tradeRules.marginRatio}倍
                               {a.tradeRules.marginBadge==="danger" && <span style={{color:"var(--down)",fontWeight:700}}>（厳重注意）</span>}
                               {a.tradeRules.marginBadge==="caution" && <span style={{color:"var(--down)"}}>（慎重）</span>}
@@ -7996,6 +8035,12 @@ function App(){
                               : <>当日の分足データなし（市場時間外の可能性）<br/></>}
                             {a.fundamentalNote}
                           </div>
+                          {!(a.daysToEarnings!=null && a.daysToEarnings>=0 && a.daysToEarnings<=10) &&
+                            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6,
+                              background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"6px 8px",marginTop:10}}>
+                              <span style={{fontSize:11,color:"var(--inkSoft)"}}>決算期待値（自動算出）</span>
+                              <EarningsStars value={a.autoEarningsStars||0}/>
+                            </div>}
                           {/* 2026-08-21 ユーザー要望：立花証券API（e_api_web_access仕様書のCLMMfdsGetIssueDetail・
                               CLMMfdsGetSyoukinZan・CLMMfdsGetShinyouZan・CLMMfdsGetHibuInfo・CLMMfdsGetNewsHead/Body）
                               から取得した銘柄詳細情報・信用残情報・証金残情報・逆日歩情報・ニュースを表示する
@@ -8048,6 +8093,7 @@ function App(){
                                   {n.body && <div style={{color:"var(--inkSoft)",marginTop:2,whiteSpace:"pre-wrap"}}>{n.body}</div>}
                                 </div>)}
                             </div>
+                          </div>}
                           </div>}
                         </div>}
                   </div>;
