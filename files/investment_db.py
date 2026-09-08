@@ -545,6 +545,13 @@ ALTER TABLE investment_profile ADD COLUMN IF NOT EXISTS initial_realized_pnl NUM
 ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS gross_pnl NUMERIC;
 ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS tax NUMERIC;
 ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS net_pnl NUMERIC;
+
+-- 2026-09-08新規（ニュース・材料連携の改善）：news_catalystsに好材料/悪材料/中立の方向性
+-- （sentiment）を追加する。既存のcategory（分類）・importance（重要度）とは別軸で、
+-- 「positive|negative|neutral」のいずれか。既存importで未指定の行はNULL（判定不能）のまま
+-- 残す＝無理にpositive/negativeへ寄せない（ユーザー指定：確信が無ければneutral扱いにする
+-- 判定ロジックはフロント/import時のヘルパー側が担う。ここではNULL可の列を追加するのみ）。
+ALTER TABLE news_catalysts ADD COLUMN IF NOT EXISTS sentiment TEXT;
 """
 
 
@@ -2130,27 +2137,58 @@ def delete_market_event(database_url, user_id, event_id):
 # v3-9続き（2026-09-05・PHASE 4 NEWS/CATALYST INTELLIGENCE）：news_catalysts。market_eventsと
 # 全く同じ「JSON貼り付け→1件ずつupsert」の考え方を踏襲する。catalyst_date・titleが必須キー
 # （UNIQUE制約もこの2つ）、event_date（発効日）は任意。
-_NEWS_CATALYST_COLS = ["event_date", "category", "importance", "summary", "affected_markets",
+_NEWS_CATALYST_COLS = ["event_date", "category", "importance", "sentiment", "summary", "affected_markets",
                         "affected_sectors", "affected_stocks", "source", "source_type",
                         "verification_status", "notes", "raw_payload"]
 _NEWS_CATALYST_JSONB_COLS = {"affected_markets", "affected_sectors", "affected_stocks", "raw_payload"}
+
+# 2026-09-08新規（ニュース・材料連携の改善）：指示書1番の好材料/悪材料キーワードリストに基づく
+# 簡易分類。importがsentimentを明示していない場合のみのフォールバックとして使う（ChatGPT等が
+# 生成した構造化JSONに既にsentimentが入っていればそれを優先し、ここでは上書きしない）。
+# タイトル・本文（summary）の両方を対象に、好材料語・悪材料語のどちらか一方だけがヒットすれば
+# その方向、両方または片方もヒットしなければneutral（指示書9番：確信が無ければneutralとし、
+# 無理にpositive/negativeを決めない）。あくまで簡易ヒューリスティックであり、Primary/Action
+# Status等の売買判定ロジックには一切使わない（参考情報の分類のみ）。
+_CATALYST_POSITIVE_KEYWORDS = [
+    "新製品", "新サービス", "大型受注", "提携", "業務提携", "資本提携", "協業",
+    "事業化", "量産開始", "量産化", "採用決定", "上方修正", "自社株買い", "増配",
+]
+_CATALYST_NEGATIVE_KEYWORDS = [
+    "下方修正", "減配", "不祥事", "事故", "訴訟", "公募増資", "希薄化", "大型売出し", "売出し",
+]
+
+
+def _classify_catalyst_sentiment(title, summary=None):
+    """タイトル・本文からsentiment（positive/negative/neutral）を推定する。判定できない・
+    どちらとも取れる場合はNone（呼び出し側でneutral扱い、または未設定のまま）を返す。"""
+    text = f"{title or ''} {summary or ''}"
+    has_pos = any(kw in text for kw in _CATALYST_POSITIVE_KEYWORDS)
+    has_neg = any(kw in text for kw in _CATALYST_NEGATIVE_KEYWORDS)
+    if has_pos and not has_neg:
+        return "positive"
+    if has_neg and not has_pos:
+        return "negative"
+    return None
 
 
 def _upsert_news_catalyst_conn(conn, user_id, cat):
     """1件のカタリストdictをupsertする。catalyst_date・titleは必須（無ければFalseを返し
     呼び出し側でカウントしない）。categoryは未指定ならOTHER、verification_statusは未指定なら
-    UNVERIFIED（画像由来等を確定情報として扱わない、既定の安全側）。"""
+    UNVERIFIED（画像由来等を確定情報として扱わない、既定の安全側）。sentimentは未指定なら
+    キーワードベースで推定を試み、判定できなければneutralとして保存する（指示書3・9番）。"""
     catalyst_date = cat.get("catalyst_date") or cat.get("date")
     title = cat.get("title")
     if not catalyst_date or not title:
         return False
-    cols = ["catalyst_date", "title"] + [c for c in _NEWS_CATALYST_COLS if c in cat or c in ("category", "verification_status")]
+    cols = ["catalyst_date", "title", "sentiment"] + [c for c in _NEWS_CATALYST_COLS if (c in cat or c in ("category", "verification_status")) and c != "sentiment"]
     values = []
     for c in cols:
         if c == "catalyst_date":
             values.append(catalyst_date)
         elif c == "title":
             values.append(title)
+        elif c == "sentiment":
+            values.append(cat.get("sentiment") or _classify_catalyst_sentiment(title, cat.get("summary")) or "neutral")
         elif c == "category":
             values.append(cat.get("category") or "OTHER")
         elif c == "verification_status":

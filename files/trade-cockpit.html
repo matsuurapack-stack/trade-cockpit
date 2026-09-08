@@ -981,7 +981,7 @@ function EarningsProgressChart({trend,latestDetail}){
 
 // 6-1章：銘柄検索・登録＋セクター別アコーディオン表示（2〜5章の仕様）を市場ごとに再利用するための共通コンポーネント。
 // 日本市場・アメリカ市場タブの両方で、このコンポーネントをそのまま使い回すことで「全く同じ仕様・UI」を担保する。
-function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,watchTargets,onToggleWatch,onOpenChart,metrics,breakoutLevels,analysisData,marketRiskLabel,onAddPosition}){
+function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuotes,analysisTargets,onToggleAnalysis,earningsTargets,onToggleEarnings,watchTargets,onToggleWatch,onOpenChart,metrics,breakoutLevels,analysisData,marketRiskLabel,onAddPosition,newsCatalysts}){
   const [q,setQ]=useState("");
   const [manualSector,setManualSector]=useState(SECTOR_CHOICES[0]);
   const [openSectors,setOpenSectors]=useState(()=>new Set());
@@ -1225,7 +1225,8 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                   <td className="mono" style={{fontWeight:800,fontSize:15,textAlign:"right",paddingLeft:10,color:isJumpTarget?"var(--card)":(enr.rsScore==null?"var(--ink)":enr.rsScore>=75?"var(--up)":enr.rsScore<25?"var(--down)":"var(--ink)")}}>{enr.rsScore!=null?enr.rsScore:"—"}</td>
                   <td className="mono" style={{fontWeight:700,fontSize:13}}>{w.code}</td>
                   <td style={{fontSize:15,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.name}>
-                    {w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}</td>
+                    {w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}
+                    <NewsBadge catalysts={newsCatalysts} code={w.code} sector={w.sector}/></td>
                   <td className="mono" style={{textAlign:"right",fontWeight:700,fontSize:14.5,color:isJumpTarget?"var(--card)":fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
                   <td className="mono" style={{textAlign:"right",fontWeight:600,fontSize:14,color:isJumpTarget?"var(--card)":fg,whiteSpace:"nowrap"}}>{enr.pct!=null?(enr.pct>0?"+":"")+enr.pct.toFixed(2)+"%":"—"}</td>
                   <td className="mono" style={{textAlign:"right",fontSize:13,fontWeight:700,whiteSpace:"nowrap"}}>{enr.marketRS!=null?(enr.marketRS>0?"+":"")+enr.marketRS.toFixed(1):"—"}</td>
@@ -1992,6 +1993,52 @@ function EventRiskNote({events,code,sector,tradeStyle}){
 // v3-9続き（PHASE 4 NEWS/CATALYST INTELLIGENCE）：EventRiskNoteと同じ位置付けで、
 // news_catalysts（マクロ・セクター・銘柄材料等）のうち銘柄コード/セクターに関連する直近の
 // 1件を参考情報として表示する。Primary/Action Statusには一切干渉しない。
+// 2026-09-08新規（ニュース・材料連携の改善）：好材料/悪材料/中立の方向性と、5段階重要度の
+// 表示メタ。既存category（分類軸）・既存market_events等のimportance（HIGH/MEDIUM/LOW、
+// 3段階）とは別軸・別表記のため、両方を吸収できるようMETAにHIGH/MEDIUM/LOWも含めておく
+// （news_catalysts.importanceは自由入力のTEXT列のため、どちらの表記も来得る）。
+const CATALYST_SENTIMENT_META={
+  positive:{icon:"🟢",sign:"＋",label:"好材料",color:"var(--up)"},
+  negative:{icon:"🔴",sign:"－",label:"悪材料",color:"var(--down)"},
+  neutral:{icon:"🔵",sign:"N",label:"中立",color:"var(--inkSoft)"},
+};
+const CATALYST_IMPORTANCE_META={
+  low:{label:"低",weight:1},medium:{label:"中",weight:2},medium_high:{label:"中高",weight:3},
+  high:{label:"高",weight:4},very_high:{label:"最重要",weight:5},
+  HIGH:{label:"高",weight:4},MEDIUM:{label:"中",weight:2},LOW:{label:"低",weight:1},
+};
+const catalystImportanceWeight=(imp)=>CATALYST_IMPORTANCE_META[imp]?.weight??0;
+// 過去の日付から「何営業日前か」を返す（土日のみ除外、祝日は簡易版として考慮しない）。
+// 当日・未来は0とする（businessDaysUntil()は未来向け、こちらは過去向けの対の関数）。
+function businessDaysAgo(dateStr){
+  if(!dateStr)return null;
+  const target=new Date(dateStr+"T00:00:00+09:00");
+  if(isNaN(target.getTime()))return null;
+  const today=new Date();
+  const todayJst=new Date(today.getFullYear(),today.getMonth(),today.getDate());
+  const targetJst=new Date(target.getFullYear(),target.getMonth(),target.getDate());
+  const diffDays=Math.round((todayJst-targetJst)/86400000);
+  if(diffDays<=0)return 0;
+  let businessDays=0,cursor=new Date(targetJst);
+  for(let i=0;i<diffDays;i++){
+    cursor=new Date(cursor.getTime()+86400000);
+    const dow=cursor.getDay();
+    if(dow!==0&&dow!==6)businessDays++;
+  }
+  return businessDays;
+}
+// 銘柄コード・セクターに関連するカタリスト「全件」（新しい順）。nextCatalystForCode()は
+// 表示用に最も参考にすべき1件だけを返す設計だったため、一覧の行バッジ（複数件・件数表示・
+// 鮮度別強調）用にこちらを別途用意する（既存のマッチング条件＝affected_stocks/
+// affected_sectorsはnextCatalystForCode()と同じものを再利用し、判定ロジックを重複させない）。
+function catalystsForCode(catalysts,code,sector){
+  if(!catalysts||!catalysts.length)return[];
+  return catalysts.filter(c=>{
+    const stocks=c.affected_stocks||[];
+    const sectors=c.affected_sectors||[];
+    return stocks.includes(code)||(sector&&sectors.includes(sector));
+  }).sort((a,b)=>(b.catalyst_date||"").localeCompare(a.catalyst_date||""));
+}
 function CatalystNote({catalysts,code,sector}){
   const c=useMemo(()=>nextCatalystForCode(catalysts,code,sector),[catalysts,code,sector]);
   if(!c)return null;
@@ -1999,7 +2046,8 @@ function CatalystNote({catalysts,code,sector}){
   const fresh=catalystFreshnessLabel(c.catalyst_date);
   const todayStr=todayISO();
   const pending=c.event_date&&c.event_date>=todayStr;
-  const importanceHot=c.importance==="HIGH"||c.importance==="高";
+  const importanceHot=catalystImportanceWeight(c.importance)>=4; // high/very_high、または既存HIGH
+  const sentMeta=CATALYST_SENTIMENT_META[c.sentiment]||null; // sentiment未設定（旧データ）ならアイコンを出さない
   let dateNote;
   if(pending){
     const days=businessDaysUntil(c.event_date);
@@ -2010,12 +2058,49 @@ function CatalystNote({catalysts,code,sector}){
   return <div style={{fontSize:11,color:importanceHot?"var(--down)":"var(--inkSoft)",
       background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"4px 8px",marginBottom:8}}
     title={`情報源：${c.source||"—"}／検証状態：${c.verification_status}（画像由来の情報は確定情報として扱わない）`}>
-    {icon} {c.title}（{dateNote}）
+    {icon} {sentMeta&&<span title={sentMeta.label}>{sentMeta.icon}</span>} {c.title}（{dateNote}）
     {importanceHot&&" ⚠重要度高"}
     {c.verification_status==="UNVERIFIED"&&" （未検証）"}
     {c.verification_status==="IMAGE_DERIVED"&&" （画像由来・要確認）"}
     {c.summary&&<div style={{marginTop:2,color:"var(--inkFaint)"}}>{c.summary}</div>}
   </div>;
+}
+// 2026-09-08新規（指示書5・6・7番）：監視銘柄・日本市場一覧の行に付ける小さなニュースマーク。
+// 好材料=🟢＋／悪材料=🔴－／重要ニュース（重要度high以上でsentimentが中立）=🟡！／
+// 通常ニュース=🔵N。同日に複数あれば件数を添える（例：🟢＋2）。ホバー（title属性、既存の
+// EventRiskNote/CatalystNote等と同じ最小限のツールチップ方式）で見出し・日付・重要度・
+// 出典・要約を表示する。鮮度：当日=強調（不透明度1・太字）／1営業日前=やや弱／
+// 2〜3営業日前=小さく／それ以前は原則非表示（ニュース履歴自体はnews_catalystsに残り続け、
+// CatalystsPanelの一覧やCatalystNoteの「やや古い情報」表示からは引き続き参照できる）。
+function NewsBadge({catalysts,code,sector}){
+  const items=useMemo(()=>catalystsForCode(catalysts,code,sector),[catalysts,code,sector]);
+  if(!items.length)return null;
+  const freshest=items[0];
+  const bdAgo=businessDaysAgo(freshest.catalyst_date);
+  const todayStr=todayISO();
+  const anyPending=items.some(c=>c.event_date&&c.event_date>=todayStr);
+  if(bdAgo==null||(bdAgo>3&&!anyPending))return null; // 指示書7番：2〜3営業日超は一覧の強調を解除
+  const sameDay=items.filter(c=>c.catalyst_date===freshest.catalyst_date);
+  const hasVeryImportant=items.some(c=>catalystImportanceWeight(c.importance)>=4);
+  let sentiment=freshest.sentiment||"neutral";
+  if(sameDay.some(c=>(c.sentiment||"neutral")==="negative"))sentiment="negative";
+  else if(sameDay.some(c=>(c.sentiment||"neutral")==="positive"))sentiment="positive";
+  const meta=CATALYST_SENTIMENT_META[sentiment]||CATALYST_SENTIMENT_META.neutral;
+  const showImportantMark=hasVeryImportant&&sentiment==="neutral";
+  const icon=showImportantMark?"🟡":meta.icon;
+  const sign=showImportantMark?"！":meta.sign;
+  const count=sameDay.length;
+  const opacity=bdAgo<=0?1:bdAgo===1?0.85:0.6;
+  const fontSize=bdAgo<=0?12:bdAgo===1?11.5:10.5;
+  const fontWeight=bdAgo<=0?800:600;
+  const titleAttr=items.slice(0,3).map(c=>{
+    const m=CATALYST_SENTIMENT_META[c.sentiment||"neutral"];
+    const imp=CATALYST_IMPORTANCE_META[c.importance]?.label||c.importance||"—";
+    return `${m.icon}${c.title}／${c.catalyst_date}／重要度:${imp}／出典:${c.source||"—"}${c.summary?`／${c.summary}`:""}`;
+  }).join("\n");
+  return <span style={{fontSize,fontWeight,color:showImportantMark?"var(--accent)":meta.color,opacity,marginLeft:4,cursor:"help",whiteSpace:"nowrap"}} title={titleAttr}>
+    {icon}{sign}{count>1?count:""}
+  </span>;
 }
 
 // v3-9続き（PHASE 5 EXPERT INTELLIGENCE）：見通し（outlook）・根拠（thesis）・確認条件・
@@ -2752,7 +2837,7 @@ function rankTop5(enriched,stockQuotes){
     .slice(0,5);
 }
 
-function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan}){
+function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan,newsCatalysts}){
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
 
@@ -3343,7 +3428,8 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
               </td>
               <td className="mono" style={{fontWeight:800,fontSize:15,textAlign:"right",paddingLeft:10,color:rsFg}}>{w.rsScore!=null?w.rsScore:"—"}</td>
               <td className="mono" style={{fontWeight:700,fontSize:13}}>{w.code}</td>
-              <td style={{fontSize:15,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.name}>{w.name}</td>
+              <td style={{fontSize:15,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.name}>{w.name}
+                <NewsBadge catalysts={newsCatalysts} code={w.code} sector={w.sector}/></td>
               <td style={{fontSize:13,color:"var(--inkSoft)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.sector||""}>{w.sector||"—"}</td>
               <td className="mono" style={{textAlign:"right",fontWeight:700,fontSize:14.5,color:fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
               <td className="mono" style={{textAlign:"right",fontWeight:600,fontSize:14,color:fg,whiteSpace:"nowrap"}}
@@ -7066,6 +7152,19 @@ function App(){
   // （a）と現在値をそのままJSONにまとめる。current（現在値）とentry（押し目エントリー価格帯＝
   // 理論値）を明確に別キーで分け、混同しないようnoteを添える。新規のサーバー計算は追加しない。
   const [analysisConsultMsg,setAnalysisConsultMsg]=useState("");
+  // 2026-09-08新規（ニュース・材料連携の改善、指示書10番）：直近の重要材料（news_catalysts）を
+  // 銘柄分析の相談用ペイロードに添える。既存のcatalystsForCode()（行バッジと同じマッチング
+  // ロジック）をそのまま再利用し、判定を重複実装しない。catalyst_dateは日付のみ（時刻を
+  // 保持しない）ため、age_hoursはその日のJST 0時からの経過時間という近似値になる点に注意。
+  const recentCatalystsForConsult=(code,sector,maxCount=5)=>{
+    const items=catalystsForCode(newsCatalysts,code,sector).slice(0,maxCount);
+    const nowMs=Date.now();
+    return items.map(c=>{
+      const baseMs=new Date(c.catalyst_date+"T00:00:00+09:00").getTime();
+      const ageHours=isNaN(baseMs)?null:Math.round(((nowMs-baseMs)/3600000)*10)/10;
+      return {sentiment:c.sentiment||"neutral",importance:c.importance||null,age_hours:ageHours,title:c.title};
+    });
+  };
   const copyAnalysisConsult=async(w,a)=>{
     const grade=gradeFromAnalysis(a);
     const strategy=classifyEntryStrategy(a);
@@ -7082,6 +7181,7 @@ function App(){
         volume:num(s.stockQuotes[w.code]?.volume)},
       margin:{ratio:a.tradeRules?.marginRatio??null,badge:a.tradeRules?.marginBadge??null},
       market_environment:a.marketEnv||null,
+      recent_catalysts:recentCatalystsForConsult(w.code,w.sector),
       comment:[a.entryReason,a.stopReason,a.targetReason].filter(Boolean),
     },setAnalysisConsultMsg);
   };
@@ -7428,7 +7528,7 @@ function App(){
       </div>}
 
       {/* ===== 監視銘柄（2026-08-21 ユーザー要望） ===== */}
-      {tab==="watch" && <WatchTargetsPanel items={watchTargetItems} stockQuotes={s.stockQuotes}
+      {tab==="watch" && <WatchTargetsPanel items={watchTargetItems} stockQuotes={s.stockQuotes} newsCatalysts={newsCatalysts}
         analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget} onOpenAnalysis={openAnalysisFor}
         earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
         onRemove={removeWatchTarget} metrics={s.metrics} watchlistAll={watchlistAll} breakoutLevels={s.breakoutLevels}
@@ -7457,7 +7557,7 @@ function App(){
           watchTargets={s.watchTargets} onToggleWatch={toggleWatchTarget}
           metrics={s.metrics} breakoutLevels={s.breakoutLevels} analysisData={s.analysisData} marketRiskLabel={s.marketRisk?.marketRiskLabel}
           onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}
-          onAddPosition={w=>setSectorPositionEntryFor({code:w.code,name:w.name,market:w.market})}/>
+          onAddPosition={w=>setSectorPositionEntryFor({code:w.code,name:w.name,market:w.market})} newsCatalysts={newsCatalysts}/>
         <p className="foot">※ ニュースはGoogleニュースRSSを利用しています。売買を推奨するものではなく、最終判断はご自身で。</p>
       </div>}
 
@@ -7475,7 +7575,7 @@ function App(){
           watchTargets={s.watchTargets} onToggleWatch={toggleWatchTarget}
           metrics={s.metrics} breakoutLevels={s.breakoutLevels} analysisData={s.analysisData} marketRiskLabel={s.marketRisk?.marketRiskLabel}
           onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}
-          onAddPosition={w=>setSectorPositionEntryFor({code:w.code,name:w.name,market:w.market})}/>
+          onAddPosition={w=>setSectorPositionEntryFor({code:w.code,name:w.name,market:w.market})} newsCatalysts={newsCatalysts}/>
         <p className="foot" style={{marginTop:16}}>※ 対象は現行のダウ工業株30種平均構成銘柄。業種分類は日本市場と同じ東証33業種の枠組みで統一しています（GICSセクターではありません）。アメリカ市場銘柄のニュース・決算・IRは「ニュース」タブのサマリー・海外市況・適時開示に統合表示しています。</p>
       </div>}
 
