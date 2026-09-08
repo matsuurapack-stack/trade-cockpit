@@ -716,6 +716,12 @@ const METRICS = [
   {key:"wti",label:"WTI原油",dp:2,tv:"OANDA:WTICOUSD",tvEmbed:true},
   {key:"gold",label:"金(Gold)",dp:1,tv:"OANDA:XAUUSD",tvEmbed:true},
   {key:"copper",label:"銅(Copper)",dp:3,tv:"CAPITALCOM:COPPER",tvEmbed:false},
+  // 2026-09-08新規（後場レビューJSON対応：SECTOR_RELATIVE_STRENGTH/SECTOR_REGIME）。
+  // 半導体セクターの実勢を測る代表ETF（200A＝NEXT FUNDS 日経半導体35 ETF、東証上場）。
+  // 既存のINDEX/get_index_quotes()パイプラインで日経平均等と全く同じ扱いで取得される
+  // （server.py側にnikkei_semiとして追加済み）。TSE上場のためTradingView無料埋め込みは
+  // 日本個別株と同じ制限で不可（embeddable()がTSE:を弾く既存仕様通り、tvEmbed:false）。
+  {key:"nikkei_semi",label:"日経半導体ETF(200A)",dp:0,tv:"TSE:200A",tvEmbed:false},
 ];
 const wOrder = {"優先":0,"通常":1,"様子見":2};
 
@@ -745,6 +751,11 @@ const emptyState=()=>({
   breakoutLevelsFetchedDate:"", // 上記が今日すでに計算済みかの判定用
   marketRisk:null, // Trade Cockpit v2 Phase3：TODAY'S MARKET用のMarket Risk Score等（{text,marketRiskScore,marketRiskLabel,marketCondition}）。1日1回計算。
   marketRiskFetchedDate:"", // 上記が今日すでに計算済みかの判定用
+  // 2026-09-08新規（後場レビューJSON対応：MORNING_TO_AFTERNOON_REGIME_CHANGE）：
+  // 当日最初に取得できたセクターレジーム（/api/sector-regime）のスナップショット。
+  // {date, regimes:{nikkei_semi:{regime,...}}}の形。「翌朝へ」でも他の当日限定キャッシュと
+  // 同様にリセットされる（emptyState()の初期値に戻る）。
+  morningSectorRegime:null,
   stockNameNewsList:[], usStockNameNewsList:[], // ニュースタブ「登録銘柄」サブタブ：IR以外も含む社名一致ニュース
   disclosureNewsList:[], usDisclosureNewsList:[], // ニュースタブ「適時開示」サブタブ：当日含む直近10日分・種類問わず全件
   analysisTargets:[], // analysisTargets: 5章「分析」ボタンで追加した銘柄コード一覧（12章の分析タブで使用）
@@ -1214,7 +1225,10 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                 const actionMeta=ACTION_STATUS_META[enr.actionStatus];
                 const reasonList=enr.actionStatus==="RISK"?enr.riskReasons.map(r=>RISK_REASON_META[r])
                   :enr.actionStatus==="WAIT"?enr.waitReasons.map(r=>WAIT_REASON_META[r]):[];
-                const statusTitle=[meta.label,actionMeta.label,reasonList.join("・")].filter(Boolean).join(" / ");
+                const themeRS=themeRelativeStrength(w,stockQuotes,metrics); // 参考情報のみ、Status判定には使わない
+                const statusTitle=[meta.label,actionMeta.label,reasonList.join("・"),
+                  themeRS&&`テーマ相対強弱 ${themeRS.relPts>0?"+":""}${themeRS.relPts.toFixed(2)}pt（対${METRICS.find(m=>m.key===themeRS.proxyKey)?.label||themeRS.proxyKey}）`]
+                  .filter(Boolean).join(" / ");
                 return <tr key={w.id} ref={el=>{rowRefs.current[w.code]=el;}} className="watch-row"
                   style={{borderTop:"1px solid var(--ruleSoft)",background:isJumpTarget?"var(--accent)":"transparent",
                     color:isJumpTarget?"var(--card)":"var(--ink)",transition:"background 0.4s, color 0.4s"}}>
@@ -1272,6 +1286,33 @@ function calcRsScore(pct,marketPct,sectorAvg){
   const raw=(marketRS||0)*3+(sectorRS||0)*3;
   const rsScore=Math.max(0,Math.min(100,Math.round(50+raw)));
   return {marketRS,sectorRS,rsScore};
+}
+
+// 2026-09-08新規（ユーザーの後場レビューJSON、app_improvement_requests
+// 「SECTOR_RELATIVE_STRENGTH」対応）：既存sectorRS（対セクター＝自分のwatchlist内の同業種
+// 平均との差）は東証33業種の粒度で、半導体材料株（例：JX金属＝非鉄金属）のような
+// テーマ横断の関連性までは拾えない。既存の`theme`欄（「＋テーマ」で自由入力済み、新規データ
+// 追加なし）にキーワードが含まれる銘柄だけ、対応するセクター代表ETF（現状は半導体＝
+// 200A、server.pyのSECTOR_PROXY_METRICSと対）との相対強弱を追加で計算する。
+// calcRsScore/rsScore/Primary・Action Statusには一切混ぜない（既存の売買判定ロジックは
+// 無変更、あくまで参考情報としてtitleツールチップ等に表示するだけ）。
+const THEME_PROXY_METRIC={"半導体":"nikkei_semi"};
+function themeProxyKeyFor(theme){
+  if(!theme)return null;
+  for(const k in THEME_PROXY_METRIC){if(theme.includes(k))return THEME_PROXY_METRIC[k];}
+  return null;
+}
+function themeRelativeStrength(w,stockQuotes,metrics){
+  const proxyKey=themeProxyKeyFor(w?.theme);
+  if(!proxyKey)return null;
+  const qt=stockQuotes[w.code]||{};
+  const ct=num(qt.t),cp=num(qt.p);
+  const pct=(ct!=null&&cp!=null&&cp)?(ct-cp)/cp*100:null;
+  const m=metrics?.[proxyKey];
+  const mt=m?num(m.t):null,mp=m?num(m.p):null;
+  const proxyPct=(mt!=null&&mp!=null&&mp)?(mt-mp)/mp*100:null;
+  if(pct==null||proxyPct==null)return null;
+  return {pct,proxyPct,relPts:pct-proxyPct,proxyKey};
 }
 
 // Trade Cockpit v3-3 Step4（UI統一）：Status/BREAK判定ロジックを共通関数化。元はWatchTargetsPanel
@@ -3379,7 +3420,10 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
             const actionMeta=ACTION_STATUS_META[w.actionStatus];
             const reasonList=w.actionStatus==="RISK"?w.riskReasons.map(r=>RISK_REASON_META[r])
               :w.actionStatus==="WAIT"?w.waitReasons.map(r=>WAIT_REASON_META[r]):[];
-            const statusTitle=[meta.label,actionMeta.label,reasonList.join("・")].filter(Boolean).join(" / ");
+            const themeRS=themeRelativeStrength(w,stockQuotes,metrics); // 参考情報のみ、Status判定には使わない
+            const statusTitle=[meta.label,actionMeta.label,reasonList.join("・"),
+              themeRS&&`テーマ相対強弱 ${themeRS.relPts>0?"+":""}${themeRS.relPts.toFixed(2)}pt（対${METRICS.find(m=>m.key===themeRS.proxyKey)?.label||themeRS.proxyKey}）`]
+              .filter(Boolean).join(" / ");
             return <tr key={w.code} className="watch-row" style={{borderTop:"1px solid var(--ruleSoft)"}}>
               <td style={{whiteSpace:"nowrap",overflow:"hidden",borderLeft:`3px solid ${meta.color}`,paddingRight:10}} title={statusTitle}>
                 <div style={{fontWeight:700,fontSize:11.5,color:meta.color,whiteSpace:"nowrap"}}>{meta.icon} {meta.label}</div>
@@ -6063,7 +6107,7 @@ function MarketEnvironmentBanner({metrics,watchlistAll,stockQuotes,top5}){
 // 重い処理（3か月分の日足取得×4指数）のため1日1回だけ自動取得し、以降は手動更新ボタンに委ねる
 // （breakoutLevelsと同じキャッシュパターン）。日経/NASDAQ/SOX/US10Yの数値自体は既存のmetrics
 // （30秒おきに自動更新済み）をそのまま使うため追加リクエストは発生しない。
-function TodaysMarketCard({metrics,watchlistAll,stockQuotes,marketRisk,onRefresh,refreshing,activeRules,importantNews}){
+function TodaysMarketCard({metrics,watchlistAll,stockQuotes,marketRisk,onRefresh,refreshing,activeRules,importantNews,sectorRegimes,morningSectorRegime,onRefreshSectorRegime,sectorRegimeFetching}){
   const pctOfMetric=(key)=>{const m=metrics[key];if(!m)return null;const t=num(m.t),p=num(m.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
   const marketPct=pctOfMetric("nikkei");
@@ -6155,6 +6199,26 @@ function TodaysMarketCard({metrics,watchlistAll,stockQuotes,marketRisk,onRefresh
               {pct!=null && <span className="mono" style={{color:pct>0?"var(--up)":pct<0?"var(--down)":"var(--inkSoft)"}}>{pct>0?"+":""}{pct.toFixed(2)}%</span>}
             </div>;})}
         </div>
+        {/* 2026-09-08新規（後場レビューJSON対応：SECTOR_REGIME・MORNING_TO_AFTERNOON_REGIME_CHANGE）。
+            対象はSECTOR_PROXY_METRICS（現状は半導体ETF200Aのみ）。RISK_ON/MIXED/RISK_OFFの
+            現在値と、当日最初に取得できた「朝のシナリオ」からの変化を表示する。Primary/Action
+            Statusには一切干渉しない参考情報。 */}
+        {Object.entries(sectorRegimes||{}).map(([key,r])=>{
+          const metaLabel=METRICS.find(m=>m.key===key)?.label||key;
+          const regimeMeta={RISK_ON:{icon:"🟢",color:"var(--up)"},MIXED:{icon:"🟡",color:"var(--accent)"},RISK_OFF:{icon:"🔴",color:"var(--down)"}}[r.regime]||{icon:"⚪",color:"var(--inkSoft)"};
+          const morning=morningSectorRegime?.regimes?.[key];
+          const regimeChanged=morning&&morning.regime!==r.regime;
+          const worsened=regimeChanged&&(
+            (morning.regime==="RISK_ON"&&(r.regime==="MIXED"||r.regime==="RISK_OFF"))||
+            (morning.regime==="MIXED"&&r.regime==="RISK_OFF"));
+          return <div key={key} style={{marginTop:8,fontSize:12}}>
+            <span style={{color:"var(--inkSoft)"}}>{metaLabel} セクターレジーム：</span>{" "}
+            <span style={{fontWeight:700,color:regimeMeta.color}} title={`現在値${r.current}／VWAP${r.vwap}（${r.aboveVwap?"VWAP上":"VWAP下"}）`}>{regimeMeta.icon} {r.regime}</span>
+            {worsened && <span style={{marginLeft:8,fontWeight:700,color:"var(--down)"}}>
+              ⚠️ 朝のシナリオが無効化されました（朝：{morning.regime}→現在：{r.regime}）
+            </span>}
+          </div>;
+        })}
         <div style={{display:"flex",gap:24,flexWrap:"wrap",marginTop:10}}>
           {strongSectors.length>0 && <div style={{fontSize:12}}>
             <span style={{color:"var(--inkSoft)"}}>強いセクター：</span>
@@ -6431,6 +6495,37 @@ function App(){
   };
   useEffect(()=>{
     if(s.marketRiskFetchedDate!==todayISO())fetchMarketRisk();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
+
+  // 2026-09-08新規（後場レビューJSON対応：SECTOR_REGIME・MORNING_TO_AFTERNOON_REGIME_CHANGE）。
+  // SECTOR_PROXY_METRICS（現状は半導体ETF200Aのみ、server.py参照）のRISK_ON/MIXED/RISK_OFFを
+  // 取得する。marketRiskとは異なり日中に変化し得るため1日1回ではなく数分おきに再取得する
+  // （ただし全市場スキャンではなく対象ETF数件のみの軽い処理）。当日最初に取得できた結果を
+  // 「朝のシナリオ」としてs.morningSectorRegimeへ保存し（既に当日分があれば上書きしない）、
+  // 以後の取得結果と比較して悪化していれば画面側で警告表示に使う。
+  const [sectorRegimes,setSectorRegimes]=useState({});
+  const [sectorRegimeFetching,setSectorRegimeFetching]=useState(false);
+  const fetchSectorRegime=async()=>{
+    setSectorRegimeFetching(true);
+    try{
+      const r=await fetch("/api/sector-regime");
+      if(r.ok){
+        const d=await r.json();
+        const regimes=d.regimes||{};
+        setSectorRegimes(regimes);
+        if(Object.keys(regimes).length){
+          setS(p=>p.morningSectorRegime?.date===todayISO()?p
+            :{...p,morningSectorRegime:{date:todayISO(),regimes}});
+        }
+      }
+    }catch(e){}
+    setSectorRegimeFetching(false);
+  };
+  useEffect(()=>{
+    fetchSectorRegime();
+    const id=setInterval(fetchSectorRegime,5*60*1000); // 5分おき（対象はETF数件のみの軽い処理のため）
+    return ()=>clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
 
@@ -7453,7 +7548,8 @@ function App(){
         <div className="sec-note" style={{marginTop:-4,marginBottom:14}}>項目をクリックするとリアルタイムチャートが下に開きます。</div>
         <TodaysMarketCard metrics={s.metrics} watchlistAll={watchlistAll} stockQuotes={s.stockQuotes}
           marketRisk={s.marketRisk} onRefresh={fetchMarketRisk} refreshing={marketRiskFetching}
-          activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)} importantNews={importantNewsAll}/>
+          activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)} importantNews={importantNewsAll}
+          sectorRegimes={sectorRegimes} morningSectorRegime={s.morningSectorRegime} onRefreshSectorRegime={fetchSectorRegime} sectorRegimeFetching={sectorRegimeFetching}/>
         <ThemeSectorRanking watchlistAll={watchlistAll} stockQuotes={s.stockQuotes} metrics={s.metrics}/>
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:1,background:"var(--rule)",border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden"}}>
           {METRICS.map(m=>{const v=s.metrics[m.key];const t=num(v.t),p=num(v.p);

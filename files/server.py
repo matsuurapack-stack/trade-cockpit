@@ -142,6 +142,12 @@ INDEX = {
     "sp500": "^GSPC", "kospi": "^KS11",
     "nikkei_fut": "NIY=F", "dow_fut": "YM=F",
     "wti": "CL=F", "gold": "GC=F", "copper": "HG=F",
+    # 2026-09-08新規（ニュース・材料連携改善の続き：ユーザーの後場レビューJSON、
+    # app_improvement_requests「SECTOR_RELATIVE_STRENGTH」対応）：日経平均・TOPIXだけでなく
+    # 半導体セクターの実勢を測る代表ETF（200A＝NEXT FUNDS 日経半導体35 ETF、東証上場）を
+    # 既存のINDEX/get_index_quotes()パイプラインにそのまま追加するだけで、新しい取得経路は
+    # 作らない（/api/quotesが自動的にこの値も返すようになる）。
+    "nikkei_semi": "200A.T",
 }
 
 
@@ -1427,6 +1433,52 @@ def _fetch_intraday(tk, interval):
         return {"closes": closes, "highs": highs, "lows": lows, "volumes": volumes}
     except Exception:
         return None
+
+
+# 2026-09-08新規（ユーザーの後場レビューJSON、app_improvement_requests「SECTOR_REGIME」対応）：
+# セクター代表ETF（現状は半導体＝200A.Tのみ）の当日値動きから、RISK_ON/MIXED/RISK_OFFの
+# 簡易レジームを判定する。既存の_fetch_intraday()（5分足チャート等で既に使っている取得関数）を
+# そのまま再利用し、新しい分足取得経路は作らない。VWAP（出来高加重平均価格）に対する現在値の
+# 位置と、直近半分・前半分の高値/安値比較（切り上げ/切り下げ）だけで判定する単純なルールベース
+# （AI不使用、他のAUTO系エンジンと同じ方針）。データ不足・取得失敗時はNoneを返す（推測値は
+# 作らない）。
+def _intraday_regime(symbol, interval="5m"):
+    if yf is None:
+        return None
+    try:
+        tk = yf.Ticker(symbol)
+        bars = _fetch_intraday(tk, interval)
+        if not bars or len(bars["closes"]) < 6:
+            return None
+        closes, highs, lows, volumes = bars["closes"], bars["highs"], bars["lows"], bars["volumes"]
+        total_vol = sum(volumes)
+        vwap = (sum(c * v for c, v in zip(closes, volumes)) / total_vol) if total_vol > 0 else (sum(closes) / len(closes))
+        current = closes[-1]
+        above_vwap = current >= vwap
+        mid = len(highs) // 2
+        first_half_high = max(highs[:mid]) if mid > 0 else highs[0]
+        second_half_high = max(highs[mid:])
+        first_half_low = min(lows[:mid]) if mid > 0 else lows[0]
+        second_half_low = min(lows[mid:])
+        higher_highs = second_half_high > first_half_high
+        lower_lows = second_half_low < first_half_low
+        if above_vwap and higher_highs and not lower_lows:
+            regime, pattern = "RISK_ON", "higher_highs"
+        elif (not above_vwap) and lower_lows:
+            regime, pattern = "RISK_OFF", "lower_lows"
+        else:
+            regime, pattern = "MIXED", "mixed"
+        return {"current": round(current, 2), "vwap": round(vwap, 2), "aboveVwap": above_vwap,
+                "regime": regime, "pattern": pattern}
+    except Exception as e:
+        print("  セクターレジーム判定失敗", symbol, e)
+        return None
+
+
+# セクター代表ETF・関連するAUTO_RS拡張（テーマ相対強弱）で使う一覧。半導体のみ先行実装
+# （ユーザーの後場レビューJSONで実際に検証された組み合わせ）。今後テーマが増えたらここに
+# 追加するだけで、GET /api/sector-regime・フロント側THEME_PROXY_METRICの両方に反映される。
+SECTOR_PROXY_METRICS = {"nikkei_semi": "200A.T"}
 
 
 # 2026-09-07新規（ポジション→リアルタイム売却判断画面 Phase2）：5分足チャート専用の取得関数。
@@ -4842,6 +4894,17 @@ class Handler(SimpleHTTPRequestHandler):
                 "marketRiskScore": env.get("marketRiskScore"), "marketRiskLabel": env.get("marketRiskLabel"),
                 "marketCondition": env.get("marketCondition"),
             })
+        elif self.path.startswith("/api/sector-regime"):
+            # 2026-09-08新規（後場レビューJSON対応：SECTOR_REGIME）。SECTOR_PROXY_METRICSの
+            # 各ティッカーについて_intraday_regime()を実行するだけ（新規の重い全市場スキャンは
+            # 増やしていない、対象はセクター代表ETF数件のみ）。フロント側は市場時間中に
+            # 数分おき、または手動更新で呼ぶ想定。
+            regimes = {}
+            for key, sym in SECTOR_PROXY_METRICS.items():
+                r = _intraday_regime(sym)
+                if r:
+                    regimes[key] = r
+            self._send_json({"regimes": regimes})
         elif self.path.startswith("/api/momentum-scan"):
             # v3-9：🐒 MOMENTUM DAY。「リアルタイムデータを反映」ボタンと同じ設計思想で、
             # ユーザーが明示的にクリックしたときだけ実行する（ページ表示のたびに自動実行はしない。
