@@ -329,6 +329,39 @@ const todayISO = () => { const d = new Date(); return `${d.getFullYear()}-${Stri
 // バグが複数箇所にあった（イベント・カタリスト・有識者見解の「今日」判定）。todayISO()と
 // このaddDaysISO()に統一する。
 const addDaysISO = (days) => { const d = new Date(); d.setDate(d.getDate()+days); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; };
+
+// 2026-09-08新規（トレード分析画面のリアルタイム性改善）：銘柄分析・現在値・市場指標の
+// 「鮮度（いつ取得した値か）」を判定・表示するための共通ヘルパー。ISO日時文字列（new Date().
+// toISOString()）を受け取り、(1)当日でなければ問答無用でSTALE、(2)当日でも指定分数を超えたら
+// STALE、(3)それ以内なら「LIVE」または「n分遅延」を返す。分析結果・現在値・市場指標のいずれも
+// 同じ基準で判定できるよう共通化する（個別に閾値判定ロジックを重複させない）。
+const ANALYSIS_STALE_MINUTES = 15; // 銘柄分析結果：この分数を超えたら陳腐化とみなし自動再取得を試みる
+const QUOTE_STALE_MINUTES = 10; // 現在値：日次モニターが30秒おきに自動更新しているため、これより古ければ何らかの理由で更新が止まっている
+const MARKET_STALE_MINUTES = 15; // 市場指標（日経・ドル円等の分析開始時サマリー表示用）
+const isStaleFetchedAt = (iso, staleMinutes) => {
+  if (!iso) return true;
+  const t = new Date(iso).getTime();
+  if (isNaN(t)) return true;
+  return (Date.now() - t) / 60000 > staleMinutes;
+};
+const freshnessInfo = (iso, staleMinutes) => {
+  if (!iso) return { text: "未取得", level: "stale" };
+  const d = new Date(iso);
+  if (isNaN(d)) return { text: "未取得", level: "stale" };
+  const sameDay = todayISO() === `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+  const hhmm = `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
+  const hhmmss = `${hhmm}:${String(d.getSeconds()).padStart(2,"0")}`;
+  if (!sameDay) return { text: `STALE（${d.getMonth()+1}/${d.getDate()} ${hhmm}取得）`, level: "stale" };
+  const ageMin = (Date.now() - d.getTime()) / 60000;
+  if (ageMin <= 1) return { text: `LIVE ${hhmmss}`, level: "live" };
+  if (ageMin <= staleMinutes) return { text: `${Math.round(ageMin)}分遅延（${hhmm}取得）`, level: "delayed" };
+  return { text: `STALE（${hhmm}取得）`, level: "stale" };
+};
+const FRESHNESS_COLOR = { live: "var(--up)", delayed: "var(--inkSoft)", stale: "var(--down)" };
+function FreshnessBadge({ iso, staleMinutes, title }) {
+  const info = freshnessInfo(iso, staleMinutes);
+  return <span className="mono" style={{ fontSize: 10.5, color: FRESHNESS_COLOR[info.level], marginLeft: 8 }} title={title}>{info.text}</span>;
+}
 const WD = ["日","月","火","水","木","金","土"];
 const MAX = 300;
 const KEY = "trade-cockpit-v1";
@@ -704,6 +737,7 @@ const DEFAULT_MY_RULES=[
 ];
 const emptyState=()=>({
   date:todayISO(), watchlist:DEFAULT_WATCHLIST, watchlistUS:DEFAULT_WATCHLIST_US, metrics:emptyMetrics(),
+  metricsFetchedAt:null, // 2026-09-08新規：s.metrics（日経平均・ドル円等）を最後に取り直したISO日時。銘柄分析の鮮度表示に使う。
   stockNews:"",marketNews:"", // 旧フロント・バックアップ互換のためのテキスト版ニュース（7章で市況メモ等のUIは削除済み、フィールドのみ残置）
   stockNewsList:[], macroNewsList:[], macroNewsDomestic:[], macroNewsOverseas:[], usStockNewsList:[], stockQuotes:{},
   usQuotesFetchedDate:"", // アメリカ市場の自動更新（毎朝6時・1日1回）が今日すでに実行済みかの判定用
@@ -1944,7 +1978,12 @@ function ExpertViewNote({views,code,sector,market,compact}){
   }
   return <div style={{fontSize:11,color:"var(--inkSoft)",background:"var(--band)",
       border:"1px solid var(--rule)",borderRadius:4,padding:"6px 8px",marginBottom:8}} title={titleAttr}>
-    <div style={{fontWeight:700,color:"var(--ink)"}}>🎓 EXPERT VIEW　{v.expert_name}</div>
+    <div style={{fontWeight:700,color:"var(--ink)"}}>🎓 EXPERT VIEW　{v.expert_name}
+      {/* 2026-09-08追加（指示書8番）：長期・中期見通しは保存済みのまま参考情報として使ってよいが、
+          「いつ時点の見解か」は常に見えるようにする（現在のリアルタイム地合いとは別データである
+          ことを画面上で区別できるようにするため）。 */}
+      {v.published_at && <span style={{marginLeft:6,fontSize:10.5,fontWeight:400,color:"var(--inkFaint)"}}>（{v.published_at}時点の見解）</span>}
+    </div>
     {v.outlook && <div style={{marginTop:2}}>{v.time_horizon?`${v.time_horizon}：`:""}{v.outlook}</div>}
     {v.confirmations && v.confirmations.length>0 && <div style={{marginTop:2,color:"var(--inkFaint)"}}>確認：{v.confirmations.join(" / ")}</div>}
     {v.invalidation_conditions && v.invalidation_conditions.length>0 && <div style={{color:"var(--inkFaint)"}}>無効化：{v.invalidation_conditions.join(" / ")}</div>}
@@ -5989,7 +6028,7 @@ function App(){
               p:(v.p!=null?String(v.p):nm[k].p),
               spark:(Array.isArray(v.spark)?v.spark:nm[k].spark)};}
           });
-          return {...p,metrics:nm};});
+          return {...p,metrics:nm,metricsFetchedAt:new Date().toISOString()};});
         setMonitorMsg((qd.fetchedAt||nowHHMM())+" 自動更新");
       }
     }catch(e){}
@@ -5997,7 +6036,9 @@ function App(){
       const srJP=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(sRef.current.watchlist)});
       if(srJP.ok){
         const sdJP=await srJP.json();
-        setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sdJP.quotes||{})}}));
+        const stampedAt=new Date().toISOString();
+        const stamped=Object.fromEntries(Object.entries(sdJP.quotes||{}).map(([k,v])=>[k,{...v,quoteFetchedAt:stampedAt}]));
+        setS(p=>({...p,stockQuotes:{...p.stockQuotes,...stamped}}));
         setJpMsg(nowHHMM()+" 自動更新");
       }
     }catch(e){}
@@ -6012,7 +6053,9 @@ function App(){
       const srUS=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(sRef.current.watchlistUS)});
       if(srUS.ok){
         const sdUS=await srUS.json();
-        setS(p=>({...p,stockQuotes:{...p.stockQuotes,...(sdUS.quotes||{})},usQuotesFetchedDate:todayISO()}));
+        const stampedAt=new Date().toISOString();
+        const stamped=Object.fromEntries(Object.entries(sdUS.quotes||{}).map(([k,v])=>[k,{...v,quoteFetchedAt:stampedAt}]));
+        setS(p=>({...p,stockQuotes:{...p.stockQuotes,...stamped},usQuotesFetchedDate:todayISO()}));
         setUsMsg(nowHHMM()+" 自動更新");
       }
     }catch(e){}
@@ -6074,6 +6117,20 @@ function App(){
   };
   useEffect(()=>{
     if(s.marketRiskFetchedDate!==todayISO())fetchMarketRisk();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
+
+  // 2026-09-08新規（トレード分析画面のリアルタイム性改善）：画面最上部の日付欄(s.date)は
+  // 元々「翌朝へ」ボタンを手動で押さない限り変わらない仕様だった（backupファイル名・曜日表示・
+  // 「翌朝へ」による1日分リセットにのみ使われ、どのAPIリクエストにも送信されない純粋な表示用
+  // フィールドと判明。s.dateがサーバーへの問い合わせ内容に影響することはない）。数日〜数週間
+  // PCを閉じずに使い続けた場合など、この欄だけが古い日付のまま取り残され「分析結果全体が
+  // その古い日付時点のもの」であるかのように見えてしまっていたのが、報告された症状の一つ
+  // （画面上部が古い日付のまま）。s.date自体は他の機能に影響しないため、起動時に今日の日付と
+  // 異なっていれば黙って今日の日付へ補正する（「翌朝へ」のような明示確認は不要＝表示の補正のみで
+  // watchlist・journal等のデータは一切変更しない）。
+  useEffect(()=>{
+    if(s.date!==todayISO())setS(p=>({...p,date:todayISO()}));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
 
@@ -6236,45 +6293,143 @@ function App(){
     return top.map(g=>`${g.key}${g.avgPct!=null?(g.avgPct>0?"+":"")+g.avgPct.toFixed(2)+"%":""}`).join("、");
   },[watchlistAll,s.stockQuotes]);
   const [analyzing,setAnalyzing]=useState(false);
-  const fetchAnalysisFor=async(items)=>{
+  // 2026-09-08更新（トレード分析画面のリアルタイム性改善）：fetchAnalysisForは元々「取得開始時に
+  // 対象銘柄のanalysisDataを即削除してから取り直す」設計だった。この方式では再取得中カードが
+  // 一瞬「データを取得できませんでした」に見えてしまい、かつ取得失敗時に「直前まで見えていた値が
+  // 実は古い参考値だった」ことが伝わらない。前回の結果は_refreshing/_refreshFailedフラグを立てて
+  // 残したまま「更新中…」「最新データ取得失敗（表示は前回取得時点の参考値）」と明示できるようにした
+  // （古い値を最新値であるかのように見せない、という要件を「消す」のではなく「正直にラベル付けする」
+  // 形で満たす）。quoteOverrides・marketFetchedAtIsoはrefreshAnalysisContextから渡され、
+  // 分析リクエスト直前に取り直した現在値・市場指標の取得時刻をそのまま分析結果に刻印する。
+  const fetchAnalysisFor=async(items,opts)=>{
     if(!items||!items.length)return;
+    const {quoteOverrides,marketFetchedAtIso}=opts||{};
     setAnalyzing(true);
-    // 再取得中に前回の結果を残したままにすると、取得に失敗した場合でも古い（現在値と食い違った）
-    // 単価がそのまま表示され続けてしまう。先に対象銘柄のanalysisDataをクリアし、取得に失敗したら
-    // 「データを取得できませんでした」と正直に表示されるようにする。
-    setS(p=>{const ad={...p.analysisData};items.forEach(w=>{delete ad[w.code];});return {...p,analysisData:ad};});
+    setS(p=>{const ad={...p.analysisData};
+      items.forEach(w=>{if(ad[w.code])ad[w.code]={...ad[w.code],_refreshing:true,_refreshFailed:false};});
+      return {...p,analysisData:ad};});
+    const markDone=(failedCodes)=>{
+      if(!failedCodes.size)return;
+      setS(p=>{const ad={...p.analysisData};
+        failedCodes.forEach(code=>{if(ad[code])ad[code]={...ad[code],_refreshing:false,_refreshFailed:true};});
+        return {...p,analysisData:ad};});
+    };
     try{
-      // 登録銘柄テーブルの現在値（30秒おきの自動更新で取得済み）をcurrentとして同封する。
-      // 分析APIは内部でyfinanceに別途問い合わせるため、これを渡さないと分析結果側の単価が
-      // テーブルの最新値とズレることがある。
+      // 登録銘柄テーブルの現在値（30秒おきの自動更新で取得済み、または直前にrefreshAnalysisContextが
+      // 取り直した値＝quoteOverrides）をcurrentとして同封する。分析APIは内部でyfinanceに別途
+      // 問い合わせるため、これを渡さないと分析結果側の単価がテーブルの最新値とズレることがある。
       // v3-7（押し目エントリー価格帯の見直し）：Primary/Action Status（enrichWatchRow、既に
       // analysisEnrichedMapとして算出済み）も同封する。サーバー側で同じ判定を再実装しない
       // （二重ロジックを避ける）ため、フロントの判定結果をそのまま渡すだけ。
       const withCurrent=items.map(w=>{
         const enr=analysisEnrichedMap.get(w.code);
-        return {...w,current:s.stockQuotes[w.code]?.t,primaryStatus:enr?.status,actionStatus:enr?.actionStatus};
+        const ov=quoteOverrides&&quoteOverrides[w.code];
+        const liveCurrent=ov?num(ov.t):s.stockQuotes[w.code]?.t;
+        return {...w,current:liveCurrent,primaryStatus:enr?.status,actionStatus:enr?.actionStatus};
       });
       const ar=await fetch("/api/analysis",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(withCurrent)});
       if(ar.ok){
         const ad=await ar.json();
-        // 診断用：この取得で実際にサーバーへ送った現在値(currentSent)と取得時刻(fetchedAt)を
-        // 結果に添えておく。「反映されない」不具合の切り分け（現在値送信自体が古いのか、
-        // 表示側が古いままなのか）をカードで直接確認できるようにする。
-        const stampedAt=nowHHMM();
+        // 診断用：この取得で実際にサーバーへ送った現在値(_currentSent)・現在値/市場指標/分析結果
+        // それぞれの取得時刻(ISO)を結果に添えておく。カード側のFreshnessBadgeがこれを使って
+        // LIVE/n分遅延/STALEを判定する。
+        const stampedAt=new Date().toISOString();
         const withCurrentByCode=Object.fromEntries(withCurrent.map(w=>[w.code,w.current]));
-        Object.entries(ad.analysis||{}).forEach(([code,r])=>{r._fetchedAt=stampedAt;r._currentSent=withCurrentByCode[code];});
+        Object.entries(ad.analysis||{}).forEach(([code,r])=>{
+          r._fetchedAtIso=stampedAt;
+          r._currentSent=withCurrentByCode[code];
+          r._quoteFetchedAtIso=(quoteOverrides&&quoteOverrides[code]?.quoteFetchedAt)||s.stockQuotes[code]?.quoteFetchedAt||null;
+          r._marketFetchedAtIso=marketFetchedAtIso||s.metricsFetchedAt||null;
+        });
         setS(p=>({...p,analysisData:{...p.analysisData,...(ad.analysis||{})}}));
+        const gotCodes=new Set(Object.keys(ad.analysis||{}));
+        markDone(new Set(items.map(w=>w.code).filter(c=>!gotCodes.has(c))));
+      }else{
+        markDone(new Set(items.map(w=>w.code)));
       }
-    }catch(e){}
+    }catch(e){
+      markDone(new Set(items.map(w=>w.code)));
+    }
     setAnalyzing(false);
   };
-  // 銘柄追加時：analysisDataにまだ結果がない対象銘柄だけを取得する
+  // 2026-09-08新規：「銘柄分析」を開く／再取得する際に、現在値・市場指標をまずその場で
+  // 取り直してから分析APIへ渡す一元的な最新化処理（ユーザー指示書9番）。ローカルに残っている
+  // 古いstockQuotes/metricsのまま分析すると、画面表示の現在値とサーバー分析結果の前提値が
+  // ズレたまま「最新分析」のように見えてしまうため。
+  const refreshAnalysisContext=async(items)=>{
+    if(!items||!items.length)return;
+    const jpItems=items.filter(w=>w.market==="JP");
+    const usItems=items.filter(w=>w.market!=="JP");
+    const nowIso=new Date().toISOString();
+    let quoteOverrides={};
+    const fetchQuotesFor=async(subset)=>{
+      if(!subset.length)return;
+      try{
+        const r=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(subset)});
+        if(r.ok){
+          const d=await r.json();
+          const stamped=Object.fromEntries(Object.entries(d.quotes||{}).map(([k,v])=>[k,{...v,quoteFetchedAt:nowIso}]));
+          quoteOverrides={...quoteOverrides,...stamped};
+          setS(p=>({...p,stockQuotes:{...p.stockQuotes,...stamped}}));
+        }
+      }catch(e){}
+    };
+    await Promise.all([fetchQuotesFor(jpItems),fetchQuotesFor(usItems)]);
+    try{
+      const qr=await fetch("/api/quotes");
+      if(qr.ok){
+        const qd=await qr.json();
+        setS(p=>{const nm={...p.metrics};
+          Object.entries(qd.quotes||{}).forEach(([k,v])=>{
+            if(nm[k]!=null&&v){nm[k]={...nm[k],
+              t:(v.t!=null?String(v.t):nm[k].t),
+              p:(v.p!=null?String(v.p):nm[k].p),
+              spark:(Array.isArray(v.spark)?v.spark:nm[k].spark)};}
+          });
+          return {...p,metrics:nm,metricsFetchedAt:nowIso};});
+      }
+    }catch(e){}
+    await fetchAnalysisFor(items,{quoteOverrides,marketFetchedAtIso:nowIso});
+  };
+  // 2026-09-08更新：銘柄追加時（新規＝analysisDataが無い）に加え、①「分析」タブを開いた瞬間、
+  // ②既存の分析結果がANALYSIS_STALE_MINUTES分を超えて陳腐化している場合、も自動で最新化する
+  // （ユーザー指示書1・5・9番：「日本市場→銘柄分析」で開いた時に古い分析結果がそのまま
+  // 表示され続けていた不具合の本体）。以前はanalysisTargetsに既に入っている銘柄は「data有り」と
+  // 判定されると二度と自動再取得されず、何日前の結果でもそのまま表示され続けていた。
+  const [analysisEntering,setAnalysisEntering]=useState(false);
   useEffect(()=>{
-    // technical_analysis_rules.md反映でスキーマ変更（strength/autoEarningsStarsフィールド追加）したため、
-    // 旧スキーマのキャッシュ済みデータ（いずれか未定義）も再取得対象に含める
-    const missing=analysisItems.filter(w=>!s.analysisData[w.code]||s.analysisData[w.code].strength===undefined||s.analysisData[w.code].autoEarningsStars===undefined);
-    if(missing.length)fetchAnalysisFor(missing);
-  },[s.analysisTargets]);
+    if(tab!=="analysis")return;
+    const legacySchema=(a)=>!a||a.strength===undefined||a.autoEarningsStars===undefined;
+    const missing=analysisItems.filter(w=>legacySchema(s.analysisData[w.code]));
+    const stale=analysisItems.filter(w=>{
+      const a=s.analysisData[w.code];
+      if(legacySchema(a))return false; // missingの方でカバー済み（二重リクエスト防止）
+      if(a._refreshing)return false; // 取得処理が既に進行中
+      return isStaleFetchedAt(a._fetchedAtIso,ANALYSIS_STALE_MINUTES);
+    });
+    const targets=[...missing,...stale];
+    if(targets.length){setAnalysisEntering(true);refreshAnalysisContext(targets).finally(()=>setAnalysisEntering(false));}
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[s.analysisTargets,tab]);
+
+  // 2026-09-08新規：上のuseEffectは「分析タブを開いた瞬間／対象銘柄が変わった瞬間」しか
+  // 見ないため、開いたまま15分以上経過した場合は何もトリガーが無くSTALE表示のまま放置されて
+  // しまう（指示書5番「一定時間以上古ければstale扱い→再取得を試す」を機械的に満たすため）。
+  // 分析タブを開いている間だけ、1分おきに陳腐化していないか確認し、あれば自動で最新化する。
+  useEffect(()=>{
+    if(tab!=="analysis")return;
+    const id=setInterval(()=>{
+      const ad=sRef.current.analysisData;
+      const targets=sRef.current.analysisTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean).filter(w=>{
+        const a=ad[w.code];
+        if(!a||a._refreshing)return false;
+        return isStaleFetchedAt(a._fetchedAtIso,ANALYSIS_STALE_MINUTES);
+      });
+      if(targets.length)refreshAnalysisContext(targets);
+    },60*1000);
+    return ()=>clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[tab]);
 
   // ===== デスクトップ通知（セクター内逆行銘柄・出来高ブレイクアウトの監視銘柄自動追加で使用） =====
   // 2026-08-21 ユーザー要望：旧「本日優先」5分おき自動スキャン機能（priorityTargets・
@@ -7191,12 +7346,20 @@ function App(){
       {tab==="analysis" && <div style={{marginTop:18}}>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
           <div className="sec-head">銘柄分析</div>
-          {analyzing && <span style={{fontSize:11,color:"var(--inkSoft)"}}>取得中…</span>}
+          {analysisEntering
+            ? <span style={{fontSize:11,color:"var(--inkSoft)",fontWeight:700}}>🔄 現在値・市場指標を最新化しています…</span>
+            : analyzing && <span style={{fontSize:11,color:"var(--inkSoft)"}}>取得中…</span>}
         </div>
         {/* 12-2章：免責表示（必須・常時表示・断定的表現を避ける） */}
         <div style={{background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14,fontSize:12.5,lineHeight:1.7,color:"var(--inkSoft)"}}>
           本分析は算出根拠の一つに過ぎず、投資判断は必ずご自身の判断で行ってください。数値を鵜呑みにせず、最終判断はご自身の責任で行ってください。
           購入・損切り・利確の各単価は「推奨」ではなく、あくまで目安・参考値です。
+          {/* 2026-09-08追加（指示書1・9番）：この画面を開くたびに、現在値・市場指標をその場で
+              取り直してから分析を再計算する（ANALYSIS_STALE_MINUTES=15分を超えて陳腐化していた
+              場合、または未取得の場合のみ。直近取得済みなら再取得しない）。 */}
+          <div style={{marginTop:6,fontSize:11.5,color:"var(--inkFaint)"}}>
+            ℹ️ 表示中の分析結果が15分以上前のものになると、この画面を開いた際に自動で現在値・市場指標ごと再取得します（各カード右上の「🔄 今すぐ最新化」で手動再取得も可能）。
+          </div>
         </div>
         {analysisItems.length===0
           ? <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13,border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)"}}>
@@ -7213,6 +7376,7 @@ function App(){
                       <div><div className="card-t">{w.name}</div><div className="card-n mono">{w.code}</div></div>
                       <div style={{display:"flex",alignItems:"center",gap:6}}>
                         {analysisConsultMsg && <span style={{fontSize:11,color:"var(--accent)",fontWeight:700}}>{analysisConsultMsg}</span>}
+                        {a && <button className="action-btn" title="現在値・市場指標を取り直してから分析を再計算する" onClick={()=>refreshAnalysisContext([w])} disabled={a._refreshing}>{a._refreshing?"更新中…":"🔄 今すぐ最新化"}</button>}
                         {a && <button className="action-btn" onClick={()=>copyAnalysisConsult(w,a)}>🤖 詳細分析を相談</button>}
                         {a && <button className="action-btn" onClick={()=>openJournalDraft(w,a)}>記録に追加</button>}
                         <button className="iconbtn" title="分析対象から外す" onClick={()=>toggleAnalysisTarget(w.code)}>×</button>
@@ -7224,10 +7388,17 @@ function App(){
                             ? "計算中…"
                             : <>データを取得できませんでした。
                                 <button className="btn" style={{marginLeft:8,fontSize:11.5,padding:"2px 10px"}}
-                                  onClick={()=>fetchAnalysisFor([w])}>再取得</button>
+                                  onClick={()=>refreshAnalysisContext([w])}>再取得</button>
                               </>}
                         </div>
                       : <div>
+                          {/* 2026-09-08新規：取得失敗時は「古い値をあたかも最新であるかのように表示しない」
+                              （指示書5番）。_refreshFailedが立っている間は、以下の現在値・評価等の表示は
+                              全て「前回取得時点の参考値」であることを明示するバナーを最上部に出す。 */}
+                          {a._refreshFailed && <div style={{fontSize:11.5,fontWeight:700,color:"var(--down)",background:"var(--downBg)",border:"1px solid var(--down)",borderRadius:4,padding:"6px 8px",marginBottom:8}}>
+                            ⚠ 最新データの取得に失敗しました。以下は前回取得時点（<FreshnessBadge iso={a._fetchedAtIso} staleMinutes={ANALYSIS_STALE_MINUTES}/>）の参考値です。
+                            <button className="btn" style={{marginLeft:8,fontSize:11,padding:"1px 8px"}} onClick={()=>refreshAnalysisContext([w])}>再試行</button>
+                          </div>}
                           {/* v3-4（UI/UX再設計）：星評価を廃止し、現在値・総合評価(A+/A/B+/B/C)・
                               エントリー戦略(NOW/PULLBACK/BREAKOUT/WAIT/AVOID)を最上部にまとめる。
                               いずれも既存のstrength・entry・stop・resistance・assessmentから
@@ -7236,7 +7407,10 @@ function App(){
                           return <div style={{marginBottom:8}}>
                             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6}}>
                               <div className="mono" style={{fontSize:14,color:"var(--inkSoft)"}}>現在値 <span style={{fontWeight:800,fontSize:20,color:"var(--ink)"}}>{a.current.toLocaleString()}</span>
-                                {a._fetchedAt && <span style={{marginLeft:8,fontSize:10.5,color:"var(--inkFaint)"}} title={`この分析結果の取得時刻。サーバーへ送った現在値：${a._currentSent!=null?a._currentSent:"（未送信＝日足終値で算出）"}`}>（取得 {a._fetchedAt}）</span>}
+                                {a._refreshing
+                                  ? <span style={{marginLeft:8,fontSize:10.5,color:"var(--inkSoft)"}}>更新中…（参考：<FreshnessBadge iso={a._fetchedAtIso} staleMinutes={ANALYSIS_STALE_MINUTES}/>時点）</span>
+                                  : a._fetchedAtIso && <FreshnessBadge iso={a._fetchedAtIso} staleMinutes={ANALYSIS_STALE_MINUTES}
+                                      title={`この分析結果の取得時刻。サーバーへ送った現在値：${a._currentSent!=null?a._currentSent:"（未送信＝日足終値で算出）"}`}/>}
                               </div>
                               <span title="総合評価（旧・星評価の後継。シグナル強度とMarket RSから算出）"
                                 style={{fontWeight:800,fontSize:16,color:GRADE_COLOR[grade],border:`1.5px solid ${GRADE_COLOR[grade]}`,borderRadius:4,padding:"1px 8px"}}>{grade}</span>
@@ -7250,8 +7424,11 @@ function App(){
                             <div className="mono" style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>
                               気配　買 {s.stockQuotes[w.code]?.bid!=null?num(s.stockQuotes[w.code].bid).toLocaleString():"—"}
                               　/　売 {s.stockQuotes[w.code]?.ask!=null?num(s.stockQuotes[w.code].ask).toLocaleString():"—"}
+                              {s.stockQuotes[w.code]?.quoteFetchedAt && <FreshnessBadge iso={s.stockQuotes[w.code].quoteFetchedAt} staleMinutes={QUOTE_STALE_MINUTES} title="現在値/気配の取得時刻"/>}
                             </div>}
-                          {a.marketEnv && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>{a.marketEnv}</div>}
+                          {a.marketEnv && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>{a.marketEnv}
+                            {a._marketFetchedAtIso && <FreshnessBadge iso={a._marketFetchedAtIso} staleMinutes={MARKET_STALE_MINUTES} title="市場環境（日経平均等）の取得時刻"/>}
+                          </div>}
                           <RelevantMarketSummary w={w} metrics={s.metrics}/>
                           <EventRiskNote events={marketEvents} code={w.code} sector={w.sector}/>
                           <CatalystNote catalysts={newsCatalysts} code={w.code} sector={w.sector}/>
