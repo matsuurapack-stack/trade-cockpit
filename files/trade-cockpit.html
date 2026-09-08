@@ -987,6 +987,11 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
   const [openSectors,setOpenSectors]=useState(()=>new Set());
   const rowRefs=useRef({}); // code -> <tr>要素。検索で既登録銘柄がヒットした際にスクロールで見せるため（2026-08-21 ユーザー要望）
   const [jumpHighlight,setJumpHighlight]=useState(null); // 直前にジャンプした銘柄コード。数秒だけ行を強調表示する
+  // 2026-09-08新規：登録銘柄（最大300件）を業種アコーディオンを開かずに直接検索するための専用欄。
+  // 上のq/resultsは「まだ登録していない候補」を探して追加する検索（既存・無変更）だが、
+  // こちらは既に登録済みのwatchlistだけを対象にする別の検索（指示書8番：全銘柄検索とは分ける）。
+  const [regQ,setRegQ]=useState("");
+  const [regActiveIndex,setRegActiveIndex]=useState(0);
 
   const regCodes=useMemo(()=>new Set(watchlist.map(w=>w.code)),[watchlist]);
   // 2026-08-21 ユーザー要望：コード・企業名に加え、読み仮名（ひらがな・カタカナどちらで入力しても
@@ -999,6 +1004,24 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
   // resultsが空のとき、実は既に登録済みなだけなのかを判定してユーザーに明示する。
   const alreadyRegisteredMatch=useMemo(()=>{const t=normKana(q.trim());if(!t)return null;
     return candidates.find(m=>regCodes.has(m.code)&&(normKana(m.code).includes(t)||normKana(m.name).includes(t)||normKana(m.kana).includes(t)))||null;},[q,regCodes,candidates]);
+  // 2026-09-08新規：登録銘柄（watchlist、最大300件）だけを対象にした検索。normKana()で
+  // コード・企業名・読み仮名・セクターいずれも大文字小文字・全角半角・カタカナ/ひらがなの
+  // 揺れを吸収して比較する（上のresults用ロジックと同じ正規化を使い回すのみ、判定ロジックの
+  // 二重実装は避ける）。クライアント側フィルタのみ（APIは叩かない、指示書10番）。
+  const regResults=useMemo(()=>{
+    const t=normKana(regQ.trim());if(!t)return[];
+    return watchlist.filter(w=>normKana(w.code).includes(t)||normKana(w.name).includes(t)||normKana(w.kana).includes(t)||normKana(w.sector).includes(t))
+      .sort((a,b)=>a.code.localeCompare(b.code)).slice(0,20);
+  },[regQ,watchlist]);
+  useEffect(()=>{setRegActiveIndex(0);},[regQ]);
+  const clearRegSearch=()=>{setRegQ("");setRegActiveIndex(0);};
+  const onRegSearchKeyDown=(e)=>{
+    if(!regResults.length)return;
+    if(e.key==="ArrowDown"){e.preventDefault();setRegActiveIndex(i=>(i+1)%regResults.length);}
+    else if(e.key==="ArrowUp"){e.preventDefault();setRegActiveIndex(i=>(i-1+regResults.length)%regResults.length);}
+    else if(e.key==="Enter"){e.preventDefault();jumpToRegistered(regResults[regActiveIndex]);}
+    else if(e.key==="Escape"){e.preventDefault();clearRegSearch();}
+  };
   const addStock=(m)=>{if(watchlist.length>=max){alert("登録は最大"+max+"社までです。");return;}
     if(regCodes.has(m.code))return; setWatchlist([...watchlist,{id:m.code,...m,watch:"通常",note:"",theme:""}]);setQ("");};
   const [sectorGuessing,setSectorGuessing]=useState(false);
@@ -1079,8 +1102,10 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
   // タブが非アクティブ/背面描画状態だと開始すらしないままスクロール位置が変わらないことがある
   // （ユーザー報告で再現）。アニメーションに依存しない"instant"に変更し、確実に移動させる。
   const jumpToRegistered=(m)=>{
+    if(!m)return;
     setOpenSectors(prev=>new Set(prev).add(m.sector));
     setQ("");
+    setRegQ(""); // 2026-09-08追加：登録銘柄専用検索から選んだ場合も、結果一覧を閉じて通常のアコーディオン表示に戻す
     setJumpHighlight(m.code);
     setTimeout(()=>{
       rowRefs.current[m.code]?.scrollIntoView({behavior:"instant",block:"center"});
@@ -1118,8 +1143,37 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
         </div>
       </div>}
     </div>
+    {/* 2026-09-08新規：登録済み銘柄（最大{max}件）だけを対象にした検索欄。上の検索欄（新規登録用、
+        既存・無変更）とは別に、既に登録済みの{watchlist.length}銘柄の中からコード・企業名・
+        読み仮名・セクターで素早く見つけて該当行へジャンプするための専用UI（指示書1〜8番）。 */}
+    <div style={{marginTop:10,position:"relative"}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,padding:"8px 12px"}}>
+        <span style={{color:"var(--inkFaint)",fontSize:13}}>🔍</span>
+        <input value={regQ} onChange={e=>setRegQ(e.target.value)} onKeyDown={onRegSearchKeyDown}
+          placeholder={`登録銘柄（${watchlist.length}件）をコード・企業名・読み仮名・セクターで検索…`}
+          style={{flex:1,border:"none",background:"transparent",outline:"none",fontSize:14}}/>
+        {regQ && <button className="iconbtn" onClick={clearRegSearch} title="検索をクリア（Escでも可）">×</button>}
+      </div>
+      {regQ.trim() && <div className="results">
+        {regResults.length===0
+          ? <div className="res-row" style={{fontSize:12.5,color:"var(--inkSoft)",cursor:"default"}}>該当する登録銘柄がありません。</div>
+          : regResults.map((m,i)=>{
+              const ct=num(stockQuotes[m.code]?.t),pt=num(stockQuotes[m.code]?.p);
+              const pct=(ct!=null&&pt!=null&&pt)?(ct-pt)/pt*100:null;
+              const pctColor=pct==null||pct===0?"var(--inkSoft)":(pct>0?"var(--up)":"var(--down)");
+              return <button key={m.code} className="res-row" onMouseEnter={()=>setRegActiveIndex(i)}
+                style={{background:i===regActiveIndex?"var(--band)":"transparent"}} onClick={()=>jumpToRegistered(m)}>
+                <span className="mono" style={{fontSize:12,width:56,color:"var(--inkSoft)"}}>{m.code}</span>
+                <span style={{flex:1,fontSize:13,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={m.name}>{m.name}</span>
+                <span style={{fontSize:11,color:"var(--inkSoft)",whiteSpace:"nowrap"}}>{m.sector}</span>
+                <span className="mono" style={{fontSize:13,fontWeight:700,minWidth:56,textAlign:"right"}}>{ct!=null?ct.toLocaleString():"—"}</span>
+                <span className="mono" style={{fontSize:11.5,fontWeight:600,color:pctColor,minWidth:52,textAlign:"right"}}>{pct!=null?(pct>0?"+":"")+pct.toFixed(2)+"%":"—"}</span>
+              </button>;
+            })}
+      </div>}
+    </div>
     <div style={{marginTop:12,border:"1px solid var(--rule)",background:"var(--card)",borderRadius:4,overflow:"hidden"}}>
-      {sectorGroups.length===0 ?
+      {regQ.trim() ? null : sectorGroups.length===0 ?
         <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13}}>{`上の検索から銘柄を登録してください（最大${max}社）。`}</div> :
         sectorGroups.map(({sector,avgPct,items},i)=>{
           const isOpen=openSectors.has(sector);
