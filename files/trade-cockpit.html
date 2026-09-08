@@ -8342,7 +8342,6 @@ function App(){
             <div className="sec-head">ニュース</div>
             <span style={{fontSize:11,color:"var(--inkSoft)"}}>{newsFetching?"更新中…":newsMsg?newsMsg+"（1時間おき自動更新）":"1時間おきに自動更新"}</span>
           </div>
-          <div className="sec-note">1時間おきに自動更新します。日本株は銘柄コードで確実に関連付けられる立花証券APIのニュース（NQN等）を優先し、報道の少ない銘柄だけGoogleニュースで補完します（広告・野球結果等は除外済み）。「サマリー」「海外市況」「登録銘柄」「適時開示」にはアメリカ市場（ダウ30社）のニュースも含みます。「適時開示」は日本の登録銘柄について当日を含む直近10日分のTDnet開示を種類を問わず（決算・上方修正・下方修正・新株予約権発行など）全件表示します（アメリカ株はTDnet対象外のためGoogleニュースのIR関連キーワードで近似）。「登録銘柄」は社名またはNQNの銘柄コードでの一致で拾ったニュース全般（優先度上位の銘柄まで）です。見出しをクリックすると元記事が開きます（NQN等、元記事URLの無い速報はクリックできません）。「カタリスト」「有識者」はChatGPT等で構造化した情報の別枠（都度取得のRSS/TDnetとは別テーブル）です。</div>
           <div className="subtabs">
             {NEWS_SUBTABS.map(t=><button key={t.key} className={"chip"+(newsSubTab===t.key?" on":"")} onClick={()=>{setNewsSubTab(t.key);setNewsShowCount(NEWS_PAGE_SIZE);}}>{t.label}</button>)}
           </div>
