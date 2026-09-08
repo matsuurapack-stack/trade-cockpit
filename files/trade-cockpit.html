@@ -859,7 +859,23 @@ function SourceThumb({source,style}){
 // 10-5章：announcements(運営からの新着情報)を渡すと、ニュース一覧の間に自然に挟み込んで表示する。
 // interval件ごとに1件挟む（末尾到達で先頭に戻る簡易ローテーション）。
 // Trade Cockpit v2 Phase4（設計案30番）：ニュースの関連度優先順位ラベル（0=最優先）。
-const NEWS_PRIORITY_LABELS=["保有","候補","監視","テーマ","その他"];
+// 2026-09-08更新（ニュース優先順位改善）：4「その他」（コード無し＝一般市況ニュース）の手前に
+// 5「登録銘柄」を追加した（保有／候補／監視／テーマのいずれにも該当しないが、登録銘柄一覧には
+// コードが載っている銘柄のニュース。指示書の「登録銘柄に企業コードで直接ひも付くニュースを、
+// 市況一般ニュースより上位に表示する」に対応。既存の保有＞候補＞監視＞テーマの並びは無変更）。
+const NEWS_PRIORITY_LABELS=["保有","候補","監視","テーマ","登録銘柄","その他"];
+// 情報源の優先順位（0=最優先）。指示書priority_orderに対応：①公式IR/TDnet②日経③NQN
+// ④その他国内⑤海外。sourceフィールド（Googleニュースの媒体名／NQN／TDnet、いずれも
+// server.py側で既に設定済み・新規取得経路は追加していない）だけで判定する。
+const NEWS_SOURCE_LABELS=["TDnet","日経","NQN","国内","海外"];
+function newsSourceRank(it){
+  const src=it?.source||"";
+  if(src==="TDnet")return 0;
+  if(src.includes("日本経済新聞")||src.includes("日経")||(it?.url||"").includes("nikkei.com"))return 1;
+  if(src==="NQN")return 2;
+  if(it?._overseas)return 4;
+  return 3;
+}
 
 // Trade Cockpit v3 Phase4（設計案43番）：ニュースのカテゴリ分類。有料AI APIは使わずキーワード
 // 辞書のみ（既存のIMPORTANT_KEYWORDS・STOCK_NAME_NEWS_EXCLUDE_KEYWORDSと同じ方式）。
@@ -889,10 +905,19 @@ function NewsList({items,showName,emptyText,priorityOf}){
       // NQN等の速報見出し（立花証券API）は元記事URLが無いため、リンクにせずカード表示にする
       const Tag=it.url?"a":"div";
       const linkProps=it.url?{href:it.url,target:"_blank",rel:"noopener noreferrer"}:{};
-      // Trade Cockpit v2 Phase4（設計案30番）：保有／候補／監視／テーマ一致に該当するニュースには
-      // バッジを付ける（優先度4=その他は表示しない）。
-      const prio=priorityOf&&it.code?priorityOf(it.code):4;
+      // Trade Cockpit v2 Phase4（設計案30番）：保有／候補／監視／テーマ／登録銘柄に該当する
+      // ニュースにはバッジを付ける（2026-09-08更新：優先度5=その他（コード無し）のみ非表示。
+      // 4=登録銘柄も表示するようになった）。
+      const prio=priorityOf&&it.code?priorityOf(it.code):5;
       const category=classifyNewsCategory(it.title);
+      // 2026-09-08新規（ニュース優先順位改善、指示書ui_request.badges対応）：出典バッジ
+      // （TDnet／日経／NQN／海外）と、内容がIR系（決算・適時開示・M&A等、既存の
+      // classifyNewsCategoryをそのまま再利用）なら追加で「IR」バッジも出す
+      // （TDnet発ならバッジ自体が既に公式IRを意味するため「IR」は重ねて出さない）。
+      const srcRank=newsSourceRank(it);
+      const srcLabel=NEWS_SOURCE_LABELS[srcRank];
+      const showSrcBadge=srcRank!==3; // 3=その他国内はノイズになるため表示しない
+      const isIrContent=(category==="IR"||category==="EARNINGS")&&srcRank!==0;
       // v3 Phase4（設計案48番）：「不要」フィードバック。AI不使用、ログ化するだけ（将来のキーワード
       // 辞書見直し用）。<a>タグ内のボタンのためクリック伝播でページ遷移しないようstopPropagation。
       const sendFeedback=(e)=>{
@@ -903,7 +928,10 @@ function NewsList({items,showName,emptyText,priorityOf}){
       };
       return <Tag key={i} className={"news-item"+(important?" important":"")} {...linkProps}>
         {important&&<span className="news-alert-badge">⚠ 重要</span>}
-        {prio<4&&<span className="chip" style={{fontSize:10,marginRight:4}}>{NEWS_PRIORITY_LABELS[prio]}</span>}
+        {prio<5&&<span className="chip" style={{fontSize:10,marginRight:4}}>{NEWS_PRIORITY_LABELS[prio]}</span>}
+        {showSrcBadge&&<span className="chip" style={{fontSize:9.5,marginRight:4,fontWeight:700,
+          color:srcRank===0?"var(--up)":"var(--inkSoft)",borderColor:srcRank===0?"var(--up)":undefined}}>{srcLabel}</span>}
+        {isIrContent&&<span className="chip" style={{fontSize:9.5,marginRight:4,color:"var(--inkSoft)"}}>IR</span>}
         <span className="chip" style={{fontSize:9.5,marginRight:4,color:"var(--inkFaint)"}}>{category}</span>
         {showName&&it.code&&<span className="news-tag">{it.code}</span>}
         <span className="news-body">
@@ -6528,13 +6556,17 @@ function App(){
     }).catch(()=>{});
   },[]);
   const newsPriorityRank=(code)=>{
-    if(!code)return 4;
+    if(!code)return 5;
     const heldCodes=new Set(s.journal.filter(j=>j.result==="未定").map(j=>j.code));
     if(heldCodes.has(code))return 0;
     if(candidateCodes.has(code))return 1;
     if(s.watchTargets.includes(code))return 2;
     if(watchlistAll.some(w=>w.code===code&&w.theme))return 3;
-    return 4;
+    // 2026-09-08新規（ニュース優先順位改善）：保有／候補／監視／テーマのいずれにも該当しなくても、
+    // 登録銘柄一覧（日本市場・アメリカ市場タブ）にコードが載っていれば、無関係な市況一般
+    // ニュース（コード無し＝5）より上位に表示する（指示書registered_stock_priority対応）。
+    if(watchlistAll.some(w=>w.code===code))return 4;
+    return 5;
   };
 
   useEffect(()=>{
@@ -6958,27 +6990,29 @@ function App(){
   // 海外市況：マクロの海外市況クエリに加え、アメリカ市場登録銘柄のニュースも含める
   const overseasAll=useMemo(()=>mergeByDate(s.macroNewsOverseas,s.usStockNewsList),[s.macroNewsOverseas,s.usStockNewsList]);
 
-  // 9-1章：「サマリー」の中身の方針。既存に該当機能がなかったため新規に決定：
-  // (1) 重大ニュース（9-2章の判定に該当）を全カテゴリから最優先で集約し、(2) 残り枠を
-  // 適時開示（日本＋アメリカ）・国内市況・海外市況からバランスよく抜粋する。重複URLは除外する。
+  // 9-1章：「サマリー」の中身の方針。2026-09-08更新（ニュース優先順位の再設計）：
+  // 従来はカテゴリ（登録銘柄IR・米国株IR・国内市況・海外市況）ごとに件数上限を決め打ちで
+  // 連結するだけだったが、指示書のranking_rulesに合わせ「①重要ニュース→②登録銘柄への
+  // 直接関連→③情報源（公式IR/TDnet＞日経＞NQN＞その他国内＞海外）→④新しさ」の順で
+  // 全件を横断ソートする方式に変更した。重複排除（URLベース）は既存のまま再利用。
+  // 表示件数の上限（旧実装のslice合計にほぼ相当する60件）だけ従来の考え方を踏襲する。
   const newsSummary=useMemo(()=>{
     const seen=new Set();
-    const push=(arr,list)=>{for(const it of list){if(!it.url||seen.has(it.url))continue;seen.add(it.url);arr.push(it);}};
-    const byDateDesc=(a,b)=>(b.published||"").localeCompare(a.published||"");
-    // 4カテゴリ（登録銘柄IR・米国株IR・国内市況・海外市況）を単純に連結するだけだと、各カテゴリ内は
-    // 新しい順でも、カテゴリをまたいだ全体では古い記事が新しい記事より上に出てしまっていたため、
-    // 「重要」枠・「残り」枠それぞれの中で公開日時の降順に並べ替える（重要枠を上に固定する方針は維持）。
-    const important=[];push(important,[...s.stockNewsList,...s.usStockNewsList,...s.macroNewsDomestic,...s.macroNewsOverseas,...s.stockNameNewsList].filter(it=>isImportantNews(it.title)));
-    important.sort(byDateDesc);
-    const rest=[];
-    push(rest,s.stockNewsList.slice(0,6));
-    push(rest,s.usStockNewsList.slice(0,6));
-    push(rest,s.macroNewsDomestic.slice(0,8));
-    push(rest,s.macroNewsOverseas.slice(0,8));
-    push(rest,s.stockNameNewsList.slice(0,10));
-    rest.sort(byDateDesc);
-    return [...important,...rest];
-  },[s.stockNewsList,s.usStockNewsList,s.macroNewsDomestic,s.macroNewsOverseas,s.stockNameNewsList]);
+    const pool=[];
+    const push=(list,overseas)=>{for(const it of list){if(!it.url||seen.has(it.url))continue;seen.add(it.url);pool.push(overseas?{...it,_overseas:true}:it);}};
+    push(s.stockNewsList,false);      // 登録銘柄（日本）のIR・TDnet
+    push(s.usStockNewsList,false);    // 登録銘柄（米国）のIR。市況一般ではなく登録銘柄関連のため海外markしない
+    push(s.macroNewsDomestic,false);  // 国内市況一般
+    push(s.macroNewsOverseas,true);   // 海外市況一般
+    push(s.stockNameNewsList,false);  // 登録銘柄の社名一致ニュース（IR以外も含む）
+    const rankOf=(it)=>[isImportantNews(it.title)?0:1, it.code?newsPriorityRank(it.code):5, newsSourceRank(it)];
+    pool.sort((a,b)=>{
+      const ra=rankOf(a),rb=rankOf(b);
+      for(let i=0;i<ra.length;i++){if(ra[i]!==rb[i])return ra[i]-rb[i];}
+      return (b.published||"").localeCompare(a.published||"");
+    });
+    return pool.slice(0,60);
+  },[s.stockNewsList,s.usStockNewsList,s.macroNewsDomestic,s.macroNewsOverseas,s.stockNameNewsList,s.watchTargets,s.journal,candidateCodes,watchlistAll]);
 
   // 10-5章：ページ最上部の重要ニュース通知バナー用（全カテゴリを対象に件数を集計）
   const importantNewsAll=useMemo(()=>{
