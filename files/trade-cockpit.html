@@ -1530,8 +1530,10 @@ const TAB_GROUPS=[
   {key:"eventDashboard",label:"イベント",tabs:[{key:"eventDashboard",label:"カレンダー"},{key:"events",label:"イベント登録"}]},
   {key:"tradeAnalysis",label:"トレード分析",tabs:[{key:"analysis",label:"分析"},{key:"earnings",label:"決算"}]},
   {key:"position",label:"ポジション",tabs:[{key:"position",label:"ポジション"}]},
-  {key:"record",label:"記録",tabs:[{key:"journal",label:"記録"},{key:"investlog",label:"投資判断ログ"},{key:"chatgptimport",label:"ChatGPT取込"},{key:"stats",label:"統計"}]},
   {key:"news",label:"ニュース",tabs:[{key:"news",label:"ニュース"}]},
+  // 2026-09-08新規（UI全体の説明文整理・タブ順変更）：ユーザー指定により「記録」を必ず
+  // 一番右端に配置する。tabキー・グループ構成自体は無変更、配列の並び順のみ変更。
+  {key:"record",label:"記録",tabs:[{key:"journal",label:"記録"},{key:"investlog",label:"投資判断ログ"},{key:"chatgptimport",label:"ChatGPT取込"},{key:"stats",label:"統計"}]},
 ];
 
 // v3-6（2026-09-04・Primary/Action 2軸化）：Primary Status＝銘柄そのものの強さ・状態。
@@ -2253,11 +2255,6 @@ function EventsPanel({events,onReload}){
   const past=sorted.filter(e=>e.event_date<todayStr);
   return <div style={{marginTop:18}}>
     <div className="sec-head">イベント登録</div>
-    <div className="sec-note" style={{fontSize:13}}>
-      経済指標・決算・中央銀行会合等の予定をJSONで貼り付けてimportします。ChatGPT等で画像から作成したJSONもそのまま使えます（有料AI APIは使用しません）。
-      画像由来の情報は確定情報として扱わず、verification_status（IMAGE_DERIVED/UNVERIFIED/VERIFIED）を必ず保存します。
-      Primary/Action Statusには直接反映せず、銘柄分析・ポジション画面に参考情報として表示するだけです。
-    </div>
     <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 12px",marginBottom:14}}>
       <textarea value={pasteText} onChange={e=>setPasteText(e.target.value)} rows={6}
         placeholder={'例: [{"event_date":"2026-09-10","title":"米雇用統計","event_type":"ECONOMIC","importance":"HIGH","country":"US","source":"ChatGPT画像認識","verification_status":"IMAGE_DERIVED"}]'}
@@ -2337,12 +2334,6 @@ function CatalystsPanel({catalysts,onReload}){
   const old=sorted.filter(c=>!isRelevant(c));
   return <div style={{marginTop:18}}>
     <div className="sec-head">カタリスト</div>
-    <div className="sec-note" style={{fontSize:13}}>
-      マクロ・セクター・銘柄材料や指数採用・資金フロー等の構造化されたカタログ情報をJSONで貼り付けてimportします（Googleニュース等のRSS本体とは別の、ChatGPT等で整理した情報専用です）。ChatGPT等で画像から作成したJSONもそのまま使えます（有料AI APIは使用しません）。
-      画像由来の情報は確定情報として扱わず、verification_status（IMAGE_DERIVED/UNVERIFIED/VERIFIED）を必ず保存します。
-      Primary/Action Statusには直接反映せず、銘柄分析・ポジション画面に参考情報として表示するだけです。
-      新しさはcatalyst_date基準でTODAY/3日以内/1週間以内/やや古いを表示しますが、指数採用・決算等の発効日（event_date）があるものはその日まで重要性を維持します。
-    </div>
     <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 12px",marginBottom:14}}>
       <textarea value={pasteText} onChange={e=>setPasteText(e.target.value)} rows={6}
         placeholder={'例: [{"catalyst_date":"2026-09-05","title":"半導体関連セクターに資金流入","category":"SECTOR_CATALYST","importance":"HIGH","affected_sectors":["半導体"],"source":"ChatGPT画像認識","verification_status":"IMAGE_DERIVED"}]'}
@@ -2428,11 +2419,6 @@ function ExpertViewsPanel({views,onReload}){
   const sorted=useMemo(()=>[...filtered].sort((a,b)=>(b.published_at||"").localeCompare(a.published_at||"")),[filtered]);
   return <div style={{marginTop:18}}>
     <div className="sec-head">有識者</div>
-    <div className="sec-note" style={{fontSize:13}}>
-      YouTube・インタビュー・セミナー・記事・SNS等の有識者見解を「見通し／根拠／確認条件／無効化条件」に分けてJSONで貼り付けてimportします（ChatGPTで要約→JSON化する運用を想定、有料AI APIは使用しません）。
-      見通しを売買シグナルへ直接変換することはなく、Primary/Action StatusにもAUTOロジックにも一切干渉しません（実市場データ・AUTO SIGNALSが優先、EXPERT VIEWが最終判断を上書きすることはありません）。
-      字幕全文が無い断片情報・要約のみの情報は確定情報として扱わず、verification_status（USER_PROVIDED_TRANSCRIPT/TRANSCRIPT_DERIVED/SUMMARY_ONLY/VERIFIED/UNVERIFIED）を必ず保存します。
-    </div>
     <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 12px",marginBottom:14}}>
       <textarea value={pasteText} onChange={e=>setPasteText(e.target.value)} rows={8}
         placeholder={'例: [{"expert_name":"○○○○","source_title":"○○チャンネル 9/4配信","source_type":"YOUTUBE","published_at":"2026-09-04","time_horizon":"SHORT_TERM","market":"JP","outlook":"9月〜10月上旬は警戒","risk_window_start":"2026-09-01","risk_window_end":"2026-10-10","thesis":"テクニカル過熱・円高・金融政策が短期逆風","confirmations":["円高一服","日銀QT議論"],"invalidation_conditions":["原油急騰","円高加速"],"verification_status":"USER_PROVIDED_TRANSCRIPT"}]'}
@@ -2596,9 +2582,6 @@ function EventDashboardPanel({events,allWatch,heldItems,onOpenManage}){
       {/* 2026-09-07新規：カレンダーからそのまま「イベント登録」サブタブへ移動できるボタン
           （見る→登録する→確認する を同じ場所で完結させる）。 */}
       {onOpenManage && <button className="action-btn" onClick={onOpenManage}>＋ イベント登録へ</button>}
-    </div>
-    <div className="sec-note" style={{fontSize:13}}>
-      既存の市場イベント（market_events、上の「イベント登録」タブから貼り付けimport）を期間・重要度・種別で絞り込んで一覧表示するだけの参照画面です。新しい判定ロジックは追加しておらず、Primary/Action Status・AUTOスコア・Position Statusには一切影響しません。保有銘柄に関係するイベント（決算等）は重要度フィルタに関係なく常に表示します。
     </div>
     {todayHigh.length>0 && <div style={{background:"var(--upBg)",border:"1px solid var(--up)",borderRadius:4,padding:"10px 14px",marginBottom:14}}>
       <div style={{fontSize:13,fontWeight:700,color:"var(--up)"}}>⚠ 本日の重要イベント {todayHigh.length}件</div>
@@ -4764,12 +4747,6 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
       </label>
       {watchAddMsg && <span style={{fontSize:11,color:"var(--inkSoft)"}}>{watchAddMsg}</span>}
     </div>
-    <div className="sec-note" style={{marginTop:-4,marginBottom:10}}>
-      ※ 取引タイプ（DAY/SWING）は新規登録に必須です。SWINGは-10%の絶対損切りルール等、取引タイプに応じた判断が働きます。
-      平均取得単価は実際に約定した単価を入力してください（トレード分析タブのentryは参考値で、ポジション管理の基準にはしません）。
-      初期SL・利確①②は任意入力で、トレード分析タブで「分析」済みの銘柄なら「分析値を使う」で反映できます。
-      監視銘柄に未登録の銘柄でもコード欄の検索からそのままポジション追加できます。
-    </div>
     {loading
       ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>読み込み中…</div>
       : items.length===0
@@ -5009,10 +4986,6 @@ function InvestmentLogPanel({marketEnvAuto,usMarketAuto,interestRateAuto,fxAuto,
 
   return <div style={{marginTop:18}}>
     <div className="sec-head">投資判断ログ</div>
-    <div className="sec-note">
-      毎日の相場観・監視銘柄ごとの評価・ChatGPTとのやり取りをサーバーDB（Neon）に記録し、後から振り返り・分析できるようにします。
-      地合い・金利・為替・原油・セクター強弱は日次モニターの直近取得値から自動で下書きに入ります（内容は自由に編集できます）。
-    </div>
 
     <div className="card" style={{padding:"14px 16px",marginBottom:16}}>
       <div style={{fontWeight:700,marginBottom:10}}>新規ログ</div>
@@ -5400,12 +5373,6 @@ function ChatGptImportPanel({journal,activeRules}){
 
   return <div style={{marginTop:18}}>
     <div className="sec-head">ChatGPT連携（投資ログ取り込み）</div>
-    <div className="sec-note">
-      ChatGPTで相談して作成した投資ログJSONをここへ貼り付けます。有料AI APIはこのアプリからは呼び出しません
-      （ChatGPTとのやり取りは従来どおりChatGPT側で行い、その結果のJSONだけをコピー＆ペーストします）。
-      従来のフラット形式（date/market/watchlist/decisions/review/rule_updates）に加え、
-      ChatGPTが出力する詳細形式（type:"morning_market_check"等のネスト構造）も自動検出して変換します。
-    </div>
 
     <div style={{marginTop:10,display:"flex",alignItems:"center",gap:8}}>
       <button className="action-btn" onClick={copyClosingReport}>📋 ChatGPT大引け振り返り用にコピー</button>
@@ -5644,12 +5611,7 @@ function ChatGptDailyImportPanel(){
 
   return <div style={{marginTop:24,paddingTop:18,borderTop:"1px solid var(--ruleSoft)"}}>
     <div className="sec-head">ChatGPT日次JSON</div>
-    <div className="sec-note">
-      ChatGPTとの日々のTrade Cockpit相談内容の要約（相場観・気付き・アプリ改善提案・バグ/リスク・新ルール案・差分updates）をJSONで貼り付けてimportします。
-      有料AI APIやChatGPT API連携は使いません（コピー＆ペーストのみ）。<b>updates=[]の場合、分析ロジック・ルール・AUTO判定は一切変更しません。</b>
-      importしただけではルールは変更されません（履歴保存のみ）。差分がある場合は履歴から「Diff Preview」で内容を確認し、「Apply Updates」を押した時だけマイルールへ反映します。
-      SWING -10%等の重要ルールは保護対象とし、自動適用しません（⚠ 保護ルールと表示された場合はマイルールタブから手動で判断してください）。
-    </div>
+    <div className="sec-note" style={{fontSize:11}}>※ importのみでは何も変更されません。「Apply Updates」を押した時だけマイルールへ反映します。</div>
 
     <div style={{marginTop:12}}>
       <label style={{fontSize:11,color:"var(--inkSoft)",display:"block",marginBottom:2}}>ChatGPTが出力した日次JSON
@@ -5854,10 +5816,6 @@ function WatchlistImportPanel({watchlist,setWatchlist,masterJP}){
 
   return <div style={{marginTop:24,paddingTop:20,borderTop:"1px solid var(--rule)"}}>
     <div className="sec-head">監視銘柄インポート（ChatGPTスクリーンショット認識結果）</div>
-    <div className="sec-note">
-      普段ChatGPTへ証券アプリの監視銘柄スクリーンショットを共有している場合、ChatGPTに認識結果をJSONで出力してもらい、ここへ貼り付けると一括登録できます。
-      画像認識はChatGPT側で行い、Trade Cockpitでは行いません（有料AI APIは呼び出しません）。銘柄コードはmasterJPと照合し、不明な場合はUNKNOWNのまま登録します。
-    </div>
     <div style={{marginTop:8,display:"flex",alignItems:"center",gap:8}}>
       <button className="action-btn" onClick={copyCurrentWatchlist}>現在の監視銘柄をChatGPT用にコピー（{watchlist.length}件）</button>
       {copyMsg && <span style={{fontSize:11,color:"var(--inkSoft)"}}>{copyMsg}</span>}
@@ -6083,8 +6041,8 @@ function MarketEnvironmentBanner({metrics,watchlistAll,stockQuotes,top5}){
     </div>
     <div style={{display:"flex",alignItems:"baseline",gap:8,marginBottom:10}}>
       <span style={{fontSize:12,color:"var(--inkSoft)"}}>今日の地合い：</span>
-      <span style={{fontWeight:800,fontSize:18,color:sentimentColor}}>{sentiment||"—"}</span>
-      <span style={{fontSize:11,color:"var(--inkFaint)"}}>（日経先物・NASDAQ・SOXの当日騰落率の平均から簡易判定／米国市場は日本株判断のための外部環境として扱います）</span>
+      <span style={{fontWeight:800,fontSize:18,color:sentimentColor}}
+        title="日経先物・NASDAQ・SOXの当日騰落率の平均から簡易判定／米国市場は日本株判断のための外部環境として扱います">{sentiment||"—"}</span>
     </div>
     <div style={{display:"flex",flexWrap:"wrap",gap:16,marginBottom:12}}>
       {ENV_ROWS.map(([label,key,dp])=>{
@@ -6276,7 +6234,6 @@ function ThemeSectorRanking({watchlistAll,stockQuotes,metrics}){
 
   return <div style={{marginBottom:18}}>
     <div className="sec-head">本日の注目セクター</div>
-    <div className="sec-note">登録銘柄（日本・アメリカ市場）の平均騰落率・Market RS（対日経平均、pt）・合計売買代金・銘柄数から自動算出。売買代金の大きさ＝強さではないため（大型株の多いセクターが上位に出やすい）、騰落率・Market RSも併記しています。「代表銘柄」はそのグループ内で最も値動きが大きい銘柄です。</div>
     {sectorRanking.length===0
       ? <div style={{fontSize:12,color:"var(--inkSoft)",marginTop:8}}>登録銘柄がありません。「日本市場」「アメリカ市場」タブで銘柄を登録してください。</div>
       : <div style={{overflowX:"auto",marginTop:8}}>
@@ -7568,8 +7525,7 @@ function App(){
             <span style={{fontSize:11,color:"var(--inkSoft)"}}>{monitorFetching?"更新中…":monitorMsg}</span>
           </div>
         </div>
-        <div className="sec-note">30秒おきに自動更新します。ドル円・日経平均・ダウ・ナスダック・SOX・米10年債・S&P500・KOSPI・日経225先物・NYダウ先物・WTI原油・金・銅 を今日値／前日値ともに取得します（数値は遅延あり）。</div>
-        <div className="sec-note" style={{marginTop:-4,marginBottom:14}}>項目をクリックするとリアルタイムチャートが下に開きます。</div>
+        <div className="sec-note">30秒おきに自動更新（数値は遅延あり）。項目クリックでチャート表示。</div>
         <TodaysMarketCard metrics={s.metrics} watchlistAll={watchlistAll} stockQuotes={s.stockQuotes}
           marketRisk={s.marketRisk} onRefresh={fetchMarketRisk} refreshing={marketRiskFetching}
           activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)} importantNews={importantNewsAll}
@@ -7622,7 +7578,6 @@ function App(){
             クリックで既存のopenAnalysisFor（analysisTargetsに追加＋トレード分析タブへ遷移）を使う。 */}
         <div style={{marginTop:18}}>
           <div className="sec-head" style={{fontSize:14}}>RS上位 監視銘柄</div>
-          <div className="sec-note">監視銘柄タブの「今日の注目TOP5」と同じ算出結果です。クリックでトレード分析へ移動します。</div>
           {todayTop5.length===0
             ? <div style={{fontSize:12,color:"var(--inkFaint)",marginTop:6}}>判定可能な監視銘柄がまだありません。</div>
             : <div style={{display:"flex",flexDirection:"column",gap:4,marginTop:8}}>
@@ -7644,7 +7599,6 @@ function App(){
               </div>}
         </div>
 
-        <p className="foot" style={{marginTop:14}}>※ 30秒おきに自動更新されます（start.bat で起動したローカルサーバー経由）。数値は遅延あり（前営業日終値〜数十分遅れ）でリアルタイムの板ではありません。</p>
       </div>}
 
       {/* ===== 監視銘柄（2026-08-21 ユーザー要望） ===== */}
@@ -7678,7 +7632,6 @@ function App(){
           metrics={s.metrics} breakoutLevels={s.breakoutLevels} analysisData={s.analysisData} marketRiskLabel={s.marketRisk?.marketRiskLabel}
           onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}
           onAddPosition={w=>setSectorPositionEntryFor({code:w.code,name:w.name,market:w.market})} newsCatalysts={newsCatalysts}/>
-        <p className="foot">※ ニュースはGoogleニュースRSSを利用しています。売買を推奨するものではなく、最終判断はご自身で。</p>
       </div>}
 
       {/* ===== US（アメリカ市場・6-1章） ===== */}
@@ -7696,7 +7649,6 @@ function App(){
           metrics={s.metrics} breakoutLevels={s.breakoutLevels} analysisData={s.analysisData} marketRiskLabel={s.marketRisk?.marketRiskLabel}
           onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}
           onAddPosition={w=>setSectorPositionEntryFor({code:w.code,name:w.name,market:w.market})} newsCatalysts={newsCatalysts}/>
-        <p className="foot" style={{marginTop:16}}>※ 対象は現行のダウ工業株30種平均構成銘柄。業種分類は日本市場と同じ東証33業種の枠組みで統一しています（GICSセクターではありません）。アメリカ市場銘柄のニュース・決算・IRは「ニュース」タブのサマリー・海外市況・適時開示に統合表示しています。</p>
       </div>}
 
       {/* ===== イベント（PHASE 3：EVENT/EARNINGS INTELLIGENCE） ===== */}
@@ -7710,7 +7662,6 @@ function App(){
           <div className="sec-head">決算分析</div>
           {earningsFetching && <span style={{fontSize:11,color:"var(--inkSoft)"}}>取得中…</span>}
         </div>
-        <div className="sec-note" style={{fontSize:13}}>TDnetから取得した直近の決算短信（決算・業績関連のみ）の実績・通期会社計画・進捗率・予想修正の有無を、数値ベースの決定的な処理で抜き出して表示します（AIによる要約ではありません）。アメリカ株はTDnet対象外のため取得できません。「決算」ボタンで銘柄を選んだ瞬間に自動で取得します。</div>
         {earningsItems.length===0
           ? <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:14,border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)"}}>
               決算分析の対象銘柄がありません。「日本市場」タブの登録銘柄一覧で「決算」ボタンを押すと、ここに追加されます。
@@ -7816,16 +7767,10 @@ function App(){
             ? <span style={{fontSize:11,color:"var(--inkSoft)",fontWeight:700}}>🔄 現在値・市場指標を最新化しています…</span>
             : analyzing && <span style={{fontSize:11,color:"var(--inkSoft)"}}>取得中…</span>}
         </div>
-        {/* 12-2章：免責表示（必須・常時表示・断定的表現を避ける） */}
-        <div style={{background:"var(--band)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:14,fontSize:12.5,lineHeight:1.7,color:"var(--inkSoft)"}}>
-          本分析は算出根拠の一つに過ぎず、投資判断は必ずご自身の判断で行ってください。数値を鵜呑みにせず、最終判断はご自身の責任で行ってください。
-          購入・損切り・利確の各単価は「推奨」ではなく、あくまで目安・参考値です。
-          {/* 2026-09-08追加（指示書1・9番）：この画面を開くたびに、現在値・市場指標をその場で
-              取り直してから分析を再計算する（ANALYSIS_STALE_MINUTES=15分を超えて陳腐化していた
-              場合、または未取得の場合のみ。直近取得済みなら再取得しない）。 */}
-          <div style={{marginTop:6,fontSize:11.5,color:"var(--inkFaint)"}}>
-            ℹ️ 表示中の分析結果が15分以上前のものになると、この画面を開いた際に自動で現在値・市場指標ごと再取得します（各カード右上の「🔄 今すぐ最新化」で手動再取得も可能）。
-          </div>
+        {/* 12-2章：免責表示（必須・断定的表現を避ける）。2026-09-08 UI整理：常時表示の長文から
+            1行へ短縮（削除はしない＝過去に「必須」指定された表示のため）。 */}
+        <div style={{fontSize:11,color:"var(--inkFaint)",marginBottom:10}} title="購入・損切り・利確の各単価は「推奨」ではなく、あくまで目安・参考値です。数値を鵜呑みにせず最終判断はご自身で行ってください。">
+          ⚠️ 参考値です。投資判断はご自身で。
         </div>
         {analysisItems.length===0
           ? <div style={{padding:26,textAlign:"center",color:"var(--inkSoft)",fontSize:13,border:"1px solid var(--rule)",borderRadius:4,background:"var(--card)"}}>
@@ -8100,18 +8045,12 @@ function App(){
                 })}
               </div>
             </div>}
-        <p className="foot" style={{marginTop:16}}>※ テクニカル指標は過去1年の日足終値（25日/75日/100日移動平均・RSI14・RCI26・ATR14・ボリンジャーバンド20,±2σ/±3σ・52週高値安値）に加え、当日の1分足・5分足・15分足をリアルタイムに取得し、当日高値安値・VWAP・短期RSIを購入/損切り/利確単価の算出に反映しています（市場時間外は分足データなしで日足のみの算出になります）。パンパカパン・ゴールデンクロス・複合底打ち等のシグナル判定を含みます。エントリー適性チェック（上昇トレンド・出来高増加・押し目・VWAP）、見送り条件（出来高過少・地合い不安定）、決算またぎの目安（yfinance取得可能な場合のみ）も自動判定しています。ファンダメンタルはyfinance取得可能な範囲（PER・PBR・配当利回り・予想EPS)を使用しています。</p>
       </div>}
 
       {/* ===== 記録（17章：売買記録・トレードジャーナル） ===== */}
       {tab==="journal" && <div style={{marginTop:18}}>
         <div className="sec-head">記録</div>
-        <div className="sec-note">
-          エントリー理由・相場環境・撤退条件を記録し、後から結果と学びを追記します。
-          {s.investmentLogMigrated
-            ? "サーバーDB（Neon）に保存され、投資判断ログと合わせて後から分析・MCP連携で利用できます。"
-            : "現在はこの端末のブラウザにのみ保存されています（サーバーには送信されません）。"}
-        </div>
+        {!s.investmentLogMigrated && <div className="sec-note" style={{fontSize:11}}>※ 現在この端末のブラウザにのみ保存されています。</div>}
         {/* 2026-09-02 ユーザー要望「投資判断ログ」：既存の記録・マイルールをサーバーDBへ移行する
             ボタン。移行後はsyncJournalSave等が自動でサーバーにも同期するため、この操作は
             1回だけでよい（IDが同じものは上書きになるため、誤って複数回押しても壊れない）。 */}
@@ -8205,7 +8144,6 @@ function App(){
             {notifyPermission!=="granted" &&
               <button className="btn" onClick={requestNotifyPermission}>{notifyPermission==="unsupported"?"通知非対応ブラウザ":"デスクトップ通知を許可"}</button>}
           </div>
-          <div className="sec-note" style={{marginTop:8}}>セクター内逆行銘柄の検知、出来高ブレイクアウト該当銘柄の「監視銘柄」への自動追加のタイミングで、ブラウザのデスクトップ通知でお知らせします（許可が必要・タブを開いている間のみ動作）。</div>
           {sectorLaggards.length>0 && <div style={{marginTop:12,paddingTop:10,borderTop:"1px solid var(--ruleSoft)"}}>
             <div style={{fontSize:12.5,fontWeight:700,color:"var(--ink)",marginBottom:6}}>↗ セクター内逆行銘柄（弱いセクターの中で一人勝ちしている銘柄）</div>
             <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
@@ -8399,10 +8337,6 @@ function App(){
         needsTradeStyle={true} onClose={()=>setSectorPositionEntryFor(null)}
         onSaved={()=>{loadHeldItems();}}/>}
 
-      <p className="foot" style={{borderTop:"1px solid var(--ruleSoft)",paddingTop:12,marginTop:24}}>
-        データはこのブラウザに自動保存されます（同じファイルを同じブラウザで開けば継続）。念のため時々「バックアップ↓」でJSON保存を。<br/>
-        このツールは判断材料の整理用で、売買を推奨するものではありません。最終判断はご自身で。
-      </p>
     </div>
   );
 }
