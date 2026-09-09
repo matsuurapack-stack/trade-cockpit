@@ -710,6 +710,44 @@ CREATE INDEX IF NOT EXISTS idx_analysis_context_log_user_code ON analysis_contex
 ALTER TABLE daily_reviews ADD COLUMN IF NOT EXISTS known_risk_ignored_json JSONB;
 """
 
+# 2026-09-10新規（朝一マーケット自動分析システム、MorningMarketCheck）。
+_SCHEMA_MORNING_CHECK_SQL = """
+CREATE TABLE IF NOT EXISTS morning_market_checks (
+    id                   SERIAL PRIMARY KEY,
+    user_id              TEXT NOT NULL,
+    check_date           TEXT NOT NULL,
+    snapshot_time        TEXT NOT NULL,  -- T0530|T0700|T0800|T0830|T0850|MANUAL
+    generated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    market_regime        TEXT,
+    volatility_regime    TEXT,
+    trend_type           TEXT,
+    market_risk_score    INTEGER,
+    volatility_score     INTEGER,
+    trend_score          INTEGER,
+    macro_pressure_score INTEGER,
+    indices_json         JSONB,
+    fx_json              JSONB,
+    commodities_json     JSONB,
+    adr_json             JSONB,
+    data_quality_json    JSONB,
+    strong_sectors_json  JSONB,
+    weak_sectors_json    JSONB,
+    watchlist_top5_json  JSONB,
+    avoid_stocks_json    JSONB,
+    resilience_json      JSONB,
+    risk_warnings_json   JSONB,
+    event_risk_json      JSONB,
+    position_risk_json   JSONB,
+    strategy_json        JSONB,
+    strategy_text        TEXT,
+    raw_payload_json     JSONB,
+    is_read              BOOLEAN NOT NULL DEFAULT false,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, check_date, snapshot_time)
+);
+CREATE INDEX IF NOT EXISTS idx_morning_checks_user_date ON morning_market_checks(user_id, check_date DESC, generated_at DESC);
+"""
+
 
 def init_schema(database_url):
     """テーブルを（無ければ）作成し、マルチユーザー化・ChatGPT連携の移行SQLも実行する。
@@ -725,6 +763,7 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_TRADE_RULES_SQL)
         conn.execute(_SCHEMA_DAILY_REVIEWS_SQL)
         conn.execute(_SCHEMA_KNOWLEDGE_ENGINE_SQL)
+        conn.execute(_SCHEMA_MORNING_CHECK_SQL)
         conn.commit()
 
 
@@ -3366,6 +3405,96 @@ def _check_playbook_discipline(database_url, user_id, exits_today):
         elif pb_ids:
             good.append(f"{label}：プレイブックを参照して決済判断")
     return good, bad
+
+
+# ============================================================
+# ---- 朝一マーケット自動分析システム（MorningMarketCheck）。2026-09-10新規 ----
+# 実際の市場データ取得・分析はserver.py側（market_data_service/morning_analysis_engine/
+# morning_report_service）が担う。ここではNeonへの保存・取得（morning_report_serviceの
+# 永続化部分）だけを持つ。
+# ============================================================
+
+_MORNING_CHECK_JSON_COLS = [
+    "indices_json", "fx_json", "commodities_json", "adr_json", "data_quality_json",
+    "strong_sectors_json", "weak_sectors_json", "watchlist_top5_json", "avoid_stocks_json",
+    "resilience_json", "risk_warnings_json", "event_risk_json", "position_risk_json",
+    "strategy_json", "raw_payload_json",
+]
+_MORNING_CHECK_SCALAR_COLS = [
+    "market_regime", "volatility_regime", "trend_type", "market_risk_score", "volatility_score",
+    "trend_score", "macro_pressure_score", "strategy_text",
+]
+
+
+def save_morning_check(database_url, user_id, check_date, snapshot_time, data):
+    """1回分のMorningMarketCheckを保存する（(user_id, check_date, snapshot_time)で
+    UNIQUE、同一時間帯の再生成＝手動再分析はON CONFLICTで上書き更新）。dataは
+    _MORNING_CHECK_SCALAR_COLS/_MORNING_CHECK_JSON_COLSのキーを持つdict。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    cols = _MORNING_CHECK_SCALAR_COLS + _MORNING_CHECK_JSON_COLS
+    values = []
+    for c in cols:
+        if c in _MORNING_CHECK_JSON_COLS:
+            values.append(json.dumps(data.get(c), ensure_ascii=False))
+        else:
+            values.append(data.get(c))
+    placeholders = ", ".join(["%s::jsonb" if c in _MORNING_CHECK_JSON_COLS else "%s" for c in cols])
+    update_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO morning_market_checks (user_id, check_date, snapshot_time, {', '.join(cols)}) "
+                f"VALUES (%s, %s, %s, {placeholders}) "
+                f"ON CONFLICT (user_id, check_date, snapshot_time) DO UPDATE SET "
+                f"{update_clause}, generated_at = now(), is_read = false "
+                f"RETURNING *",
+                [user_id, check_date, snapshot_time] + values,
+            )
+            saved = cur.fetchone()
+        conn.commit()
+    return _row_to_json(saved)
+
+
+def get_latest_morning_check(database_url, user_id, check_date=None):
+    """当日（省略時は今日）分の最新MorningMarketCheckを1件返す（無ければNone）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    check_date = check_date or datetime.date.today().isoformat()
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM morning_market_checks WHERE user_id=%s AND check_date=%s "
+                "ORDER BY generated_at DESC LIMIT 1", [user_id, check_date])
+            row = cur.fetchone()
+    return _row_to_json(row) if row else None
+
+
+def list_morning_checks(database_url, user_id, check_date=None, limit=10):
+    """当日（省略時は今日）分のMorningMarketCheckを時系列（古い→新しい）で返す。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    check_date = check_date or datetime.date.today().isoformat()
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM morning_market_checks WHERE user_id=%s AND check_date=%s "
+                "ORDER BY generated_at ASC LIMIT %s", [user_id, check_date, limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def mark_morning_check_read(database_url, user_id, check_id):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return False
+    with pool.connection() as conn:
+        conn.execute("UPDATE morning_market_checks SET is_read=true WHERE id=%s AND user_id=%s", [check_id, user_id])
+        conn.commit()
+    return True
 
 
 # ---- investment_profile（投資プロフィール。2026-09-02新規） ----

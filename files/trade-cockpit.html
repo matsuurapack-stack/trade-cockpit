@@ -1680,6 +1680,9 @@ const ENTRY_STRATEGY_META={
 // 移行処理は不要、既存コードへの影響なし）。EventsPanelコンポーネント自体は無変更・再利用。
 const TAB_GROUPS=[
   {key:"watch",label:"監視銘柄",tabs:[{key:"watch",label:"監視銘柄"}]},
+  // 2026-09-10新規（朝一マーケット自動分析システム）：常設ナビの目立つ位置（監視銘柄の
+  // すぐ隣）に配置。既存タブの並び・キーには一切影響しない独立タブ。
+  {key:"morningcheck",label:"🌅 朝一",tabs:[{key:"morningcheck",label:"朝一チェック"}]},
   {key:"market",label:"市場",tabs:[{key:"monitor",label:"概況"},{key:"briefing",label:"日本株一覧"},{key:"us",label:"米国株一覧"}]},
   {key:"eventDashboard",label:"イベント",tabs:[{key:"eventDashboard",label:"カレンダー"},{key:"events",label:"イベント登録"}]},
   {key:"tradeAnalysis",label:"トレード分析",tabs:[{key:"analysis",label:"分析"},{key:"earnings",label:"決算"}]},
@@ -6959,6 +6962,248 @@ function RecentReflectionsNote(){
   </div>;
 }
 
+// ============================================================
+// 2026-09-10新規（朝一マーケット自動分析システム、MorningMarketCheck）：
+// 既存のNotification API連携（notifyDesktop/requestNotifyPermission、App内で既に
+// 使われているセクター内逆行銘柄通知と同じ仕組み）をそのまま再利用する。
+// 音は外部ファイルを持たずWeb Audio APIの短いビープ音で鳴らす（指示書19番「短い1回音」）。
+// ブラウザの自動再生制限対策として、AudioContextは最初のユーザー操作（クリック等）まで
+// 生成を遅らせる（指示書「初回のみユーザー操作後に音声許可を初期化」）。
+// ============================================================
+let _morningCheckAudioCtx=null;
+if(typeof window!=="undefined"){
+  const initAudio=()=>{
+    if(!_morningCheckAudioCtx){
+      try{_morningCheckAudioCtx=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}
+    }
+    window.removeEventListener("click",initAudio);
+    window.removeEventListener("keydown",initAudio);
+  };
+  window.addEventListener("click",initAudio,{once:true});
+  window.addEventListener("keydown",initAudio,{once:true});
+}
+function playMorningCheckChime(urgent){
+  try{
+    const ctx=_morningCheckAudioCtx;
+    if(!ctx)return;
+    const o=ctx.createOscillator(),g=ctx.createGain();
+    o.type="sine";o.frequency.value=urgent?880:660;
+    g.gain.setValueAtTime(0.0001,ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.15,ctx.currentTime+0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001,ctx.currentTime+0.35);
+    o.connect(g);g.connect(ctx.destination);
+    o.start();o.stop(ctx.currentTime+0.4);
+    if(urgent){
+      setTimeout(()=>{
+        const o2=ctx.createOscillator(),g2=ctx.createGain();
+        o2.type="sine";o2.frequency.value=880;
+        g2.gain.setValueAtTime(0.0001,ctx.currentTime);
+        g2.gain.exponentialRampToValueAtTime(0.15,ctx.currentTime+0.02);
+        g2.gain.exponentialRampToValueAtTime(0.0001,ctx.currentTime+0.35);
+        o2.connect(g2);g2.connect(ctx.destination);
+        o2.start();o2.stop(ctx.currentTime+0.4);
+      },450);
+    }
+  }catch(e){}
+}
+const MORNING_REGIME_META={
+  RISK_ON:{label:"RISK ON",color:"var(--up)"},MILD_RISK_ON:{label:"やや強気",color:"var(--up)"},
+  NEUTRAL:{label:"中立",color:"var(--inkSoft)"},MILD_RISK_OFF:{label:"やや弱気",color:"var(--accent)"},
+  RISK_OFF:{label:"RISK OFF",color:"var(--down)"},HIGH_VOLATILITY:{label:"高ボラティリティ",color:"var(--down)"},
+};
+const MORNING_DATA_STATUS_META={ok:{icon:"✅",label:"LIVE"},stale:{icon:"🟠",label:"STALE"},failed:{icon:"🔴",label:"FAILED"},no_data:{icon:"🟡",label:"データなし"}};
+const MORNING_RISK_LEVEL_META={CRITICAL:{icon:"🔴",color:"var(--down)"},WARNING:{icon:"⚠",color:"var(--down)"},WATCH:{icon:"🟡",color:"var(--accent)"},INFO:{icon:"ℹ",color:"var(--inkSoft)"}};
+const MORNING_INDEX_LABELS={dow:"NYダウ",nasdaq:"NASDAQ",sp500:"S&P500",sox:"SOX",nasdaq_fut:"NASDAQ先物",
+  nikkei:"日経平均",nikkei_fut:"日経先物",topix_etf:"TOPIX(ETF代理)",growth250_etf:"グロース250(ETF代理)",
+  vix:"VIX",nikkei_vi_etn:"日経VI(ETN)",us10y:"米10年債",usdjpy:"ドル円",eurjpy:"ユーロ円",dxy:"ドルインデックス",
+  kospi:"KOSPI",wti:"WTI原油",gold:"金",brent:"Brent原油"};
+
+function MorningCheckSettings(){
+  const [soundOn,setSoundOn]=useState(()=>{try{return localStorage.getItem("morningCheckSound")!=="off";}catch(e){return true;}});
+  const [popupOn,setPopupOn]=useState(()=>{try{return localStorage.getItem("morningCheckPopup")!=="off";}catch(e){return true;}});
+  const toggle=(key,val,setter)=>{setter(val);try{localStorage.setItem(key,val?"on":"off");}catch(e){}};
+  return {soundOn,popupOn,
+    setSoundOn:v=>toggle("morningCheckSound",v,setSoundOn),
+    setPopupOn:v=>toggle("morningCheckPopup",v,setPopupOn)};
+}
+
+function MorningCheckPanel({notifyPermission,requestNotifyPermission,notifyDesktop}){
+  const [check,setCheck]=useState(null);
+  const [loading,setLoading]=useState(true);
+  const [generating,setGenerating]=useState(false);
+  const [detailOpen,setDetailOpen]=useState(false);
+  const settings=MorningCheckSettings();
+  const lastSeenIdRef=useRef(null);
+  const [toast,setToast]=useState(null);
+
+  const load=async(announce)=>{
+    const d=await fetchJsonSafe("/api/morning-check");
+    const c=(d&&d.check)||null;
+    if(c&&announce&&lastSeenIdRef.current!=null&&c.id!==lastSeenIdRef.current){
+      // 新しいレポートが生成された（前回ポーリング時と別ID）＝完成通知を出す
+      const urgent=(c.risk_warnings_json||[]).some(w=>w.level==="CRITICAL");
+      if(settings.soundOn)playMorningCheckChime(urgent);
+      if(settings.popupOn){
+        setToast({urgent,title:`${urgent?"⚠ MARKET RISK ALERT　":"🔔 "}朝一チェックが完成しました`,
+          body:[c.strong_sectors_json?.length?`強い：${c.strong_sectors_json.slice(0,2).join("・")}`:null,
+                (c.watchlist_top5_json||[])[0]?`本命：${c.watchlist_top5_json[0].name}`:null].filter(Boolean).join("　")});
+        setTimeout(()=>setToast(null),urgent?12000:8000);
+      }
+      notifyDesktop?.("朝一チェックが完成しました",(c.strategy_text||"").slice(0,80));
+    }
+    if(c)lastSeenIdRef.current=c.id;
+    setCheck(c);setLoading(false);
+  };
+  useEffect(()=>{load(false);
+    const id=setInterval(()=>load(true),60*1000);
+    return ()=>clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
+  useEffect(()=>{
+    if(check&&!check.is_read){
+      fetchJsonSafe("/api/morning-check/mark-read",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:check.id})});
+    }
+  },[check?.id]);
+
+  const generate=async()=>{
+    setGenerating(true);
+    const d=await fetchJsonSafe("/api/morning-check/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({snapshotTime:"MANUAL"})});
+    setGenerating(false);
+    if(d&&d.check){lastSeenIdRef.current=d.check.id;setCheck(d.check);}
+  };
+
+  const copyMorningCheckConsult=async()=>{
+    if(!check)return;
+    await copyChatGPTPayload("朝一チェックを相談","morning_check_report",{
+      market_regime:check.market_regime,volatility_regime:check.volatility_regime,
+      market_risk_score:check.market_risk_score,
+      indices:check.indices_json,fx:check.fx_json,commodities:check.commodities_json,
+      strong_sectors:check.strong_sectors_json,weak_sectors:check.weak_sectors_json,
+      watchlist_top5:check.watchlist_top5_json,avoid_stocks:check.avoid_stocks_json,
+      resilience_watch:check.resilience_json,risk_warnings:check.risk_warnings_json,
+      position_risk:check.position_risk_json,strategy:check.strategy_json,
+      data_quality:check.data_quality_json,
+    },()=>{});
+  };
+
+  if(loading)return <div style={{marginTop:18,fontSize:12,color:"var(--inkFaint)"}}>読み込み中…</div>;
+
+  return <div style={{marginTop:18}}>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+      <div className="sec-head">🌅 朝一チェック</div>
+      <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+        {notifyPermission!=="granted"&&notifyPermission!=="unsupported"&&
+          <button className="iconbtn" style={{fontSize:11}} onClick={requestNotifyPermission}>🔔 通知を許可</button>}
+        <label style={{fontSize:11,display:"flex",alignItems:"center",gap:3}}>
+          <input type="checkbox" checked={settings.soundOn} onChange={e=>settings.setSoundOn(e.target.checked)}/>通知音
+        </label>
+        <label style={{fontSize:11,display:"flex",alignItems:"center",gap:3}}>
+          <input type="checkbox" checked={settings.popupOn} onChange={e=>settings.setPopupOn(e.target.checked)}/>ポップアップ
+        </label>
+        {check&&<button className="action-btn" onClick={copyMorningCheckConsult}>🤖 朝一チェックを相談</button>}
+        <button className="action-btn" onClick={generate} disabled={generating}>{generating?"分析中…":"今すぐ朝一分析"}</button>
+      </div>
+    </div>
+
+    {!check
+      ? <div style={{padding:20,textAlign:"center",color:"var(--inkSoft)",fontSize:12.5,border:"1px solid var(--rule)",borderRadius:4,marginTop:10}}>
+          本日の朝一チェックはまだありません。「今すぐ朝一分析」を押すか、定時（05:30/07:00/08:00/08:30/08:50）の自動生成をお待ちください。
+        </div>
+    : <div style={{marginTop:12}}>
+        <div className="card" style={{padding:"14px 16px"}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+            <span style={{fontWeight:800,fontSize:16,color:(MORNING_REGIME_META[check.market_regime]||{}).color}}>
+              {(MORNING_REGIME_META[check.market_regime]||{}).label||check.market_regime}
+            </span>
+            <span className="mono" style={{fontSize:22,fontWeight:800,color:(MORNING_REGIME_META[check.market_regime]||{}).color}}>
+              {check.market_risk_score}<span style={{fontSize:12,fontWeight:400,color:"var(--inkSoft)"}}> / 100</span>
+            </span>
+            <span style={{fontSize:11,color:"var(--inkFaint)"}}>ボラティリティ：{check.volatility_regime}</span>
+            <span style={{fontSize:11,color:"var(--inkFaint)",marginLeft:"auto"}}>最終更新：{new Date(check.generated_at).toLocaleString("ja-JP")}（{check.snapshot_time}）</span>
+          </div>
+          {check.strategy_text && <div style={{marginTop:8,fontSize:12.5,lineHeight:1.6}}>{check.strategy_text}</div>}
+        </div>
+
+        {(check.risk_warnings_json||[]).length>0 && <div style={{display:"flex",flexDirection:"column",gap:4,marginTop:10}}>
+          {check.risk_warnings_json.map((w,i)=><div key={i} style={{fontSize:12.5,fontWeight:700,color:(MORNING_RISK_LEVEL_META[w.level]||{}).color,
+            background:"var(--downBg)",border:`1px solid ${(MORNING_RISK_LEVEL_META[w.level]||{}).color||"var(--rule)"}`,borderRadius:4,padding:"5px 9px"}}>
+            {(MORNING_RISK_LEVEL_META[w.level]||{}).icon} {w.message}
+          </div>)}
+        </div>}
+
+        {(check.position_risk_json||[]).length>0 && <div className="card" style={{padding:"10px 12px",marginTop:10,borderLeft:"3px solid var(--down)"}}>
+          <b style={{fontSize:12,color:"var(--down)"}}>保有ポジション警戒</b>
+          {check.position_risk_json.map((p,i)=><div key={i} style={{fontSize:12,marginTop:4}}>
+            <b>{p.name||p.code}</b> {p.pnlPct>0?"+":""}{p.pnlPct}%　<span style={{color:(MORNING_RISK_LEVEL_META[p.level]||{}).color}}>{p.message}</span>
+          </div>)}
+        </div>}
+
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))",gap:8,marginTop:10}}>
+          <div className="card" style={{padding:"10px 12px"}}>
+            <b style={{fontSize:12}}>🔥 TODAY TOP5</b>
+            {(check.watchlist_top5_json||[]).length===0?<div style={{fontSize:11.5,color:"var(--inkFaint)",marginTop:6}}>該当銘柄なし</div>:
+              <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:6}}>
+                {check.watchlist_top5_json.map(t=><div key={t.code} style={{fontSize:12}}>
+                  <b>{t.rank}. {t.name}</b>（{t.code}）{t.changePct>0?"+":""}{t.changePct}%　{t.resilience==="STRONG"&&<span title="地合い逆行の強い相対強度">🛡</span>}
+                  <div style={{fontSize:10.5,color:"var(--inkSoft)"}}>{(t.reason||[]).join("・")}</div>
+                </div>)}
+              </div>}
+          </div>
+          <div className="card" style={{padding:"10px 12px"}}>
+            <b style={{fontSize:12}}>SECTOR</b>
+            <div style={{marginTop:6,fontSize:12}}>
+              {(check.strong_sectors_json||[]).map(s=><div key={s} style={{color:"var(--up)"}}>↑ {s}</div>)}
+              {(check.weak_sectors_json||[]).map(s=><div key={s} style={{color:"var(--down)"}}>↓ {s}</div>)}
+              {!(check.strong_sectors_json||[]).length&&!(check.weak_sectors_json||[]).length&&<div style={{color:"var(--inkFaint)"}}>明確な偏りなし</div>}
+            </div>
+          </div>
+          <div className="card" style={{padding:"10px 12px"}}>
+            <b style={{fontSize:12}}>追わない銘柄</b>
+            <div style={{marginTop:6,fontSize:12}}>
+              {(check.avoid_stocks_json||[]).length===0?<span style={{color:"var(--inkFaint)"}}>該当なし</span>:
+                check.avoid_stocks_json.map(a=><div key={a.code}>{a.name}：{(a.reasons||[]).join("・")}</div>)}
+            </div>
+          </div>
+        </div>
+
+        <button className="iconbtn" style={{fontSize:11.5,marginTop:12}} onClick={()=>setDetailOpen(v=>!v)}>{detailOpen?"▾":"▸"} 詳細データを表示</button>
+        {detailOpen && <div style={{marginTop:8}}>
+          <div className="card" style={{padding:"10px 12px"}}>
+            <b style={{fontSize:12}}>指標</b>
+            <div style={{display:"flex",flexWrap:"wrap",gap:10,marginTop:6,fontSize:12}}>
+              {Object.entries(check.indices_json||{}).map(([k,v])=><span key={k} className="mono">
+                {MORNING_INDEX_LABELS[k]||k} {v.value!=null?v.value.toLocaleString():"—"}
+                {v.changePct!=null&&<span style={{color:v.changePct>0?"var(--up)":v.changePct<0?"var(--down)":"var(--inkSoft)"}}> {v.changePct>0?"+":""}{v.changePct}%</span>}
+                {" "}{(MORNING_DATA_STATUS_META[v.status]||{}).icon}
+              </span>)}
+            </div>
+          </div>
+          {(check.resilience_json||[]).length>0 && <div className="card" style={{padding:"10px 12px",marginTop:8}}>
+            <b style={{fontSize:12}}>🛡 地合い耐性（地合い逆行の強い銘柄）</b>
+            <div style={{marginTop:6,fontSize:12}}>
+              {check.resilience_json.map(r=><div key={r.code}>{r.name}　{r.changePct>0?"+":""}{r.changePct}%　対市場{r.marketRS>0?"+":""}{r.marketRS}pt</div>)}
+            </div>
+          </div>}
+          <div className="card" style={{padding:"10px 12px",marginTop:8}}>
+            <b style={{fontSize:12}}>DATA HEALTH</b>
+            <div style={{display:"flex",flexWrap:"wrap",gap:8,marginTop:6,fontSize:11.5}}>
+              {Object.entries(check.data_quality_json||{}).map(([k,v])=><span key={k}>{MORNING_INDEX_LABELS[k]||k} {(MORNING_DATA_STATUS_META[v]||{}).icon}</span>)}
+            </div>
+          </div>
+        </div>}
+      </div>}
+
+    {toast && <div style={{position:"fixed",right:16,bottom:16,zIndex:9999,maxWidth:320,
+        background:"var(--card)",border:`2px solid ${toast.urgent?"var(--down)":"var(--accent)"}`,borderRadius:8,
+        padding:"10px 12px",boxShadow:"0 4px 16px rgba(0,0,0,0.25)",cursor:"pointer"}}
+      onClick={()=>{setToast(null);}}>
+      <div style={{fontWeight:800,fontSize:12.5,color:toast.urgent?"var(--down)":"var(--accent)"}}>{toast.title}</div>
+      {toast.body && <div style={{fontSize:11.5,marginTop:4,color:"var(--inkSoft)"}}>{toast.body}</div>}
+      <div style={{fontSize:10.5,color:"var(--inkFaint)",marginTop:4}}>クリックで閉じる</div>
+    </div>}
+  </div>;
+}
+
 // テーマ・セクター強弱の可視化：SectorWatchlist内のsectorGroups集計（平均騰落率・合計売買代金）と
 // 同じ考え方を、JP+US統合した銘柄リストに対して汎用的に適用する。keyFnがnull/""を返す銘柄は
 // 対象外にする（テーマ未設定銘柄をテーマ別ランキングから除外するため）。
@@ -9395,6 +9640,9 @@ function App(){
 
       {/* ===== 今日の振り返り（日次投資レビュー、2026-09-09新規） ===== */}
       {tab==="dailyreview" && <DailyReviewPanel/>}
+
+      {/* ===== 朝一チェック（MorningMarketCheck、2026-09-10新規） ===== */}
+      {tab==="morningcheck" && <MorningCheckPanel notifyPermission={notifyPermission} requestNotifyPermission={requestNotifyPermission} notifyDesktop={notifyDesktop}/>}
 
       {/* ===== NEWS（9章・9-1章・9-2章） ===== */}
       {tab==="news" && (()=>{

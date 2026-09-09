@@ -148,7 +148,23 @@ INDEX = {
     # 既存のINDEX/get_index_quotes()パイプラインにそのまま追加するだけで、新しい取得経路は
     # 作らない（/api/quotesが自動的にこの値も返すようになる）。
     "nikkei_semi": "200A.T",
+    # 2026-09-10新規（朝一マーケット自動分析システム）：TOPIX・グロース250は無料で取れる
+    # 生の指数値ティッカーがYahoo Financeに存在しないため、連動ETF（1306＝野村TOPIX連動型
+    # 上場投信、2516＝NEXT FUNDS 東証グロース市場250 ETF）の価格を「変化率の代理指標」
+    # として使う（絶対値をTOPIXの実際のポイント数であるかのように見せない、UI側で
+    # 「ETF代理」であることを明示する）。日経平均VI（2036）は出来高が薄く取得できない日も
+    # ある（過去にFear&Greed同様の理由で撤去した経緯があるためsource_statusで正直に
+    # failed/staleを返す設計にする、CLAUDE.md「撤去済み機能」参照）。
+    "topix_etf": "1306.T", "growth250_etf": "2516.T", "vix": "^VIX", "nikkei_vi_etn": "2036.T",
+    "eurjpy": "EURJPY=X", "dxy": "DX-Y.NYB", "nasdaq_fut": "NQ=F", "brent": "BZ=F",
 }
+# 2026-09-10新規：登録銘柄のうちADR（米国預託証券）が存在する主要銘柄のみのYahoo Finance
+# ティッカー対応表（網羅的ではない、無ければ「ADRなし」として扱うだけで失敗にはしない）。
+ADR_TICKER_MAP = {
+    "7203": "TM", "6758": "SONY", "7267": "HMC", "8306": "MUFG", "8316": "SMFG",
+    "8591": "IX", "8035": "TOELY", "6501": "HTHIY", "4568": "DSNKY",
+    "8031": "MITSY", "8001": "ITOCY", "9984": "SFTBY", "6861": "KYCCF",
+}  # 動作確認済みティッカーのみ（NTT・三菱商事はYahoo Finance上でADR銘柄が見つからず対象外）
 
 
 def _two_closes(sym):
@@ -1479,6 +1495,536 @@ def _market_environment():
 
     return {"text": text, "nikkeiChangePct": n225["changePct"], "bad": n225["trend"] == "down",
             "marketRiskScore": risk["score"], "marketRiskLabel": risk["label"], "marketCondition": market_condition}
+
+
+# ============================================================
+# 朝一マーケット自動分析システム（MorningMarketCheck）。2026-09-10新規。
+# 指示書の方針通り、取得（market_data_service）と分析（morning_analysis_engine）を分離する。
+# 既存のINDEX/get_index_quotes・_market_risk_score・get_stock_quotes・投資判断エンジン
+# （investment_db.relevant_catalysts_for等）を可能な限り再利用し、新しい取得経路・
+# 判定基準を無闇に増やさない。
+# ============================================================
+
+MORNING_CHECK_SNAPSHOT_TIMES = {  # 指示書2番：将来変更しやすいよう定数化（JST、24h表記）
+    "T0530": "05:30", "T0700": "07:00", "T0800": "08:00", "T0830": "08:30", "T0850": "08:50",
+}
+MORNING_CHECK_FINAL_SNAPSHOT = "T0850"
+
+
+# ---- market_data_service：取得のみ、分析ロジックを含まない ----
+
+def fetch_adr_snapshot(codes):
+    """登録銘柄コードのうちADR_TICKER_MAPに存在するものだけADR変動率を取得する（指示書3G番）。
+    存在しない銘柄はスキップするだけで失敗として扱わない。"""
+    out = {}
+    if yf is None:
+        return out
+    for code in codes:
+        adr_ticker = ADR_TICKER_MAP.get(code)
+        if not adr_ticker:
+            continue
+        try:
+            r = _two_closes(adr_ticker)
+            if r and r.get("t") is not None and r.get("p"):
+                pct = (r["t"] - r["p"]) / r["p"] * 100
+                out[code] = {"adrTicker": adr_ticker, "adrPct": round(pct, 2), "adrClose": r["t"], "status": "ok"}
+        except Exception as e:
+            print("  ADR取得失敗", code, adr_ticker, e)
+    return out
+
+
+def fetch_fear_greed():
+    """Fear & Greed Index（CNN公開データ）。CLAUDE.md記載の通り、過去に不安定なスクレイピング
+    処理のため撤去した経緯がある。無料の公式APIが存在しないため、ここでは推測値を作らず
+    常にNone/failedを返す設計にする（指示書15番「取得不能はnull、推測禁止」を厳守）。
+    将来ユーザーが信頼できる取得先を用意できた場合にこの関数だけ差し替えれば良い設計
+    （market_data_service/morning_analysis_engineの分離により、分析ロジック側の変更は
+    不要）。"""
+    return {"value": None, "label": None, "status": "failed",
+            "note": "Fear&Greedは無料の公式APIが無いため未取得（推測値は作らない）"}
+
+
+def _fetch_index_snapshot(keys):
+    """INDEX辞書のうち指定キーだけを取得し、timestamp・status付きで返す（指示書15番：
+    データ品質の追跡）。既存get_index_quotes()を全キー分呼ぶと無駄なので、必要な分だけ
+    個別に_two_closes()する。"""
+    out = {}
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    for key in keys:
+        sym = INDEX.get(key)
+        if not sym:
+            continue
+        try:
+            r = _two_closes(sym)
+            if r and r.get("t") is not None:
+                pct = ((r["t"] - r["p"]) / r["p"] * 100) if r.get("p") else None
+                # nikkei_vi_etn等、前日値が取れない（薄商い）場合は値はあってもchange不明＝stale扱い
+                status = "ok" if r.get("p") is not None else "stale"
+                out[key] = {"value": r["t"], "prevClose": r.get("p"), "changePct": round(pct, 2) if pct is not None else None,
+                            "timestamp": now_iso, "status": status, "symbol": sym}
+            else:
+                out[key] = {"value": None, "prevClose": None, "changePct": None, "timestamp": now_iso,
+                            "status": "failed", "symbol": sym}
+        except Exception as e:
+            print("  指数取得失敗", key, sym, e)
+            out[key] = {"value": None, "prevClose": None, "changePct": None, "timestamp": now_iso,
+                        "status": "failed", "symbol": sym}
+    return out
+
+
+# ---- morning_analysis_engine：既に取得済みのデータから判断を組み立てる（新規APIは呼ばない）----
+
+def _morning_volatility_score(indices):
+    """VIX・日経VI（取得できれば）からボラティリティスコア（0〜100、高いほど高ボラ）を作る。
+    指示書6番のvolatility_scoreに対応。VIXが主指標、日経VIは補助（取得不能な日が多いため）。"""
+    vix = indices.get("vix", {})
+    score, missing = 30, []
+    v = vix.get("value")
+    if v is not None:
+        # VIX目安：<15落ち着き、15-20平常、20-25やや高い、25-35高い、35+極端
+        if v >= 35: score = 95
+        elif v >= 25: score = 75
+        elif v >= 20: score = 55
+        elif v >= 15: score = 35
+        else: score = 15
+    else:
+        missing.append("VIX")
+    nvi = indices.get("nikkei_vi_etn", {})
+    if nvi.get("status") == "ok" and nvi.get("changePct") is not None and nvi["changePct"] > 5:
+        score = min(100, score + 10)
+    return max(0, min(100, score)), missing
+
+
+def _morning_macro_pressure_score(indices, commodities):
+    """金利・為替・原油から「マクロ的な逆風」の強さ（0〜100）を作る（指示書6番の
+    macro_pressure_score）。米金利上昇＋ドル円急変動＋原油急騰を加点する単純ルールベース。"""
+    score = 30
+    us10y = indices.get("us10y", {})
+    if us10y.get("changePct") is not None and us10y["changePct"] >= 2:
+        score += 25
+    usdjpy = indices.get("usdjpy", {})
+    if usdjpy.get("changePct") is not None and abs(usdjpy["changePct"]) >= 1.0:
+        score += 15
+    wti = commodities.get("wti", {})
+    if wti.get("changePct") is not None and wti["changePct"] >= 3:
+        score += 20
+    return max(0, min(100, score))
+
+
+def _morning_trend_score(indices):
+    """米指数・日本先物のトレンド方向を単純平均してtrend_score（0〜100、高いほど上昇トレンド
+    優勢）にする。"""
+    pcts = []
+    for k in ("dow", "nasdaq", "sp500", "sox", "nikkei_fut"):
+        v = indices.get(k, {}).get("changePct")
+        if v is not None:
+            pcts.append(v)
+    if not pcts:
+        return 50, ["米指数/日経先物"]
+    avg = sum(pcts) / len(pcts)
+    # ±2%を振り切りとみなして0-100へ線形マップ（中心50）
+    score = max(0, min(100, round(50 + avg * 25)))
+    return score, []
+
+
+def classify_morning_regime(risk_score, volatility_score, indices):
+    """market_regime・volatility_regime・trend_typeを分けて判定する（指示書5番：1つに
+    無理やり固定しない）。risk_scoreは既存_market_risk_score()の0-100（高いほどRISK OFF）を
+    そのまま使う。"""
+    if risk_score is None:
+        market_regime = "NEUTRAL"
+    elif risk_score >= 76: market_regime = "RISK_OFF"
+    elif risk_score >= 60: market_regime = "MILD_RISK_OFF"
+    elif risk_score <= 20: market_regime = "RISK_ON"
+    elif risk_score <= 40: market_regime = "MILD_RISK_ON"
+    else: market_regime = "NEUTRAL"
+
+    if volatility_score is not None and volatility_score >= 70:
+        volatility_regime = "HIGH"
+        if market_regime in ("NEUTRAL", "MILD_RISK_ON", "MILD_RISK_OFF"):
+            market_regime = "HIGH_VOLATILITY"
+    elif volatility_score is not None and volatility_score >= 45:
+        volatility_regime = "ELEVATED"
+    else:
+        volatility_regime = "LOW"
+
+    sox = indices.get("sox", {}).get("changePct")
+    dow = indices.get("dow", {}).get("changePct")
+    if sox is not None and dow is not None and abs(sox - dow) >= 1.5:
+        trend_type = "selective_strength"  # 指数間で強弱がバラつく＝選別相場
+    elif market_regime in ("RISK_ON", "MILD_RISK_ON"):
+        trend_type = "broad_strength"
+    elif market_regime in ("RISK_OFF", "MILD_RISK_OFF"):
+        trend_type = "broad_weakness"
+    else:
+        trend_type = "mixed"
+    return market_regime, volatility_regime, trend_type
+
+
+_SECTOR_PROXY_HINTS = {
+    "energy": ["INPEX", "石油", "商社"], "trading_companies": ["商社"],
+    "semiconductor": ["半導体"], "semiconductor_equipment": ["半導体製造装置"],
+    "high_per_growth": ["グロース", "成長株"], "defense": ["防衛"],
+}
+
+
+def compute_macro_sector_strength(indices, commodities):
+    """マクロ指標（原油・金利・SOX・ADR等）から当日の強い/弱いセクターを推定する（指示書7番）。
+    個別銘柄の強弱と混同しないよう、あくまでマクロ要因からの推定に限定し、既存ADR/ニュース等の
+    個別材料は別枠（generate_morning_watchlist_focus側）で扱う。"""
+    strong, weak = [], []
+    wti = commodities.get("wti", {}).get("changePct")
+    brent = commodities.get("brent", {}).get("changePct")
+    oil_up = (wti is not None and wti >= 2) or (brent is not None and brent >= 2)
+    oil_down = (wti is not None and wti <= -2) or (brent is not None and brent <= -2)
+    if oil_up:
+        strong += ["energy", "trading_companies"]
+    if oil_down:
+        weak.append("energy")
+    us10y = indices.get("us10y", {}).get("changePct")
+    if us10y is not None and us10y >= 2:
+        weak.append("high_per_growth")
+        strong.append("bank")
+    elif us10y is not None and us10y <= -2:
+        strong.append("high_per_growth")
+    sox = indices.get("sox", {}).get("changePct")
+    if sox is not None and sox >= 1.5:
+        strong.append("semiconductor")
+    elif sox is not None and sox <= -1.5:
+        weak.append("semiconductor")
+    return list(dict.fromkeys(strong)), list(dict.fromkeys(weak))
+
+
+HARD_STOP_APPROACHING_PCT = -8.0  # 指示書11番／既存calcHardStop/hardStopState（trade-cockpit.html）と同じ閾値
+HARD_STOP_TRIGGER_PCT = -10.0
+
+
+def evaluate_position_risk_warnings(database_url, user_id, stock_quotes):
+    """保有ポジションの損切りルール接近・到達を判定する（指示書11・16番）。新しい閾値は
+    作らず、既存のSWING HARD STOP（取得単価×0.90＝-10%で強制、-8%で接近警告）をそのまま
+    Python側でも参照する（trade-cockpit.htmlのcalcHardStop/hardStopStateと同じ値、
+    ロジックの二重実装ではなく同じ既存ルールの再掲）。"""
+    if investment_db is None or not database_url:
+        return []
+    positions = investment_db.list_portfolio(database_url, user_id)
+    warnings = []
+    for p in positions:
+        code = p.get("code")
+        avg = p.get("average_price")
+        current = (stock_quotes.get(code) or {}).get("t")
+        if avg is None or current is None or not avg:
+            continue
+        pnl_pct = (current - avg) / avg * 100
+        style = (p.get("trade_style") or "").upper()
+        level = None
+        if style == "SWING":
+            if pnl_pct <= HARD_STOP_TRIGGER_PCT:
+                level = "CRITICAL"
+            elif pnl_pct <= HARD_STOP_APPROACHING_PCT:
+                level = "WARNING"
+        elif pnl_pct <= HARD_STOP_APPROACHING_PCT:
+            level = "WARNING"  # DAY建玉は絶対ルール対象外だが、大幅含み損は情報として警告する
+        if level:
+            warnings.append({
+                "code": code, "name": p.get("name"), "pnlPct": round(pnl_pct, 2), "level": level,
+                "message": ("損切りルール到達。一度売却してください（再エントリーは別判断）。"
+                            if level == "CRITICAL" else "損切りラインに接近しています。"),
+            })
+    return warnings
+
+
+def generate_morning_watchlist_focus(database_url, user_id, market_data):
+    """登録銘柄の朝の注目TOP5・追わない銘柄・地合い耐性銘柄を生成する（指示書4・8・10番）。
+    重い日足履歴取得（analyze_stock等）は使わず、get_stock_quotes（既存の軽量な当日値取得）＋
+    ADR＋既存のカタリスト/イベント関連度判定（investment_db.relevant_catalysts_for・
+    upcoming_event_signals、判断エンジンから再利用）だけでスコアリングする。"""
+    if investment_db is None or not database_url:
+        return {"top5": [], "avoid": [], "resilience": []}
+    watchlist = investment_db.list_watchlist(database_url, user_id, market="JP")
+    if not watchlist:
+        return {"top5": [], "avoid": [], "resilience": []}
+    quotes = get_stock_quotes(watchlist)
+    nikkei_chg = market_data.get("indices", {}).get("nikkei", {}).get("changePct")
+    adr = fetch_adr_snapshot([w["code"] for w in watchlist])
+
+    # セクター平均（対セクター計算用、既存run_momentum_stage1のsector_avgと同じ考え方の軽量版）
+    sector_sum, sector_count = {}, {}
+    rows = []
+    for w in watchlist:
+        code = w.get("code")
+        q = quotes.get(code)
+        if not q or q.get("t") is None or not q.get("p"):
+            continue
+        chg = (q["t"] - q["p"]) / q["p"] * 100
+        rows.append({"code": code, "name": w.get("name"), "sector": w.get("sector"), "changePct": chg,
+                      "turnover": q.get("turnover"), "high": q.get("high"), "low": q.get("low"),
+                      "current": q.get("t")})
+        if w.get("sector"):
+            sector_sum[w["sector"]] = sector_sum.get(w["sector"], 0.0) + chg
+            sector_count[w["sector"]] = sector_count.get(w["sector"], 0) + 1
+    sector_avg = {s: sector_sum[s] / sector_count[s] for s in sector_sum}
+
+    scored = []
+    for row in rows:
+        code = row["code"]
+        market_rs = (row["changePct"] - nikkei_chg) if nikkei_chg is not None else None
+        sector_rs = (row["changePct"] - sector_avg.get(row["sector"], row["changePct"])) if row.get("sector") else None
+        row["marketRS"] = round(market_rs, 2) if market_rs is not None else None
+        row["sectorRS"] = round(sector_rs, 2) if sector_rs is not None else None
+        row["resilience"] = _rs_resilience_tier(
+            {"changePct": row["changePct"], "marketRS": market_rs}, nikkei_chg)
+        adr_row = adr.get(code)
+        row["adrPct"] = adr_row["adrPct"] if adr_row else None
+        catalysts = investment_db.relevant_catalysts_for(database_url, user_id, code=code, sector=row.get("sector"), limit=2)
+        row["catalysts"] = catalysts
+        events = investment_db.upcoming_event_signals(database_url, user_id, code=code, sector=row.get("sector"))
+        row["eventSignals"] = events["signals"]
+
+        score, reasons, risks = 0.0, [], []
+        if market_rs is not None:
+            score += max(-20, min(30, market_rs * 4))
+            if market_rs >= 3:
+                reasons.append(f"対市場+{market_rs:.1f}pt")
+        if row["resilience"] == "STRONG":
+            score += 25
+            reasons.append("地合い逆行の強い相対強度（🛡地合い耐性）")
+        elif row["resilience"] == "NORMAL":
+            score += 12
+        if adr_row:
+            score += max(-15, min(20, adr_row["adrPct"] * 3))
+            if adr_row["adrPct"] >= 2:
+                reasons.append(f"ADR+{adr_row['adrPct']:.1f}%（先回り買い材料）")
+        pos_cat = [c for c in catalysts if c.get("sentiment") == "positive" and c.get("freshness") in ("LIVE", "CURRENT")]
+        neg_cat = [c for c in catalysts if c.get("sentiment") == "negative" and c.get("freshness") in ("LIVE", "CURRENT")]
+        if pos_cat:
+            score += 15
+            reasons.append(f"好材料：{pos_cat[0].get('title','')[:20]}")
+        if neg_cat:
+            score -= 20
+            risks.append(f"悪材料：{neg_cat[0].get('title','')[:20]}")
+        if "EVENT_RISK_HIGH" in row["eventSignals"]:
+            risks.append("重要イベント接近")
+            score -= 10
+        if row["changePct"] <= -3:
+            risks.append("当日大幅安")
+            score -= 15
+        row["score"] = round(score, 1)
+        row["reasons"] = reasons
+        row["risks"] = risks
+        scored.append(row)
+
+    scored.sort(key=lambda r: -r["score"])
+    top5_pool = [r for r in scored if r["score"] > 0][:5]
+    top5 = []
+    for i, r in enumerate(top5_pool):
+        top5.append({
+            "rank": i + 1, "code": r["code"], "name": r["name"], "score": round(r["score"]),
+            "reason": r["reasons"] or ["総合スコア上位"], "risks": r["risks"],
+            "current": r["current"], "changePct": round(r["changePct"], 2),
+            "marketRS": r["marketRS"], "sectorRS": r["sectorRS"], "adrPct": r["adrPct"],
+            "resilience": r["resilience"],
+            "trigger": "寄り後VWAP維持＋5分足安値切り上げを確認してからのエントリーを推奨",
+            "avoidCondition": "寄り天・出来高を伴わない上昇・悪材料の追加",
+        })
+    avoid = [{"code": r["code"], "name": r["name"], "reasons": r["risks"] or ["セクター/地合い逆風"]}
+             for r in scored if r["score"] <= -15][:5]
+    resilience_watch = [{"code": r["code"], "name": r["name"], "changePct": round(r["changePct"], 2),
+                          "marketRS": r["marketRS"]} for r in scored if r["resilience"] == "STRONG"][:10]
+    return {"top5": top5, "avoid": avoid, "resilience": resilience_watch}
+
+
+def generate_morning_strategy(market_regime, volatility_regime, risk_score, event_signals):
+    """今日の戦略を自動生成する（指示書13番）。構造化フィールド＋自然文の両方を返す。"""
+    if market_regime in ("RISK_OFF", "HIGH_VOLATILITY"):
+        primary, swing, entry_style, size = "daytrade", "avoid", "wait_for_confirmation", "reduced"
+    elif market_regime in ("MILD_RISK_OFF",):
+        primary, swing, entry_style, size = "daytrade", "selective", "wait_for_confirmation", "normal"
+    elif market_regime in ("RISK_ON", "MILD_RISK_ON"):
+        primary, swing, entry_style, size = "daytrade_and_swing", "allowed", "normal", "normal"
+    else:
+        primary, swing, entry_style, size = "daytrade", "selective", "normal", "normal"
+    if "EVENT_RISK_HIGH" in (event_signals or []):
+        swing = "avoid"
+        size = "reduced"
+    strategy = {"primary": primary, "swing": swing, "entry_style": entry_style, "position_size": size,
+                "focus": "relative_strength", "avoid": "blind_dip_buying"}
+    regime_text = {"RISK_ON": "リスクオン", "MILD_RISK_ON": "やや強気", "NEUTRAL": "中立",
+                   "MILD_RISK_OFF": "やや弱気", "RISK_OFF": "リスクオフ", "HIGH_VOLATILITY": "高ボラティリティ"}.get(market_regime, market_regime)
+    text = f"指数は{regime_text}。"
+    if swing == "avoid":
+        text += "スイングの新規は避け、デイトレード中心に。"
+    elif swing == "selective":
+        text += "スイングは厳選のみ、デイトレード中心に。"
+    else:
+        text += "デイトレード・スイングともに通常運用。"
+    text += "指数の逆張りは避け、地合いに逆行して強い銘柄（相対強度）を優先する。"
+    return strategy, text
+
+
+def generate_morning_market_check(database_url, user_id, snapshot_time):
+    """MorningMarketCheck1回分を生成・保存する（morning_report_serviceの中核）。データ単位で
+    取得失敗しても全体を落とさない（指示書20番）。戻り値: 保存済みレコード（dict）。"""
+    data_quality = {}
+    now = datetime.datetime.now(datetime.timezone.utc)
+    check_date = _jst_today_date_str() if "_jst_today_date_str" in globals() else datetime.date.today().isoformat()
+
+    index_keys = ["dow", "nasdaq", "sp500", "sox", "nasdaq_fut", "nikkei", "nikkei_fut", "topix_etf",
+                  "growth250_etf", "vix", "nikkei_vi_etn", "us10y", "usdjpy", "eurjpy", "dxy", "kospi"]
+    try:
+        indices = _fetch_index_snapshot(index_keys)
+    except Exception as e:
+        print("  MorningCheck: 指数取得で例外", e)
+        indices = {}
+    for k in index_keys:
+        data_quality[k] = indices.get(k, {}).get("status", "failed")
+
+    commodities = {k: indices[k] for k in ("wti", "gold", "brent") if k in indices}
+    try:
+        commodities.update(_fetch_index_snapshot(["wti", "gold", "brent"]))
+    except Exception:
+        pass
+    for k in ("wti", "gold", "brent"):
+        data_quality[k] = commodities.get(k, {}).get("status", "failed")
+
+    fear_greed = fetch_fear_greed()
+    data_quality["fear_greed"] = fear_greed["status"]
+
+    try:
+        watchlist_all = investment_db.list_watchlist(database_url, user_id, market="JP") if investment_db else []
+        adr = fetch_adr_snapshot([w["code"] for w in watchlist_all])
+        data_quality["adr"] = "ok" if adr else "no_data"
+    except Exception as e:
+        print("  MorningCheck: ADR取得で例外", e)
+        adr, watchlist_all = {}, []
+        data_quality["adr"] = "failed"
+
+    volatility_score, vol_missing = _morning_volatility_score(indices)
+    macro_pressure_score = _morning_macro_pressure_score(indices, commodities)
+    trend_score, trend_missing = _morning_trend_score(indices)
+    n225_trend = _index_trend(INDEX["nikkei"])
+    nasdaq_trend = _index_trend(INDEX["nasdaq"])
+    sox_trend = _index_trend(INDEX["sox"])
+    us10y_trend = _index_trend(INDEX["us10y"])
+    usdjpy_trend = _index_trend(INDEX["usdjpy"])
+    risk = _market_risk_score(n225_trend, nasdaq_trend, sox_trend, us10y_trend, usdjpy_trend)
+    market_risk_score = risk["score"]
+
+    market_regime, volatility_regime, trend_type = classify_morning_regime(market_risk_score, volatility_score, indices)
+    strong_sectors, weak_sectors = compute_macro_sector_strength(indices, commodities)
+
+    try:
+        event_info = investment_db.upcoming_event_signals(database_url, user_id) if investment_db else {"events": [], "signals": []}
+    except Exception as e:
+        print("  MorningCheck: イベント取得で例外", e)
+        event_info = {"events": [], "signals": []}
+
+    try:
+        focus = generate_morning_watchlist_focus(database_url, user_id, {"indices": indices})
+        data_quality["watchlist"] = "ok"
+    except Exception as e:
+        print("  MorningCheck: 銘柄分析で例外", e)
+        focus = {"top5": [], "avoid": [], "resilience": []}
+        data_quality["watchlist"] = "failed"
+
+    try:
+        stock_quotes_for_positions = get_stock_quotes(watchlist_all) if watchlist_all else {}
+        # ポジション銘柄がwatchlist外の場合も拾えるよう、保有銘柄も追加取得する
+        try:
+            positions_all = investment_db.list_portfolio(database_url, user_id) if investment_db else []
+            extra = [p for p in positions_all if p.get("code") not in stock_quotes_for_positions]
+            if extra:
+                stock_quotes_for_positions.update(get_stock_quotes(extra))
+        except Exception:
+            pass
+        position_risk = evaluate_position_risk_warnings(database_url, user_id, stock_quotes_for_positions)
+        data_quality["positions"] = "ok"
+    except Exception as e:
+        print("  MorningCheck: ポジションリスク判定で例外", e)
+        position_risk = []
+        data_quality["positions"] = "failed"
+
+    strategy, strategy_text = generate_morning_strategy(market_regime, volatility_regime, market_risk_score, event_info["signals"])
+
+    risk_warnings = []
+    vix_val = indices.get("vix", {}).get("value")
+    if vix_val is not None and vix_val >= 25:
+        risk_warnings.append({"level": "WARNING" if vix_val < 35 else "CRITICAL", "message": f"VIX {vix_val}"})
+    us10y_val = indices.get("us10y", {}).get("value")
+    if us10y_val is not None and us10y_val >= 4.5:
+        risk_warnings.append({"level": "WATCH", "message": f"米10年債 {us10y_val}%"})
+    brent_val = commodities.get("brent", {}).get("value")
+    if brent_val is not None and brent_val >= 100:
+        risk_warnings.append({"level": "WATCH", "message": f"Brent {brent_val}ドル超"})
+    if "EVENT_RISK_HIGH" in event_info["signals"]:
+        risk_warnings.append({"level": "WARNING", "message": "重要イベントが目前"})
+    if any(w["level"] == "CRITICAL" for w in position_risk):
+        risk_warnings.insert(0, {"level": "CRITICAL", "message": "保有銘柄が損切りルールに到達"})
+
+    payload = {
+        "market_regime": market_regime, "volatility_regime": volatility_regime, "trend_type": trend_type,
+        "market_risk_score": market_risk_score, "volatility_score": volatility_score,
+        "trend_score": trend_score, "macro_pressure_score": macro_pressure_score,
+        "indices_json": indices, "fx_json": {k: indices[k] for k in ("usdjpy", "eurjpy", "dxy") if k in indices},
+        "commodities_json": commodities, "adr_json": adr, "data_quality_json": data_quality,
+        "strong_sectors_json": strong_sectors, "weak_sectors_json": weak_sectors,
+        "watchlist_top5_json": focus["top5"], "avoid_stocks_json": focus["avoid"],
+        "resilience_json": focus["resilience"], "risk_warnings_json": risk_warnings[:3],
+        "event_risk_json": event_info["events"][:5], "position_risk_json": position_risk,
+        "strategy_json": strategy, "strategy_text": strategy_text,
+        "raw_payload_json": {"feargreed": fear_greed, "generatedAt": now.isoformat(), "missing": vol_missing + trend_missing},
+    }
+    saved = investment_db.save_morning_check(database_url, user_id, check_date, snapshot_time, payload) if investment_db else None
+    return saved
+
+
+def _morning_check_scheduler_users():
+    """定時生成の対象ユーザー一覧。マルチユーザー設定（USERS）があればその全員、
+    無ければ既存の後方互換ユーザー名（"matsuura"）1人だけ（既存の_LEGACY_OWNERと同じ値）。"""
+    if USERS:
+        return list(USERS.keys())
+    return ["matsuura"]
+
+
+def _is_jp_market_business_day(d):
+    """土日はスキップする（指示書1番「祝日・休場日は生成しない」の最低限の実装）。
+    日本の祝日カレンダーライブラリには依存していないため、平日だが東証休場の祝日
+    （振替休日等）は判定できない点が既知の制約——実行時に指数取得が全滅した場合は
+    データ品質欄（data_quality）に反映されるだけで、レポート自体は空値のまま保存される
+    （捏造はしない）。"""
+    return d.weekday() < 5
+
+
+def _morning_check_scheduler_loop():
+    """指示書2番の定時（05:30/07:00/08:00/08:30/08:50 JST）にMorningMarketCheckを自動生成する
+    デーモンスレッド。60秒間隔でJST時刻をチェックし、対象時刻の分に一度だけ発火する
+    （プロセス内メモリの発火済みセットで同一プロセス内の二重発火を防ぎ、DBのUNIQUE制約
+    （user_id, check_date, snapshot_time）が最終防衛線としてさらに二重生成を防ぐ）。"""
+    fired = set()  # {(check_date, snapshot_time, user_id)}
+    JST = datetime.timezone(datetime.timedelta(hours=9))
+    while True:
+        try:
+            now_jst = datetime.datetime.now(JST)
+            hhmm = now_jst.strftime("%H:%M")
+            if _is_jp_market_business_day(now_jst):
+                for snapshot_time, target_hhmm in MORNING_CHECK_SNAPSHOT_TIMES.items():
+                    if hhmm == target_hhmm:
+                        check_date = now_jst.date().isoformat()
+                        for user_id in _morning_check_scheduler_users():
+                            key = (check_date, snapshot_time, user_id)
+                            if key in fired:
+                                continue
+                            fired.add(key)
+                            try:
+                                generate_morning_market_check(DATABASE_URL, user_id, snapshot_time)
+                                print(f"  [MorningCheck] {user_id} {snapshot_time}（{target_hhmm}）生成完了")
+                            except Exception as e:
+                                print(f"  [MorningCheck] {user_id} {snapshot_time} 生成失敗", e)
+                # 日付が変わったら発火済みセットをクリアして無限に肥大化しないようにする
+                if len(fired) > 200:
+                    fired = {k for k in fired if k[0] == now_jst.date().isoformat()}
+        except Exception as e:
+            print("  [MorningCheck] スケジューラループで例外", e)
+        time.sleep(60)
 
 
 def _fetch_intraday(tk, interval):
@@ -5023,6 +5569,19 @@ class Handler(SimpleHTTPRequestHandler):
             review = investment_db.get_daily_review(DATABASE_URL, self.current_user, date) \
                 if (investment_db is not None and DATABASE_URL) else None
             self._send_json({"review": review})
+        # ---- 2026-09-10新規（朝一マーケット自動分析システム） ----
+        elif self.path.startswith("/api/morning-check/list"):
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            checks = investment_db.list_morning_checks(DATABASE_URL, self.current_user, check_date=params.get("date", [None])[0]) \
+                if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"checks": checks})
+        elif self.path.startswith("/api/morning-check"):
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            check = investment_db.get_latest_morning_check(DATABASE_URL, self.current_user, check_date=params.get("date", [None])[0]) \
+                if (investment_db is not None and DATABASE_URL) else None
+            self._send_json({"check": check})
         # ---- 2026-09-09新規（判断エンジン強化：知識の実利用） ----
         elif self.path.startswith("/api/trade-playbooks"):
             qs = urllib.parse.urlparse(self.path).query
@@ -5586,6 +6145,29 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             created = investment_db.generate_rule_candidates_from_reflections(DATABASE_URL, self.current_user)
             self._send_json({"candidates": created})
+        elif self.path == "/api/morning-check/generate":
+            # 指示書21番：定時以外でも現在時点の臨時レポートを作成する手動更新（MANUAL）。
+            # スケジューラが呼ぶ定時生成もsnapshot_time（T0530等）を指定してこの同じ関数を
+            # 呼ぶだけで、生成ロジックの二重実装はしない。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            snapshot_time = body.get("snapshotTime") or "MANUAL"
+            try:
+                check = generate_morning_market_check(DATABASE_URL, self.current_user, snapshot_time)
+            except Exception as e:
+                import traceback
+                print("  /api/morning-check/generate 想定外のエラー")
+                traceback.print_exc()
+                self._send_json({"fatalError": f"{type(e).__name__}: {e}"})
+                return
+            self._send_json({"check": check})
+        elif self.path == "/api/morning-check/mark-read":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            ok = investment_db.mark_morning_check_read(DATABASE_URL, self.current_user, body.get("id"))
+            self._send_json({"ok": ok})
         elif self.path == "/api/trade-playbooks/backfill":
             # 指示書11・12番：expert_viewsの構造化データからplaybook候補を生成する
             # （常にTESTING/LOW、自動ACTIVE禁止）。
@@ -5964,6 +6546,10 @@ def main():
             print("[投資判断ログ] DBスキーマ確認OK")
         except Exception as e:
             print("[投資判断ログ] DB接続・スキーマ作成に失敗（この機能のみ利用不可。他機能には影響しません）", e)
+        # 2026-09-10新規（朝一マーケット自動分析システム、指示書2番）：定時スケジューラを
+        # デーモンスレッドで起動する。サーバーが起動している間だけ機能する
+        # （start.bat/サーバー常駐が前提、CLAUDE.md「使用中は閉じない」と整合）。
+        threading.Thread(target=_morning_check_scheduler_loop, daemon=True).start()
     try:
         httpd = ThreadingTCPServer((HOST, PORT), Handler)
     except OSError:
