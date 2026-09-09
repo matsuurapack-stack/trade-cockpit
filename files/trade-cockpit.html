@@ -1690,7 +1690,11 @@ const TAB_GROUPS=[
   // 2026-09-09新規（ルール学習システム）：既存4サブタブに「ルール」を追加。tabキーは
   // "traderules"（既存の"rules"に近い名前だが、旧/api/rules・investment_rulesとは別物である
   // ことを明確にするため衝突しない専用キーにした）。
-  {key:"record",label:"記録",tabs:[{key:"journal",label:"記録"},{key:"investlog",label:"投資判断ログ"},{key:"chatgptimport",label:"ChatGPT取込"},{key:"stats",label:"統計"},{key:"traderules",label:"ルール"}]},
+  // 2026-09-09更新（統合インテリジェンス機能、指示書28番）：「今日の振り返り」を追加し、
+  // 指示書の推奨順（投資判断ログ／ChatGPT連携／今日の振り返り／ルール／統計）に合わせて
+  // 並び替え。tabキー自体は無変更（"journal"は既存の「記録」サブタブのまま、日次レビューは
+  // 新設の"dailyreview"）。
+  {key:"record",label:"記録",tabs:[{key:"journal",label:"記録"},{key:"investlog",label:"投資判断ログ"},{key:"chatgptimport",label:"ChatGPT連携"},{key:"dailyreview",label:"今日の振り返り"},{key:"traderules",label:"ルール"},{key:"stats",label:"統計"}]},
 ];
 
 // v3-6（2026-09-04・Primary/Action 2軸化）：Primary Status＝銘柄そのものの強さ・状態。
@@ -3343,6 +3347,11 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
       {consultMsg && <span style={{fontSize:12,color:"var(--accent)",fontWeight:700}}>{consultMsg}</span>}
       {recordMsg && <span style={{fontSize:12,color:"var(--accent)",fontWeight:700}}>{recordMsg}</span>}
     </div>
+
+    {/* 2026-09-09新規（日次投資レビュー、指示書21番）：朝一チェックの入口となるこのタブの
+        最上部に「昨日までの反省」を表示する。監視銘柄タブは実質的な朝一チェック画面のため
+        ここに置く。反省が無ければ何も表示しない。 */}
+    <RecentReflectionsNote/>
 
     {/* v3-4「今日の注目TOP5」：既存のenrichWatchRow()出力のみから軽量に順位付け（新規のサーバー
         計算・重い分析呼び出しなし）。クリックで既存のonOpenAnalysis（analysisTargetsに追加＋
@@ -5584,6 +5593,16 @@ function normalizeChatGPTPayload(raw){
   const positions=(Array.isArray(base.positions)?base.positions:[]).map((p,i)=>_cgNormalizeCode(p,"positions",i,warnings));
   const recentCatalysts=(Array.isArray(base.recent_catalysts)?base.recent_catalysts:[]).map((c,i)=>_cgNormalizeCode(c,"recent_catalysts",i,warnings));
   const events=Array.isArray(base.events)?base.events:[];
+  // 2026-09-09追加（ChatGPT統合連携、指示書3番）：news/expert_opinions/catalysts/
+  // user_feedback/position_reviewは任意項目。無くても既存動作に一切影響しない
+  // （常に配列/空文字/空オブジェクトへフォールバックするだけ）。catalystsは既存の
+  // recent_catalystsキーとも意味が重なるため、catalysts未指定ならrecent_catalystsを
+  // そのまま流用する（サーバー側classify_chatgpt_unified_payloadは"catalysts"キーを見る）。
+  const news=Array.isArray(base.news)?base.news:[];
+  const expertOpinions=Array.isArray(base.expert_opinions)?base.expert_opinions:[];
+  const catalysts=Array.isArray(base.catalysts)?base.catalysts:recentCatalysts;
+  const userFeedback=typeof base.user_feedback==="string"?base.user_feedback:"";
+  const positionReview=(base.position_review&&typeof base.position_review==="object"&&!Array.isArray(base.position_review))?base.position_review:{};
 
   const reviewRaw=base.review;
   const review=Array.isArray(reviewRaw)?reviewRaw.join("\n"):(reviewRaw||"");
@@ -5599,6 +5618,7 @@ function normalizeChatGPTPayload(raw){
     type:base.type||"investment_update",
     date, market, watchlist, decisions, positions, events,
     recent_catalysts:recentCatalysts, review, rule_updates:ruleUpdates, notes,
+    news, expert_opinions:expertOpinions, catalysts, user_feedback:userFeedback, position_review:positionReview,
   };
   return{normalized,warnings,errors};
 }
@@ -5688,8 +5708,14 @@ function ChatGptImportPanel({journal,activeRules}){
         notes.push(`ℹ️ ポジション情報${normalized.positions.length}件が含まれていますが、実際の保有株の変更は安全のため自動反映しません。「ポジション」タブから内容をご確認のうえ手動で登録してください。`);
       if((normalized.events||[]).length)
         notes.push(`ℹ️ イベント情報${normalized.events.length}件は、保存時に「イベント登録」へも自動で取り込みます。`);
-      if((normalized.recent_catalysts||[]).length)
-        notes.push(`ℹ️ 材料情報${normalized.recent_catalysts.length}件は、保存時に「カタリスト」へも自動で取り込みます。`);
+      if((normalized.catalysts||[]).length)
+        notes.push(`ℹ️ 材料情報${normalized.catalysts.length}件は、保存時に「カタリスト」へも自動で取り込みます。`);
+      if((normalized.news||[]).length)
+        notes.push(`ℹ️ ニュース情報${normalized.news.length}件は、保存時にカタリストとして自動で取り込みます。`);
+      if((normalized.expert_opinions||[]).length)
+        notes.push(`ℹ️ 有識者見解${normalized.expert_opinions.length}件は、保存時に「有識者」へも自動で取り込みます。`);
+      if(normalized.user_feedback)
+        notes.push(`ℹ️ 感想（user_feedback）が含まれています。保存時に「今日の振り返り」へ反映します。`);
       setExtraNote(notes.join("\n"));
     }
   };
@@ -5737,36 +5763,18 @@ function ChatGptImportPanel({journal,activeRules}){
     }else if(d.errors){setSaveMsg("保存失敗：\n・"+d.errors.join("\n・"));}
     else if(d.error){setDupInfo(d);}
     else{
-      // 2026-09-08新規（ChatGPT連携JSONスキーマ統一、指示書8番）：同じ共通スキーマ内に
-      // events/recent_catalystsが含まれていれば、既存のEventsPanel/CatalystsPanelと全く
-      // 同じimport API（/api/market-events/import・/api/news-catalysts/import）へも渡す
-      // （内部DBスキーマ・保存処理はそれぞれ既存のまま、二重実装しない）。失敗しても投資
-      // 判断ログ本体の保存は既に成功しているため、ベストエフォートとして扱う（他の連携と
-      // 同じ方針）。positionsは実際の保有株を書き換えるため、安全のため自動反映しない
-      // （parse()時点でその旨を案内済み）。
+      // 2026-09-09更新（ChatGPT統合連携、指示書1・2番）：events/news/catalysts/
+      // expert_opinions/user_feedbackの振り分けはサーバー側save_chatgpt_unified_import()が
+      // 一括で行うようになったため、フロント側から個別API（/api/market-events/import等）を
+      // 二重に叩く旧実装は削除した。ここではd.unified（各バケットのimport結果）を読んで
+      // メッセージを組み立てるだけ（保存処理自体の二重実装を避ける）。
       const extraMsgs=[];
-      if((parsed.events||[]).length){
-        try{
-          const evR=await fetch("/api/market-events/import",{method:"POST",headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({events:parsed.events.map(e=>({
-              event_date:e.date,title:e.event||e.title,importance:e.importance,
-              affected_stocks:e.related_codes||e.affected_stocks||[],notes:e.note,
-            }))})});
-          const evD=await evR.json().catch(()=>null);
-          if(evD&&!evD.error)extraMsgs.push(`イベント登録：新規${evD.imported||0}件・更新${evD.updated||0}件`);
-        }catch(e){}
-      }
-      if((parsed.recent_catalysts||[]).length){
-        try{
-          const catR=await fetch("/api/news-catalysts/import",{method:"POST",headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({catalysts:parsed.recent_catalysts.map(c=>({
-              catalyst_date:c.date,title:c.title,summary:c.detail,sentiment:c.sentiment,
-              affected_stocks:c.code?[c.code]:[],source:"ChatGPT連携（共通スキーマ）",
-            }))})});
-          const catD=await catR.json().catch(()=>null);
-          if(catD&&!catD.error)extraMsgs.push(`カタリスト：新規${catD.imported||0}件`);
-        }catch(e){}
-      }
+      const u=d.unified||{};
+      if(u.events)extraMsgs.push(`イベント：新規${u.events.imported||0}件・更新${u.events.updated||0}件`);
+      if(u.news)extraMsgs.push(`ニュース：新規${u.news.imported||0}件`);
+      if(u.catalysts)extraMsgs.push(`カタリスト：新規${u.catalysts.imported||0}件`);
+      if(u.expert_opinions)extraMsgs.push(`有識者見解：新規${u.expert_opinions.imported||0}件`);
+      if(u.user_feedback?.saved)extraMsgs.push(`今日の振り返りに感想を反映しました（${u.user_feedback.date}）`);
       // 2026-09-09新規（ルール学習システム、指示書18番）：「本日のルール更新」を保存結果に
       // 追加表示する。d.ruleSyncはsave_chatgpt_import()側でsync_rule_updates_to_trade_rules()
       // の戻り値がそのまま入っている（新規に集計し直さない）。
@@ -5785,7 +5793,11 @@ function ChatGptImportPanel({journal,activeRules}){
   const labelStyle={fontSize:11,color:"var(--inkSoft)",display:"block",marginBottom:2};
 
   return <div style={{marginTop:18}}>
-    <div className="sec-head">ChatGPT連携（投資ログ取り込み）</div>
+    {/* 2026-09-09更新（指示書1・2・29番）：「投資ログ取り込み」から「ChatGPT統合連携」へ
+        役割を拡張。ChatGPTから受け取った市場情報・銘柄・ニュース・イベント・有識者見解・
+        投資判断・ルールを自動分類して取り込む唯一の入口という位置づけを明示する。 */}
+    <div className="sec-head">ChatGPT統合連携</div>
+    <div className="sec-note" style={{marginTop:2}}>ChatGPTから受け取った市場情報、銘柄、ニュース、イベント、有識者見解、投資判断、ルールを自動分類して取り込みます。</div>
 
     <div style={{marginTop:10,display:"flex",alignItems:"center",gap:8}}>
       <button className="action-btn" onClick={copyClosingReport}>📋 ChatGPT大引け振り返り用にコピー</button>
@@ -5814,6 +5826,26 @@ function ChatGptImportPanel({journal,activeRules}){
       <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:12.5,color:"var(--inkSoft)"}}>
         {parseWarnings.map((w,i)=><li key={i}>{w}</li>)}
       </ul>
+    </div>}
+    {/* 2026-09-09新規（ChatGPT統合連携、指示書5番）：分類結果のプレビュー。市場情報1件・
+        監視銘柄N件・判断N件・ルールN件・ニュースN件・イベントN件・有識者見解N件、のように
+        保存先ごとの件数を一覧表示する。0件の項目は省略（表示過多を避ける）。 */}
+    {parsed && <div className="card" style={{marginTop:12,padding:"10px 14px",border:"1px solid var(--rule)"}}>
+      <b style={{fontSize:12.5}}>今回のJSONから分類：</b>
+      <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:6}}>
+        {[["市場情報",parsed.market?.condition||parsed.market?.summary?1:0],
+          ["監視銘柄",(parsed.watchlist||[]).length],["判断",(parsed.decisions||[]).length],
+          ["ルール",(parsed.rule_updates||[]).length],["ニュース",(parsed.news||[]).length],
+          ["カタリスト",(parsed.catalysts||[]).length],["イベント",(parsed.events||[]).length],
+          ["有識者見解",(parsed.expert_opinions||[]).length],["感想",parsed.user_feedback?1:0]]
+          .filter(([,n])=>n>0).map(([label,n])=>
+            <span key={label} className="chip" style={{fontSize:11.5}}>{label} {n}件</span>)}
+        {[["市場情報",parsed.market?.condition||parsed.market?.summary?1:0],["監視銘柄",(parsed.watchlist||[]).length],
+          ["判断",(parsed.decisions||[]).length],["ルール",(parsed.rule_updates||[]).length],
+          ["ニュース",(parsed.news||[]).length],["カタリスト",(parsed.catalysts||[]).length],
+          ["イベント",(parsed.events||[]).length],["有識者見解",(parsed.expert_opinions||[]).length]]
+          .every(([,n])=>n===0) && <span style={{fontSize:11.5,color:"var(--inkFaint)"}}>分類できた項目はありません（date/market/watchlist/decisions等をご確認ください）</span>}
+      </div>
     </div>}
     {parsed&&extraNote && <div className="card" style={{marginTop:12,padding:"10px 14px",border:"1px solid var(--rule)",whiteSpace:"pre-wrap",fontSize:12.5,color:"var(--inkSoft)"}}>{extraNote}</div>}
 
@@ -6686,6 +6718,157 @@ function TradeRulesPanel(){
   </div>;
 }
 
+// ============================================================
+// 2026-09-09新規（日次投資レビュー・投資スコア、指示書Phase4・5・30番）：「記録」グループの
+// 新規サブタブ「今日の振り返り」。ポジション・売買履歴・持ち越し・ルール遵守から自動生成された
+// スコア（生のPnLではなく実データから機械的に検証できる項目の積み上げ、指示書14番）を表示し、
+// ユーザー感想の入力・保存を行う。
+// ============================================================
+const DAILY_REVIEW_SCORE_AXES=[
+  ["score_rule_adherence","ルール遵守",25],["score_entry_quality","エントリー",20],
+  ["score_exit_quality","利確・損切り",20],["score_market_fit","地合い適応",15],
+  ["score_risk_mgmt","リスク管理",10],["score_reflection","振り返り",10],
+];
+function scoreColor(score,max){
+  if(score==null)return"var(--inkFaint)";
+  const ratio=score/max;
+  return ratio>=0.8?"var(--up)":ratio>=0.5?"var(--accent)":"var(--down)";
+}
+function DailyReviewPanel(){
+  const [date,setDate]=useState(todayISO());
+  const [review,setReview]=useState(null);
+  const [loading,setLoading]=useState(true);
+  const [generating,setGenerating]=useState(false);
+  const [feedbackDraft,setFeedbackDraft]=useState("");
+  const [savingFeedback,setSavingFeedback]=useState(false);
+  const [feedbackMsg,setFeedbackMsg]=useState("");
+  const [history,setHistory]=useState([]);
+
+  const load=async(d)=>{
+    setLoading(true);
+    const r=await fetchJsonSafe(`/api/daily-review?date=${d}`);
+    const rev=(r&&r.review)||null;
+    setReview(rev);
+    setFeedbackDraft(rev?.user_feedback||"");
+    setLoading(false);
+  };
+  useEffect(()=>{load(date);},[date]);
+
+  const loadHistory=async()=>{
+    const r=await fetchJsonSafe("/api/daily-review/list");
+    setHistory((r&&r.reviews)||[]);
+  };
+  useEffect(()=>{loadHistory();},[]);
+
+  const generate=async()=>{
+    setGenerating(true);
+    const r=await fetchJsonSafe("/api/daily-review/generate",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({date})});
+    setGenerating(false);
+    if(r&&r.review){setReview(r.review);setFeedbackDraft(r.review.user_feedback||"");loadHistory();}
+  };
+  const saveFeedback=async()=>{
+    setSavingFeedback(true);setFeedbackMsg("");
+    const r=await fetchJsonSafe("/api/daily-review/feedback",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({date,feedback:feedbackDraft})});
+    setSavingFeedback(false);
+    if(r&&r.review){setReview(r.review);setFeedbackMsg("保存しました");loadHistory();}
+    else setFeedbackMsg("保存に失敗しました");
+  };
+
+  return <div style={{marginTop:18}}>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+      <div className="sec-head">今日の振り返り</div>
+      <div style={{display:"flex",gap:6,alignItems:"center"}}>
+        <input type="date" value={date} onChange={e=>setDate(e.target.value)} style={{fontSize:12,padding:"3px 5px"}}/>
+        <button className="action-btn" onClick={generate} disabled={generating}>{generating?"生成中…":review?"再生成":"スコアを生成"}</button>
+      </div>
+    </div>
+    <div className="sec-note">ポジション・売買履歴・持ち越し・ルール遵守状況から自動で採点します。利益が出てもルール違反なら減点、損失でも正しい損切りなら高評価になり得ます（「結果」より「判断プロセス」の評価）。</div>
+
+    {loading ? <div style={{fontSize:12,color:"var(--inkFaint)",marginTop:10}}>読み込み中…</div>
+    : !review ? <div style={{padding:20,textAlign:"center",color:"var(--inkSoft)",fontSize:12.5,border:"1px solid var(--rule)",borderRadius:4,marginTop:10}}>
+        {date}のレビューはまだありません。「スコアを生成」を押してください。
+      </div>
+    : <div style={{marginTop:12}}>
+        <div className="card" style={{padding:"14px 16px",textAlign:"center"}}>
+          <div style={{fontSize:12,color:"var(--inkSoft)"}}>今日の投資スコア</div>
+          <div style={{fontSize:36,fontWeight:800,color:scoreColor(review.score_total,100)}}>{review.score_total}<span style={{fontSize:16,fontWeight:400,color:"var(--inkSoft)"}}> / 100</span></div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:8,marginTop:10}}>
+          {DAILY_REVIEW_SCORE_AXES.map(([key,label,max])=>
+            <div key={key} className="card" style={{padding:"8px 10px",textAlign:"center"}}>
+              <div style={{fontSize:11,color:"var(--inkSoft)"}}>{label}</div>
+              <div style={{fontSize:18,fontWeight:700,color:scoreColor(review[key],max)}}>{review[key]}/{max}</div>
+            </div>)}
+        </div>
+
+        {(review.good_points||[]).length>0 && <div className="card" style={{padding:"10px 12px",marginTop:10,borderLeft:"3px solid var(--up)"}}>
+          <b style={{fontSize:12,color:"var(--up)"}}>良かった点</b>
+          <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:12}}>{(review.good_points||[]).map((g,i)=><li key={i}>{g}</li>)}</ul>
+        </div>}
+        {(review.improvement_points||[]).length>0 && <div className="card" style={{padding:"10px 12px",marginTop:10,borderLeft:"3px solid var(--down)"}}>
+          <b style={{fontSize:12,color:"var(--down)"}}>改善点</b>
+          <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:12}}>{(review.improvement_points||[]).map((g,i)=><li key={i}>{g}</li>)}</ul>
+        </div>}
+        {(review.tomorrow_notes||[]).length>0 && <div className="card" style={{padding:"10px 12px",marginTop:10,borderLeft:"3px solid var(--accent)"}}>
+          <b style={{fontSize:12,color:"var(--accent)"}}>明日の注意</b>
+          <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:12}}>{(review.tomorrow_notes||[]).map((g,i)=><li key={i}>{g}</li>)}</ul>
+        </div>}
+
+        <div className="card" style={{padding:"10px 12px",marginTop:10}}>
+          <b style={{fontSize:12}}>自分の感想</b>
+          <textarea value={feedbackDraft} onChange={e=>setFeedbackDraft(e.target.value)} rows={3}
+            placeholder="例：YEは自信があったので持ち越したが、地合いが悪い中で少し無理をしたと思う。"
+            style={{width:"100%",fontSize:12.5,padding:6,marginTop:6,boxSizing:"border-box"}}/>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginTop:6}}>
+            <button className="action-btn" onClick={saveFeedback} disabled={savingFeedback}>{savingFeedback?"保存中…":"保存"}</button>
+            {feedbackMsg && <span style={{fontSize:11.5,color:"var(--accent)"}}>{feedbackMsg}</span>}
+          </div>
+          {(review.reflection_tags||[]).length>0 && <div style={{marginTop:8,display:"flex",flexWrap:"wrap",gap:4}}>
+            {(review.reflection_tags||[]).map(t=><span key={t} className="chip" style={{fontSize:11}}>{t}</span>)}
+          </div>}
+        </div>
+      </div>}
+
+    {history.length>0 && <div style={{marginTop:18}}>
+      <b style={{fontSize:12.5}}>スコア履歴</b>
+      <div style={{overflowX:"auto",marginTop:6}}>
+        <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+          <thead><tr style={{textAlign:"left",borderBottom:"1px solid var(--rule)"}}>
+            <th style={{padding:"4px 6px"}}>日付</th><th style={{padding:"4px 6px"}}>スコア</th>
+            <th style={{padding:"4px 6px"}}>ルール遵守</th><th style={{padding:"4px 6px"}}>主な反省</th>
+          </tr></thead>
+          <tbody>{history.map(h=><tr key={h.review_date} style={{borderBottom:"1px solid var(--ruleSoft)",cursor:"pointer"}} onClick={()=>setDate(h.review_date)}>
+            <td style={{padding:"4px 6px"}} className="mono">{h.review_date}</td>
+            <td style={{padding:"4px 6px",fontWeight:700,color:scoreColor(h.score_total,100)}}>{h.score_total}</td>
+            <td style={{padding:"4px 6px"}}>{h.score_rule_adherence}/25</td>
+            <td style={{padding:"4px 6px",color:"var(--inkSoft)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:260}}>
+              {(h.improvement_points||[])[0]||"—"}</td>
+          </tr>)}</tbody>
+        </table>
+      </div>
+    </div>}
+  </div>;
+}
+
+// 朝一チェック・トレード分析に表示する「昨日の反省」（指示書21番）。既存のrecent_reflections_for
+// をそのまま呼ぶだけの軽量表示。反省が無ければ何も表示しない（無理に埋めない）。
+function RecentReflectionsNote(){
+  const [reflections,setReflections]=useState([]);
+  useEffect(()=>{
+    fetchJsonSafe("/api/daily-review/recent?days=3").then(d=>setReflections((d&&d.reflections)||[]));
+  },[]);
+  if(!reflections.length)return null;
+  return <div className="card" style={{padding:"8px 10px",marginBottom:10,borderLeft:"3px solid var(--accent)"}}>
+    <div style={{fontSize:11.5,fontWeight:700,color:"var(--accent)",marginBottom:4}}>📝 昨日までの反省</div>
+    {reflections.map(r=><div key={r.date} style={{fontSize:11.5,marginBottom:3}}>
+      <span className="mono" style={{color:"var(--inkFaint)"}}>{r.date}</span>
+      {(r.tomorrowNotes.length?r.tomorrowNotes:r.improvementPoints).slice(0,3).map((t,i)=><div key={i} style={{marginLeft:8}}>・{t}</div>)}
+    </div>)}
+  </div>;
+}
+
 // テーマ・セクター強弱の可視化：SectorWatchlist内のsectorGroups集計（平均騰落率・合計売買代金）と
 // 同じ考え方を、JP+US統合した銘柄リストに対して汎用的に適用する。keyFnがnull/""を返す銘柄は
 // 対象外にする（テーマ未設定銘柄をテーマ別ランキングから除外するため）。
@@ -6742,6 +6925,10 @@ function MarketEnvironmentBanner({metrics,watchlistAll,stockQuotes,top5}){
     // market/semiconductor/sectorカテゴリのACTIVE/TESTINGルールを添える（全ルールは送らない）。
     const activeRulesForMorning=await fetchJsonSafe("/api/trade-rules/relevant?categories=market,semiconductor,sector,event")
       .then(d=>(d&&d.rules)||[]).catch(()=>[]);
+    // 2026-09-09新規（統合インテリジェンス機能、指示書25・26番）：直近の振り返り（昨日までの
+    // 反省点）を添える。全履歴ではなく直近3日分だけ（指示書27番：古い情報を無制限に混ぜない）。
+    const recentReflections=await fetchJsonSafe("/api/daily-review/recent?days=3")
+      .then(d=>(d&&d.reflections)||[]).catch(()=>[]);
     await copyChatGPTPayload("朝一分析","morning_market",{
       sentiment,
       indices:Object.fromEntries(ENV_ROWS.map(([label,key,dp])=>{
@@ -6759,6 +6946,7 @@ function MarketEnvironmentBanner({metrics,watchlistAll,stockQuotes,top5}){
         grade:lightweightGrade(w),action:lightweightAction(w),reason:lightweightReason(w),
       })),
       active_rules:activeRulesForMorning.map(r=>({rule:r.rule_text,confidence:r.confidence,action:r.action_text||null})),
+      recent_reflections:recentReflections.map(r=>({date:r.date,score:r.score,notes:(r.tomorrowNotes.length?r.tomorrowNotes:r.improvementPoints).slice(0,3)})),
     },setMorningMsg);
   };
 
@@ -9079,6 +9267,9 @@ function App(){
 
       {/* ===== ルール（学習システム、2026-09-09新規） ===== */}
       {tab==="traderules" && <TradeRulesPanel/>}
+
+      {/* ===== 今日の振り返り（日次投資レビュー、2026-09-09新規） ===== */}
+      {tab==="dailyreview" && <DailyReviewPanel/>}
 
       {/* ===== NEWS（9章・9-1章・9-2章） ===== */}
       {tab==="news" && (()=>{

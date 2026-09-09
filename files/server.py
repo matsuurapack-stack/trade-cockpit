@@ -5004,6 +5004,25 @@ class Handler(SimpleHTTPRequestHandler):
                 category=params.get("category", [None])[0], rule_type=params.get("ruleType", [None])[0],
             ) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"rules": rules})
+        # ---- 2026-09-09新規（日次投資レビュー・投資スコア、指示書Phase4・5） ----
+        elif self.path.startswith("/api/daily-review/recent"):
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            days = int(params.get("days", [3])[0])
+            reflections = investment_db.recent_reflections_for(DATABASE_URL, self.current_user, days=days) \
+                if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"reflections": reflections})
+        elif self.path.startswith("/api/daily-review/list"):
+            reviews = investment_db.list_daily_reviews(DATABASE_URL, self.current_user) \
+                if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"reviews": reviews})
+        elif self.path.startswith("/api/daily-review"):
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            date = params.get("date", [None])[0] or datetime.date.today().isoformat()
+            review = investment_db.get_daily_review(DATABASE_URL, self.current_user, date) \
+                if (investment_db is not None and DATABASE_URL) else None
+            self._send_json({"review": review})
         elif self.path.startswith("/api/chatgpt-import/list"):
             imports = investment_db.list_chatgpt_imports(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"imports": imports})
@@ -5459,6 +5478,29 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             result = investment_db.migrate_legacy_rules_to_trade_rules(DATABASE_URL, self.current_user)
             self._send_json(result)
+        # ---- 2026-09-09新規（日次投資レビュー・投資スコア、指示書Phase4・5） ----
+        elif self.path == "/api/daily-review/generate":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            date = body.get("date") or datetime.date.today().isoformat()
+            review = investment_db.generate_daily_review(DATABASE_URL, self.current_user, date)
+            if review is None:
+                self._send_json({"error": "レビュー生成に失敗しました"}); return
+            self._send_json({"review": review})
+        elif self.path == "/api/daily-review/feedback":
+            # 指示書18・19番：ユーザー感想を保存し、翌日以降の分析（recent_reflections_for）へ
+            # 使えるようにする。保存と同時にreflection_tagsを抽出し、その日のスコアも再計算する
+            # （損切り遅れ・利確遅れ等の自己申告がスコアの利確損切り軸に反映されるため）。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            date = body.get("date") or datetime.date.today().isoformat()
+            feedback = body.get("feedback") or ""
+            review = investment_db.save_review_user_feedback(DATABASE_URL, self.current_user, date, feedback)
+            if review is None:
+                self._send_json({"error": "感想の保存に失敗しました"}); return
+            self._send_json({"review": review})
         # ---- ChatGPT連携（2026-09-02新規、Phase1）：有料AI APIは使わず、ChatGPTが出力した
         # 投資ログJSONを手動貼り付けで取り込む。 ----
         elif self.path == "/api/chatgpt-import/save":
@@ -5478,13 +5520,28 @@ class Handler(SimpleHTTPRequestHandler):
                 if errors:
                     self._send_json({"errors": errors})
                     return
-                result = investment_db.save_chatgpt_import(DATABASE_URL, self.current_user, payload, force=force)
+                # 2026-09-09更新（ChatGPT統合連携、指示書1・2番）：唯一の取り込み口として、
+                # 既存のsave_chatgpt_import()（無変更）を内部で呼びつつevents/news/catalysts/
+                # expert_opinions/user_feedbackがあれば自動振り分けするsave_chatgpt_unified_
+                # import()へ切り替えた。従来の必須キーだけのJSONでも戻り値の形は完全互換
+                # （unified/classificationキーが追加されるだけ）。
+                result = investment_db.save_chatgpt_unified_import(DATABASE_URL, self.current_user, payload, force=force)
                 self._send_json(result)
             except Exception as e:
                 import traceback
                 print("  /api/chatgpt-import/save 想定外のエラー")
                 traceback.print_exc()
                 self._send_json({"fatalError": f"{type(e).__name__}: {e}"})
+        elif self.path == "/api/chatgpt-import/preview":
+            # 2026-09-09新規（ChatGPT統合連携、指示書5番）：保存前に分類結果だけをプレビュー
+            # する（DBへの書き込みは一切しない）。既存validate_chatgpt_payloadと同じ
+            # payloadを渡す。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            payload = body.get("payload")
+            classified = investment_db.classify_chatgpt_unified_payload(payload)
+            self._send_json({"counts": classified["counts"]})
         elif self.path == "/api/chatgpt-daily/import":
             # v3-9続き（PHASE 6 DAILY CHATGPT JSON IMPORT）：STEP1「Import（履歴保存）」のみ。
             # updates=[]でもinvestment_rules等には一切書き込まない（apply_status='NO_UPDATES'

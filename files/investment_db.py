@@ -613,6 +613,32 @@ CREATE TABLE IF NOT EXISTS trade_rule_history (
 CREATE INDEX IF NOT EXISTS idx_trade_rule_history_rule ON trade_rule_history(rule_id, created_at DESC);
 """
 
+# 2026-09-09新規（日次投資レビュー・投資スコア）：daily_reviews。
+_SCHEMA_DAILY_REVIEWS_SQL = """
+CREATE TABLE IF NOT EXISTS daily_reviews (
+    id                    SERIAL PRIMARY KEY,
+    user_id               TEXT NOT NULL,
+    review_date           TEXT NOT NULL,
+    score_total           INTEGER,
+    score_rule_adherence  INTEGER,
+    score_entry_quality   INTEGER,
+    score_exit_quality    INTEGER,
+    score_market_fit      INTEGER,
+    score_risk_mgmt       INTEGER,
+    score_reflection      INTEGER,
+    good_points           JSONB,
+    improvement_points    JSONB,
+    tomorrow_notes        JSONB,
+    auto_summary          TEXT,
+    user_feedback         TEXT,
+    reflection_tags       JSONB,
+    generated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, review_date)
+);
+CREATE INDEX IF NOT EXISTS idx_daily_reviews_user_date ON daily_reviews(user_id, review_date DESC);
+"""
+
 
 def init_schema(database_url):
     """テーブルを（無ければ）作成し、マルチユーザー化・ChatGPT連携の移行SQLも実行する。
@@ -626,6 +652,7 @@ def init_schema(database_url):
         conn.execute(_MIGRATE_MULTIUSER_SQL)
         conn.execute(_MIGRATE_CHATGPT_IMPORT_SQL)
         conn.execute(_SCHEMA_TRADE_RULES_SQL)
+        conn.execute(_SCHEMA_DAILY_REVIEWS_SQL)
         conn.commit()
 
 
@@ -1620,6 +1647,505 @@ def migrate_legacy_rules_to_trade_rules(database_url, user_id):
                 result["migratedFromDailyLog"] += 1
 
     return result
+
+
+# ============================================================
+# ---- ChatGPT統合連携（2026-09-09新規、指示書Phase1）----
+# 「投資ログ取り込み」から「ChatGPT統合インポート」へ役割拡張。1つのJSONに複数種別の情報
+# （market/watchlist/decisions/rule_updates/review＝既存必須項目、events/news/
+# expert_opinions/catalysts/user_feedback/position_review＝今回追加の任意項目）が
+# 混在していても、アプリ側で内容を判定して既存の各保存先（save_chatgpt_import・
+# import_market_events・import_news_catalysts・import_expert_views・daily_reviews）へ
+# 自動振り分けする。新しい保存ロジック・重複排除ロジックは作らず、既存の各関数（イベント・
+# カタリスト・有識者は既にPHASE3〜5で構築済み）をそのまま呼ぶだけ（指示書「既存の重複排除
+# ロジックは可能な限り再利用する」）。
+# ============================================================
+
+def _classify_single_item(item):
+    """1件のオブジェクトを内容（キー形状）から分類する（指示書4番）。優先順位付き
+    ヒューリスティックのみ（AI不使用）。判定できなければNoneを返す（無理に分類しない）。"""
+    if not isinstance(item, dict):
+        return None
+    keys = set(item.keys())
+    if "expert_name" in keys and (keys & {"thesis", "confirmations", "invalidation_conditions", "outlook"}):
+        return "expert_opinions"
+    if (keys & {"event_date", "event_type"}) or ({"event", "importance"} <= keys):
+        return "events"
+    if "headline" in keys or ("title" in keys and (keys & {"source", "published_at"})):
+        return "news"
+    if "rule" in keys and (keys & {"action", "confidence", "status"}):
+        return "rule_updates"
+    if "code" in keys and "action" in keys and (keys & {"reason", "risk", "time_horizon"}):
+        return "decisions"
+    if {"code", "name"} <= keys and (keys & {"stance", "view", "theme", "priority"}):
+        return "watchlist"
+    return None
+
+
+# 統合payloadの既知トップレベルキー（標準envelope＋今回追加の任意キー）。この集合に無い
+# キーで値が配列のものだけ、_classify_single_item()による内容判定の対象にする（指示書4番）。
+_UNIFIED_KNOWN_KEYS = {
+    "schema_version", "type", "date", "market", "watchlist", "decisions", "review",
+    "rule_updates", "events", "news", "expert_opinions", "catalysts",
+    "user_feedback", "position_review", "notes",
+}
+
+
+def classify_chatgpt_unified_payload(payload):
+    """統合ChatGPT連携の中核（指示書2〜5番）。DBへの書き込みは行わない純粋関数——
+    プレビュー表示（指示書5番）と実保存（save_chatgpt_unified_import）の両方から呼ぶ。
+    既存の必須キー（date/market/watchlist/decisions/review/rule_updates）が無くても
+    正常動作し（指示書3番）、今回追加の任意キー（events/news/expert_opinions/catalysts/
+    user_feedback/position_review）が無くても正常動作する。
+    戻り値: {"buckets": {...}, "counts": {...}}"""
+    if not isinstance(payload, dict):
+        payload = {}
+    market = payload.get("market") if isinstance(payload.get("market"), dict) else {}
+    watchlist = list(payload.get("watchlist")) if isinstance(payload.get("watchlist"), list) else []
+    decisions = list(payload.get("decisions")) if isinstance(payload.get("decisions"), list) else []
+    rule_updates = list(payload.get("rule_updates")) if isinstance(payload.get("rule_updates"), list) else []
+    events = list(payload.get("events")) if isinstance(payload.get("events"), list) else []
+    news = list(payload.get("news")) if isinstance(payload.get("news"), list) else []
+    expert_opinions = list(payload.get("expert_opinions")) if isinstance(payload.get("expert_opinions"), list) else []
+    catalysts = list(payload.get("catalysts")) if isinstance(payload.get("catalysts"), list) else []
+    user_feedback = payload.get("user_feedback") or ""
+    position_review = payload.get("position_review") if isinstance(payload.get("position_review"), dict) else {}
+    review = payload.get("review") or ""
+
+    unclassified = 0
+    for k, v in payload.items():
+        if k in _UNIFIED_KNOWN_KEYS or not isinstance(v, list):
+            continue
+        for item in v:
+            bucket = _classify_single_item(item)
+            if bucket == "watchlist":
+                watchlist.append(item)
+            elif bucket == "decisions":
+                decisions.append(item)
+            elif bucket == "rule_updates":
+                rule_updates.append(item)
+            elif bucket == "events":
+                events.append(item)
+            elif bucket == "news":
+                news.append(item)
+            elif bucket == "expert_opinions":
+                expert_opinions.append(item)
+            else:
+                unclassified += 1
+
+    buckets = {
+        "market_summary": market or None, "watchlist": watchlist, "decisions": decisions,
+        "rule_updates": rule_updates, "events": events, "news": news,
+        "expert_opinions": expert_opinions, "catalysts": catalysts,
+        "user_feedback": user_feedback, "review": review, "position_review": position_review,
+    }
+    counts = {
+        "market_summary": 1 if market else 0, "watchlist": len(watchlist), "decisions": len(decisions),
+        "rule_updates": len(rule_updates), "events": len(events), "news": len(news),
+        "expert_opinions": len(expert_opinions), "catalysts": len(catalysts),
+        "user_feedback": 1 if user_feedback else 0, "review": 1 if review else 0,
+        "unclassified": unclassified,
+    }
+    return {"buckets": buckets, "counts": counts}
+
+
+def _map_news_item_to_catalyst(item):
+    """統合連携の"news"バケット（headline/title/source/published_at/impact/sentiment/
+    affected_codes等、指示書8番）を、既存news_catalystsテーブルが期待する形
+    （catalyst_date/title必須）へ変換する。ニュースと材料（カタリスト）は「株価に影響しうる
+    情報」という意味で同じ土台のため、新しいテーブルは作らず既存news_catalystsへ統合する。"""
+    date = item.get("date") or item.get("catalyst_date") or (item.get("published_at") or "")[:10] or None
+    codes = item.get("affected_codes") or item.get("codes") or ([item["code"]] if item.get("code") else [])
+    return {
+        "catalyst_date": date,
+        "title": item.get("headline") or item.get("title"),
+        "summary": item.get("summary") or item.get("detail"),
+        "sentiment": item.get("sentiment"),
+        "importance": item.get("importance"),
+        "affected_stocks": codes,
+        "affected_sectors": item.get("affected_sectors") or ([item["sector"]] if item.get("sector") else []),
+        "source": item.get("source") or "ChatGPT統合連携",
+    }
+
+
+def save_chatgpt_unified_import(database_url, user_id, payload, force=False):
+    """統合ChatGPT連携の保存処理（指示書1・2番、ユーザー向けの唯一の取り込み口）。
+    既存save_chatgpt_import()（daily_log/stock_judgments/investment_rules/trade_rules
+    保存、無変更）をそのまま呼び、追加でevents/news/catalysts/expert_opinionsが
+    あれば既存のimport_market_events/import_news_catalysts/import_expert_viewsへ
+    振り分け、user_feedbackがあればdaily_reviewsへ保存する。戻り値は既存
+    save_chatgpt_import()の戻り値に"unified"（各バケットのimport結果）と
+    "classification"（分類件数）を追加したもの。"""
+    base_result = save_chatgpt_import(database_url, user_id, payload, force=force)
+    if "error" in base_result:
+        return base_result
+    classified = classify_chatgpt_unified_payload(payload)
+    buckets = classified["buckets"]
+    unified = {}
+    if buckets["events"]:
+        unified["events"] = import_market_events(database_url, user_id, buckets["events"])
+    if buckets["news"]:
+        unified["news"] = import_news_catalysts(database_url, user_id, [_map_news_item_to_catalyst(n) for n in buckets["news"]])
+    if buckets["catalysts"]:
+        unified["catalysts"] = import_news_catalysts(database_url, user_id, buckets["catalysts"])
+    if buckets["expert_opinions"]:
+        unified["expert_opinions"] = import_expert_views(database_url, user_id, buckets["expert_opinions"])
+    if buckets["user_feedback"]:
+        review_date = payload.get("date") or datetime.date.today().isoformat()
+        save_review_user_feedback(database_url, user_id, review_date, buckets["user_feedback"], source="chatgpt_import")
+        unified["user_feedback"] = {"saved": True, "date": review_date}
+    base_result["unified"] = unified
+    base_result["classification"] = classified["counts"]
+    return base_result
+
+
+# ============================================================
+# ---- daily_reviews（日次投資レビュー・投資スコア。2026-09-09新規、指示書Phase4・5）----
+# ポジション・売買履歴・持ち越し・ルール遵守から1日単位で自動評価する。「儲かった＝高得点」
+# にしない（指示書14番）ため、生のPnLはスコアの直接入力にせず、実データ（portfolio/
+# trade_history/trade_rules）から検証できる具体的なチェック結果だけを積み上げる設計にした。
+# ============================================================
+
+RULE_ADHERENCE_MAX = 25
+ENTRY_QUALITY_MAX = 20
+EXIT_QUALITY_MAX = 20
+MARKET_FIT_MAX = 15
+RISK_MGMT_MAX = 10
+REFLECTION_MAX = 10
+DEDUCTION_RULE_VIOLATION = 8
+DEDUCTION_TEMPORARY_RULE_VIOLATION = 15  # 指示書17番：例外ルールの期限超過持ち越しは強く減点
+
+_REFLECTION_TAG_KEYWORDS = [
+    ("FOMO", ["飛びつき", "焦って", "乗り遅れ", "FOMO", "fomo"]),
+    ("高値追い", ["高値追い", "高値掴み", "追いかけて買"]),
+    ("損切り遅れ", ["損切りが遅れ", "損切り遅れ", "塩漬け", "ロスカットが遅"]),
+    ("利確遅れ", ["利確を逃", "利確が遅れ", "欲張っ", "もっと上がると思っ"]),
+    ("ナンピン", ["ナンピン"]),
+    ("過信", ["自信があったので", "過信", "大丈夫だと思っ"]),
+    ("地合い無視", ["地合いを無視", "地合いが悪い中", "地合いに逆行"]),
+    ("ルール違反", ["ルールに反", "ルール違反", "原則から外れ", "例外扱いにして"]),
+    ("良い判断", ["良い判断", "冷静に判断", "計画通り"]),
+    ("冷静な見送り", ["見送った", "様子見にした", "無理せず"]),
+]
+# 上のフレーズ完全一致だけでは「損切りも少し遅れた気がする」のように助詞・修飾語が挟まる
+# 自然な言い回しを取りこぼすため、タグごとに「全て含まれていれば良い」語のANDパターンも
+# 併用する（形態素解析はしない軽量な補完、指示書20番のキーワード方式の範囲内）。
+_REFLECTION_TAG_AND_KEYWORDS = [
+    ("損切り遅れ", [["損切り", "遅れ"], ["ロスカット", "遅"]]),
+    ("利確遅れ", [["利確", "遅れ"], ["利確", "逃し"]]),
+    ("高値追い", [["高値", "追"]]),
+    ("地合い無視", [["地合い", "無視"], ["地合い", "逆行"]]),
+]
+
+
+def extract_reflection_tags(text):
+    """ユーザー感想からタグを抽出する（指示書20番、キーワード方式・AI不使用）。"""
+    if not text:
+        return []
+    tags = {tag for tag, kws in _REFLECTION_TAG_KEYWORDS if any(k in text for k in kws)}
+    for tag, patterns in _REFLECTION_TAG_AND_KEYWORDS:
+        if any(all(k in text for k in pat) for pat in patterns):
+            tags.add(tag)
+    # 元のリスト順を維持して返す（表示の安定性のため）
+    order = [t for t, _ in _REFLECTION_TAG_KEYWORDS]
+    return [t for t in order if t in tags] + [t for t in tags if t not in order]
+
+
+def _check_rule_adherence(database_url, user_id, review_date, positions, rules):
+    """ルール遵守（25点満点）。実データ（保有中ポジション・trade_rules）から機械的に
+    チェックできるものだけを対象にする（指示書14番：単純な損益判定はしない）。"""
+    good, bad = [], []
+    score = RULE_ADHERENCE_MAX
+    active_rules = [r for r in rules if r["status"] == "ACTIVE"]
+    temp_rules = [r for r in rules if r["rule_type"] == "TEMPORARY"]
+
+    # 1) 持ち越し原則なし系ルール：trade_style=DAY（デイトレ）の建玉が保有中＝持ち越し発生。
+    #    その銘柄コードを名指しした有効なTEMPORARY例外ルールが無ければ違反とみなす。
+    no_carry_active = any("持ち越し" in r["rule_text"] and "原則" in r["rule_text"] for r in active_rules)
+    if no_carry_active:
+        day_positions = [p for p in positions if (p.get("trade_style") or "").upper() == "DAY"]
+        for p in day_positions:
+            covered = any(t["scope"] == "stock" and p["code"] in (t.get("rule_text") or "")
+                          and t["status"] not in ("EXPIRED", "RETIRED") for t in temp_rules)
+            label = p.get("name") or p["code"]
+            if covered:
+                good.append(f"{label}：デイトレ持ち越しだが例外ルールとして明示登録済み")
+            else:
+                score -= DEDUCTION_RULE_VIOLATION
+                bad.append(f"{label}：デイトレ想定の建玉を例外登録なしで持ち越し（持ち越し原則ルール違反）")
+
+    # 2) TEMPORARYルールの期限切れ後も対象銘柄を持ち越している場合（指示書17番の例そのもの）
+    held_codes = {p["code"] for p in positions}
+    for t in temp_rules:
+        if t["status"] == "EXPIRED" and t.get("scope") == "stock":
+            mentioned = [c for c in held_codes if c in (t.get("rule_text") or "")]
+            if mentioned:
+                score -= DEDUCTION_TEMPORARY_RULE_VIOLATION
+                bad.append(f"例外ルール『{t['rule_text'][:40]}…』の期限超過後も持ち越しを継続（例外違反）")
+
+    # 3) 逆指値必須ルールがACTIVEなのに、保有銘柄に損切りライン未設定のものがある
+    stop_required = any("逆指値" in r["rule_text"] for r in active_rules)
+    if stop_required and positions:
+        no_stop = [p for p in positions if p.get("current_stop") is None and p.get("initial_stop") is None]
+        if no_stop:
+            deduct = min(DEDUCTION_RULE_VIOLATION, len(no_stop) * 3)
+            score -= deduct
+            bad.append(f"{len(no_stop)}銘柄で損切りライン（逆指値）が未設定")
+        else:
+            good.append("保有銘柄は全て損切りラインを設定済み")
+
+    return max(0, min(RULE_ADHERENCE_MAX, score)), good, bad
+
+
+def _check_entry_quality(new_positions):
+    """エントリー品質（20点満点）：その日新規に持ったポジションが、初期損切り・利確目標を
+    決めた上で入っているか（計画性）を見る。現在値との比較等の厳密な「高値掴みだったか」判定は
+    リアルタイムスナップショットが無いと不可能なため、v1では計画性チェックに限定する。"""
+    if not new_positions:
+        return ENTRY_QUALITY_MAX, ["本日の新規エントリーなし（判定対象外、満点扱い）"], []
+    good, bad = [], []
+    score = ENTRY_QUALITY_MAX
+    per_item = ENTRY_QUALITY_MAX / max(1, len(new_positions))
+    for p in new_positions:
+        label = p.get("name") or p["code"]
+        missing = [n for n, v in [("初期損切り", p.get("initial_stop")), ("利確目標", p.get("target_1"))] if v is None]
+        if missing:
+            score -= per_item * (len(missing) / 2)
+            bad.append(f"{label}：エントリー時に{('・'.join(missing))}が未設定のまま建玉化")
+        else:
+            good.append(f"{label}：損切り・利確目標を決めてからエントリー")
+    return max(0, round(score)), good, bad
+
+
+def _check_exit_quality(exits_today, reflection_tags):
+    """利確・損切り（20点満点）：当日の決済（trade_history）を評価する。損失決済＝悪い、では
+    なく、損切り遅れ等の反省タグが無ければ「計画通りの損切り」として扱う（指示書15番の
+    「損失でも正しい損切りなら高評価可能」の実装）。"""
+    if not exits_today:
+        return EXIT_QUALITY_MAX, ["本日の決済なし（判定対象外、満点扱い）"], []
+    good, bad = [], []
+    score = EXIT_QUALITY_MAX
+    per_item = EXIT_QUALITY_MAX / max(1, len(exits_today))
+    late_exit_flagged = "損切り遅れ" in reflection_tags
+    greedy_flagged = "利確遅れ" in reflection_tags
+    for t in exits_today:
+        label = t.get("name") or t["code"]
+        pnl = t.get("net_pnl") if t.get("net_pnl") is not None else t.get("pnl")
+        if pnl is not None and pnl < 0:
+            if late_exit_flagged:
+                score -= per_item
+                bad.append(f"{label}：損失決済かつ本人の振り返りで「損切り遅れ」を自己申告")
+            else:
+                good.append(f"{label}：損失決済だが計画的な損切りとして処理（自己申告の遅れ報告なし）")
+        else:
+            if greedy_flagged:
+                score -= per_item * 0.5
+                bad.append(f"{label}：利益確定だが本人の振り返りで「利確遅れ」を自己申告")
+            else:
+                good.append(f"{label}：利益確定")
+    return max(0, round(score)), good, bad
+
+
+def _check_market_fit(new_positions, market_condition):
+    """地合い適応（15点満点）：地合いが軟調（リスクオフ等）な日に新規エントリーを増やして
+    いないかを見る。market_conditionはdaily_log保存時の自由記述テキストのため、キーワードで
+    軽く判定する（厳密な数値判定はしない）。"""
+    if not market_condition:
+        return MARKET_FIT_MAX, [], ["地合い情報が未記録のため判定不能（満点扱い）"]
+    risk_off = any(k in market_condition for k in ["リスクオフ", "軟調", "弱い", "急落", "下落"])
+    if not risk_off:
+        return MARKET_FIT_MAX, [f"地合い「{market_condition}」の下で通常運用"], []
+    if not new_positions:
+        return MARKET_FIT_MAX, [f"地合い軟調（{market_condition}）の中、新規エントリーを抑制"], []
+    deduct = min(MARKET_FIT_MAX, len(new_positions) * 5)
+    return max(0, MARKET_FIT_MAX - deduct), [], [f"地合い軟調（{market_condition}）にも関わらず新規{len(new_positions)}件エントリー"]
+
+
+def _check_risk_management(database_url, user_id, review_date):
+    """リスク管理（10点満点）：その日にFAILED評価されたriskカテゴリのルールがあれば減点する
+    （既存のルール学習システムと接続、指示書10番）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return RISK_MGMT_MAX, [], []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT h.reason, r.rule_text FROM trade_rule_history h JOIN trade_rules r ON r.id=h.rule_id "
+                "WHERE h.user_id=%s AND h.event_type='EVALUATION' AND h.eval_result='FAILED' "
+                "AND h.eval_date=%s AND r.category='risk'", [user_id, review_date])
+            fails = cur.fetchall()
+    if not fails:
+        return RISK_MGMT_MAX, [], []
+    deduct = min(RISK_MGMT_MAX, len(fails) * 5)
+    return max(0, RISK_MGMT_MAX - deduct), [], [f"リスク関連ルール『{f['rule_text'][:30]}…』がFAILED評価" for f in fails]
+
+
+def generate_daily_review(database_url, user_id, review_date, user_feedback=None):
+    """指示書13〜17番：1日の投資振り返りを自動生成し、1〜100点で評価する。既存の
+    ChatGPT取込・trade_rules・portfolio・trade_historyのデータだけを使い、新しい判定
+    ロジックを勝手に「賢く」しすぎない（機械的に検証できる項目だけを積み上げる設計）。
+    戻り値: 保存済みdaily_reviewsの1行（camelCase変換済み）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    positions = list_portfolio(database_url, user_id)
+    history = list_trade_history(database_url, user_id, limit=500)
+    rules = list_trade_rules(database_url, user_id)
+
+    exits_today = [t for t in history if str(t.get("closed_at") or "")[:10] == review_date]
+    new_positions = [p for p in positions if str(p.get("acquired_at") or p.get("created_at") or "")[:10] == review_date]
+
+    # market_condition: その日のdaily_logがあれば使う（無くても判定不能として満点扱いにするだけ）
+    market_condition = None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT market_env FROM daily_log WHERE user_id=%s AND date=%s ORDER BY id DESC LIMIT 1",
+                        [user_id, review_date])
+            row = cur.fetchone()
+            if row:
+                market_condition = row.get("market_env")
+            # 既存のuser_feedback（同日、まだ無ければNone）
+            cur.execute("SELECT user_feedback FROM daily_reviews WHERE user_id=%s AND review_date=%s",
+                        [user_id, review_date])
+            existing = cur.fetchone()
+    effective_feedback = user_feedback if user_feedback is not None else (existing.get("user_feedback") if existing else None)
+    reflection_tags = extract_reflection_tags(effective_feedback)
+
+    score_rule, good_rule, bad_rule = _check_rule_adherence(database_url, user_id, review_date, positions, rules)
+    score_entry, good_entry, bad_entry = _check_entry_quality(new_positions)
+    score_exit, good_exit, bad_exit = _check_exit_quality(exits_today, reflection_tags)
+    score_market, good_market, bad_market = _check_market_fit(new_positions, market_condition)
+    score_risk, good_risk, bad_risk = _check_risk_management(database_url, user_id, review_date)
+    score_reflection = REFLECTION_MAX if (effective_feedback or "").strip() else 4
+
+    score_total = score_rule + score_entry + score_exit + score_market + score_risk + score_reflection
+    good_points = good_rule + good_entry + good_exit + good_market + good_risk
+    improvement_points = bad_rule + bad_entry + bad_exit + bad_market + bad_risk
+
+    tomorrow_notes = []
+    for t in temp_rules_expiring_soon(rules, review_date):
+        tomorrow_notes.append(f"{t['rule_text'][:40]}…（期限{t.get('expires_date')}）を必ず順守")
+    if "損切り遅れ" in reflection_tags:
+        tomorrow_notes.append("含み損ポジションは早めの損切り判断を意識する")
+    if "利確遅れ" in reflection_tags:
+        tomorrow_notes.append("含み益ポジションは目標到達で機械的に利確する")
+    if "高値追い" in reflection_tags or "FOMO" in reflection_tags:
+        tomorrow_notes.append("急騰銘柄への飛び乗りエントリーを控える")
+
+    auto_summary = f"今日の投資スコア：{score_total}/100（ルール遵守{score_rule}/{RULE_ADHERENCE_MAX}・" \
+        f"エントリー{score_entry}/{ENTRY_QUALITY_MAX}・利確損切り{score_exit}/{EXIT_QUALITY_MAX}・" \
+        f"地合い適応{score_market}/{MARKET_FIT_MAX}・リスク管理{score_risk}/{RISK_MGMT_MAX}・" \
+        f"振り返り{score_reflection}/{REFLECTION_MAX}）"
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "INSERT INTO daily_reviews (user_id, review_date, score_total, score_rule_adherence, "
+                "score_entry_quality, score_exit_quality, score_market_fit, score_risk_mgmt, "
+                "score_reflection, good_points, improvement_points, tomorrow_notes, auto_summary, "
+                "user_feedback, reflection_tags, updated_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s::jsonb,now()) "
+                "ON CONFLICT (user_id, review_date) DO UPDATE SET "
+                "score_total=EXCLUDED.score_total, score_rule_adherence=EXCLUDED.score_rule_adherence, "
+                "score_entry_quality=EXCLUDED.score_entry_quality, score_exit_quality=EXCLUDED.score_exit_quality, "
+                "score_market_fit=EXCLUDED.score_market_fit, score_risk_mgmt=EXCLUDED.score_risk_mgmt, "
+                "score_reflection=EXCLUDED.score_reflection, good_points=EXCLUDED.good_points, "
+                "improvement_points=EXCLUDED.improvement_points, tomorrow_notes=EXCLUDED.tomorrow_notes, "
+                "auto_summary=EXCLUDED.auto_summary, "
+                "user_feedback=COALESCE(daily_reviews.user_feedback, EXCLUDED.user_feedback), "
+                "reflection_tags=EXCLUDED.reflection_tags, updated_at=now() "
+                "RETURNING *",
+                [user_id, review_date, score_total, score_rule, score_entry, score_exit, score_market,
+                 score_risk, score_reflection, json.dumps(good_points, ensure_ascii=False),
+                 json.dumps(improvement_points, ensure_ascii=False), json.dumps(tomorrow_notes, ensure_ascii=False),
+                 auto_summary, effective_feedback, json.dumps(reflection_tags, ensure_ascii=False)])
+            saved = cur.fetchone()
+        conn.commit()
+    return _row_to_json(saved)
+
+
+def temp_rules_expiring_soon(rules, review_date, days=1):
+    """TEMPORARYルールのうちreview_date基準でdays日以内に期限が来るものを返す（指示書21番
+    「明日の注意」用）。"""
+    try:
+        base = datetime.date.fromisoformat(review_date)
+    except (ValueError, TypeError):
+        return []
+    out = []
+    for r in rules:
+        if r["rule_type"] != "TEMPORARY" or r["status"] in ("EXPIRED", "RETIRED") or not r.get("expires_date"):
+            continue
+        try:
+            exp = datetime.date.fromisoformat(r["expires_date"])
+        except ValueError:
+            continue
+        if 0 <= (exp - base).days <= days:
+            out.append(r)
+    return out
+
+
+def save_review_user_feedback(database_url, user_id, review_date, feedback, source="manual"):
+    """日次レビューへユーザー感想を保存する（指示書18番）。該当日のdaily_reviewsが無ければ
+    先に生成してから感想を上書きする（感想入力だけ先に行われるケースに対応）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT id FROM daily_reviews WHERE user_id=%s AND review_date=%s", [user_id, review_date])
+            exists = cur.fetchone()
+    if not exists:
+        generate_daily_review(database_url, user_id, review_date, user_feedback=feedback)
+    tags = extract_reflection_tags(feedback)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE daily_reviews SET user_feedback=%s, reflection_tags=%s::jsonb, updated_at=now() "
+                "WHERE user_id=%s AND review_date=%s RETURNING *",
+                [feedback, json.dumps(tags, ensure_ascii=False), user_id, review_date])
+            saved = cur.fetchone()
+        conn.commit()
+    # 感想保存後はルール遵守以外の軸（振り返り点・利確損切り点の反省タグ反映）も再計算する
+    return generate_daily_review(database_url, user_id, review_date, user_feedback=feedback)
+
+
+def get_daily_review(database_url, user_id, review_date):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM daily_reviews WHERE user_id=%s AND review_date=%s", [user_id, review_date])
+            row = cur.fetchone()
+    return _row_to_json(row) if row else None
+
+
+def list_daily_reviews(database_url, user_id, limit=60):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM daily_reviews WHERE user_id=%s ORDER BY review_date DESC LIMIT %s",
+                        [user_id, limit])
+            return [_row_to_json(r) for r in cur.fetchall()]
+
+
+def recent_reflections_for(database_url, user_id, days=3):
+    """朝一チェック・トレード分析の「昨日の反省」表示用（指示書21番）。直近days日分の
+    improvement_points/tomorrow_notes/reflection_tagsをまとめて返す。"""
+    reviews = list_daily_reviews(database_url, user_id, limit=days)
+    out = []
+    for r in reviews:
+        if not (r.get("improvement_points") or r.get("tomorrow_notes")):
+            continue
+        out.append({
+            "date": r.get("review_date"), "score": r.get("score_total"),
+            "improvementPoints": r.get("improvement_points") or [],
+            "tomorrowNotes": r.get("tomorrow_notes") or [],
+            "reflectionTags": r.get("reflection_tags") or [],
+        })
+    return out
 
 
 # ---- investment_profile（投資プロフィール。2026-09-02新規） ----
