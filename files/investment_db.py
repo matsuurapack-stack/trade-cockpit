@@ -748,6 +748,34 @@ CREATE TABLE IF NOT EXISTS morning_market_checks (
 CREATE INDEX IF NOT EXISTS idx_morning_checks_user_date ON morning_market_checks(user_id, check_date DESC, generated_at DESC);
 """
 
+# 2026-09-10新規（損切りルール是正・最優先修正）：ポジション損切りルールを1箇所で一元管理する
+# 共通設定。旧SWING限定の-8%接近警告/-10%強制ハードストップ（trade-cockpit.htmlの
+# calcHardStop/hardStopState、server.pyのHARD_STOP_APPROACHING_PCT/HARD_STOP_TRIGGER_PCT）は
+# ユーザーの実際の運用ルールと一致していなかったため、ここを唯一の真実（single source of
+# truth）として全トレードスタイル共通の-6%WATCH/-7%WARNING/-8%EXITへ是正する。
+# 重要：既存trade_rulesの"SWING_STOP_LOSS"（"スイングは-10%で損切り"、CRITICAL・保護対象
+# ルール）は削除・書き換えしない（過去の学習履歴・保護機構への影響を避けるため）。
+# あくまで「実際の判定に使う値」をこの新しいテーブルへ一本化するだけで、trade_rulesの
+# 学習系（evidence/confidence等）とは別物として扱う——ハードな業務ルール（閾値固定・
+# 行動固定）と、証拠を積み重ねて信頼度が変化する学習系ルールは性質が違うため、あえて
+# 混在させない設計にした。
+DEFAULT_POSITION_RISK_RULES = {
+    "watch_pct": -6.0, "warning_pct": -7.0, "max_loss_pct": -8.0,
+    "action": "EXIT", "allow_reentry": True, "reentry_requires_new_decision": True,
+}
+_SCHEMA_POSITION_RISK_RULES_SQL = """
+CREATE TABLE IF NOT EXISTS position_risk_rules (
+    user_id                        TEXT PRIMARY KEY,
+    watch_pct                      NUMERIC NOT NULL DEFAULT -6.0,
+    warning_pct                    NUMERIC NOT NULL DEFAULT -7.0,
+    max_loss_pct                   NUMERIC NOT NULL DEFAULT -8.0,
+    action                         TEXT NOT NULL DEFAULT 'EXIT',
+    allow_reentry                  BOOLEAN NOT NULL DEFAULT true,
+    reentry_requires_new_decision  BOOLEAN NOT NULL DEFAULT true,
+    updated_at                     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
 
 def init_schema(database_url):
     """テーブルを（無ければ）作成し、マルチユーザー化・ChatGPT連携の移行SQLも実行する。
@@ -764,7 +792,67 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_DAILY_REVIEWS_SQL)
         conn.execute(_SCHEMA_KNOWLEDGE_ENGINE_SQL)
         conn.execute(_SCHEMA_MORNING_CHECK_SQL)
+        conn.execute(_SCHEMA_POSITION_RISK_RULES_SQL)
         conn.commit()
+
+
+def get_position_risk_rules(database_url, user_id):
+    """ポジション損切りルールの共通設定（唯一の真実）を返す。保存済み行が無ければ
+    DEFAULT_POSITION_RISK_RULESをそのまま返す（未設定でも即座に正しい既定値で動く）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return dict(DEFAULT_POSITION_RISK_RULES)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM position_risk_rules WHERE user_id=%s", [user_id])
+            row = cur.fetchone()
+    if not row:
+        return dict(DEFAULT_POSITION_RISK_RULES)
+    return {
+        "watch_pct": float(row["watch_pct"]), "warning_pct": float(row["warning_pct"]),
+        "max_loss_pct": float(row["max_loss_pct"]), "action": row["action"],
+        "allow_reentry": row["allow_reentry"], "reentry_requires_new_decision": row["reentry_requires_new_decision"],
+    }
+
+
+def save_position_risk_rules(database_url, user_id, data):
+    """将来のユーザー設定変更に備えたupsert（今回のUIからは呼ばないが、共通設定を1箇所に
+    まとめる設計のため保存経路も用意しておく）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    merged = {**DEFAULT_POSITION_RISK_RULES, **data}
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "INSERT INTO position_risk_rules (user_id, watch_pct, warning_pct, max_loss_pct, action, "
+                "allow_reentry, reentry_requires_new_decision, updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,now()) "
+                "ON CONFLICT (user_id) DO UPDATE SET watch_pct=EXCLUDED.watch_pct, warning_pct=EXCLUDED.warning_pct, "
+                "max_loss_pct=EXCLUDED.max_loss_pct, action=EXCLUDED.action, allow_reentry=EXCLUDED.allow_reentry, "
+                "reentry_requires_new_decision=EXCLUDED.reentry_requires_new_decision, updated_at=now() "
+                "RETURNING *",
+                [user_id, merged["watch_pct"], merged["warning_pct"], merged["max_loss_pct"], merged["action"],
+                 merged["allow_reentry"], merged["reentry_requires_new_decision"]])
+            saved = cur.fetchone()
+        conn.commit()
+    return _row_to_json(saved)
+
+
+def evaluate_position_risk_tier(pnl_pct, rules=None):
+    """pnl_pct（取得単価比%）から現在の階層（None|WATCH|WARNING|EXIT）を判定する共通関数。
+    Morning Check・Position画面・通知・利確損切り相談・日次レビューが全てこの関数を通す
+    ことで、閾値のズレ（例：Morning CheckだけAPPROACHING/STOPの旧表現のまま、といった
+    食い違い）を構造的に防ぐ。"""
+    rules = rules or DEFAULT_POSITION_RISK_RULES
+    if pnl_pct is None:
+        return None
+    if pnl_pct <= rules["max_loss_pct"]:
+        return "EXIT"
+    if pnl_pct <= rules["warning_pct"]:
+        return "WARNING"
+    if pnl_pct <= rules["watch_pct"]:
+        return "WATCH"
+    return None
 
 
 # ---- daily_log / stock_judgments ----
@@ -3065,6 +3153,10 @@ def _check_known_risk_ignored(database_url, user_id, review_date, positions, new
             _add(code, "プレイブックの回避条件が発動していたにも関わらず新規建玉")
         if uc.get("active_risk_rule_ids") and code in new_codes:
             _add(code, "リスク関連のACTIVEルールが該当していたにも関わらず新規建玉")
+        # 2026-09-10新規（損切りルール是正）：EXIT RULE（-8%到達）が判定済みなのに
+        # 保有継続（その日のうちに売却していない）していれば最重要の違反として検出する。
+        if (log.get("judgment") == "EXIT" or "POSITION_RISK_EXIT" in risk_flags) and code in held_codes:
+            _add(code, "EXIT RULE（-8%到達）が判定されていたにも関わらず保有継続")
     return ignored
 
 
@@ -3076,15 +3168,30 @@ def _check_known_risk_ignored(database_url, user_id, review_date, positions, new
 
 # ---- ポジション相談・利確損切り相談：EXIT側の総合判断（指示書5・6番） ----
 
-def evaluate_exit_judgment(context, position=None):
+def evaluate_exit_judgment(context, position=None, risk_rules=None):
     """保有銘柄向けの総合判断（HOLD/RAISE_STOP/TAKE_PROFIT/REDUCE/EXIT/NO_OVERNIGHT）を
     生成する。新規買い判断（synthesize_trade_judgment）とは別に、matched_playbooksの
     exit_conditions_json/stop_conditions_jsonとtrade_rulesのexit/riskカテゴリを強く
-    参照する（指示書5・6番）。positionは{"unrealized_pnl_pct":float,...}（省略可）。"""
+    参照する（指示書5・6番）。positionは{"unrealized_pnl_pct":float,...}（省略可）。
+    2026-09-10更新（損切りルール是正・最優先修正）：get_position_risk_rules()由来の
+    共通設定（既定-8%）に到達した場合はEXITを絶対最優先で確定し、以降のいかなる材料
+    （プレイブック・行動警告・イベント等）でも上書きしない——自信度・材料・ファンダ・
+    ニュース・AI分析結果に関係なく一旦売却を促す、というユーザー指定の最新ルール。
+    旧実装は判定の途中（他の材料の後）でjudgment=="HOLD"の場合のみEXITにしていたため、
+    先に他の材料でjudgmentが決まっているとEXITへ上書きされない不具合があった。"""
     position = position or {}
     reasons, risk_flags, supporting, opposing = [], [], [], []
-    judgment = "HOLD"
     pnl_pct = position.get("unrealized_pnl_pct")
+    rules = risk_rules or DEFAULT_POSITION_RISK_RULES
+    risk_tier = evaluate_position_risk_tier(pnl_pct, rules)
+    if risk_tier == "EXIT":
+        return {
+            "judgment": "EXIT", "confidence": 100,
+            "reasons": [f"EXIT RULE：買値から{pnl_pct:.1f}%（{rules['max_loss_pct']:.1f}%到達）。"
+                        f"一旦売却してください。再エントリーは新しいトレードとして判断します。"],
+            "risk_flags": ["POSITION_RISK_EXIT"], "supporting": [], "opposing": ["含み損がEXIT RULEに到達"],
+        }
+    judgment = "HOLD"
 
     if "NO_OVERNIGHT" in (context.get("event_signals") or []):
         judgment = "NO_OVERNIGHT"
@@ -3123,11 +3230,14 @@ def evaluate_exit_judgment(context, position=None):
             opposing.append("損切り遅れの反省履歴")
 
     if pnl_pct is not None:
-        if pnl_pct <= -8:
-            reasons.append(f"含み損{pnl_pct:.1f}%")
+        if risk_tier == "WARNING":
+            reasons.append(f"損切りライン接近（含み損{pnl_pct:.1f}%、EXIT RULE {rules['max_loss_pct']:.1f}%まであと僅か）")
             if judgment == "HOLD":
-                judgment = "EXIT"
-            opposing.append("含み損拡大")
+                judgment = "RAISE_STOP"
+            opposing.append("損切りラインに接近")
+        elif risk_tier == "WATCH":
+            reasons.append(f"含み損がやや拡大（{pnl_pct:.1f}%、注視）")
+            opposing.append("含み損やや拡大")
         elif pnl_pct >= 8:
             reasons.append(f"含み益{pnl_pct:.1f}%")
             if judgment == "HOLD":
@@ -3178,6 +3288,12 @@ def evaluate_overnight_decision(database_url, user_id, code, context, unrealized
     NO_OVERNIGHT, "score":int, "reasons":[...]}"""
     reasons = []
     score = 0
+    # 2026-09-10新規（損切りルール是正・最優先修正）：EXIT RULE（-8%到達）に既に達している
+    # ポジションは、そもそも持ち越し以前に売却すべきなので無条件でNO_OVERNIGHTにする。
+    risk_tier = evaluate_position_risk_tier(unrealized_pnl_pct) if unrealized_pnl_pct is not None else None
+    if risk_tier == "EXIT":
+        reasons.append("EXIT RULE（損切りライン）に到達済み。持ち越し以前に売却してください")
+        score += 5
     if "NO_OVERNIGHT" in (context.get("event_signals") or []):
         reasons.append("重要イベント直前のためNO_OVERNIGHTルールに該当")
         score += 3

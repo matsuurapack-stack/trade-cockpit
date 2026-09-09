@@ -1695,17 +1695,22 @@ def compute_macro_sector_strength(indices, commodities):
     return list(dict.fromkeys(strong)), list(dict.fromkeys(weak))
 
 
-HARD_STOP_APPROACHING_PCT = -8.0  # 指示書11番／既存calcHardStop/hardStopState（trade-cockpit.html）と同じ閾値
-HARD_STOP_TRIGGER_PCT = -10.0
+# 2026-09-10更新（損切りルール是正・最優先修正）：旧HARD_STOP_APPROACHING_PCT(-8%警告)/
+# HARD_STOP_TRIGGER_PCT(-10%強制、SWING限定)はユーザーの実際の運用ルールと不一致だった
+# ため撤去。以後は investment_db.get_position_risk_rules()/evaluate_position_risk_tier()
+# （唯一の共通設定、trade-cockpit.html側にも同じ値をミラーしてある）を全トレードスタイル
+# 共通で参照する。
 
 
 def evaluate_position_risk_warnings(database_url, user_id, stock_quotes):
-    """保有ポジションの損切りルール接近・到達を判定する（指示書11・16番）。新しい閾値は
-    作らず、既存のSWING HARD STOP（取得単価×0.90＝-10%で強制、-8%で接近警告）をそのまま
-    Python側でも参照する（trade-cockpit.htmlのcalcHardStop/hardStopStateと同じ値、
-    ロジックの二重実装ではなく同じ既存ルールの再掲）。"""
+    """保有ポジションの損切りルール接近・到達を判定する（指示書11・16番、2026-09-10是正）。
+    -6%WATCH/-7%WARNING/-8%EXITを全トレードスタイル共通で適用する（自信度・材料・
+    ファンダ・AI分析結果に関わらず、-8%到達時点では一旦売却を促す＝EXIT RULE）。
+    投資判断がまだ有効なら、さらに下落した後の再エントリーは「別トレード」として
+    検討してよい（allow_reentry・reentry_requires_new_decision、rules内に保持）。"""
     if investment_db is None or not database_url:
         return []
+    rules = investment_db.get_position_risk_rules(database_url, user_id)
     positions = investment_db.list_portfolio(database_url, user_id)
     warnings = []
     for p in positions:
@@ -1715,21 +1720,22 @@ def evaluate_position_risk_warnings(database_url, user_id, stock_quotes):
         if avg is None or current is None or not avg:
             continue
         pnl_pct = (current - avg) / avg * 100
-        style = (p.get("trade_style") or "").upper()
-        level = None
-        if style == "SWING":
-            if pnl_pct <= HARD_STOP_TRIGGER_PCT:
-                level = "CRITICAL"
-            elif pnl_pct <= HARD_STOP_APPROACHING_PCT:
-                level = "WARNING"
-        elif pnl_pct <= HARD_STOP_APPROACHING_PCT:
-            level = "WARNING"  # DAY建玉は絶対ルール対象外だが、大幅含み損は情報として警告する
-        if level:
-            warnings.append({
-                "code": code, "name": p.get("name"), "pnlPct": round(pnl_pct, 2), "level": level,
-                "message": ("損切りルール到達。一度売却してください（再エントリーは別判断）。"
-                            if level == "CRITICAL" else "損切りラインに接近しています。"),
-            })
+        tier = investment_db.evaluate_position_risk_tier(pnl_pct, rules)
+        if not tier:
+            continue
+        if tier == "EXIT":
+            message = (f"🚨 EXIT RULE\n\n買値から{rules['max_loss_pct']:.1f}%に到達しました。\n\n"
+                       f"「売却」\n\n投資判断がまだ有効でも一旦撤退してください。"
+                       f"再エントリーは新しいトレードとして判断します。")
+            level = "CRITICAL"
+        elif tier == "WARNING":
+            message = f"損切りライン（{rules['max_loss_pct']:.1f}%）に接近しています（現在{pnl_pct:.1f}%）。"
+            level = "WARNING"
+        else:  # WATCH
+            message = f"含み損がやや拡大しています（現在{pnl_pct:.1f}%）。"
+            level = "WATCH"
+        warnings.append({"code": code, "name": p.get("name"), "pnlPct": round(pnl_pct, 2),
+                          "level": level, "tier": tier, "message": message})
     return warnings
 
 
@@ -5582,6 +5588,17 @@ class Handler(SimpleHTTPRequestHandler):
             check = investment_db.get_latest_morning_check(DATABASE_URL, self.current_user, check_date=params.get("date", [None])[0]) \
                 if (investment_db is not None and DATABASE_URL) else None
             self._send_json({"check": check})
+        elif self.path.startswith("/api/position-risk-rules"):
+            # 2026-09-10新規（損切りルール是正・最優先修正）：Morning Check・Positions・
+            # 通知・利確損切り相談・日次レビューが全て同じこの設定を参照する唯一の真実。
+            if investment_db is not None and DATABASE_URL:
+                rules = investment_db.get_position_risk_rules(DATABASE_URL, self.current_user)
+            elif investment_db is not None:
+                rules = investment_db.DEFAULT_POSITION_RISK_RULES
+            else:
+                rules = {"watch_pct": -6.0, "warning_pct": -7.0, "max_loss_pct": -8.0,
+                          "action": "EXIT", "allow_reentry": True, "reentry_requires_new_decision": True}
+            self._send_json({"rules": rules})
         # ---- 2026-09-09新規（判断エンジン強化：知識の実利用） ----
         elif self.path.startswith("/api/trade-playbooks"):
             qs = urllib.parse.urlparse(self.path).query
@@ -6098,7 +6115,8 @@ class Handler(SimpleHTTPRequestHandler):
                 rule_categories=body.get("ruleCategories"),
             )
             if scope == "exit":
-                judgment = investment_db.evaluate_exit_judgment(context, position=body.get("position"))
+                risk_rules = investment_db.get_position_risk_rules(DATABASE_URL, self.current_user)
+                judgment = investment_db.evaluate_exit_judgment(context, position=body.get("position"), risk_rules=risk_rules)
             elif scope == "overnight":
                 pos = body.get("position") or {}
                 overnight = investment_db.evaluate_overnight_decision(
@@ -6139,6 +6157,14 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             n = investment_db.refresh_expert_view_statuses(DATABASE_URL, self.current_user)
             self._send_json({"updated": n})
+        elif self.path == "/api/position-risk-rules/save":
+            # 2026-09-10新規：将来ユーザーが閾値を変更できるようにするための保存経路
+            # （今回のUIからは呼ばないが、共通設定を1箇所にまとめる設計のため用意する）。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            saved = investment_db.save_position_risk_rules(DATABASE_URL, self.current_user, body)
+            self._send_json({"rules": saved})
         elif self.path == "/api/trade-rules/generate-from-reflections":
             # 指示書16番：直近の反省の繰り返しからTESTINGルール候補を生成する。
             if not self._investment_db_ready():
