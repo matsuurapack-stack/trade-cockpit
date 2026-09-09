@@ -1358,8 +1358,14 @@ function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysi
   const volRatio=(levels?.volAvg5&&vol!=null)?vol/levels.volAvg5:null;
   const highBreak=!!(levels&&ct!=null&&ct>levels.highLookback);
   const volSurge=volRatio!=null&&volRatio>=1.5;
-  const ind=analysisData?.[w.code]?.indicators;
-  const assessment=analysisData?.[w.code]?.assessment;
+  // 2026-09-09追記（TOP5/監視銘柄一覧と詳細分析のENTRY判定不整合の修正）：aは「分析」済み
+  // 銘柄のanalyze_stock()フル結果（未分析ならundefined）。detailed分析側のdayTradeLabel・
+  // EntryConditionsChecklist・pullbackEntryと全く同じフィールドをここでも読み、「銘柄として
+  // 強いか」（Primary Status／breakType）と「今買えるか」（waitReasons／actionStatus）を
+  // 混同しないよう、後者の判定にa.entryConditionsMet/Total・a.tradeRules.pullbackEntryを使う。
+  const a=analysisData?.[w.code];
+  const ind=a?.indicators;
+  const assessment=a?.assessment;
   const vwapReclaim=!!(ind?.vwap!=null&&ct!=null&&ct>ind.vwap);
   const resistBreak=!!(ind?.resistance!=null&&ct!=null&&ct>ind.resistance);
   let breakType=null;
@@ -1418,28 +1424,48 @@ function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysi
   if(assessment?.chaseRisk)riskReasons.push("CHASE_RISK");
   if(pct!=null&&pct>=5&&pullbackPct!=null&&pullbackPct>=3)riskReasons.push("SPIKE_REVERSAL");
   if(pct!=null&&Math.abs(pct)>=8)riskReasons.push("EXTREME_MOVE");
-  if(analysisData?.[w.code]?.tradeRules?.marginBadge==="danger")riskReasons.push("MARGIN_DANGER");
+  if(a?.tradeRules?.marginBadge==="danger")riskReasons.push("MARGIN_DANGER");
   if(ind?.rsi!=null&&ind.rsi>=80)riskReasons.push("RSI_HOT");
 
-  // WAIT（「弱いから待つ」ではなく「候補としては良いがエントリー条件未達」。既にbreakType成立済み＝
-  // BREAK系は「もう入る条件が整っている」ためWAIT対象外とする）：
+  // WAIT（「弱いから待つ」ではなく「候補としては良いがエントリー条件未達」）：
+  // 2026-09-09修正（TOP5/監視銘柄一覧のENTRY READYが詳細分析のCHASE RISK／WAIT判定と
+  // 矛盾する不具合対応。実例：5019出光興産＝ACTIVE BREAK＋総合RS高だが、詳細分析は
+  // CHASE RISK・Entry Conditions 4/7・押し目未形成でWAIT）。
+  // 旧実装は「既にbreakType成立済み＝BREAK系はもう入る条件が整っている」という前提で
+  // isBreak時はWAIT判定そのものをスキップしていたが、これが誤りだった——「銘柄として強い
+  // （ACTIVE BREAK）」と「今この価格から入ってよいか」は別軸であり、ブレイク済みでも
+  // 押し目未形成・エントリー条件未達なら入るべきではない。isBreakによる除外を撤廃し、
+  // NEAR_BREAKOUT（ブレイク前夜の意味なのでisBreak時は対象外のまま）以外は
+  // BREAK系にも同じ基準を適用する。
   //  - VWAP_NOT_RECLAIMED: VWAP未回復（分析済みのみ）
   //  - RANGE_UNCONFIRMED: プラス圏だが当日レンジの下半分＝押し目形成途中／下げ止まり未確認
-  //  - NEAR_BREAKOUT: highLookbackまで1.5%以内だが未突破＝ブレイク直前
+  //  - NEAR_BREAKOUT: highLookbackまで1.5%以内だが未突破＝ブレイク直前（isBreak時は対象外）
   //  - SECTOR_WEAK: Sector RS <= -2pt
   //  - MARKET_SOFT: 地合いが明確に軟調（日経当日-1%以下、またはMarket RiskがHIGH RISK/RISK OFF）
   //    かつ、この銘柄自身のMarket RS/Sector RSが地合いを跳ね返すほど強くはない場合のみ。
   //    ※ 市場が少しマイナスというだけでは発火しない・Market RS/Sector RSが非常に強い（+5pt以上）
   //    銘柄は地合いだけを理由にWAITへ落とさない（全面安の中の相対的な強さを重視する戦略のため）。
+  //  - NO_PULLBACK_YET（新規）: 当日+3%以上伸びているのに高値から2%未満しか押していない＝
+  //    まだ一度も反落していない「飛び乗り」状態。CHASE_UP（+8%・押し2%未満→RISK）より緩い
+  //    水準で、分析データの有無に関わらずstockQuotes（当日高値・現在値）だけで判定できる。
+  //    実例の5019（当日+5.7%、高値からの押し約1.4%）はこの条件で正しくWAITになる。
+  //  - ENTRY_CONDITIONS_INCOMPLETE（新規）:「分析」済み銘柄について、詳細分析のEntry
+  //    Conditions（entryConditionsMet/Total、詳細分析タブのdayTradeLabel／
+  //    EntryConditionsChecklistと全く同じ数値）が全条件成立していない場合。「RSが高い
+  //    だけでは入場許可にしない」（指示書5番）の直接的な実装——詳細分析側の判定を
+  //    再利用するだけで新規の判定基準は増やさない。
+  //  - PULLBACK_PENDING（新規）: 詳細分析のtradeRules.pullbackEntry.status==="candidate"
+  //    （押し目候補ゾーンにまだ到達していない）の場合。「押し目待ち」の詳細分析結果を
+  //    そのままTOP5/監視銘柄一覧のENTRY判定に反映する（指示書4番）。
   // WAITはPrimary StatusがWEAK（rsScore<50）の銘柄には付けない。「弱いから待つ」ではなく
   // 「候補としては良いがエントリー条件未達」という意味を保つため、そもそも候補にすらならない
   // 弱い銘柄（WEAK）はWAITではなくNONE（対象外）として扱う。
   const waitReasons=[];
-  if(!isBreak&&rsScore!=null&&rsScore>=50){
+  if(rsScore!=null&&rsScore>=50){
     if(ind?.vwap!=null&&ct!=null&&ct<ind.vwap)waitReasons.push("VWAP_NOT_RECLAIMED");
     const rangePos=(todayHigh!=null&&todayLow!=null&&ct!=null&&todayHigh>todayLow)?(ct-todayLow)/(todayHigh-todayLow):null;
     if(pct!=null&&pct>0&&rangePos!=null&&rangePos<0.5)waitReasons.push("RANGE_UNCONFIRMED");
-    if(levels?.highLookback!=null&&ct!=null&&ct<levels.highLookback&&((levels.highLookback-ct)/levels.highLookback)<=0.015)waitReasons.push("NEAR_BREAKOUT");
+    if(!isBreak&&levels?.highLookback!=null&&ct!=null&&ct<levels.highLookback&&((levels.highLookback-ct)/levels.highLookback)<=0.015)waitReasons.push("NEAR_BREAKOUT");
     if(sectorRS!=null&&sectorRS<=-2)waitReasons.push("SECTOR_WEAK");
     const veryStrongRS=(marketRS!=null&&marketRS>=5)||(sectorRS!=null&&sectorRS>=5);
     if(!veryStrongRS){
@@ -1448,6 +1474,9 @@ function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysi
       const sectorSoft=sectorRS!=null&&sectorRS<=0;
       if(marketSoft&&(rsNotStrongEnough||sectorSoft))waitReasons.push("MARKET_SOFT");
     }
+    if(pct!=null&&pct>=3&&pullbackPct!=null&&pullbackPct<2)waitReasons.push("NO_PULLBACK_YET");
+    if(a&&a.entryConditionsTotal>0&&a.entryConditionsMet<a.entryConditionsTotal)waitReasons.push("ENTRY_CONDITIONS_INCOMPLETE");
+    if(a?.tradeRules?.pullbackEntry?.status==="candidate")waitReasons.push("PULLBACK_PENDING");
   }
 
   // Action Statusの排他決定：RISK > WAIT > ENTRY_READY > NONE。
@@ -1523,13 +1552,26 @@ const GRADE_COLOR={"A+":"var(--up)","A":"var(--up)","B+":"var(--accent)","B":"va
 // エントリー戦略（NOW/PULLBACK/BREAKOUT/WAIT/AVOID）。既存のentry/stop/current・resistance・
 // avoidChecklist・assessment（Falling Knife/Chase Risk）から判定するだけで、購入単価を
 // そのまま表に出す旧方式を置き換える（新規のサーバー計算は追加しない）。
-function classifyEntryStrategy(a){
+// 2026-09-09更新（TOP5/監視銘柄一覧とのENTRY判定統一。指示書「共通関数化」対応）：
+// 第2引数enr（enrichWatchRow()の出力。TOP5・監視銘柄一覧・詳細分析の全てが同じ値を参照）を
+// 渡すと、「NOW（今買える）」はenr.actionStatus==="ENTRY_READY"の場合のみ許可する。
+// これにより、詳細分析カードの一番上のこのバッジと、その下のAssessmentCardが表示する
+// Action Status（ACTION_STATUS_META、同じenr由来）が食い違うことがなくなる——
+// 「銘柄として強いか」（BREAKOUT/PULLBACKという状況ラベル）はそのまま出しつつ、「今買える」
+// という結論だけはTOP5/監視銘柄一覧と共通のenr.actionStatusに一本化する（指示書1番）。
+// enrを渡さない旧来の呼び出し（無ければ全ての既存呼び出し元は互換のため必須にしない）では
+// 従来通りの判定にフォールバックする。
+function classifyEntryStrategy(a,enr){
   const criticalAvoid=(a.tradeRules?.avoidChecklist||[]).some(c=>c.hit&&["catastrophicVolumeCrash","badEarnings"].includes(c.key));
   if(a.assessment?.fallingKnife||criticalAvoid)return "AVOID";
   if(a.assessment?.chaseRisk)return "WAIT";
-  if(a.tradeRules?.entryPattern)return "NOW";
+  const entryReady=enr?enr.actionStatus==="ENTRY_READY":true;
+  if(entryReady){
+    if(a.tradeRules?.entryPattern)return "NOW";
+    const current=a.current,entry=a.entry;
+    if(current!=null&&entry!=null&&current<=entry*1.005)return "NOW";
+  }
   const current=a.current,entry=a.entry,resistance=a.indicators?.resistance;
-  if(current!=null&&entry!=null&&current<=entry*1.005)return "NOW";
   if(current!=null&&resistance!=null&&current>=resistance*0.995)return "BREAKOUT";
   if(current!=null&&entry!=null&&current>entry)return "PULLBACK";
   return "WAIT";
@@ -1777,6 +1819,10 @@ const WAIT_REASON_META = {
   NEAR_BREAKOUT:       "ブレイク直前",
   SECTOR_WEAK:         "セクター軟調",
   MARKET_SOFT:         "地合い軟調",
+  // 2026-09-09追加（TOP5/監視銘柄一覧と詳細分析のENTRY判定統一）：
+  NO_PULLBACK_YET:            "押し目未形成",
+  ENTRY_CONDITIONS_INCOMPLETE:"エントリー条件未達",
+  PULLBACK_PENDING:           "押し目待ち",
 };
 const TRADE_CANDIDATE_STATUS_OPTIONS=[
   {value:"WATCH",label:"監視"},{value:"WAIT",label:"待機"},
@@ -2748,6 +2794,13 @@ function describeWaitReason(code,enr,a){
     case "NEAR_BREAKOUT": return "ブレイク水準まで僅差（未突破）";
     case "SECTOR_WEAK": return enr.sectorRS!=null?`対セクター${enr.sectorRS>0?"+":""}${enr.sectorRS.toFixed(1)}pt`:WAIT_REASON_META.SECTOR_WEAK;
     case "MARKET_SOFT": return "地合いが軟調";
+    case "NO_PULLBACK_YET": return `当日${enr.pct!=null?(enr.pct>0?"+":"")+enr.pct.toFixed(1)+"%":"—"}のまま高値から反落していない（押し目未形成）`;
+    case "ENTRY_CONDITIONS_INCOMPLETE": return a.entryConditionsTotal>0?`Entry Conditions ${a.entryConditionsMet}/${a.entryConditionsTotal}（未達）`:WAIT_REASON_META.ENTRY_CONDITIONS_INCOMPLETE;
+    case "PULLBACK_PENDING": {
+      const z=a.tradeRules?.pullbackEntry;
+      if(z?.zoneLow!=null&&z?.zoneHigh!=null)return `押し目候補 ${z.zoneLow.toLocaleString()}〜${z.zoneHigh.toLocaleString()}円に未到達`;
+      return WAIT_REASON_META.PULLBACK_PENDING;
+    }
     default: return WAIT_REASON_META[code]||code;
   }
 }
@@ -2762,6 +2815,8 @@ const RISK_RESOLUTION_META={
 const WAIT_RESOLUTION_META={
   VWAP_NOT_RECLAIMED:"VWAP回復待ち", RANGE_UNCONFIRMED:"下げ止まり確認待ち",
   NEAR_BREAKOUT:"高値更新（ブレイク成立）待ち", SECTOR_WEAK:"セクター全体の回復待ち", MARKET_SOFT:"地合いの回復待ち",
+  NO_PULLBACK_YET:"押し目形成待ち（高値掴み回避）", ENTRY_CONDITIONS_INCOMPLETE:"残りのエントリー条件成立待ち",
+  PULLBACK_PENDING:"押し目候補ゾーン到達待ち",
 };
 // 2026-09-08更新（分析カードUI改善：DECISION_FIRST_LAYOUT「重要な理由3件以内」対応）：
 // 表示件数を3件にキャップした。既存のriskReasons/waitReasons自体・describeRiskReason等の
@@ -4658,7 +4713,7 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
       },
       note:"average_price_actualは実際に約定した取得単価（ポジション管理の基準）。hard_stop_swingはSWING限定の-10%絶対損切りルールで、他のどの材料よりも優先される（stateがSTOPなら他条件に関わらず撤退が原則）。以下のtrade_analysis_reference.entry_theoreticalはトレード分析タブの理論値で、参考情報にすぎず取得単価とは別物。",
       trade_analysis_reference:a?{
-        grade:gradeFromAnalysis(a),action:classifyEntryStrategy(a),
+        grade:gradeFromAnalysis(a),action:classifyEntryStrategy(a,analysisEnrichedMap?.get(it.code)),
         entry_theoretical:a.entry,initial_stop_theoretical:a.stop,
         target_1_theoretical:a.target,target_2_theoretical:a.fullExitTarget??null,
       }:null,
@@ -7482,7 +7537,9 @@ function App(){
   };
   const copyAnalysisConsult=async(w,a)=>{
     const grade=gradeFromAnalysis(a);
-    const strategy=classifyEntryStrategy(a);
+    // 2026-09-09更新：画面表示（詳細分析カード最上部のバッジ）と同じenrを渡し、ChatGPTへの
+    // 相談内容も画面表示と食い違わないようにする（指示書1番の共通化を相談用コピーにも適用）。
+    const strategy=classifyEntryStrategy(a,analysisEnrichedMap.get(w.code));
     const rr=(a.entry!=null&&a.stop!=null&&a.target!=null&&(a.entry-a.stop)>0)?(a.target-a.entry)/(a.entry-a.stop):null;
     await copyChatGPTPayload("詳細分析を相談","trade_analysis",{
       stock:{code:w.code,name:w.name,market:w.market,sector:w.sector||null},
@@ -8053,7 +8110,7 @@ function App(){
                               エントリー戦略(NOW/PULLBACK/BREAKOUT/WAIT/AVOID)を最上部にまとめる。
                               いずれも既存のstrength・entry・stop・resistance・assessmentから
                               クライアント側で導出するのみで、サーバー側ロジックは無変更。 */}
-                          {(()=>{const grade=gradeFromAnalysis(a);const strategy=classifyEntryStrategy(a);const sm=ENTRY_STRATEGY_META[strategy];
+                          {(()=>{const grade=gradeFromAnalysis(a);const strategy=classifyEntryStrategy(a,enr);const sm=ENTRY_STRATEGY_META[strategy];
                           return <div style={{marginBottom:8}}>
                             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6}}>
                               <div className="mono" style={{fontSize:14,color:"var(--inkSoft)"}}>現在値 <span style={{fontWeight:800,fontSize:20,color:"var(--ink)"}}>{a.current.toLocaleString()}</span>
