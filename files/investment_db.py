@@ -2099,10 +2099,16 @@ def generate_daily_review(database_url, user_id, review_date, user_feedback=None
     # NO_OVERNIGHT等の警告が出ていたのに実際に持ち越した銘柄を検出し、「知っていたのに
     # 無視した」としてルール遵守点をさらに減点する（結果論ではなく、その時点で警告が
     # 出ていたかどうかで判定、指示書27番）。
-    known_risk_ignored = _check_known_risk_ignored(database_url, user_id, review_date, positions)
+    known_risk_ignored = _check_known_risk_ignored(database_url, user_id, review_date, positions, new_positions=new_positions)
     if known_risk_ignored:
         score_rule = max(0, score_rule - DEDUCTION_RULE_VIOLATION * len(known_risk_ignored))
         bad_rule = bad_rule + [f"{k['code']}：{k['reason']}（知っていたのに無視）" for k in known_risk_ignored]
+
+    # 2026-09-09新規（判断エンジン全画面統合、指示書18番）：その日の決済がplaybookの
+    # 回避条件発動を無視していなかったか／playbookを参照して判断していたかを反映する。
+    good_pb, bad_pb = _check_playbook_discipline(database_url, user_id, exits_today)
+    good_entry = good_entry + good_pb
+    bad_rule = bad_rule + bad_pb
 
     score_total = score_rule + score_entry + score_exit + score_market + score_risk + score_reflection
     good_points = good_rule + good_entry + good_exit + good_market + good_risk
@@ -2778,7 +2784,10 @@ def build_relevant_trading_context(database_url, user_id, stock_code=None, secto
     matched_playbooks = matched_playbooks_for(database_url, user_id, signals, code=stock_code, sector=sector,
                                                 timeframe=(position or {}).get("trade_style"), limit=3)
     behavioral_warnings = behavioral_warnings_from_reflections(database_url, user_id)
-    similar_trades = find_similar_trades_for(database_url, user_id, code=stock_code, sector=sector, limit=5)
+    # 2026-09-09拡張（指示書14番）：similar_tradesはmatched_playbooksのIDも照合材料に使う
+    # （同銘柄＋同じプレイブックで判断していた過去トレードを優先表示）。
+    similar_trades = find_similar_trades_for(database_url, user_id, code=stock_code, sector=sector, limit=5,
+                                               matched_playbook_ids=[p["id"] for p in matched_playbooks])
 
     return {
         "recent_news": recent_news,
@@ -2793,19 +2802,43 @@ def build_relevant_trading_context(database_url, user_id, stock_code=None, secto
     }
 
 
-# ---- 過去売買の類似検索（指示書11番） ----
+# ---- 過去売買の類似検索（指示書11・14番） ----
 
-def find_similar_trades_for(database_url, user_id, code=None, sector=None, limit=5):
-    """過去のtrade_historyから、同銘柄または（呼び出し側がsectorを渡せる場合）類似の
-    条件に一致する直近の売買を返す（指示書11番の簡易版：同銘柄一致を主軸とし、
-    セクター単位の類似は銘柄コード前方一致等の精緻な業種マスタが無いため今回は対象外、
-    同銘柄一致のみを確実な情報として返す設計）。"""
+def find_similar_trades_for(database_url, user_id, code=None, sector=None, limit=5, matched_playbook_ids=None):
+    """過去のtrade_historyから類似トレードを抽出する（指示書14番）。指示書が挙げる項目
+    （sector/time_of_day/momentum_state/volatility等）のうち、実際にDBへ永続化されて
+    いて検証可能なものだけをスコア化する：同銘柄（基礎点）＋同じプレイブックを参照して
+    判断していたか（analysis_context_log.used_context.playbooksとの突合）。
+    sector/時間帯/ボラティリティ・モメンタム状態は現状trade_historyに記録が無く、
+    捏造を避けるため今回はスコアに含めない（今後の課題）。"""
     if not code:
         return []
     history = list_trade_history(database_url, user_id, limit=200)
-    matches = [t for t in history if t.get("code") == code]
-    matches.sort(key=lambda t: t.get("closed_at") or "", reverse=True)
-    return matches[:limit]
+    same_code = [t for t in history if t.get("code") == code]
+    if not same_code:
+        return []
+    matched_playbook_ids = set(matched_playbook_ids or [])
+    pool = _get_pool(database_url) if matched_playbook_ids else None
+    scored = []
+    for t in same_code:
+        score = 3  # 同銘柄一致の基礎点
+        if pool:
+            with pool.connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        "SELECT used_context_json FROM analysis_context_log WHERE user_id=%s AND code=%s "
+                        "AND analysis_date <= %s ORDER BY analysis_date DESC LIMIT 3",
+                        [user_id, code, str(t.get("closed_at") or "")[:10]])
+                    logs = cur.fetchall()
+            used_pbs = set()
+            for log in logs:
+                used_pbs |= set((log.get("used_context_json") or {}).get("playbooks") or [])
+            if used_pbs & matched_playbook_ids:
+                score += 2  # 同じプレイブックで判断していた過去トレードを優先
+        scored.append((score, t.get("closed_at") or "", t))
+    scored.sort(key=lambda x: (-x[0], x[1]), reverse=False)
+    scored.sort(key=lambda x: -x[0])
+    return [t for _, _, t in scored[:limit]]
 
 
 # ---- 総合判断の生成（指示書21〜23番） ----
@@ -2818,92 +2851,126 @@ def synthesize_trade_judgment(context, base_signal=None):
     頼らない総合判断・確信度・理由を生成する（指示書21〜23番）。base_signalは呼び出し側の
     既存ロジック（enrichWatchRow由来のactionStatus等）から渡す「今のところの一次判断」
     （例："ENTRY_READY"|"WAIT"|"RISK"）——このエンジンはそれを置き換えるのではなく、
-    知識コンテキストで補強・警告を上乗せする。情報が矛盾する場合はconfidenceを下げる
-    （指示書22番）。戻り値: {"judgment":..., "confidence":0-100, "reasons":[...],
-    "risk_flags":[...]}"""
+    知識コンテキストで補強・警告を上乗せする。
+    2026-09-09更新（指示書16・17番）：各材料をbullish（強気＝supporting）／bearish
+    （弱気・警戒＝opposing）に分類し、単純な材料数ではなく方向の一致度でconfidenceを
+    調整する（賛否が割れているほど確信度を下げる、指示書16番の「rules bearish／events
+    bearish／expert bearish／playbook bullish なら判断は慎重」を一般化した実装）。
+    戻り値: {"judgment":..., "confidence":0-100, "reasons":[...], "risk_flags":[...],
+    "supporting":[...], "opposing":[...]}（supporting/opposingはcontradicting_context
+    用、指示書17番）"""
     reasons = []
     risk_flags = []
+    supporting = []  # bullish寄りの材料（テキストラベル）
+    opposing = []    # bearish/警戒寄りの材料
     judgment = {"ENTRY_READY": "BUY_CANDIDATE", "RISK": "WAIT", "WAIT": "WAIT"}.get(base_signal, "WAIT")
-    confidence = 60
+    if base_signal == "ENTRY_READY":
+        supporting.append("既存の一次判断（Action Status）がENTRY_READY")
 
     if "EVENT_RISK_HIGH" in (context.get("event_signals") or []):
         risk_flags.append("EVENT_RISK_HIGH")
         reasons.append("重要イベントが目前")
+        opposing.append("重要イベントが目前")
         if judgment == "BUY_CANDIDATE":
             judgment = "WAIT"
-        confidence -= 15
     if "NO_OVERNIGHT" in (context.get("event_signals") or []):
         risk_flags.append("NO_OVERNIGHT")
         reasons.append("イベント前のため持ち越し非推奨")
+        opposing.append("イベント前のため持ち越し非推奨")
         judgment = "NO_OVERNIGHT" if judgment not in ("EXIT", "TAKE_PROFIT") else judgment
 
     neg_news = [n for n in (context.get("recent_news") or []) if n.get("sentiment") == "negative" and n.get("freshness") in ("LIVE", "CURRENT")]
+    pos_news = [n for n in (context.get("recent_news") or []) if n.get("sentiment") == "positive" and n.get("freshness") in ("LIVE", "CURRENT")]
     if neg_news:
         reasons.append(f"直近ネガティブ材料あり（{neg_news[0].get('title','')[:20]}）")
         risk_flags.append("NEGATIVE_NEWS")
+        opposing.append("直近ネガティブニュース")
         if judgment == "BUY_CANDIDATE":
             judgment = "WAIT"
-        confidence -= 10
+    if pos_news:
+        supporting.append("直近ポジティブニュース")
 
     top_playbook = (context.get("matched_playbooks") or [None])[0]
     if top_playbook:
         if top_playbook["matchDetail"]["avoidTriggered"]:
             reasons.append(f"プレイブック『{top_playbook['name']}』の回避条件に該当")
             risk_flags.append("PLAYBOOK_AVOID")
+            opposing.append(f"プレイブック『{top_playbook['name']}』の回避条件")
             if judgment == "BUY_CANDIDATE":
                 judgment = "WAIT"
-            confidence -= 15
         elif top_playbook["matchScore"] >= 70:
             reasons.append(f"プレイブック『{top_playbook['name']}』適合度{top_playbook['matchScore']}%")
-            confidence += 10
+            supporting.append(f"プレイブック『{top_playbook['name']}』高適合")
 
     high_conf_rules = [r for r in (context.get("relevant_rules") or []) if r.get("confidence") == "HIGH" and r.get("status") == "ACTIVE"]
-    if high_conf_rules:
+    risk_rules = [r for r in high_conf_rules if r.get("category") == "risk"]
+    if risk_rules:
+        reasons.append(f"ACTIVEルール『{risk_rules[0]['rule_text'][:20]}…』が該当")
+        opposing.append(f"リスク系ACTIVEルール『{risk_rules[0]['rule_text'][:16]}…』")
+    elif high_conf_rules:
         reasons.append(f"ACTIVEルール『{high_conf_rules[0]['rule_text'][:20]}…』が該当")
-        confidence += 5
+        supporting.append(f"ACTIVEルール『{high_conf_rules[0]['rule_text'][:16]}…』")
 
     for w in (context.get("behavioral_warnings") or []):
         reasons.append(w["message"][:24] + "…")
         risk_flags.append(w["code"])
+        opposing.append(w["code"])
         if judgment == "BUY_CANDIDATE" and w["code"] == "CHASE_RISK_HIGH":
             judgment = "WAIT"
-            confidence -= 10
 
     weakened_experts = [e for e in (context.get("expert_views") or []) if e.get("status") == "WEAKENED"]
     confirmed_experts = [e for e in (context.get("expert_views") or []) if e.get("status") == "CONFIRMED"]
     if confirmed_experts:
         reasons.append(f"{confirmed_experts[0]['expert_name']}氏の見解が支持されている")
-        confidence += 5
+        supporting.append(f"{confirmed_experts[0]['expert_name']}氏の見解（CONFIRMED）")
     if weakened_experts:
-        confidence -= 5
+        opposing.append(f"{weakened_experts[0]['expert_name']}氏の見解（WEAKENED）")
 
-    # 情報が矛盾する場合（強気材料と警戒材料が両方立つ）は確信度を下げる（指示書22番）
-    if risk_flags and confidence >= 60 and judgment == "BUY_CANDIDATE":
-        confidence -= 10
+    # 指示書16番：材料数ではなく方向の一致度でconfidenceを決める。全会一致（片方が0件）に
+    # 近いほど高く、賛否が割れる（両方に材料がある）ほど低くする。基準confidence=60から、
+    # 一致率（多数派側の割合）に応じて増減させる簡易実装。
+    total_factors = len(supporting) + len(opposing)
+    if total_factors == 0:
+        confidence = 55  # 材料が全く無い＝判断根拠が薄いため中立よりやや低め
+    else:
+        majority = max(len(supporting), len(opposing))
+        agreement_rate = majority / total_factors  # 1.0=全会一致, 0.5=真っ二つ
+        confidence = round(40 + agreement_rate * 40)  # 40(五分五分)〜80(全会一致)のレンジ
+        if len(opposing) > len(supporting):
+            confidence -= 10  # 警戒材料が優勢な場合はさらに慎重寄りに
 
     confidence = max(0, min(100, confidence))
     return {
         "judgment": judgment, "confidence": confidence,
         "reasons": reasons[:5],  # 指示書23番：3〜5件へ要約
         "risk_flags": list(dict.fromkeys(risk_flags)),
+        "supporting": supporting, "opposing": opposing,
     }
 
 
 def save_analysis_context_log(database_url, user_id, code, analysis_type, judgment_result, context, analysis_date=None):
     """指示書24番：各分析実行時にused_contextを保存する。日次レビューのknown_risk_ignored
-    検出（指示書26番）で再利用する。"""
+    検出（指示書19・26番）で再利用する。2026-09-09拡張：risk_flags・matched_playbooksの
+    avoid発動有無・supporting/opposing区分（指示書17番のcontradicting_context）も保存する。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
     analysis_date = analysis_date or datetime.date.today().isoformat()
+    playbooks = context.get("matched_playbooks") or []
     used_context = {
         "rules": [r.get("id") for r in (context.get("relevant_rules") or [])],
         "expert_views": [e.get("id") for e in (context.get("expert_views") or [])],
         "events": [e.get("id") for e in (context.get("upcoming_events") or [])],
         "news": [n.get("id") for n in (context.get("recent_news") or [])],
-        "playbooks": [p.get("id") for p in (context.get("matched_playbooks") or [])],
+        "playbooks": [p.get("id") for p in playbooks],
         "similar_trades": [t.get("id") for t in (context.get("similar_trades") or [])],
         "event_signals": context.get("event_signals") or [],
+        "risk_flags": judgment_result.get("risk_flags") or [],
+        "avoid_playbook_ids": [p.get("id") for p in playbooks if (p.get("matchDetail") or {}).get("avoidTriggered")],
+        "active_risk_rule_ids": [r.get("id") for r in (context.get("relevant_rules") or [])
+                                   if r.get("category") == "risk" and r.get("status") == "ACTIVE"],
+        "supporting": judgment_result.get("supporting") or [],
+        "opposing": judgment_result.get("opposing") or [],
     }
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -2919,13 +2986,16 @@ def save_analysis_context_log(database_url, user_id, code, analysis_type, judgme
     return _row_to_json(saved)
 
 
-def _check_known_risk_ignored(database_url, user_id, review_date, positions):
-    """指示書26番：その日のanalysis_context_logでNO_OVERNIGHT等の警告が出ていた銘柄が、
-    実際に持ち越された（保有継続）かを機械的に照合する。「結果論」ではなく「その時点で
-    警告が出ていたか」を見る（指示書27番の精神に合わせる）。"""
+def _check_known_risk_ignored(database_url, user_id, review_date, positions, new_positions=None):
+    """指示書19・26番：その日のanalysis_context_logで警告が出ていたのに実際の売買行動が
+    それを無視したケースを機械的に照合する（「結果論」ではなく「その時点で警告が出ていたか」
+    で判定、指示書27番）。2026-09-09拡張：NO_OVERNIGHTに加え、EVENT_RISK_HIGH（重要イベント
+    直前の持ち越し）・PLAYBOOK_AVOID（回避条件発動下での新規建玉）・ACTIVE_RISK_RULE
+    （riskカテゴリのACTIVEルールが文脈にあった中での新規建玉）も検出対象にする。"""
     pool = _get_pool(database_url)
     if pool is None:
         return []
+    new_positions = new_positions if new_positions is not None else []
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -2933,15 +3003,369 @@ def _check_known_risk_ignored(database_url, user_id, review_date, positions):
                 "WHERE user_id=%s AND analysis_date=%s AND code IS NOT NULL", [user_id, review_date])
             logs = cur.fetchall()
     held_codes = {p["code"] for p in positions}
-    ignored_codes = set()  # 同一銘柄・同日に複数回分析していても1件にまとめる（重複表示防止）
+    new_codes = {p["code"] for p in new_positions}
+    seen = set()  # (code, reason)単位で重複排除
     ignored = []
+
+    def _add(code, reason):
+        key = (code, reason)
+        if key not in seen:
+            seen.add(key)
+            ignored.append({"code": code, "reason": reason})
+
     for log in logs:
-        signals = (log.get("used_context_json") or {}).get("event_signals") or []
-        if log.get("judgment") == "NO_OVERNIGHT" or "NO_OVERNIGHT" in signals:
-            if log.get("code") in held_codes and log["code"] not in ignored_codes:
-                ignored_codes.add(log["code"])
-                ignored.append({"code": log["code"], "reason": "NO_OVERNIGHT警告があったにも関わらず持ち越し"})
+        code = log.get("code")
+        uc = log.get("used_context_json") or {}
+        signals = uc.get("event_signals") or []
+        risk_flags = uc.get("risk_flags") or []
+        if (log.get("judgment") == "NO_OVERNIGHT" or "NO_OVERNIGHT" in signals) and code in held_codes:
+            _add(code, "NO_OVERNIGHT警告があったにも関わらず持ち越し")
+        if "EVENT_RISK_HIGH" in signals and code in held_codes:
+            _add(code, "重要イベント直前の警告があったにも関わらず持ち越し")
+        if (uc.get("avoid_playbook_ids") or "PLAYBOOK_AVOID" in risk_flags) and code in new_codes:
+            _add(code, "プレイブックの回避条件が発動していたにも関わらず新規建玉")
+        if uc.get("active_risk_rule_ids") and code in new_codes:
+            _add(code, "リスク関連のACTIVEルールが該当していたにも関わらず新規建玉")
     return ignored
+
+
+# ============================================================
+# ---- 判断エンジンの全画面統合＋自己適応。2026-09-09新規 ----
+# 個別銘柄分析に接続済みの統合コンテキストを、朝一・TOP5・ポジション・利確損切り・
+# 持ち越し判断へ接続し、playbookの自分との相性学習・過去知識のplaybook候補化を追加する。
+# ============================================================
+
+# ---- ポジション相談・利確損切り相談：EXIT側の総合判断（指示書5・6番） ----
+
+def evaluate_exit_judgment(context, position=None):
+    """保有銘柄向けの総合判断（HOLD/RAISE_STOP/TAKE_PROFIT/REDUCE/EXIT/NO_OVERNIGHT）を
+    生成する。新規買い判断（synthesize_trade_judgment）とは別に、matched_playbooksの
+    exit_conditions_json/stop_conditions_jsonとtrade_rulesのexit/riskカテゴリを強く
+    参照する（指示書5・6番）。positionは{"unrealized_pnl_pct":float,...}（省略可）。"""
+    position = position or {}
+    reasons, risk_flags, supporting, opposing = [], [], [], []
+    judgment = "HOLD"
+    pnl_pct = position.get("unrealized_pnl_pct")
+
+    if "NO_OVERNIGHT" in (context.get("event_signals") or []):
+        judgment = "NO_OVERNIGHT"
+        reasons.append("イベント前のため持ち越し非推奨")
+        risk_flags.append("NO_OVERNIGHT")
+        opposing.append("イベント前の持ち越しリスク")
+
+    exit_rules = [r for r in (context.get("relevant_rules") or [])
+                  if r.get("status") == "ACTIVE" and r.get("category") in ("exit", "risk")]
+    for r in exit_rules[:2]:
+        reasons.append(f"ACTIVEルール『{r['rule_text'][:20]}…』")
+        opposing.append(f"ルール『{r['rule_text'][:16]}…』")
+
+    top_playbook = (context.get("matched_playbooks") or [None])[0]
+    if top_playbook:
+        exit_conds = top_playbook.get("exit_conditions_json") or []
+        stop_conds = top_playbook.get("stop_conditions_json") or []
+        if top_playbook["matchDetail"]["avoidTriggered"]:
+            reasons.append(f"プレイブック『{top_playbook['name']}』の回避条件が発動中")
+            if judgment == "HOLD":
+                judgment = "REDUCE"
+            opposing.append("プレイブック回避条件")
+        elif exit_conds or stop_conds:
+            reasons.append(f"プレイブック『{top_playbook['name']}』のexit/stop条件を参照")
+
+    for w in (context.get("behavioral_warnings") or []):
+        if w["code"] == "TAKE_PROFIT_DISCIPLINE_WARNING" and pnl_pct is not None and pnl_pct > 0:
+            reasons.append("最近、利確判断が遅れがち（過去の反省）")
+            if judgment == "HOLD":
+                judgment = "TAKE_PROFIT"
+            opposing.append("利確遅れの反省履歴")
+        if w["code"] == "STOP_DISCIPLINE_WARNING" and pnl_pct is not None and pnl_pct < 0:
+            reasons.append("最近、損切り判断が遅れがち（過去の反省）")
+            if judgment == "HOLD":
+                judgment = "RAISE_STOP"
+            opposing.append("損切り遅れの反省履歴")
+
+    if pnl_pct is not None:
+        if pnl_pct <= -8:
+            reasons.append(f"含み損{pnl_pct:.1f}%")
+            if judgment == "HOLD":
+                judgment = "EXIT"
+            opposing.append("含み損拡大")
+        elif pnl_pct >= 8:
+            reasons.append(f"含み益{pnl_pct:.1f}%")
+            if judgment == "HOLD":
+                judgment = "TAKE_PROFIT"
+            supporting.append("含み益十分")
+
+    neg_news = [n for n in (context.get("recent_news") or []) if n.get("sentiment") == "negative" and n.get("freshness") in ("LIVE", "CURRENT")]
+    if neg_news:
+        reasons.append(f"直近ネガティブ材料あり（{neg_news[0].get('title','')[:20]}）")
+        opposing.append("直近ネガティブニュース")
+        if judgment == "HOLD":
+            judgment = "REDUCE"
+
+    total = len(supporting) + len(opposing)
+    confidence = 55 if total == 0 else round(40 + (max(len(supporting), len(opposing)) / total) * 40)
+    if opposing and not supporting:
+        confidence = min(100, confidence + 10)  # 警戒材料しか無い場合はむしろ判断がはっきりする
+    confidence = max(0, min(100, confidence))
+    return {"judgment": judgment, "confidence": confidence, "reasons": reasons[:5],
+            "risk_flags": list(dict.fromkeys(risk_flags)), "supporting": supporting, "opposing": opposing}
+
+
+# ---- 持ち越し判断専用ロジック（指示書7番） ----
+
+OVERNIGHT_DECISIONS = ["OVERNIGHT_OK", "OVERNIGHT_CAUTION", "NO_OVERNIGHT"]
+
+
+def _count_past_known_risk_ignored_for_code(database_url, user_id, code, days=30):
+    """指示書7番「known_risk_ignored履歴」：過去days日でこの銘柄が何回known_risk_ignoredに
+    載ったかを数える。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    since = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT known_risk_ignored_json FROM daily_reviews WHERE user_id=%s AND review_date>=%s",
+                        [user_id, since])
+            rows = cur.fetchall()
+    return sum(1 for r in rows for item in (r.get("known_risk_ignored_json") or []) if item.get("code") == code)
+
+
+def evaluate_overnight_decision(database_url, user_id, code, context, unrealized_pnl_pct=None,
+                                  market_condition=None, sector_rs=None):
+    """持ち越し判断専用（指示書7番）。翌日重要イベント・決算・FOMC/日銀・overnight禁止
+    ルール・含み益/含み損・地合い・セクター相対強度・直近反省・known_risk_ignored履歴を
+    明示的にチェックする。戻り値: {"decision":OVERNIGHT_OK|OVERNIGHT_CAUTION|
+    NO_OVERNIGHT, "score":int, "reasons":[...]}"""
+    reasons = []
+    score = 0
+    if "NO_OVERNIGHT" in (context.get("event_signals") or []):
+        reasons.append("重要イベント直前のためNO_OVERNIGHTルールに該当")
+        score += 3
+    high_events = [e for e in (context.get("upcoming_events") or [])
+                   if (e.get("importance") or "").lower() in ("high", "critical") and e.get("business_days_until", 9) <= 1]
+    if high_events:
+        title = high_events[0].get("title") or high_events[0].get("event") or "重要イベント"
+        reasons.append(f"{title}が翌営業日までに予定されている")
+        score += 2
+    no_overnight_rules = [r for r in (context.get("relevant_rules") or [])
+                            if r.get("status") == "ACTIVE" and "持ち越し" in (r.get("rule_text") or "")]
+    if no_overnight_rules:
+        reasons.append(f"ACTIVEルール『{no_overnight_rules[0]['rule_text'][:20]}…』")
+        score += 2
+    if unrealized_pnl_pct is not None and unrealized_pnl_pct < 0:
+        reasons.append(f"含み損{unrealized_pnl_pct:.1f}%の状態")
+        score += 1
+    if market_condition and any(k in market_condition for k in ("リスクオフ", "軟調", "弱い")):
+        reasons.append(f"地合いが軟調（{market_condition}）")
+        score += 1
+    if sector_rs is not None and sector_rs < -2:
+        reasons.append(f"セクター相対強度が弱い（{sector_rs:+.1f}pt）")
+        score += 1
+    for w in (context.get("behavioral_warnings") or []):
+        reasons.append(w["message"][:24] + "…")
+        score += 1
+    past_ignored = _count_past_known_risk_ignored_for_code(database_url, user_id, code)
+    if past_ignored > 0:
+        reasons.append(f"過去{past_ignored}回、この銘柄でリスク警告を無視した記録あり")
+        score += 1
+
+    decision = "NO_OVERNIGHT" if score >= 4 else "OVERNIGHT_CAUTION" if score >= 2 else "OVERNIGHT_OK"
+    return {"decision": decision, "score": score, "reasons": reasons[:5]}
+
+
+# ---- playbook実績の自動更新・自分との相性（指示書8〜10番） ----
+
+USER_COMPAT_PRIOR_N = 4       # ベイズ的縮小の疑似試行回数（指示書9番「最低試行回数」対応）
+USER_COMPAT_PRIOR_RATE = 0.5  # 事前分布の勝率（サンプルが少ない間は五分五分寄りに縮小する）
+
+
+def compute_user_compatibility_score(success, failure, neutral, avg_return):
+    """user_compatibility_score計算式（指示書9・10番）。単純勝率にはしない：
+    ①ベイズ的縮小（疑似試行4回・勝率50%を事前分布とし、サンプルが少ないほど50点側へ
+    寄せる、極端な値を防ぐ）を掛けた勝率（重み70%）と、②平均リターン（±20%にクリップ、
+    重み30%）を合成する。playbook自体のconfidence（一般的な再現性、trade_rulesと同じ
+    evidence/success_count方式）とは完全に別軸として保存するため、「一般再現性は高いが
+    本人適合度は低い」という指示書10番の状態を表現できる。"""
+    n = (success or 0) + (failure or 0) + (neutral or 0)
+    shrunk_rate = ((success or 0) + USER_COMPAT_PRIOR_N * USER_COMPAT_PRIOR_RATE) / (n + USER_COMPAT_PRIOR_N)
+    return_component = max(-20, min(20, avg_return)) if avg_return is not None else 0
+    score = shrunk_rate * 100 * 0.7 + (50 + return_component) * 0.3
+    return round(max(0, min(100, score)), 1)
+
+
+def record_trade_outcome_for_playbooks(database_url, user_id, code, trade):
+    """指示書8番：売却確定後に呼ぶ（server.py側でadd_position_exit成功後にベストエフォート
+    で呼ぶ想定、失敗しても売却本体には影響させない）。直近のanalysis_context_log
+    （この銘柄・保有期間中に記録されたもの）からused_context.playbooksを集め、実際の
+    売買結果と紐づけてtrade_playbooksのuser_attempt/success/failure_count・
+    user_avg_return・user_compatibility_scoreを更新する。同時にplaybook自体の
+    一般的なevidence/success/failure_countも更新する（自分の結果は「一般的な再現性」の
+    証拠の一部でもあるため）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return {"updated": 0}
+    net_pnl = trade.get("net_pnl") if trade.get("net_pnl") is not None else trade.get("pnl")
+    entry_price, shares = trade.get("entry_price"), trade.get("shares")
+    return_pct = None
+    if entry_price and shares and net_pnl is not None:
+        cost = entry_price * shares
+        if cost:
+            return_pct = (net_pnl / cost) * 100
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT used_context_json FROM analysis_context_log WHERE user_id=%s AND code=%s "
+                "ORDER BY created_at DESC LIMIT 20", [user_id, code])
+            logs = cur.fetchall()
+    playbook_ids = set()
+    for log in logs:
+        playbook_ids |= {pid for pid in ((log.get("used_context_json") or {}).get("playbooks") or []) if pid is not None}
+    if not playbook_ids:
+        return {"updated": 0}
+    is_success = (net_pnl or 0) > 0
+    updated = 0
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            for pid in playbook_ids:
+                cur.execute("SELECT * FROM trade_playbooks WHERE id=%s AND user_id=%s", [pid, user_id])
+                pb = cur.fetchone()
+                if not pb:
+                    continue
+                prev_n = pb["user_attempt_count"] or 0
+                attempt = prev_n + 1
+                success = (pb["user_success_count"] or 0) + (1 if is_success else 0)
+                failure = (pb["user_failure_count"] or 0) + (0 if is_success else 1)
+                if return_pct is not None:
+                    new_avg = ((pb.get("user_avg_return") or 0) * prev_n + return_pct) / attempt
+                else:
+                    new_avg = pb.get("user_avg_return")
+                compat = compute_user_compatibility_score(success, failure, attempt - success - failure, new_avg)
+                cur.execute(
+                    "UPDATE trade_playbooks SET user_attempt_count=%s, user_success_count=%s, "
+                    "user_failure_count=%s, user_avg_return=%s, user_compatibility_score=%s, "
+                    "evidence_count=evidence_count+1, success_count=success_count+%s, "
+                    "failure_count=failure_count+%s, updated_at=now() WHERE id=%s",
+                    [attempt, success, failure, new_avg, compat, 1 if is_success else 0, 0 if is_success else 1, pid])
+                updated += 1
+        conn.commit()
+    return {"updated": updated, "returnPct": return_pct}
+
+
+# ---- 過去文章からのplaybook候補化（指示書11・12番） ----
+
+def backfill_playbook_candidates_from_expert_views(database_url, user_id):
+    """expert_viewsのうちconfirmations/invalidation_conditionsが明確に構造化されている
+    （短いフレーズの配列として既に保存済み）ものだけをplaybook候補化する（指示書11番）。
+    thesisのような自由文はDSL条件として技術的シグナルと照合できないため含めない
+    （「曖昧な一般論はplaybook化しない」＝マッチング可能な構造化データが無ければ
+    作らない、という実務的な解釈）。自動ACTIVE禁止（created_from=legacy_text、
+    source_type=BACKFILL、常にTESTING/LOW、指示書12番）。戻り値: 新規作成件数。"""
+    views = list_expert_views(database_url, user_id, limit=300)
+    created = 0
+    for v in views:
+        confirmations = v.get("confirmations") or []
+        invalidations = v.get("invalidation_conditions") or []
+        if not confirmations and not invalidations:
+            continue
+        pb = {
+            "name": f"{v['expert_name']}見解由来（{v.get('published_at')}）",
+            "source_trader": v["expert_name"], "source_title": v.get("source_title"),
+            "source_type": "BACKFILL", "timeframe": v.get("time_horizon"),
+            "applicable_sectors": [v["sector"]] if v.get("sector") else [],
+            "applicable_stocks": v.get("stocks") or [],
+            "confirmation_conditions": confirmations,
+            "avoid_conditions": invalidations,
+        }
+        res = upsert_trade_playbook(database_url, user_id, pb, created_from="legacy_text")
+        if res and res["action"] == "created":
+            created += 1
+    return created
+
+
+# ---- playbook重複防止：条件の正規化類似度（指示書13番） ----
+
+def _serialize_playbook_conditions(pb):
+    parts = []
+    for key in ("entry_conditions_json", "confirmation_conditions_json", "exit_conditions_json",
+                "stop_conditions_json", "avoid_conditions_json"):
+        for c in (pb.get(key) or []):
+            parts.append(c if isinstance(c, str) else json.dumps(c, ensure_ascii=False, sort_keys=True))
+    return _normalize_rule_key(" ".join(parts))
+
+
+def find_similar_trade_playbooks(database_url, user_id, pb, exclude_id=None, limit=5):
+    """指示書13番：名前だけでなくentry/exit/avoid条件の正規化類似度（trade_rulesと同じ
+    _rule_similarity・バイグラムJaccard）で重複候補を検出する。自動統合・削除はしない。"""
+    key = _serialize_playbook_conditions(pb)
+    if not key:
+        return []
+    existing = list_trade_playbooks(database_url, user_id)
+    scored = []
+    for e in existing:
+        if exclude_id and e["id"] == exclude_id:
+            continue
+        ekey = _serialize_playbook_conditions(e)
+        if not ekey:
+            continue
+        sim = _rule_similarity(key, ekey)
+        if sim >= _RULE_SIMILARITY_THRESHOLD:
+            scored.append({"similarity": round(sim, 3), **e})
+    scored.sort(key=lambda x: -x["similarity"])
+    return scored[:limit]
+
+
+# ---- TOP5相談：軽量な候補別フラグ（指示書4番） ----
+
+def lightweight_context_flags_for_codes(database_url, user_id, codes, sector_map=None):
+    """TOP5相談用の軽量版。各候補についてフルコンテキストを取得するのではなく、
+    event_risk・直近ネガティブニュース有無・行動警告有無だけを安く返す（指示書4番
+    「TOP5の順位自体を大きく自動変更しすぎず、まずは補助判断・注意フラグとして利用」）。"""
+    sector_map = sector_map or {}
+    behavioral = behavioral_warnings_from_reflections(database_url, user_id)
+    has_behavioral_warning = len(behavioral) > 0
+    out = {}
+    for code in codes:
+        sector = sector_map.get(code)
+        event_info = upcoming_event_signals(database_url, user_id, code=code, sector=sector)
+        news = relevant_catalysts_for(database_url, user_id, code=code, sector=sector, limit=3)
+        out[code] = {
+            "eventRisk": "EVENT_RISK_HIGH" in event_info["signals"],
+            "negativeNews": any(n.get("sentiment") == "negative" for n in news),
+            "behavioralWarning": has_behavioral_warning,
+        }
+    return out
+
+
+# ---- 日次レビューとplaybook評価の接続（指示書18番） ----
+
+def _check_playbook_discipline(database_url, user_id, exits_today):
+    """その日の決済（trade_history）がplaybookのavoid条件発動を無視していなかったか、
+    playbookを参照して判断していたかを日次レビューへ反映する（指示書18番）。"""
+    good, bad = [], []
+    if not exits_today:
+        return good, bad
+    pool = _get_pool(database_url)
+    if pool is None:
+        return good, bad
+    for t in exits_today:
+        code = t.get("code")
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT used_context_json FROM analysis_context_log WHERE user_id=%s AND code=%s "
+                    "ORDER BY created_at DESC LIMIT 5", [user_id, code])
+                logs = cur.fetchall()
+        label = t.get("name") or code
+        avoid_seen = any((log.get("used_context_json") or {}).get("avoid_playbook_ids") for log in logs)
+        pb_ids = set()
+        for log in logs:
+            pb_ids |= set((log.get("used_context_json") or {}).get("playbooks") or [])
+        if avoid_seen:
+            bad.append(f"{label}：プレイブック回避条件が発動していた履歴あり")
+        elif pb_ids:
+            good.append(f"{label}：プレイブックを参照して決済判断")
+    return good, bad
 
 
 # ---- investment_profile（投資プロフィール。2026-09-02新規） ----

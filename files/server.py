@@ -5521,23 +5521,50 @@ class Handler(SimpleHTTPRequestHandler):
             # 指示書18・19・24番：分析直前に呼ぶ統合コンテキストビルダー。総合判断・確信度・
             # 理由も同時に生成し、used_context_jsonをanalysis_context_logへ記録する
             # （日次レビューのknown_risk_ignored検出で再利用するため、副作用のあるPOSTにした）。
+            # 2026-09-09更新（判断エンジン全画面統合、指示書1・5・6・7番）：scope
+            # （"entry"省略時デフォルト|"exit"|"overnight"）で朝一・個別銘柄分析向けの
+            # 新規買い判断（synthesize_trade_judgment）と、ポジション/利確損切り相談向けの
+            # EXIT判断（evaluate_exit_judgment）、持ち越し判断専用（evaluate_overnight_decision）
+            # を同じエンドポイント・同じcontext builderから出し分ける（画面ごとの独自簡易
+            # ルール抽出を廃止し、共通context builderへ寄せる）。
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
             code = body.get("code")
+            scope = body.get("scope") or "entry"
             context = investment_db.build_relevant_trading_context(
                 DATABASE_URL, self.current_user, stock_code=code, sector=body.get("sector"),
                 market=body.get("market"), position=body.get("position"),
                 analysis_type=body.get("analysisType") or "stock", signals=body.get("signals") or {},
                 rule_categories=body.get("ruleCategories"),
             )
-            judgment = investment_db.synthesize_trade_judgment(context, base_signal=body.get("baseSignal"))
+            if scope == "exit":
+                judgment = investment_db.evaluate_exit_judgment(context, position=body.get("position"))
+            elif scope == "overnight":
+                pos = body.get("position") or {}
+                overnight = investment_db.evaluate_overnight_decision(
+                    DATABASE_URL, self.current_user, code, context,
+                    unrealized_pnl_pct=pos.get("unrealized_pnl_pct"), market_condition=body.get("marketCondition"),
+                    sector_rs=body.get("sectorRs"))
+                judgment = {"judgment": overnight["decision"], "confidence": None,
+                            "reasons": overnight["reasons"], "risk_flags": [], "score": overnight["score"]}
+            else:
+                judgment = investment_db.synthesize_trade_judgment(context, base_signal=body.get("baseSignal"))
             log = None
             if code:
                 log = investment_db.save_analysis_context_log(
-                    DATABASE_URL, self.current_user, code, body.get("analysisType") or "stock",
+                    DATABASE_URL, self.current_user, code, body.get("analysisType") or scope,
                     judgment, context, analysis_date=body.get("date"))
             self._send_json({"context": context, "judgment": judgment, "logId": (log or {}).get("id")})
+        elif self.path == "/api/knowledge-context/top5-flags":
+            # 指示書4番：TOP5相談向けの軽量な候補別フラグ（フルコンテキストは取得しない）。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            codes = body.get("codes") or []
+            sector_map = body.get("sectorMap") or {}
+            flags = investment_db.lightweight_context_flags_for_codes(DATABASE_URL, self.current_user, codes, sector_map=sector_map)
+            self._send_json({"flags": flags})
         elif self.path == "/api/expert-views/evaluate":
             # 指示書2・28番：有識者見解1件をSUPPORTED/FAILED/NEUTRALで評価する。
             if not self._investment_db_ready():
@@ -5559,6 +5586,21 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             created = investment_db.generate_rule_candidates_from_reflections(DATABASE_URL, self.current_user)
             self._send_json({"candidates": created})
+        elif self.path == "/api/trade-playbooks/backfill":
+            # 指示書11・12番：expert_viewsの構造化データからplaybook候補を生成する
+            # （常にTESTING/LOW、自動ACTIVE禁止）。
+            if not self._investment_db_ready():
+                return
+            created = investment_db.backfill_playbook_candidates_from_expert_views(DATABASE_URL, self.current_user)
+            self._send_json({"created": created})
+        elif self.path == "/api/trade-playbooks/similar":
+            # 指示書13番：条件の正規化類似度で重複候補を検出する（自動統合・削除はしない）。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            candidates = investment_db.find_similar_trade_playbooks(
+                DATABASE_URL, self.current_user, body.get("playbook") or {}, exclude_id=body.get("excludeId"))
+            self._send_json({"candidates": candidates})
         # ---- ChatGPT連携（2026-09-02新規、Phase1）：有料AI APIは使わず、ChatGPTが出力した
         # 投資ログJSONを手動貼り付けで取り込む。 ----
         elif self.path == "/api/chatgpt-import/save":
@@ -5787,6 +5829,15 @@ class Handler(SimpleHTTPRequestHandler):
             result = investment_db.add_position_exit(
                 DATABASE_URL, self.current_user, body.get("code"), body.get("market") or "JP",
                 body.get("exitPrice"), body.get("shares"))
+            # 2026-09-09追加（判断エンジン全画面統合、指示書8番）：売却が成功した場合のみ、
+            # ベストエフォートでplaybook実績を更新する（add_position_exit自体は無変更、
+            # 失敗してもここで例外を握りつぶし売却結果のレスポンスには影響させない）。
+            if result and "error" not in result and result.get("trade"):
+                try:
+                    investment_db.record_trade_outcome_for_playbooks(
+                        DATABASE_URL, self.current_user, body.get("code"), result["trade"])
+                except Exception:
+                    pass
             self._send_json(result)
         elif self.path == "/api/investment-totals/set-initial":
             # 2026-09-07新規：通算実現損益の初期値をユーザーが最初に手入力するためのAPI。

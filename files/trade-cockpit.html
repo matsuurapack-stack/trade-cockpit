@@ -3374,12 +3374,19 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
   // v3-4（ChatGPT連携の再配置）：「今日のTOP5を相談」。TOP5各銘柄の詳細に加え、
   // 監視銘柄全体のサマリー（summary、既に画面上部に表示している件数と同じ値）も含める。
   const copyWatchTop5Consult=async()=>{
+    // 2026-09-09新規（判断エンジン全画面統合、指示書4番）：候補ごとにフルコンテキストは
+    // 取得せず、event_risk・直近ネガティブニュース・行動警告の3フラグだけを1回のAPI呼び
+    // 出しでまとめて取得する（TOP5の順位自体は変更せず、補助フラグとしてのみ利用）。
+    const sectorMap=Object.fromEntries(top5.map(w=>[w.code,w.sector||null]));
+    const flags=await fetchJsonSafe("/api/knowledge-context/top5-flags",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({codes:top5.map(w=>w.code),sectorMap})}).then(d=>(d&&d.flags)||{}).catch(()=>({}));
     await copyChatGPTPayload("今日のTOP5を相談","watchlist_top5",{
       watchlist_summary:{total:items.length,...summary},
       top5:top5.map(w=>({
         code:w.code,name:w.name,current:num(stockQuotes[w.code]?.t),
         pct_change:w.pct,rs_score:w.rsScore,status:w.status,
         grade:lightweightGrade(w),action:lightweightAction(w),reason:lightweightReason(w),
+        knowledge_flags:flags[w.code]||null,
       })),
     },setConsultMsg);
   };
@@ -4904,6 +4911,17 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
     const cats=[...new Set([...guessRuleCategoriesForStock(it.sector,it.theme),"position","exit"])];
     const activeRulesForPosition=await fetchJsonSafe(`/api/trade-rules/relevant?categories=${encodeURIComponent(cats.join(","))}`)
       .then(d=>(d&&d.rules)||[]).catch(()=>[]);
+    // 2026-09-09新規（判断エンジン全画面統合、指示書5・6番）：ポジション相談・利確損切り
+    // 相談は新規買い判断ではなくEXIT側（HOLD/RAISE_STOP/TAKE_PROFIT/REDUCE/EXIT/
+    // NO_OVERNIGHT）を返すscope="exit"で統合コンテキストを取得する。
+    const knowledgeExit=await fetchJsonSafe("/api/knowledge-context",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({code:it.code,sector:it.sector,market:it.market,scope:"exit",
+        position:{trade_style:it.trade_style,unrealized_pnl_pct:pnlPct}})}).catch(()=>null);
+    // 2026-09-09新規（判断エンジン全画面統合、指示書7番）：持ち越し判断専用ロジック
+    // （OVERNIGHT_OK/OVERNIGHT_CAUTION/NO_OVERNIGHT）も併せて取得する。
+    const overnight=await fetchJsonSafe("/api/knowledge-context",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({code:it.code,sector:it.sector,market:it.market,scope:"overnight",
+        position:{trade_style:it.trade_style,unrealized_pnl_pct:pnlPct}})}).catch(()=>null);
     await copyChatGPTPayload("利確・損切り相談","position_management",{
       stock:{code:it.code,name:it.name,market:it.market},
       position:{
@@ -4921,6 +4939,12 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
         target_1_theoretical:a.target,target_2_theoretical:a.fullExitTarget??null,
       }:null,
       active_rules:activeRulesForPosition.map(r=>({rule:r.rule_text,confidence:r.confidence,action:r.action_text||null})),
+      integrated_judgment:knowledgeExit&&!knowledgeExit.error?{
+        judgment:knowledgeExit.judgment.judgment,confidence:knowledgeExit.judgment.confidence,reasons:knowledgeExit.judgment.reasons,
+        matched_playbook:knowledgeExit.context.matched_playbooks[0]?{name:knowledgeExit.context.matched_playbooks[0].name,matchScore:knowledgeExit.context.matched_playbooks[0].matchScore}:null,
+        upcoming_events:knowledgeExit.context.upcoming_events.slice(0,2).map(e=>({title:e.title||e.event,business_days_until:e.business_days_until})),
+      }:null,
+      overnight_decision:overnight&&!overnight.error?{decision:overnight.judgment.judgment,reasons:overnight.judgment.reasons}:null,
       question:"今のSLを上げるべきか、TP1で利確すべきか、トレンド継続ならどこまで伸ばすべきか相談したいです。",
     },setPositionConsultMsg);
   };
@@ -6995,6 +7019,19 @@ function MarketEnvironmentBanner({metrics,watchlistAll,stockQuotes,top5}){
     // 反省点）を添える。全履歴ではなく直近3日分だけ（指示書27番：古い情報を無制限に混ぜない）。
     const recentReflections=await fetchJsonSafe("/api/daily-review/recent?days=3")
       .then(d=>(d&&d.reflections)||[]).catch(()=>[]);
+    // 2026-09-09新規（判断エンジン全画面統合、指示書3番）：朝一では個別銘柄よりmarket全体
+    // （macro expert views・直近の重要イベント・行動警告）を優先する。stock_codeを渡さない
+    // build_relevant_trading_contextを呼び、「今日やってはいけないこと」を行動警告＋
+    // riskカテゴリのACTIVEルールから自動生成する。
+    const morningKnowledge=await fetchJsonSafe("/api/knowledge-context",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({market:"JP",ruleCategories:["market","risk","semiconductor","sector","event"]})}).catch(()=>null);
+    const avoidToday=[];
+    if(morningKnowledge&&!morningKnowledge.error){
+      (morningKnowledge.context.behavioral_warnings||[]).forEach(w=>avoidToday.push(w.message));
+      (morningKnowledge.context.relevant_rules||[]).filter(r=>r.category==="risk"&&r.status==="ACTIVE").slice(0,2)
+        .forEach(r=>avoidToday.push(`ACTIVEルール『${r.rule_text}』に注意`));
+      if((morningKnowledge.context.event_signals||[]).includes("EVENT_RISK_HIGH"))avoidToday.push("重要イベント直前のため新規は慎重に");
+    }
     await copyChatGPTPayload("朝一分析","morning_market",{
       sentiment,
       indices:Object.fromEntries(ENV_ROWS.map(([label,key,dp])=>{
@@ -7013,6 +7050,9 @@ function MarketEnvironmentBanner({metrics,watchlistAll,stockQuotes,top5}){
       })),
       active_rules:activeRulesForMorning.map(r=>({rule:r.rule_text,confidence:r.confidence,action:r.action_text||null})),
       recent_reflections:recentReflections.map(r=>({date:r.date,score:r.score,notes:(r.tomorrowNotes.length?r.tomorrowNotes:r.improvementPoints).slice(0,3)})),
+      expert_views:(morningKnowledge&&!morningKnowledge.error?morningKnowledge.context.expert_views:[]).map(e=>({expert_name:e.expert_name,outlook:e.outlook,status:e.status})),
+      upcoming_events:(morningKnowledge&&!morningKnowledge.error?morningKnowledge.context.upcoming_events:[]).slice(0,5).map(e=>({title:e.title||e.event,business_days_until:e.business_days_until,importance:e.importance})),
+      today_avoid:avoidToday,
     },setMorningMsg);
   };
 
