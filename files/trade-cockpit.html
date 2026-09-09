@@ -3015,6 +3015,68 @@ function AppliedRulesPanel({sector,theme}){
   </div>;
 }
 
+// 2026-09-09新規（判断エンジン強化、指示書18・19・21〜23・29番）：統合コンテキスト
+// ビルダー（サーバー側build_relevant_trading_context+synthesize_trade_judgment）を
+// 呼び、総合判断・確信度・理由（3〜5件）だけをコンパクトに表示する。ルール・有識者・
+// プレイブックの詳細は折りたたみ（指示書29番「UIは増やしすぎない」）。
+const TRADE_JUDGMENT_META={
+  BUY_CANDIDATE:{label:"買い候補",color:"var(--up)"},
+  WAIT:{label:"様子見",color:"var(--inkSoft)"},
+  TAKE_PROFIT:{label:"利確優先",color:"var(--accent)"},
+  RAISE_STOP:{label:"損切りライン引き上げ",color:"var(--accent)"},
+  REDUCE:{label:"縮小",color:"var(--accent)"},
+  EXIT:{label:"手仕舞い",color:"var(--down)"},
+  NO_OVERNIGHT:{label:"持ち越し非推奨",color:"var(--down)"},
+};
+// 既存のanalyze_stock()結果（indicators/assessment/tradeRules、新規計算なし）から、
+// playbook照合・判断エンジン用の軽量シグナルを組み立てる。
+function buildSignalsFromAnalysis(a){
+  if(!a)return{};
+  const findCk=(list,key)=>(list||[]).find(c=>c.key===key)?.pass;
+  return{
+    volume_surge:!!findCk(a.tradeRules?.entryChecklist,"volume"),
+    vwap_position:(a.indicators?.vwap&&a.current)?a.current/a.indicators.vwap:null,
+    falling_knife:!!a.assessment?.fallingKnife,
+    chase_risk:!!a.assessment?.chaseRisk,
+    high_update:!!findCk(a.tradeRules?.entryTimingChecklist,"highUpdate"),
+  };
+}
+function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
+  const [result,setResult]=useState(null);
+  const [detailOpen,setDetailOpen]=useState(false);
+  useEffect(()=>{
+    let alive=true;
+    if(!code)return;
+    fetchJsonSafe("/api/knowledge-context",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({code,sector,market,position:tradeStyle?{trade_style:tradeStyle}:null,
+        analysisType:"stock",signals:buildSignalsFromAnalysis(a),baseSignal})})
+      .then(d=>{if(alive&&d&&!d.error)setResult(d);});
+    return ()=>{alive=false;};
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[code,sector,market,tradeStyle,baseSignal]);
+  if(!result)return null;
+  const{judgment,context}=result;
+  const jm=TRADE_JUDGMENT_META[judgment.judgment]||{label:judgment.judgment,color:"var(--ink)"};
+  return <div style={{border:`1px solid ${jm.color}`,borderRadius:4,padding:"8px 10px",marginBottom:8,background:"var(--band)"}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:6}}>
+      <div style={{fontWeight:800,fontSize:13,color:jm.color}}>総合判断：{jm.label}</div>
+      <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>確信度 {judgment.confidence}%</div>
+    </div>
+    {judgment.reasons.length>0 && <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:11.5}}>
+      {judgment.reasons.map((r,i)=><li key={i}>{r}</li>)}
+    </ul>}
+    <button className="iconbtn" style={{fontSize:10.5,marginTop:4}} onClick={()=>setDetailOpen(v=>!v)}>{detailOpen?"▾":"▸"} 詳細データ</button>
+    {detailOpen && <div style={{fontSize:11,color:"var(--inkSoft)",marginTop:4,display:"flex",flexDirection:"column",gap:2}}>
+      {context.recent_news.length>0 && <div>ニュース {context.recent_news.length}件（最新：{context.recent_news[0].title}）</div>}
+      {context.upcoming_events.length>0 && <div>直近イベント {context.upcoming_events.length}件（{context.upcoming_events[0].title||context.upcoming_events[0].event}まであと{context.upcoming_events[0].business_days_until}営業日）</div>}
+      {context.matched_playbooks.length>0 && <div>プレイブック適合：{context.matched_playbooks[0].name}（{context.matched_playbooks[0].matchScore}%）</div>}
+      {context.expert_views.length>0 && <div>関連する有識者見解 {context.expert_views.length}件</div>}
+      {context.similar_trades.length>0 && <div>過去の同銘柄取引 {context.similar_trades.length}件</div>}
+      {context.behavioral_warnings.length>0 && <div style={{color:"var(--down)"}}>行動警告：{context.behavioral_warnings.map(w=>w.code).join("・")}</div>}
+    </div>}
+  </div>;
+}
+
 function AssessmentCard({assessment:a,marginBadge,marginRatio,enr,sectorRank}){
   const meta=PRIMARY_STATUS_META[enr.status];
   const actionMeta=ACTION_STATUS_META[enr.actionStatus];
@@ -5603,6 +5665,8 @@ function normalizeChatGPTPayload(raw){
   const catalysts=Array.isArray(base.catalysts)?base.catalysts:recentCatalysts;
   const userFeedback=typeof base.user_feedback==="string"?base.user_feedback:"";
   const positionReview=(base.position_review&&typeof base.position_review==="object"&&!Array.isArray(base.position_review))?base.position_review:{};
+  // 2026-09-09追加（判断エンジン強化、指示書8番）：trade_playbooksも任意項目として通す。
+  const tradePlaybooks=Array.isArray(base.trade_playbooks)?base.trade_playbooks:[];
 
   const reviewRaw=base.review;
   const review=Array.isArray(reviewRaw)?reviewRaw.join("\n"):(reviewRaw||"");
@@ -5619,6 +5683,7 @@ function normalizeChatGPTPayload(raw){
     date, market, watchlist, decisions, positions, events,
     recent_catalysts:recentCatalysts, review, rule_updates:ruleUpdates, notes,
     news, expert_opinions:expertOpinions, catalysts, user_feedback:userFeedback, position_review:positionReview,
+    trade_playbooks:tradePlaybooks,
   };
   return{normalized,warnings,errors};
 }
@@ -5774,6 +5839,7 @@ function ChatGptImportPanel({journal,activeRules}){
       if(u.news)extraMsgs.push(`ニュース：新規${u.news.imported||0}件`);
       if(u.catalysts)extraMsgs.push(`カタリスト：新規${u.catalysts.imported||0}件`);
       if(u.expert_opinions)extraMsgs.push(`有識者見解：新規${u.expert_opinions.imported||0}件`);
+      if(u.trade_playbooks)extraMsgs.push(`プレイブック：新規${u.trade_playbooks.imported||0}件・既存${u.trade_playbooks.matched||0}件`);
       if(u.user_feedback?.saved)extraMsgs.push(`今日の振り返りに感想を反映しました（${u.user_feedback.date}）`);
       // 2026-09-09新規（ルール学習システム、指示書18番）：「本日のルール更新」を保存結果に
       // 追加表示する。d.ruleSyncはsave_chatgpt_import()側でsync_rule_updates_to_trade_rules()
@@ -5837,7 +5903,7 @@ function ChatGptImportPanel({journal,activeRules}){
           ["監視銘柄",(parsed.watchlist||[]).length],["判断",(parsed.decisions||[]).length],
           ["ルール",(parsed.rule_updates||[]).length],["ニュース",(parsed.news||[]).length],
           ["カタリスト",(parsed.catalysts||[]).length],["イベント",(parsed.events||[]).length],
-          ["有識者見解",(parsed.expert_opinions||[]).length],["感想",parsed.user_feedback?1:0]]
+          ["有識者見解",(parsed.expert_opinions||[]).length],["プレイブック",(parsed.trade_playbooks||[]).length],["感想",parsed.user_feedback?1:0]]
           .filter(([,n])=>n>0).map(([label,n])=>
             <span key={label} className="chip" style={{fontSize:11.5}}>{label} {n}件</span>)}
         {[["市場情報",parsed.market?.condition||parsed.market?.summary?1:0],["監視銘柄",(parsed.watchlist||[]).length],
@@ -8188,6 +8254,14 @@ function App(){
     const cats=guessRuleCategoriesForStock(w.sector,w.theme);
     const activeRulesForConsult=await fetchJsonSafe(`/api/trade-rules/relevant?categories=${encodeURIComponent(cats.join(","))}`)
       .then(d=>(d&&d.rules)||[]).catch(()=>[]);
+    // 2026-09-09新規（判断エンジン強化、指示書18・19・25番）：統合コンテキスト＋総合判断も
+    // 添える。画面のKnowledgeJudgmentPanelと同じエンドポイントを呼ぶため、表示と相談内容が
+    // 食い違わない。失敗してもベストエフォート（他の連携と同じ方針、無くても既存項目だけで
+    // 相談は成立する）。
+    const knowledge=await fetchJsonSafe("/api/knowledge-context",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({code:w.code,sector:w.sector,market:w.market,analysisType:"stock",
+        signals:buildSignalsFromAnalysis(a),baseSignal:analysisEnrichedMap.get(w.code)?.actionStatus})})
+      .catch(()=>null);
     await copyChatGPTPayload("詳細分析を相談","trade_analysis",{
       stock:{code:w.code,name:w.name,market:w.market,sector:w.sector||null},
       price:{current:a.current,note:"currentは現在値（実勢価格）。levels.entry_theoreticalはテクニカルから算出した押し目エントリー価格帯の理論値で、現在値と同じとは限らない。"},
@@ -8202,6 +8276,11 @@ function App(){
       market_environment:a.marketEnv||null,
       recent_catalysts:recentCatalystsForConsult(w.code,w.sector),
       active_rules:activeRulesForConsult.map(r=>({rule:r.rule_text,confidence:r.confidence,action:r.action_text||null})),
+      integrated_judgment:knowledge&&!knowledge.error?{
+        judgment:knowledge.judgment.judgment,confidence:knowledge.judgment.confidence,reasons:knowledge.judgment.reasons,
+        upcoming_events:knowledge.context.upcoming_events.slice(0,3).map(e=>({title:e.title||e.event,business_days_until:e.business_days_until})),
+        matched_playbook:knowledge.context.matched_playbooks[0]?{name:knowledge.context.matched_playbooks[0].name,matchScore:knowledge.context.matched_playbooks[0].matchScore}:null,
+      }:null,
       comment:[a.entryReason,a.stopReason,a.targetReason].filter(Boolean),
     },setAnalysisConsultMsg);
   };
@@ -8851,6 +8930,12 @@ function App(){
                             {a._marketFetchedAtIso && <FreshnessBadge iso={a._marketFetchedAtIso} staleMinutes={MARKET_STALE_MINUTES} title="市場環境（日経平均等）の取得時刻"/>}
                           </div>}
                           <RelevantMarketSummary w={w} metrics={s.metrics}/>
+                          {/* 2026-09-09新規（判断エンジン強化）：知識コンテキストを実際の分析へ
+                              利用した総合判断（買い候補/様子見/利確優先等）・確信度・理由を表示
+                              （指示書21〜23番）。既存のEventRiskNote/CatalystNote/ExpertViewNote
+                              等の個別表示は無変更のまま維持し、その上に統合判断を追加する形。 */}
+                          <KnowledgeJudgmentPanel code={w.code} sector={w.sector} market={w.market}
+                            tradeStyle={enr?.status==="ACTIVE_BREAK"||enr?.status==="HOT"?"DAY":undefined} baseSignal={enr?.actionStatus} a={a}/>
                           <EventRiskNote events={marketEvents} code={w.code} sector={w.sector}/>
                           <CatalystNote catalysts={newsCatalysts} code={w.code} sector={w.sector}/>
                           <ExpertViewNote views={expertViews} code={w.code} sector={w.sector} market={w.market}/>

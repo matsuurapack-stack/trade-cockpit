@@ -5023,6 +5023,21 @@ class Handler(SimpleHTTPRequestHandler):
             review = investment_db.get_daily_review(DATABASE_URL, self.current_user, date) \
                 if (investment_db is not None and DATABASE_URL) else None
             self._send_json({"review": review})
+        # ---- 2026-09-09新規（判断エンジン強化：知識の実利用） ----
+        elif self.path.startswith("/api/trade-playbooks"):
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            playbooks = investment_db.list_trade_playbooks(DATABASE_URL, self.current_user, status=params.get("status", [None])[0]) \
+                if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"playbooks": playbooks})
+        elif self.path.startswith("/api/expert-views/relevant"):
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            views = investment_db.relevant_expert_views_for(
+                DATABASE_URL, self.current_user, code=params.get("code", [None])[0],
+                sector=params.get("sector", [None])[0], market=params.get("market", [None])[0],
+            ) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"views": views})
         elif self.path.startswith("/api/chatgpt-import/list"):
             imports = investment_db.list_chatgpt_imports(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"imports": imports})
@@ -5501,6 +5516,49 @@ class Handler(SimpleHTTPRequestHandler):
             if review is None:
                 self._send_json({"error": "感想の保存に失敗しました"}); return
             self._send_json({"review": review})
+        # ---- 2026-09-09新規（判断エンジン強化：知識の実利用） ----
+        elif self.path == "/api/knowledge-context":
+            # 指示書18・19・24番：分析直前に呼ぶ統合コンテキストビルダー。総合判断・確信度・
+            # 理由も同時に生成し、used_context_jsonをanalysis_context_logへ記録する
+            # （日次レビューのknown_risk_ignored検出で再利用するため、副作用のあるPOSTにした）。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            code = body.get("code")
+            context = investment_db.build_relevant_trading_context(
+                DATABASE_URL, self.current_user, stock_code=code, sector=body.get("sector"),
+                market=body.get("market"), position=body.get("position"),
+                analysis_type=body.get("analysisType") or "stock", signals=body.get("signals") or {},
+                rule_categories=body.get("ruleCategories"),
+            )
+            judgment = investment_db.synthesize_trade_judgment(context, base_signal=body.get("baseSignal"))
+            log = None
+            if code:
+                log = investment_db.save_analysis_context_log(
+                    DATABASE_URL, self.current_user, code, body.get("analysisType") or "stock",
+                    judgment, context, analysis_date=body.get("date"))
+            self._send_json({"context": context, "judgment": judgment, "logId": (log or {}).get("id")})
+        elif self.path == "/api/expert-views/evaluate":
+            # 指示書2・28番：有識者見解1件をSUPPORTED/FAILED/NEUTRALで評価する。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            view = investment_db.record_expert_view_evaluation(DATABASE_URL, self.current_user, body.get("id"), body.get("result"))
+            if view is None:
+                self._send_json({"error": "評価に失敗しました"}); return
+            self._send_json({"view": view})
+        elif self.path == "/api/expert-views/refresh-status":
+            # 指示書1番：全有識者見解のstatusを現在日付・評価実績で再判定する。
+            if not self._investment_db_ready():
+                return
+            n = investment_db.refresh_expert_view_statuses(DATABASE_URL, self.current_user)
+            self._send_json({"updated": n})
+        elif self.path == "/api/trade-rules/generate-from-reflections":
+            # 指示書16番：直近の反省の繰り返しからTESTINGルール候補を生成する。
+            if not self._investment_db_ready():
+                return
+            created = investment_db.generate_rule_candidates_from_reflections(DATABASE_URL, self.current_user)
+            self._send_json({"candidates": created})
         # ---- ChatGPT連携（2026-09-02新規、Phase1）：有料AI APIは使わず、ChatGPTが出力した
         # 投資ログJSONを手動貼り付けで取り込む。 ----
         elif self.path == "/api/chatgpt-import/save":

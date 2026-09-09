@@ -639,6 +639,77 @@ CREATE TABLE IF NOT EXISTS daily_reviews (
 CREATE INDEX IF NOT EXISTS idx_daily_reviews_user_date ON daily_reviews(user_id, review_date DESC);
 """
 
+# 2026-09-09新規（判断エンジン強化：知識を実際の分析へ使う、指示書1・2・6・24番）。
+_SCHEMA_KNOWLEDGE_ENGINE_SQL = """
+-- 指示書1・2番：有識者見解の自動評価・信頼度学習用の列を追加（既存expert_viewsを拡張、
+-- 新規テーブルは作らない）。
+ALTER TABLE expert_views ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE expert_views ADD COLUMN IF NOT EXISTS supported_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE expert_views ADD COLUMN IF NOT EXISTS failed_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE expert_views ADD COLUMN IF NOT EXISTS neutral_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE expert_views ADD COLUMN IF NOT EXISTS last_evaluated_at TIMESTAMPTZ;
+ALTER TABLE expert_views ADD COLUMN IF NOT EXISTS accuracy_score NUMERIC;
+-- 指示書2番「分野別精度」：expert_name+topicの組み合わせ単位で正答率を積み上げられるよう、
+-- topic列（既存）をそのまま分野キーとして使う（新規列は増やさない）。
+
+CREATE TABLE IF NOT EXISTS trade_playbooks (
+    id                          SERIAL PRIMARY KEY,
+    user_id                     TEXT NOT NULL,
+    playbook_key                TEXT NOT NULL,  -- 正規化キー（trade_rulesのrule_keyと同じ考え方、重複防止用）
+    name                        TEXT NOT NULL,
+    source_trader                TEXT,
+    source_title                TEXT,
+    source_type                  TEXT,
+    market_type                  TEXT,   -- JP|US等
+    timeframe                    TEXT,   -- DAYTRADE|SWING|POSITION等
+    applicable_sectors_json      JSONB,
+    applicable_stocks_json       JSONB,
+    entry_conditions_json        JSONB,
+    confirmation_conditions_json JSONB,
+    exit_conditions_json         JSONB,
+    stop_conditions_json         JSONB,
+    avoid_conditions_json        JSONB,
+    position_management_json     JSONB,
+    status                      TEXT NOT NULL DEFAULT 'TESTING',  -- TESTING|ACTIVE|REVISED|RETIRED
+    confidence                  TEXT NOT NULL DEFAULT 'LOW',
+    evidence_count               INTEGER NOT NULL DEFAULT 0,
+    success_count                INTEGER NOT NULL DEFAULT 0,
+    failure_count                INTEGER NOT NULL DEFAULT 0,
+    neutral_count                INTEGER NOT NULL DEFAULT 0,
+    user_attempt_count            INTEGER NOT NULL DEFAULT 0,
+    user_success_count            INTEGER NOT NULL DEFAULT 0,
+    user_failure_count            INTEGER NOT NULL DEFAULT 0,
+    user_avg_return               NUMERIC,
+    user_compatibility_score      NUMERIC,
+    created_from                 TEXT,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, playbook_key)
+);
+CREATE INDEX IF NOT EXISTS idx_trade_playbooks_user_status ON trade_playbooks(user_id, status);
+
+-- 指示書24・26番：各分析実行時に「何を参照したか」を残し、実際の売買・日次レビューで
+-- 「知っていたのに無視した」を検出できるようにする。
+CREATE TABLE IF NOT EXISTS analysis_context_log (
+    id                SERIAL PRIMARY KEY,
+    user_id           TEXT NOT NULL,
+    code              TEXT,
+    analysis_type     TEXT,   -- morning|stock|top5|position|exit_consult等
+    analysis_date     TEXT NOT NULL,
+    judgment          TEXT,   -- BUY_CANDIDATE|WAIT|TAKE_PROFIT|RAISE_STOP|REDUCE|EXIT|NO_OVERNIGHT等
+    confidence_score  INTEGER,
+    reasons_json      JSONB,
+    used_context_json JSONB,  -- {"rules":[...],"expert_views":[...],"events":[...],"news":[...],
+                               --  "playbooks":[...],"similar_trades":[...],"reflections":[...]}
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_analysis_context_log_user_date ON analysis_context_log(user_id, analysis_date DESC);
+CREATE INDEX IF NOT EXISTS idx_analysis_context_log_user_code ON analysis_context_log(user_id, code, analysis_date DESC);
+
+-- 指示書26番：日次レビューへ「知っていたのに無視した」件数を残す列を追加。
+ALTER TABLE daily_reviews ADD COLUMN IF NOT EXISTS known_risk_ignored_json JSONB;
+"""
+
 
 def init_schema(database_url):
     """テーブルを（無ければ）作成し、マルチユーザー化・ChatGPT連携の移行SQLも実行する。
@@ -653,6 +724,7 @@ def init_schema(database_url):
         conn.execute(_MIGRATE_CHATGPT_IMPORT_SQL)
         conn.execute(_SCHEMA_TRADE_RULES_SQL)
         conn.execute(_SCHEMA_DAILY_REVIEWS_SQL)
+        conn.execute(_SCHEMA_KNOWLEDGE_ENGINE_SQL)
         conn.commit()
 
 
@@ -1687,7 +1759,7 @@ def _classify_single_item(item):
 _UNIFIED_KNOWN_KEYS = {
     "schema_version", "type", "date", "market", "watchlist", "decisions", "review",
     "rule_updates", "events", "news", "expert_opinions", "catalysts",
-    "user_feedback", "position_review", "notes",
+    "user_feedback", "position_review", "notes", "trade_playbooks",
 }
 
 
@@ -1711,6 +1783,8 @@ def classify_chatgpt_unified_payload(payload):
     user_feedback = payload.get("user_feedback") or ""
     position_review = payload.get("position_review") if isinstance(payload.get("position_review"), dict) else {}
     review = payload.get("review") or ""
+    # 2026-09-09追加（判断エンジン強化、指示書8番）：trade_playbooksも任意キーとして受け付ける。
+    trade_playbooks = list(payload.get("trade_playbooks")) if isinstance(payload.get("trade_playbooks"), list) else []
 
     unclassified = 0
     for k, v in payload.items():
@@ -1738,13 +1812,14 @@ def classify_chatgpt_unified_payload(payload):
         "rule_updates": rule_updates, "events": events, "news": news,
         "expert_opinions": expert_opinions, "catalysts": catalysts,
         "user_feedback": user_feedback, "review": review, "position_review": position_review,
+        "trade_playbooks": trade_playbooks,
     }
     counts = {
         "market_summary": 1 if market else 0, "watchlist": len(watchlist), "decisions": len(decisions),
         "rule_updates": len(rule_updates), "events": len(events), "news": len(news),
         "expert_opinions": len(expert_opinions), "catalysts": len(catalysts),
         "user_feedback": 1 if user_feedback else 0, "review": 1 if review else 0,
-        "unclassified": unclassified,
+        "trade_playbooks": len(trade_playbooks), "unclassified": unclassified,
     }
     return {"buckets": buckets, "counts": counts}
 
@@ -1794,6 +1869,8 @@ def save_chatgpt_unified_import(database_url, user_id, payload, force=False):
         review_date = payload.get("date") or datetime.date.today().isoformat()
         save_review_user_feedback(database_url, user_id, review_date, buckets["user_feedback"], source="chatgpt_import")
         unified["user_feedback"] = {"saved": True, "date": review_date}
+    if buckets.get("trade_playbooks"):
+        unified["trade_playbooks"] = import_trade_playbooks(database_url, user_id, buckets["trade_playbooks"])
     base_result["unified"] = unified
     base_result["classification"] = classified["counts"]
     return base_result
@@ -2018,6 +2095,15 @@ def generate_daily_review(database_url, user_id, review_date, user_feedback=None
     score_risk, good_risk, bad_risk = _check_risk_management(database_url, user_id, review_date)
     score_reflection = REFLECTION_MAX if (effective_feedback or "").strip() else 4
 
+    # 2026-09-09新規（判断エンジン強化、指示書26番）：その日のanalysis_context_logで
+    # NO_OVERNIGHT等の警告が出ていたのに実際に持ち越した銘柄を検出し、「知っていたのに
+    # 無視した」としてルール遵守点をさらに減点する（結果論ではなく、その時点で警告が
+    # 出ていたかどうかで判定、指示書27番）。
+    known_risk_ignored = _check_known_risk_ignored(database_url, user_id, review_date, positions)
+    if known_risk_ignored:
+        score_rule = max(0, score_rule - DEDUCTION_RULE_VIOLATION * len(known_risk_ignored))
+        bad_rule = bad_rule + [f"{k['code']}：{k['reason']}（知っていたのに無視）" for k in known_risk_ignored]
+
     score_total = score_rule + score_entry + score_exit + score_market + score_risk + score_reflection
     good_points = good_rule + good_entry + good_exit + good_market + good_risk
     improvement_points = bad_rule + bad_entry + bad_exit + bad_market + bad_risk
@@ -2043,8 +2129,8 @@ def generate_daily_review(database_url, user_id, review_date, user_feedback=None
                 "INSERT INTO daily_reviews (user_id, review_date, score_total, score_rule_adherence, "
                 "score_entry_quality, score_exit_quality, score_market_fit, score_risk_mgmt, "
                 "score_reflection, good_points, improvement_points, tomorrow_notes, auto_summary, "
-                "user_feedback, reflection_tags, updated_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s::jsonb,now()) "
+                "user_feedback, reflection_tags, known_risk_ignored_json, updated_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s::jsonb,%s::jsonb,now()) "
                 "ON CONFLICT (user_id, review_date) DO UPDATE SET "
                 "score_total=EXCLUDED.score_total, score_rule_adherence=EXCLUDED.score_rule_adherence, "
                 "score_entry_quality=EXCLUDED.score_entry_quality, score_exit_quality=EXCLUDED.score_exit_quality, "
@@ -2053,12 +2139,14 @@ def generate_daily_review(database_url, user_id, review_date, user_feedback=None
                 "improvement_points=EXCLUDED.improvement_points, tomorrow_notes=EXCLUDED.tomorrow_notes, "
                 "auto_summary=EXCLUDED.auto_summary, "
                 "user_feedback=COALESCE(daily_reviews.user_feedback, EXCLUDED.user_feedback), "
-                "reflection_tags=EXCLUDED.reflection_tags, updated_at=now() "
+                "reflection_tags=EXCLUDED.reflection_tags, known_risk_ignored_json=EXCLUDED.known_risk_ignored_json, "
+                "updated_at=now() "
                 "RETURNING *",
                 [user_id, review_date, score_total, score_rule, score_entry, score_exit, score_market,
                  score_risk, score_reflection, json.dumps(good_points, ensure_ascii=False),
                  json.dumps(improvement_points, ensure_ascii=False), json.dumps(tomorrow_notes, ensure_ascii=False),
-                 auto_summary, effective_feedback, json.dumps(reflection_tags, ensure_ascii=False)])
+                 auto_summary, effective_feedback, json.dumps(reflection_tags, ensure_ascii=False),
+                 json.dumps(known_risk_ignored, ensure_ascii=False)])
             saved = cur.fetchone()
         conn.commit()
     return _row_to_json(saved)
@@ -2146,6 +2234,714 @@ def recent_reflections_for(database_url, user_id, days=3):
             "reflectionTags": r.get("reflection_tags") or [],
         })
     return out
+
+
+# ============================================================
+# ---- 判断エンジン強化（知識の実利用）。2026-09-09新規 ----
+# 「情報を保存するだけ」から「現在の分析へ実際に使う」への拡張。ChatGPT統合連携・
+# trade_rules・daily_reviews・recent_reflections（前回・前々回コミット）を土台に、
+# 有識者見解の自動評価・イベント/ニュースの分析接続・プレイブック・統合コンテキスト
+# ビルダー・used_context記録までを実装する。表示専用の機能は増やさず、既存の分析
+# payload（詳細分析を相談・朝一分析・ポジション相談等）へ実際に注入することを優先する。
+# ============================================================
+
+# ---- 情報鮮度フレームワーク（指示書5番） ----
+FRESHNESS_LIVE_HOURS = 2
+FRESHNESS_CURRENT_HOURS = 24
+FRESHNESS_RECENT_DAYS = 3
+FRESHNESS_STALE_DAYS = 14
+
+
+def compute_freshness(date_or_datetime_str, now=None):
+    """日付・日時文字列からLIVE/CURRENT/RECENT/STALE/EXPIREDを判定する（指示書5番）。
+    news/expert_views/events/reflectionsで共通利用する。未来日付（予定されているイベント等）
+    はLIVE扱い。パースできない・値が無い場合はEXPIRED（無理に鮮度を高く見せない）。"""
+    if not date_or_datetime_str:
+        return "EXPIRED"
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    try:
+        s = str(date_or_datetime_str)
+        if len(s) <= 10:
+            dt = datetime.datetime.fromisoformat(s).replace(tzinfo=datetime.timezone.utc)
+        else:
+            dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+    except (ValueError, TypeError):
+        return "STALE"
+    delta_hours = (now - dt).total_seconds() / 3600
+    if delta_hours < 0:
+        return "LIVE"
+    if delta_hours <= FRESHNESS_LIVE_HOURS:
+        return "LIVE"
+    if delta_hours <= FRESHNESS_CURRENT_HOURS:
+        return "CURRENT"
+    if delta_hours <= FRESHNESS_RECENT_DAYS * 24:
+        return "RECENT"
+    if delta_hours <= FRESHNESS_STALE_DAYS * 24:
+        return "STALE"
+    return "EXPIRED"
+
+
+_FRESHNESS_ANALYSIS_ALLOWED = {"LIVE", "CURRENT", "RECENT"}  # 指示書5番：分析payloadは原則ここまで
+
+
+# ---- 有識者見解の自動評価（指示書1・2番） ----
+
+def evaluate_expert_view_status(view, today=None):
+    """有識者見解1件の現在statusを判定する（指示書1番：ACTIVE/CONFIRMED/
+    PARTIALLY_CONFIRMED/WEAKENED/INVALIDATED/EXPIRED）。risk_window_end/
+    effective_untilが過去日付ならEXPIRED。手動評価（record_expert_view_evaluation）が
+    蓄積していればsupported/failed比率でCONFIRMED〜WEAKENED/INVALIDATEDを判定する
+    （AI不使用、既存のconfirmations/invalidation_conditionsは自由記述のため、内容の
+    自動突合はせずrecord_expert_view_evaluationでのユーザー評価に委ねる保守的な設計）。"""
+    today = today or datetime.date.today()
+    end = view.get("risk_window_end") or view.get("effective_until")
+    if end:
+        try:
+            if today > datetime.date.fromisoformat(str(end)[:10]):
+                return "EXPIRED"
+        except ValueError:
+            pass
+    supported = view.get("supported_count") or 0
+    failed = view.get("failed_count") or 0
+    total = supported + failed + (view.get("neutral_count") or 0)
+    if total == 0:
+        return view.get("status") or "ACTIVE"
+    rate = supported / total
+    if failed >= 2 and supported == 0:
+        return "INVALIDATED"
+    if rate >= 0.7 and total >= 2:
+        return "CONFIRMED"
+    if rate >= 0.4:
+        return "PARTIALLY_CONFIRMED"
+    return "WEAKENED"
+
+
+def refresh_expert_view_statuses(database_url, user_id):
+    """全有識者見解のstatusを毎回の分析時に再評価する（指示書1番「現在データと毎日照合」）。
+    期限切れ判定が主目的の軽量チェックで、新しいAPI呼び出しは発生しない。戻り値: 更新件数。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    views = list_expert_views(database_url, user_id, limit=500)
+    n = 0
+    with pool.connection() as conn:
+        for v in views:
+            new_status = evaluate_expert_view_status(v)
+            if new_status != v.get("status"):
+                conn.execute("UPDATE expert_views SET status=%s, updated_at=now() WHERE id=%s AND user_id=%s",
+                             [new_status, v["id"], user_id])
+                n += 1
+        conn.commit()
+    return n
+
+
+def record_expert_view_evaluation(database_url, user_id, view_id, result):
+    """有識者見解1件をSUPPORTED/FAILED/NEUTRALで評価する（指示書2・28番）。
+    supported_count/failed_count/neutral_count・accuracy_score・statusを更新する。"""
+    pool = _get_pool(database_url)
+    if pool is None or result not in ("SUPPORTED", "FAILED", "NEUTRAL"):
+        return None
+    col = {"SUPPORTED": "supported_count", "FAILED": "failed_count", "NEUTRAL": "neutral_count"}[result]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM expert_views WHERE id=%s AND user_id=%s", [view_id, user_id])
+            row = cur.fetchone()
+            if not row:
+                return None
+            new_val = (row[col] or 0) + 1
+            merged = {**row, col: new_val}
+            total = (merged.get("supported_count") or 0) + (merged.get("failed_count") or 0) + (merged.get("neutral_count") or 0)
+            accuracy = round((merged.get("supported_count") or 0) / total, 3) if total > 0 else None
+            new_status = evaluate_expert_view_status(merged)
+            cur.execute(
+                f"UPDATE expert_views SET {col}=%s, accuracy_score=%s, status=%s, last_evaluated_at=now(), updated_at=now() "
+                f"WHERE id=%s AND user_id=%s RETURNING *",
+                [new_val, accuracy, new_status, view_id, user_id])
+            saved = cur.fetchone()
+        conn.commit()
+    return _row_to_json(saved)
+
+
+def _expert_view_matches(v, code, sector, market):
+    """既存フロント側expertViewMatches()と同じ関連度判定（stocks一致／sector一致／
+    stocks・sector両方空でmarket一致＝市場全体言及）をサーバー側でも再利用する。"""
+    stocks = v.get("stocks") or []
+    if code and code in stocks:
+        return True
+    if sector and v.get("sector") and v["sector"] == sector:
+        return True
+    if market and v.get("market") == market and not stocks and not v.get("sector"):
+        return True
+    return False
+
+
+def relevant_expert_views_for(database_url, user_id, code=None, sector=None, market=None, limit=5):
+    """分析対象に関連する有識者見解だけを返す（指示書1番：古い・無関係な見解は入れない）。
+    INVALIDATED/EXPIREDおよびfreshnessがEXPIREDのものは除外。"""
+    views = list_expert_views(database_url, user_id, market=market, limit=200)
+    out = []
+    for v in views:
+        if v.get("status") in ("INVALIDATED", "EXPIRED"):
+            continue
+        if not _expert_view_matches(v, code, sector, market):
+            continue
+        fresh_basis = v.get("risk_window_end") or v.get("effective_until") or v.get("published_at")
+        if compute_freshness(fresh_basis) == "EXPIRED":
+            continue
+        out.append(v)
+    out.sort(key=lambda v: v.get("published_at") or "", reverse=True)
+    return out[:limit]
+
+
+# ---- イベントを実際の売買判断へ接続（指示書3番） ----
+
+EVENT_SIGNAL_META = {
+    "EVENT_RISK_HIGH": "重要イベントが目前（当日〜1営業日以内）",
+    "NO_OVERNIGHT": "重要イベント前は持ち越しを避ける",
+    "ENTRY_CAUTION": "重要イベント直前は新規エントリーに注意",
+    "REDUCE_SIZE": "イベント接近のためポジションサイズを抑える",
+    "TAKE_PROFIT_PRIORITY": "イベント接近のため利益確定を優先",
+}
+
+
+def _business_days_between(base, target):
+    """base（date）からtarget（date）までの営業日数（土日のみ除外、祝日は考慮しない簡易版、
+    既存のbusinessDaysUntil()と同じ考え方）。target<baseなら負値。"""
+    if target == base:
+        return 0
+    step = 1 if target > base else -1
+    d, n = base, 0
+    while d != target:
+        d += datetime.timedelta(days=step)
+        if d.weekday() < 5:
+            n += step
+    return n
+
+
+def upcoming_event_signals(database_url, user_id, code=None, sector=None, position=None, today=None, days_ahead=7):
+    """当日/1営業日前/2営業日前/3営業日前/1週間以内の重要イベントを判定し、補助判断フラグを
+    生成する（指示書3番）。positionは{"trade_style":"DAY"|"SWING", ...}等（省略可、無ければ
+    NO_OVERNIGHT系の判定はスキップ）。戻り値: {"events":[...], "signals":[...]}。"""
+    today = today or datetime.date.today()
+    events = list_market_events(database_url, user_id, from_date=today.isoformat(),
+                                 to_date=(today + datetime.timedelta(days=days_ahead)).isoformat())
+    relevant = []
+    for e in events:
+        affected_codes = e.get("affected_stocks") or []
+        affected_sectors = e.get("affected_sectors") or []
+        if code and affected_codes and code not in affected_codes:
+            if sector and affected_sectors and sector not in affected_sectors:
+                continue
+            elif not affected_sectors and affected_codes:
+                continue
+        try:
+            ev_date = datetime.date.fromisoformat(str(e.get("event_date"))[:10])
+        except (ValueError, TypeError):
+            continue
+        bd = _business_days_between(today, ev_date)
+        if bd < 0 or bd > 5:
+            continue
+        relevant.append({**e, "business_days_until": bd})
+
+    signals = []
+    high_soon = [e for e in relevant if (e.get("importance") or "").lower() in ("high", "critical") and e["business_days_until"] <= 1]
+    if high_soon:
+        signals.append("EVENT_RISK_HIGH")
+        signals.append("ENTRY_CAUTION")
+        if position and (position.get("trade_style") or "").upper() in ("DAY", "SWING"):
+            signals.append("NO_OVERNIGHT")
+        signals.append("REDUCE_SIZE")
+        if position:
+            signals.append("TAKE_PROFIT_PRIORITY")
+    relevant.sort(key=lambda e: e["business_days_until"])
+    return {"events": relevant, "signals": list(dict.fromkeys(signals))}
+
+
+# ---- ニュース・カタリストの分析接続（指示書4番） ----
+
+def relevant_catalysts_for(database_url, user_id, code=None, sector=None, limit=5, max_freshness_days=FRESHNESS_STALE_DAYS):
+    """news_catalystsを分析へ使う（指示書4番）。affected_stocks/affected_sectors一致で
+    絞り込み、freshness（catalyst_date基準）がEXPIRED（STALE_DAYSを超過）のものは除外。
+    重要度＞鮮度の順でソートする（直近重要ネガティブを優先的に前へ）。"""
+    catalysts = list_news_catalysts(database_url, user_id, limit=200)
+    _importance_rank = {"high": 0, "medium_high": 1, "medium": 2, "low": 3}
+    out = []
+    for c in catalysts:
+        codes = c.get("affected_stocks") or []
+        sectors = c.get("affected_sectors") or []
+        if code and codes and code not in codes:
+            if not (sector and sectors and sector in sectors):
+                continue
+        elif not codes and sector and sectors and sector not in sectors:
+            continue
+        fresh = compute_freshness(c.get("catalyst_date"))
+        if fresh == "EXPIRED":
+            continue
+        out.append({**c, "freshness": fresh})
+    out.sort(key=lambda c: (_importance_rank.get((c.get("importance") or "").lower(), 9),
+                              0 if c.get("sentiment") == "negative" else 1,
+                              {"LIVE": 0, "CURRENT": 1, "RECENT": 2, "STALE": 3}.get(c["freshness"], 4)))
+    return out[:limit]
+
+
+# ---- reflectionを行動警告へ変換（指示書15・16番） ----
+
+BEHAVIORAL_WARNING_META = {
+    "CHASE_RISK_HIGH": "最近、高値追い・FOMOでの失敗が続いています。急騰銘柄への飛び乗りに注意",
+    "TAKE_PROFIT_DISCIPLINE_WARNING": "最近、利確判断が遅れがちです。目標到達で機械的に利確する意識を",
+    "STOP_DISCIPLINE_WARNING": "最近、損切り判断が遅れがちです。計画した損切りラインを守る意識を",
+}
+_BEHAVIORAL_WARNING_TRIGGER_TAGS = {
+    "CHASE_RISK_HIGH": {"高値追い", "FOMO"},
+    "TAKE_PROFIT_DISCIPLINE_WARNING": {"利確遅れ"},
+    "STOP_DISCIPLINE_WARNING": {"損切り遅れ"},
+}
+BEHAVIORAL_WARNING_MIN_OCCURRENCES = 2  # 直近N日でこの回数以上繰り返されたら警告（定数化）
+
+
+def behavioral_warnings_from_reflections(database_url, user_id, days=5):
+    """直近days日のreflection_tagsから行動警告を生成する（指示書15番）。表示だけでなく
+    build_relevant_trading_context経由で分析へ投入する想定。"""
+    reviews = list_daily_reviews(database_url, user_id, limit=days)
+    tag_counts = {}
+    for r in reviews:
+        for t in (r.get("reflection_tags") or []):
+            tag_counts[t] = tag_counts.get(t, 0) + 1
+    warnings = []
+    for code, trigger_tags in _BEHAVIORAL_WARNING_TRIGGER_TAGS.items():
+        occurrences = sum(tag_counts.get(t, 0) for t in trigger_tags)
+        if occurrences >= BEHAVIORAL_WARNING_MIN_OCCURRENCES:
+            warnings.append({"code": code, "message": BEHAVIORAL_WARNING_META[code], "occurrences": occurrences})
+    return warnings
+
+
+RULE_CANDIDATE_FROM_REFLECTION_MIN_OCCURRENCES = 3  # 定数化（指示書16番の「一定回数」）
+_REFLECTION_TAG_RULE_CANDIDATE_TEXT = {
+    "利確遅れ": "含み益が一定以上になったら逆指値（トレーリングストップ）を引き上げる",
+    "損切り遅れ": "含み損が拡大する前に、決めた損切りラインで機械的に手仕舞う",
+    "高値追い": "当日大幅上昇・押し目未形成の銘柄には新規で飛び乗らない",
+    "FOMO": "焦って追いかけ買いをせず、押し目形成を待つ",
+    "ナンピン": "含み損ポジションへの無計画なナンピンをしない",
+}
+
+
+def generate_rule_candidates_from_reflections(database_url, user_id, days=14):
+    """同じreflection_tagが繰り返された場合にTESTINGルール候補を生成する（指示書16番）。
+    自動ACTIVEにはしない。既存upsert_trade_rule_from_text（rule_keyでの重複防止）を
+    再利用するため、同じ候補を複数回実行しても増殖しない。戻り値: 生成/一致した候補の一覧。"""
+    reviews = list_daily_reviews(database_url, user_id, limit=days)
+    tag_counts = {}
+    for r in reviews:
+        for t in (r.get("reflection_tags") or []):
+            tag_counts[t] = tag_counts.get(t, 0) + 1
+    created = []
+    for tag, text in _REFLECTION_TAG_RULE_CANDIDATE_TEXT.items():
+        if tag_counts.get(tag, 0) >= RULE_CANDIDATE_FROM_REFLECTION_MIN_OCCURRENCES:
+            res = upsert_trade_rule_from_text(
+                database_url, user_id, text, category="risk",
+                initial_status="TESTING", initial_confidence="LOW",
+                created_from=f"reflection_pattern:{tag}",
+            )
+            if res:
+                created.append({"tag": tag, "occurrences": tag_counts[tag], "ruleId": res["id"], "action": res["action"]})
+    return created
+
+
+# ---- trade_playbooks（指示書6〜10番） ----
+
+def _normalize_playbook_key(name, source_trader=None):
+    """trade_rulesと同じ正規化方式（_normalize_rule_key）を流用し、名前+出典者で
+    重複判定キーを作る。"""
+    return _normalize_rule_key(f"{name}|{source_trader or ''}")
+
+
+_PLAYBOOK_JSON_COLS = ["applicable_sectors_json", "applicable_stocks_json", "entry_conditions_json",
+                        "confirmation_conditions_json", "exit_conditions_json", "stop_conditions_json",
+                        "avoid_conditions_json", "position_management_json"]
+
+
+def upsert_trade_playbook(database_url, user_id, pb, created_from="manual"):
+    """1件のplaybook dictをupsertする（指示書7番：新規は必ずTESTING/LOWまたはMEDIUM）。
+    playbook_keyの完全一致で重複判定（指示書「自動ACTIVEにしない」を厳守、statusを
+    手動以外で上書きしない）。"""
+    pool = _get_pool(database_url)
+    if pool is None or not pb.get("name"):
+        return None
+    key = _normalize_playbook_key(pb["name"], pb.get("source_trader"))
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT id FROM trade_playbooks WHERE user_id=%s AND playbook_key=%s", [user_id, key])
+            existing = cur.fetchone()
+            if existing:
+                cur.execute("UPDATE trade_playbooks SET evidence_count=evidence_count+1, updated_at=now() "
+                            "WHERE id=%s RETURNING *", [existing["id"]])
+                saved = cur.fetchone()
+                conn.commit()
+                return {"action": "matched", **_row_to_json(saved)}
+            cols = ["name", "source_trader", "source_title", "source_type", "market_type", "timeframe"] + _PLAYBOOK_JSON_COLS
+            src_map = {
+                "applicable_sectors_json": pb.get("applicable_sectors") or pb.get("applicable_sectors_json"),
+                "applicable_stocks_json": pb.get("applicable_stocks") or pb.get("applicable_stocks_json"),
+                "entry_conditions_json": pb.get("entry_conditions") or pb.get("entry_conditions_json"),
+                "confirmation_conditions_json": pb.get("confirmation_conditions") or pb.get("confirmation_conditions_json"),
+                "exit_conditions_json": pb.get("exit_conditions") or pb.get("exit_conditions_json"),
+                "stop_conditions_json": pb.get("stop_conditions") or pb.get("stop_conditions_json"),
+                "avoid_conditions_json": pb.get("avoid_conditions") or pb.get("avoid_conditions_json"),
+                "position_management_json": pb.get("position_management") or pb.get("position_management_json"),
+            }
+            values = []
+            for c in cols:
+                if c in _PLAYBOOK_JSON_COLS:
+                    values.append(json.dumps(src_map.get(c) or [], ensure_ascii=False))
+                else:
+                    values.append(pb.get(c))
+            placeholders = ", ".join(["%s::jsonb" if c in _PLAYBOOK_JSON_COLS else "%s" for c in cols])
+            cur.execute(
+                f"INSERT INTO trade_playbooks (user_id, playbook_key, {', '.join(cols)}, status, confidence, "
+                f"evidence_count, created_from) VALUES (%s,%s,{placeholders},'TESTING','LOW',1,%s) RETURNING *",
+                [user_id, key] + values + [created_from],
+            )
+            saved = cur.fetchone()
+        conn.commit()
+    return {"action": "created", **_row_to_json(saved)}
+
+
+def import_trade_playbooks(database_url, user_id, playbooks, created_from="chatgpt_import"):
+    """playbooks（dictのリスト）を1件ずつupsertする（指示書8番）。戻り値:
+    {"imported":N,"matched":M,"skipped":K}。"""
+    imported = matched = skipped = 0
+    for pb in playbooks:
+        if not isinstance(pb, dict) or not pb.get("name"):
+            skipped += 1
+            continue
+        res = upsert_trade_playbook(database_url, user_id, pb, created_from=created_from)
+        if not res:
+            skipped += 1
+        elif res["action"] == "created":
+            imported += 1
+        else:
+            matched += 1
+    return {"imported": imported, "matched": matched, "skipped": skipped}
+
+
+def list_trade_playbooks(database_url, user_id, status=None):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = ["user_id=%s"], [user_id]
+    if status:
+        where.append("status=%s")
+        params.append(status)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SELECT * FROM trade_playbooks WHERE {' AND '.join(where)} ORDER BY updated_at DESC", params)
+            return [_row_to_json(r) for r in cur.fetchall()]
+
+
+def _condition_matches(cond, signals):
+    """1つの条件（文字列 or {"key":...,"op":...,"value":...}）が、現在のsignals dict
+    （出来高倍率・VWAP位置・セクターRS等、呼び出し側が用意する軽量な数値/真偽値の集合）に
+    合致するかを判定する。文字列条件はsignalsのキーとして真偽値をそのまま見る簡易実装
+    （例："volume_surge"というキーがTrueならヒット）。厳密なDSLは作らず、既存の
+    analyze_stock()の出力キー名をそのままcondition文字列として書けるようにする設計。"""
+    if isinstance(cond, str):
+        return bool(signals.get(cond))
+    if isinstance(cond, dict):
+        key, op, val = cond.get("key"), cond.get("op", "eq"), cond.get("value")
+        cur = signals.get(key)
+        if cur is None:
+            return False
+        try:
+            if op == "gte":
+                return cur >= val
+            if op == "lte":
+                return cur <= val
+            if op == "gt":
+                return cur > val
+            if op == "lt":
+                return cur < val
+            if op == "eq":
+                return cur == val
+        except TypeError:
+            return False
+    return False
+
+
+PLAYBOOK_AVOID_PENALTY = 40  # 定数化（指示書9番：avoid_conditions発動時は大きく減点）
+
+
+def playbook_match_score(playbook, signals):
+    """対象銘柄の現在シグナル（signals、呼び出し側でVWAP位置・出来高倍率・セクターRS・
+    モメンタム・イベント距離等を用意する）と1件のplaybookを照合し、0〜100の適合度を返す
+    （指示書9番）。条件一致率をベースに、avoid_conditionsが1つでも発動していれば大きく
+    減点する。戻り値: {"score":0-100, "matched_entry":[...], "matched_avoid":[...]}。"""
+    entry_conds = playbook.get("entry_conditions_json") or []
+    confirm_conds = playbook.get("confirmation_conditions_json") or []
+    avoid_conds = playbook.get("avoid_conditions_json") or []
+    all_conds = entry_conds + confirm_conds
+    if not all_conds:
+        base_score = 50  # 条件が定義されていないplaybookは判定不能寄りの中立値
+    else:
+        matched = [c for c in all_conds if _condition_matches(c, signals)]
+        base_score = round(100 * len(matched) / len(all_conds))
+    matched_avoid = [c for c in avoid_conds if _condition_matches(c, signals)]
+    score = max(0, base_score - PLAYBOOK_AVOID_PENALTY * len(matched_avoid))
+    return {"score": score, "matchedEntryCount": len([c for c in all_conds if _condition_matches(c, signals)]),
+            "totalConditions": len(all_conds), "avoidTriggered": len(matched_avoid) > 0}
+
+
+def matched_playbooks_for(database_url, user_id, signals, code=None, sector=None, timeframe=None, limit=3):
+    """対象銘柄に適合するplaybookを照合し、スコア順で上位を返す（指示書9番）。
+    RETIREDは対象外。"""
+    playbooks = list_trade_playbooks(database_url, user_id)
+    out = []
+    for pb in playbooks:
+        if pb.get("status") == "RETIRED":
+            continue
+        stocks = pb.get("applicable_stocks_json") or []
+        sectors = pb.get("applicable_sectors_json") or []
+        if stocks and code and code not in stocks:
+            continue
+        if sectors and sector and sector not in sectors:
+            continue
+        if timeframe and pb.get("timeframe") and pb["timeframe"] != timeframe:
+            continue
+        m = playbook_match_score(pb, signals)
+        out.append({**pb, "matchScore": m["score"], "matchDetail": m})
+    out.sort(key=lambda p: -p["matchScore"])
+    return out[:limit]
+
+
+# ---- 類似相場日検索（指示書12番） ----
+
+def similar_market_days_for(database_url, user_id, current_snapshot, limit=5, exclude_date=None):
+    """daily_log.raw_payload.marketから、現在の相場スナップショット（current_snapshot:
+    {"nikkei_pct":float,"decliner_ratio":float,...}のうち利用可能なものだけでよい）に
+    近い過去日を抽出する（指示書12番）。数値項目のユークリッド距離が近い順。項目が
+    無ければ照合対象から除外する（捏造しない）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT date, raw_payload FROM daily_log WHERE user_id=%s AND raw_payload IS NOT NULL ORDER BY date DESC LIMIT 200",
+                        [user_id])
+            logs = cur.fetchall()
+    candidates = []
+    keys = list(current_snapshot.keys())
+    if not keys:
+        return []
+    for log in logs:
+        if exclude_date and str(log.get("date")) == str(exclude_date):
+            continue
+        payload = log.get("raw_payload") or {}
+        market = payload.get("market") or {}
+        snap = market.get("snapshot") or {}
+        matched_keys = [k for k in keys if k in snap and isinstance(snap.get(k), (int, float))]
+        if not matched_keys:
+            continue
+        dist = sum((snap[k] - current_snapshot[k]) ** 2 for k in matched_keys) ** 0.5
+        candidates.append({"date": log.get("date"), "distance": round(dist, 3),
+                            "matchedFields": matched_keys, "condition": market.get("condition")})
+    candidates.sort(key=lambda c: c["distance"])
+    return candidates[:limit]
+
+
+# ---- 統合ナレッジコンテキストビルダー（指示書18〜20番） ----
+
+CONTEXT_CATEGORY_PRIORITY = [  # 指示書20番の優先順位（表示・送信時のソート基準として使う）
+    "current_position", "recent_news", "upcoming_events", "relevant_rules",
+    "matched_playbooks", "expert_views", "behavioral_warnings", "similar_trades", "similar_market_days",
+]
+
+
+def build_relevant_trading_context(database_url, user_id, stock_code=None, sector=None, market=None,
+                                     position=None, analysis_type="stock", signals=None,
+                                     rule_categories=None):
+    """分析直前に呼ぶ統合コンテキストビルダー（指示書18・19番）。朝一分析・個別銘柄分析・
+    TOP5相談・ポジション相談・利確損切り相談・日次レビューから共通で使う。全ての情報源を
+    毎回総なめにするのではなく、関連度・鮮度であらかじめ絞った少量だけを返す（指示書26番
+    「古い一般論は低優先」）。signalsはplaybook照合用の軽量な数値/真偽値dict（省略可、
+    無ければmatched_playbooksは空になる）。
+    戻り値: {"recent_news":[], "upcoming_events":[], "relevant_rules":[], "expert_views":[],
+    "matched_playbooks":[], "similar_trades":[], "similar_market_days":[],
+    "behavioral_warnings":[]}"""
+    signals = signals or {}
+    rule_categories = rule_categories or ([sector] if sector else None)
+
+    recent_news = relevant_catalysts_for(database_url, user_id, code=stock_code, sector=sector, limit=5)
+    event_info = upcoming_event_signals(database_url, user_id, code=stock_code, sector=sector, position=position)
+    relevant_rules = relevant_trade_rules_for(database_url, user_id, categories=rule_categories, limit=6)
+    expert_views = relevant_expert_views_for(database_url, user_id, code=stock_code, sector=sector, market=market, limit=5)
+    matched_playbooks = matched_playbooks_for(database_url, user_id, signals, code=stock_code, sector=sector,
+                                                timeframe=(position or {}).get("trade_style"), limit=3)
+    behavioral_warnings = behavioral_warnings_from_reflections(database_url, user_id)
+    similar_trades = find_similar_trades_for(database_url, user_id, code=stock_code, sector=sector, limit=5)
+
+    return {
+        "recent_news": recent_news,
+        "upcoming_events": event_info["events"],
+        "event_signals": event_info["signals"],
+        "relevant_rules": relevant_rules,
+        "expert_views": expert_views,
+        "matched_playbooks": matched_playbooks,
+        "similar_trades": similar_trades,
+        "similar_market_days": [],  # current_snapshotが呼び出し側にしか無いため、必要な場合は個別にsimilar_market_days_forを呼ぶ
+        "behavioral_warnings": behavioral_warnings,
+    }
+
+
+# ---- 過去売買の類似検索（指示書11番） ----
+
+def find_similar_trades_for(database_url, user_id, code=None, sector=None, limit=5):
+    """過去のtrade_historyから、同銘柄または（呼び出し側がsectorを渡せる場合）類似の
+    条件に一致する直近の売買を返す（指示書11番の簡易版：同銘柄一致を主軸とし、
+    セクター単位の類似は銘柄コード前方一致等の精緻な業種マスタが無いため今回は対象外、
+    同銘柄一致のみを確実な情報として返す設計）。"""
+    if not code:
+        return []
+    history = list_trade_history(database_url, user_id, limit=200)
+    matches = [t for t in history if t.get("code") == code]
+    matches.sort(key=lambda t: t.get("closed_at") or "", reverse=True)
+    return matches[:limit]
+
+
+# ---- 総合判断の生成（指示書21〜23番） ----
+
+TRADE_JUDGMENTS = ["BUY_CANDIDATE", "WAIT", "TAKE_PROFIT", "RAISE_STOP", "REDUCE", "EXIT", "NO_OVERNIGHT"]
+
+
+def synthesize_trade_judgment(context, base_signal=None):
+    """統合コンテキスト（build_relevant_trading_context()の戻り値）から、単一材料だけに
+    頼らない総合判断・確信度・理由を生成する（指示書21〜23番）。base_signalは呼び出し側の
+    既存ロジック（enrichWatchRow由来のactionStatus等）から渡す「今のところの一次判断」
+    （例："ENTRY_READY"|"WAIT"|"RISK"）——このエンジンはそれを置き換えるのではなく、
+    知識コンテキストで補強・警告を上乗せする。情報が矛盾する場合はconfidenceを下げる
+    （指示書22番）。戻り値: {"judgment":..., "confidence":0-100, "reasons":[...],
+    "risk_flags":[...]}"""
+    reasons = []
+    risk_flags = []
+    judgment = {"ENTRY_READY": "BUY_CANDIDATE", "RISK": "WAIT", "WAIT": "WAIT"}.get(base_signal, "WAIT")
+    confidence = 60
+
+    if "EVENT_RISK_HIGH" in (context.get("event_signals") or []):
+        risk_flags.append("EVENT_RISK_HIGH")
+        reasons.append("重要イベントが目前")
+        if judgment == "BUY_CANDIDATE":
+            judgment = "WAIT"
+        confidence -= 15
+    if "NO_OVERNIGHT" in (context.get("event_signals") or []):
+        risk_flags.append("NO_OVERNIGHT")
+        reasons.append("イベント前のため持ち越し非推奨")
+        judgment = "NO_OVERNIGHT" if judgment not in ("EXIT", "TAKE_PROFIT") else judgment
+
+    neg_news = [n for n in (context.get("recent_news") or []) if n.get("sentiment") == "negative" and n.get("freshness") in ("LIVE", "CURRENT")]
+    if neg_news:
+        reasons.append(f"直近ネガティブ材料あり（{neg_news[0].get('title','')[:20]}）")
+        risk_flags.append("NEGATIVE_NEWS")
+        if judgment == "BUY_CANDIDATE":
+            judgment = "WAIT"
+        confidence -= 10
+
+    top_playbook = (context.get("matched_playbooks") or [None])[0]
+    if top_playbook:
+        if top_playbook["matchDetail"]["avoidTriggered"]:
+            reasons.append(f"プレイブック『{top_playbook['name']}』の回避条件に該当")
+            risk_flags.append("PLAYBOOK_AVOID")
+            if judgment == "BUY_CANDIDATE":
+                judgment = "WAIT"
+            confidence -= 15
+        elif top_playbook["matchScore"] >= 70:
+            reasons.append(f"プレイブック『{top_playbook['name']}』適合度{top_playbook['matchScore']}%")
+            confidence += 10
+
+    high_conf_rules = [r for r in (context.get("relevant_rules") or []) if r.get("confidence") == "HIGH" and r.get("status") == "ACTIVE"]
+    if high_conf_rules:
+        reasons.append(f"ACTIVEルール『{high_conf_rules[0]['rule_text'][:20]}…』が該当")
+        confidence += 5
+
+    for w in (context.get("behavioral_warnings") or []):
+        reasons.append(w["message"][:24] + "…")
+        risk_flags.append(w["code"])
+        if judgment == "BUY_CANDIDATE" and w["code"] == "CHASE_RISK_HIGH":
+            judgment = "WAIT"
+            confidence -= 10
+
+    weakened_experts = [e for e in (context.get("expert_views") or []) if e.get("status") == "WEAKENED"]
+    confirmed_experts = [e for e in (context.get("expert_views") or []) if e.get("status") == "CONFIRMED"]
+    if confirmed_experts:
+        reasons.append(f"{confirmed_experts[0]['expert_name']}氏の見解が支持されている")
+        confidence += 5
+    if weakened_experts:
+        confidence -= 5
+
+    # 情報が矛盾する場合（強気材料と警戒材料が両方立つ）は確信度を下げる（指示書22番）
+    if risk_flags and confidence >= 60 and judgment == "BUY_CANDIDATE":
+        confidence -= 10
+
+    confidence = max(0, min(100, confidence))
+    return {
+        "judgment": judgment, "confidence": confidence,
+        "reasons": reasons[:5],  # 指示書23番：3〜5件へ要約
+        "risk_flags": list(dict.fromkeys(risk_flags)),
+    }
+
+
+def save_analysis_context_log(database_url, user_id, code, analysis_type, judgment_result, context, analysis_date=None):
+    """指示書24番：各分析実行時にused_contextを保存する。日次レビューのknown_risk_ignored
+    検出（指示書26番）で再利用する。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    analysis_date = analysis_date or datetime.date.today().isoformat()
+    used_context = {
+        "rules": [r.get("id") for r in (context.get("relevant_rules") or [])],
+        "expert_views": [e.get("id") for e in (context.get("expert_views") or [])],
+        "events": [e.get("id") for e in (context.get("upcoming_events") or [])],
+        "news": [n.get("id") for n in (context.get("recent_news") or [])],
+        "playbooks": [p.get("id") for p in (context.get("matched_playbooks") or [])],
+        "similar_trades": [t.get("id") for t in (context.get("similar_trades") or [])],
+        "event_signals": context.get("event_signals") or [],
+    }
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "INSERT INTO analysis_context_log (user_id, code, analysis_type, analysis_date, judgment, "
+                "confidence_score, reasons_json, used_context_json) VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb) "
+                "RETURNING *",
+                [user_id, code, analysis_type, analysis_date, judgment_result.get("judgment"),
+                 judgment_result.get("confidence"), json.dumps(judgment_result.get("reasons") or [], ensure_ascii=False),
+                 json.dumps(used_context, ensure_ascii=False)])
+            saved = cur.fetchone()
+        conn.commit()
+    return _row_to_json(saved)
+
+
+def _check_known_risk_ignored(database_url, user_id, review_date, positions):
+    """指示書26番：その日のanalysis_context_logでNO_OVERNIGHT等の警告が出ていた銘柄が、
+    実際に持ち越された（保有継続）かを機械的に照合する。「結果論」ではなく「その時点で
+    警告が出ていたか」を見る（指示書27番の精神に合わせる）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT code, judgment, used_context_json FROM analysis_context_log "
+                "WHERE user_id=%s AND analysis_date=%s AND code IS NOT NULL", [user_id, review_date])
+            logs = cur.fetchall()
+    held_codes = {p["code"] for p in positions}
+    ignored_codes = set()  # 同一銘柄・同日に複数回分析していても1件にまとめる（重複表示防止）
+    ignored = []
+    for log in logs:
+        signals = (log.get("used_context_json") or {}).get("event_signals") or []
+        if log.get("judgment") == "NO_OVERNIGHT" or "NO_OVERNIGHT" in signals:
+            if log.get("code") in held_codes and log["code"] not in ignored_codes:
+                ignored_codes.add(log["code"])
+                ignored.append({"code": log["code"], "reason": "NO_OVERNIGHT警告があったにも関わらず持ち越し"})
+    return ignored
 
 
 # ---- investment_profile（投資プロフィール。2026-09-02新規） ----
