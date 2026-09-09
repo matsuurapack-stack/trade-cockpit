@@ -4959,6 +4959,51 @@ class Handler(SimpleHTTPRequestHandler):
         elif self.path.startswith("/api/rules"):
             rules = investment_db.list_rules(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"rules": rules})
+        # ---- 2026-09-09新規（ルール学習システム）：既存/api/rules（investment_rules、単純な
+        # 自由テキストルール）とは別の新テーブルtrade_rules用。既存ルートは無変更。 ----
+        elif self.path.startswith("/api/trade-rules/detail"):
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            rule_id = params.get("id", [None])[0]
+            if not rule_id or not (investment_db is not None and DATABASE_URL):
+                self._send_json({"error": "idが必要です"}); return
+            rule = investment_db.get_trade_rule(DATABASE_URL, self.current_user, int(rule_id))
+            if rule is None:
+                self._send_json({"error": "指定されたルールが見つかりません"}); return
+            self._send_json({"rule": rule})
+        elif self.path.startswith("/api/trade-rules/similar"):
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            text = params.get("text", [None])[0]
+            exclude_id = params.get("excludeId", [None])[0]
+            candidates = investment_db.find_similar_trade_rules(
+                DATABASE_URL, self.current_user, text or "",
+                exclude_id=int(exclude_id) if exclude_id else None,
+            ) if (investment_db is not None and DATABASE_URL and text) else []
+            self._send_json({"candidates": candidates})
+        elif self.path.startswith("/api/trade-rules/debug-stats"):
+            stats = investment_db.trade_rules_debug_stats(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else {}
+            self._send_json({"stats": stats})
+        elif self.path.startswith("/api/trade-rules/relevant"):
+            # 朝一分析・トレード分析・ポジション分析のChatGPT相談payload・分析カード表示用
+            # （指示書12・13番）。?categories=semiconductor,market のようにカンマ区切りで渡す。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            cats_raw = params.get("categories", [None])[0]
+            categories = [c for c in (cats_raw or "").split(",") if c] or None
+            rules = investment_db.relevant_trade_rules_for(
+                DATABASE_URL, self.current_user, categories=categories,
+            ) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"rules": rules})
+        elif self.path.startswith("/api/trade-rules"):
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            rules = investment_db.list_trade_rules(
+                DATABASE_URL, self.current_user,
+                status=params.get("status", [None])[0], confidence=params.get("confidence", [None])[0],
+                category=params.get("category", [None])[0], rule_type=params.get("ruleType", [None])[0],
+            ) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"rules": rules})
         elif self.path.startswith("/api/chatgpt-import/list"):
             imports = investment_db.list_chatgpt_imports(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"imports": imports})
@@ -5367,6 +5412,53 @@ class Handler(SimpleHTTPRequestHandler):
             body = self._read_json_body()
             investment_db.delete_rule(DATABASE_URL, self.current_user, body.get("id"))
             self._send_json({"ok": True})
+        # ---- 2026-09-09新規（ルール学習システム） ----
+        elif self.path == "/api/trade-rules/evaluate":
+            # 指示書6番：ルール1件を特定の日でSUPPORTED/FAILED/NEUTRAL/NOT_APPLICABLE評価する。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            result = investment_db.record_rule_evaluation(
+                DATABASE_URL, self.current_user, body.get("id"), body.get("evalResult"),
+                eval_date=body.get("evalDate"), note=body.get("note"), source="manual",
+            )
+            if result is None:
+                self._send_json({"error": "評価に失敗しました（idまたはevalResultを確認してください）"}); return
+            self._send_json(result)
+        elif self.path == "/api/trade-rules/update":
+            # 指示書16番：手動操作（昇格/差し戻し/REVISED/RETIRED・信頼度変更・文章修正・
+            # 例外追加・アクション修正）。指示書17番：変更履歴はrecord_rule_evaluation/
+            # update_trade_rule内部でtrade_rule_historyへ自動記録される。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            ok = investment_db.update_trade_rule(
+                DATABASE_URL, self.current_user, body.get("id"), body.get("fields") or {},
+                reason=body.get("reason"), source="manual",
+            )
+            if not ok:
+                self._send_json({"error": "更新に失敗しました（idを確認してください）"}); return
+            self._send_json({"ok": True})
+        elif self.path == "/api/trade-rules/revise":
+            # 指示書8番：既存ルールをREVISEDへ落とし、修正版ルールを新規に派生させる。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            result = investment_db.create_revised_trade_rule(
+                DATABASE_URL, self.current_user, body.get("parentId"), body.get("newRuleText"),
+                reason=body.get("reason"), category=body.get("category"), action_text=body.get("actionText"),
+            )
+            if result is None:
+                self._send_json({"error": "修正版ルールの作成に失敗しました（parentIdを確認してください）"}); return
+            self._send_json(result)
+        elif self.path == "/api/trade-rules/migrate":
+            # 指示書1・5番：過去のrule_updates・investment_rulesからの初期移行、およびA〜D
+            # ルール・既存の長期ルールの登録。rule_keyのUNIQUE制約により何度実行しても安全
+            # （新しい過去データが増えていれば追加で拾うだけの冪等処理）。
+            if not self._investment_db_ready():
+                return
+            result = investment_db.migrate_legacy_rules_to_trade_rules(DATABASE_URL, self.current_user)
+            self._send_json(result)
         # ---- ChatGPT連携（2026-09-02新規、Phase1）：有料AI APIは使わず、ChatGPTが出力した
         # 投資ログJSONを手動貼り付けで取り込む。 ----
         elif self.path == "/api/chatgpt-import/save":

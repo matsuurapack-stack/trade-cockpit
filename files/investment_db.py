@@ -554,6 +554,65 @@ ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS net_pnl NUMERIC;
 ALTER TABLE news_catalysts ADD COLUMN IF NOT EXISTS sentiment TEXT;
 """
 
+# 2026-09-09新規（ルール学習システム）：投資判断ログ系の他テーブルより後に作成する必要は
+# 無いが、既存の大きな_SCHEMA_SQL文字列を直接編集して差分を分かりにくくしないよう、
+# 独立したブロックとして追加する（_MIGRATE_CHATGPT_IMPORT_SQL等と同じ方針）。
+_SCHEMA_TRADE_RULES_SQL = """
+CREATE TABLE IF NOT EXISTS trade_rules (
+    id                 SERIAL PRIMARY KEY,
+    user_id            TEXT NOT NULL,
+    rule_key           TEXT NOT NULL,
+    title              TEXT,
+    rule_text          TEXT NOT NULL,
+    category           TEXT,
+    scope              TEXT,
+    rule_type          TEXT NOT NULL DEFAULT 'TESTING',  -- PERMANENT|TESTING|TEMPORARY
+    status             TEXT NOT NULL DEFAULT 'TESTING',  -- TESTING|ACTIVE|REVISED|RETIRED|EXPIRED
+    confidence         TEXT NOT NULL DEFAULT 'LOW',       -- LOW|MEDIUM|HIGH
+    evidence_count     INTEGER NOT NULL DEFAULT 0,
+    success_count      INTEGER NOT NULL DEFAULT 0,
+    failure_count      INTEGER NOT NULL DEFAULT 0,
+    neutral_count      INTEGER NOT NULL DEFAULT 0,
+    first_seen_date    TEXT,
+    last_seen_date     TEXT,
+    last_verified_date TEXT,
+    last_failed_date   TEXT,
+    action_text        TEXT,
+    conditions_json    JSONB,
+    exceptions_json    JSONB,
+    source_json        JSONB,
+    notes              TEXT,
+    parent_rule_id     INTEGER REFERENCES trade_rules(id) ON DELETE SET NULL,
+    revised_from       INTEGER,
+    expires_date       TEXT,
+    created_from       TEXT,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, rule_key)
+);
+CREATE INDEX IF NOT EXISTS idx_trade_rules_user_status ON trade_rules(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_trade_rules_user_category ON trade_rules(user_id, category);
+
+CREATE TABLE IF NOT EXISTS trade_rule_history (
+    id             SERIAL PRIMARY KEY,
+    user_id        TEXT NOT NULL,
+    rule_id        INTEGER NOT NULL REFERENCES trade_rules(id) ON DELETE CASCADE,
+    event_type     TEXT NOT NULL,  -- CREATED|MENTION|EVALUATION|STATUS_CHANGE|CONFIDENCE_CHANGE|TEXT_EDIT|EXPIRED
+    eval_result    TEXT,           -- SUPPORTED|FAILED|NEUTRAL|NOT_APPLICABLE（EVALUATIONのみ）
+    eval_date      TEXT,
+    old_status     TEXT,
+    new_status     TEXT,
+    old_confidence TEXT,
+    new_confidence TEXT,
+    old_text       TEXT,
+    new_text       TEXT,
+    reason         TEXT,
+    source         TEXT,  -- auto|manual|chatgpt_import|legacy_rule_update|instruction_seed 等
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_trade_rule_history_rule ON trade_rule_history(rule_id, created_at DESC);
+"""
+
 
 def init_schema(database_url):
     """テーブルを（無ければ）作成し、マルチユーザー化・ChatGPT連携の移行SQLも実行する。
@@ -566,6 +625,7 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_SQL)
         conn.execute(_MIGRATE_MULTIUSER_SQL)
         conn.execute(_MIGRATE_CHATGPT_IMPORT_SQL)
+        conn.execute(_SCHEMA_TRADE_RULES_SQL)
         conn.commit()
 
 
@@ -878,6 +938,690 @@ def delete_rule(database_url, user_id, rule_id):
         conn.commit()
 
 
+# ============================================================
+# ---- trade_rules（ルール学習システム。2026-09-09新規） ----
+# 目的：rule_updates（ChatGPT取り込みJSONの一部）を「その日限りのメモ」として単純追記する
+# だけだった従来のinvestment_rules運用を、「蓄積→照合→検証→昇格/修正/弱体化→次回分析へ反映」
+# という循環に変える。既存のinvestment_rules・save_chatgpt_import・rule_updatesスキーマ
+# （文字列配列 or {rule,status}配列）は一切変更せず、並行して動く新テーブルとして追加する
+# （指示書「既存のChatGPT取り込み、daily_log、rule_updates、分析ロジックを壊さない」に対応）。
+# ============================================================
+
+# ---- ルール文の正規化・重複判定（指示書3番） ----
+_RULE_ZEN_HAN_TABLE = str.maketrans(
+    "０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ",
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+)
+_RULE_DATE_RE1 = re.compile(r"\d{4}[-/年]\d{1,2}[-/月]\d{1,2}日?")
+_RULE_DATE_RE2 = re.compile(r"\d{1,2}[/月]\d{1,2}日?")
+_RULE_PUNCT_RE = re.compile(r"[、。・「」『』【】\[\]（）()｢｣!！?？,.:：;；\-—―~〜\"'’“”]")
+_RULE_SPACE_RE = re.compile(r"[\s　]+")
+
+
+def _normalize_rule_key(text):
+    """ルール文の重複判定用キー。記号除去・全角半角吸収・空白除去・小文字化・日付表現の除去だけの
+    軽量な正規化（形態素解析・銘柄マスタ照合等は使わない）。完全一致の重複防止が目的で、意味的な
+    近さの判定は`_rule_similarity`（類似ルール候補の提示専用、自動統合はしない）に委ねる。"""
+    if not text:
+        return ""
+    t = str(text).translate(_RULE_ZEN_HAN_TABLE).lower()
+    t = _RULE_DATE_RE1.sub("", t)
+    t = _RULE_DATE_RE2.sub("", t)
+    t = _RULE_PUNCT_RE.sub("", t)
+    t = _RULE_SPACE_RE.sub("", t)
+    return t
+
+
+def _rule_bigrams(s):
+    return set(s[i:i + 2] for i in range(len(s) - 1)) if len(s) >= 2 else ({s} if s else set())
+
+
+def _rule_similarity(key_a, key_b):
+    """文字バイグラムのJaccard係数（0〜1）による簡易類似度。形態素解析なしでの近似実装。
+    「200Aが後場に安値更新する日は半導体買いを慎重にする」と「日経半導体ETFが前場高値後に
+    後場安値を更新した日は新規半導体買いを抑える」のような表記違いの同義ルールを拾うための
+    緩い指標——自動統合はせず、あくまで「類似ルール候補」として提示するだけに使う（指示書3番）。"""
+    ba, bb = _rule_bigrams(key_a), _rule_bigrams(key_b)
+    if not ba or not bb:
+        return 0.0
+    inter = len(ba & bb)
+    union = len(ba | bb)
+    return inter / union if union else 0.0
+
+
+_RULE_SIMILARITY_THRESHOLD = 0.55  # これ以上で「類似ルール候補」として提示する下限（定数化）
+
+# ---- カテゴリ・スコープの簡易推定（キーワード方式、既存のIR_KEYWORDS等と同じ考え方） ----
+_RULE_CATEGORY_KEYWORDS = [
+    ("earnings", ["決算", "上方修正", "下方修正"]),
+    ("semiconductor", ["半導体", "200A", "SOX", "ソックス"]),
+    ("event", ["FOMC", "日銀会合", "雇用統計", "イベント", "決定会合"]),
+    ("risk", ["損切り", "ロスカット", "撤退", "ストップ"]),
+    ("exit", ["利確", "持ち越し", "手仕舞", "決済"]),
+    ("entry", ["新規エントリー", "新規買い", "買い増し"]),
+    ("position", ["ポジション", "建玉", "持ち越し"]),
+    ("momentum", ["急騰", "モメンタム", "出来高急増"]),
+    ("swing", ["スイング"]),
+    ("daytrade", ["デイトレ", "日計り", "寄り天"]),
+    ("sector", ["セクター", "業種", "ヒートマップ"]),
+    ("market", ["地合い", "日経", "TOPIX", "プライム", "値下がり銘柄比率", "指数"]),
+]
+
+
+def _guess_rule_category(text):
+    t = text or ""
+    for cat, kws in _RULE_CATEGORY_KEYWORDS:
+        if any(k in t for k in kws):
+            return cat
+    return "market"
+
+
+def _guess_rule_scope(text):
+    t = text or ""
+    if re.search(r"[0-9]{4}[A-Z]?(?:[^0-9A-Za-z]|$)", t):  # 4桁銘柄コードらしき文字列
+        return "stock"
+    if any(k in t for k in ["セクター", "業種", "半導体", "銀行", "内需", "輸出"]):
+        return "sector"
+    if any(k in t for k in ["地合い", "相場全体", "市場全体", "指数"]):
+        return "market_condition"
+    return "global"
+
+
+# ---- 昇格・弱体化の閾値（指示書7・8番。ハードコードせず定数化） ----
+RULE_PROMOTION_MIN_EVIDENCE_MEDIUM = 2
+RULE_PROMOTION_MIN_SUCCESS_MEDIUM = 2
+RULE_PROMOTION_MIN_EVIDENCE_ACTIVE = 4
+RULE_PROMOTION_MIN_SUCCESS_RATE_ACTIVE = 0.70
+RULE_PROMOTION_MIN_EVIDENCE_HIGH = 6
+RULE_PROMOTION_MIN_SUCCESS_RATE_HIGH = 0.75
+# evidence_countはChatGPT取込での「再言及」だけでも増える（sync_rule_updates_to_trade_rules・
+# upsert_trade_rule_from_text参照）ため、evidence_countだけを条件にするとほぼ未検証（評価0〜1回）
+# のルールが「何度も話題に出ただけ」でACTIVE/HIGHまで昇格してしまう抜け道になる。success_rateは
+# 実際の評価件数（total_eval=success+failure+neutral）だけから計算されるため、評価が少ないと
+# 少数の結果だけで100%になりやすい点も合わせ、実際に検証された回数の下限を別途設ける。
+RULE_PROMOTION_MIN_TOTAL_EVAL_ACTIVE = 2   # ACTIVE昇格に必要な実評価（SUPPORTED/FAILED/NEUTRAL）回数の下限
+RULE_PROMOTION_MIN_TOTAL_EVAL_HIGH = 3     # HIGH昇格に必要な実評価回数の下限
+RULE_DEMOTION_MIN_EVAL_FOR_CHECK = 3       # 失敗率を評価するのに必要な最低評価回数
+RULE_DEMOTION_FAILURE_RATE_THRESHOLD = 0.4  # これ以上の失敗率で弱体化候補にする
+
+
+def _evaluate_rule_promotion(row):
+    """ルール1件の現在値（evidence_count/success_count/failure_count/neutral_count/status/
+    confidence/rule_type）から、新しいstatus・confidenceと変更理由を返す（指示書7・8番）。
+    TEMPORARYルールおよびRETIRED/EXPIRED済みは対象外（指示書15番：一時ルールは通常の昇格対象
+    から除外）。DBへの書き込みはこの関数では行わない（呼び出し側の責務）。"""
+    if row.get("rule_type") == "TEMPORARY" or row.get("status") in ("RETIRED", "EXPIRED"):
+        return row.get("status"), row.get("confidence"), None
+    evidence = row.get("evidence_count") or 0
+    success = row.get("success_count") or 0
+    failure = row.get("failure_count") or 0
+    neutral = row.get("neutral_count") or 0
+    total_eval = success + failure + neutral
+    success_rate = (success / total_eval) if total_eval > 0 else 0.0
+    failure_rate = (failure / total_eval) if total_eval > 0 else 0.0
+    old_status, old_conf = row.get("status"), row.get("confidence")
+    new_status, new_conf, reason = old_status, old_conf, None
+
+    # 弱体化を先に判定（FAILEDが増えている場合は消さずに信頼度・ステータスを落とすだけ、指示書8番）
+    if total_eval >= RULE_DEMOTION_MIN_EVAL_FOR_CHECK and failure_rate >= RULE_DEMOTION_FAILURE_RATE_THRESHOLD:
+        if old_conf == "HIGH":
+            new_conf = "MEDIUM"
+            reason = f"失敗率{failure_rate:.0%}のためHIGH→MEDIUMへ弱体化"
+        elif old_status == "ACTIVE":
+            new_status = "REVISED"
+            reason = f"失敗率{failure_rate:.0%}のためREVISED候補へ（修正版ルールの作成を検討してください）"
+        return new_status, new_conf, reason
+
+    # 昇格判定（evidence_count・success_count/success_rateの組み合わせ、指示書7番の目安）。
+    # ACTIVE/HIGHへの昇格はtotal_eval（実評価回数）の下限も満たす必要がある（上記の抜け道対策）。
+    if (evidence >= RULE_PROMOTION_MIN_EVIDENCE_HIGH and success_rate >= RULE_PROMOTION_MIN_SUCCESS_RATE_HIGH
+            and total_eval >= RULE_PROMOTION_MIN_TOTAL_EVAL_HIGH):
+        if old_conf != "HIGH":
+            new_conf = "HIGH"
+            reason = f"evidence{evidence}件・実評価{total_eval}件・成功率{success_rate:.0%}のためHIGHへ昇格"
+        if old_status == "TESTING":
+            new_status = "ACTIVE"
+    elif (evidence >= RULE_PROMOTION_MIN_EVIDENCE_ACTIVE and success_rate >= RULE_PROMOTION_MIN_SUCCESS_RATE_ACTIVE
+            and total_eval >= RULE_PROMOTION_MIN_TOTAL_EVAL_ACTIVE):
+        if old_status == "TESTING":
+            new_status = "ACTIVE"
+            reason = f"evidence{evidence}件・実評価{total_eval}件・成功率{success_rate:.0%}のためACTIVEへ昇格"
+        if old_conf == "LOW":
+            new_conf = "MEDIUM"
+    elif evidence >= RULE_PROMOTION_MIN_EVIDENCE_MEDIUM and success >= RULE_PROMOTION_MIN_SUCCESS_MEDIUM:
+        if old_conf == "LOW":
+            new_conf = "MEDIUM"
+            reason = f"evidence{evidence}件・成功{success}件のためMEDIUMへ"
+    return new_status, new_conf, reason
+
+
+def _trade_rule_row_to_json(row):
+    d = _row_to_json(row)
+    s = d.get("success_count") or 0
+    f = d.get("failure_count") or 0
+    n = d.get("neutral_count") or 0
+    total = s + f + n
+    d["success_rate"] = round(s / total, 3) if total > 0 else None
+    d["total_evaluations"] = total
+    return d
+
+
+def upsert_trade_rule_from_text(database_url, user_id, rule_text, source_info=None, category=None,
+                                  scope=None, rule_type="TESTING", action_text=None,
+                                  initial_status="TESTING", initial_confidence="LOW",
+                                  expires_date=None, created_from="chatgpt_import", seen_date=None,
+                                  exceptions=None, extra_fields=None):
+    """ルール文1件をtrade_rulesへ照合・反映する中核関数（指示書4番）。rule_key（正規化済み
+    テキスト）の完全一致で既存ルールを検索し、見つかれば「支持された」ものとしてevidence_count
+    を加算・source_json（最大20件）に取り込み元を追記・昇格判定を再計算する。見つからなければ
+    status=TESTING・confidence=LOWの新規ルールとして作成する（既定値。呼び出し側で上書き可）。
+    戻り値: {"action":"matched"|"created", "id":..., "evidenceCount":..., "statusChanged":bool,
+    "confidenceChanged":bool, "newStatus":..., "newConfidence":...} または pool未設定時None。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    rule_text = (rule_text or "").strip()
+    if not rule_text:
+        return None
+    rule_key = _normalize_rule_key(rule_text)
+    if not rule_key:
+        return None
+    seen_date = seen_date or datetime.date.today().isoformat()
+    category = category or _guess_rule_category(rule_text)
+    scope = scope or _guess_rule_scope(rule_text)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM trade_rules WHERE user_id=%s AND rule_key=%s", [user_id, rule_key])
+            row = cur.fetchone()
+            if row:
+                sources = row.get("source_json") or []
+                if source_info:
+                    sources = (sources + [source_info])[-20:]
+                new_evidence = (row["evidence_count"] or 0) + 1
+                merged = {**row, "evidence_count": new_evidence}
+                new_status, new_conf, reason = _evaluate_rule_promotion(merged)
+                status_changed = new_status != row["status"]
+                conf_changed = new_conf != row["confidence"]
+                set_clauses = ["evidence_count=%s", "last_seen_date=%s", "source_json=%s::jsonb", "updated_at=now()"]
+                params = [new_evidence, seen_date, json.dumps(sources, ensure_ascii=False)]
+                if status_changed:
+                    set_clauses.append("status=%s"); params.append(new_status)
+                if conf_changed:
+                    set_clauses.append("confidence=%s"); params.append(new_conf)
+                params += [row["id"], user_id]
+                cur.execute(f"UPDATE trade_rules SET {', '.join(set_clauses)} WHERE id=%s AND user_id=%s", params)
+                cur.execute(
+                    "INSERT INTO trade_rule_history (user_id,rule_id,event_type,reason,source) "
+                    "VALUES (%s,%s,'MENTION',%s,%s)",
+                    [user_id, row["id"], f"再言及によりevidence_count={new_evidence}", created_from])
+                if status_changed:
+                    cur.execute(
+                        "INSERT INTO trade_rule_history (user_id,rule_id,event_type,old_status,new_status,reason,source) "
+                        "VALUES (%s,%s,'STATUS_CHANGE',%s,%s,%s,'auto')",
+                        [user_id, row["id"], row["status"], new_status, reason])
+                if conf_changed:
+                    cur.execute(
+                        "INSERT INTO trade_rule_history (user_id,rule_id,event_type,old_confidence,new_confidence,reason,source) "
+                        "VALUES (%s,%s,'CONFIDENCE_CHANGE',%s,%s,%s,'auto')",
+                        [user_id, row["id"], row["confidence"], new_conf, reason])
+                conn.commit()
+                return {"action": "matched", "id": row["id"], "evidenceCount": new_evidence,
+                        "statusChanged": status_changed, "confidenceChanged": conf_changed,
+                        "newStatus": new_status, "newConfidence": new_conf}
+            else:
+                extra = extra_fields or {}
+                sources = [source_info] if source_info else []
+                cur.execute(
+                    "INSERT INTO trade_rules (user_id, rule_key, title, rule_text, category, scope, rule_type, "
+                    "status, confidence, evidence_count, first_seen_date, last_seen_date, action_text, "
+                    "exceptions_json, source_json, created_from, parent_rule_id, revised_from, expires_date) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,1,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s) RETURNING id",
+                    [user_id, rule_key, rule_text[:80], rule_text, category, scope, rule_type,
+                     initial_status, initial_confidence, seen_date, seen_date, action_text,
+                     json.dumps(exceptions or [], ensure_ascii=False), json.dumps(sources, ensure_ascii=False),
+                     created_from, extra.get("parent_rule_id"), extra.get("revised_from"), expires_date],
+                )
+                new_id = cur.fetchone()["id"]
+                cur.execute(
+                    "INSERT INTO trade_rule_history (user_id,rule_id,event_type,new_status,new_confidence,reason,source) "
+                    "VALUES (%s,%s,'CREATED',%s,%s,%s,%s)",
+                    [user_id, new_id, initial_status, initial_confidence, f"created_from={created_from}", created_from])
+                conn.commit()
+                return {"action": "created", "id": new_id, "evidenceCount": 1,
+                        "statusChanged": False, "confidenceChanged": False,
+                        "newStatus": initial_status, "newConfidence": initial_confidence}
+
+
+def record_rule_evaluation(database_url, user_id, rule_id, eval_result, eval_date=None, note=None, source="manual"):
+    """ルール1件を特定の日で評価する（指示書6番）。eval_result: SUPPORTED/FAILED/NEUTRAL/
+    NOT_APPLICABLE。呼ぶたびに該当カウンタ（success/failure/neutral_count、NOT_APPLICABLE以外
+    はevidence_countも）を加算し、_evaluate_rule_promotionで昇格/弱体化を再計算、
+    trade_rule_historyへEVALUATIONイベントとして記録する。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    if eval_result not in ("SUPPORTED", "FAILED", "NEUTRAL", "NOT_APPLICABLE"):
+        return None
+    eval_date = eval_date or datetime.date.today().isoformat()
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM trade_rules WHERE id=%s AND user_id=%s", [rule_id, user_id])
+            row = cur.fetchone()
+            if not row:
+                return None
+            col = {"SUPPORTED": "success_count", "FAILED": "failure_count", "NEUTRAL": "neutral_count"}.get(eval_result)
+            updates = {}
+            if col:
+                updates[col] = (row[col] or 0) + 1
+            if eval_result != "NOT_APPLICABLE":
+                updates["evidence_count"] = (row["evidence_count"] or 0) + 1
+            updates["last_verified_date"] = eval_date
+            if eval_result == "FAILED":
+                updates["last_failed_date"] = eval_date
+            merged = {**row, **updates}
+            new_status, new_conf, reason = _evaluate_rule_promotion(merged)
+            set_clauses = [f"{k}=%s" for k in updates]
+            params = list(updates.values())
+            if new_status != row["status"]:
+                set_clauses.append("status=%s"); params.append(new_status)
+            if new_conf != row["confidence"]:
+                set_clauses.append("confidence=%s"); params.append(new_conf)
+            set_clauses.append("updated_at=now()")
+            params += [rule_id, user_id]
+            cur.execute(f"UPDATE trade_rules SET {', '.join(set_clauses)} WHERE id=%s AND user_id=%s", params)
+            cur.execute(
+                "INSERT INTO trade_rule_history (user_id,rule_id,event_type,eval_result,eval_date,"
+                "old_status,new_status,old_confidence,new_confidence,reason,source) "
+                "VALUES (%s,%s,'EVALUATION',%s,%s,%s,%s,%s,%s,%s,%s)",
+                [user_id, rule_id, eval_result, eval_date, row["status"], new_status,
+                 row["confidence"], new_conf, note or reason, source])
+        conn.commit()
+    return {"id": rule_id, "newStatus": new_status, "newConfidence": new_conf, "promotionReason": reason}
+
+
+def update_trade_rule(database_url, user_id, rule_id, fields, reason=None, source="manual"):
+    """手動操作（指示書16番）：status/confidence/rule_text/action_text/exceptions_json/
+    conditions_json/category/scope/rule_type/expires_date/notesのいずれかを更新し、変更前後を
+    trade_rule_historyへ記録する（指示書17番）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    allowed = ["status", "confidence", "rule_text", "title", "action_text", "exceptions_json",
+               "conditions_json", "category", "scope", "rule_type", "expires_date", "notes"]
+    fields = {k: v for k, v in fields.items() if k in allowed}
+    if not fields:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM trade_rules WHERE id=%s AND user_id=%s", [rule_id, user_id])
+            row = cur.fetchone()
+            if not row:
+                return None
+            set_clauses, params = [], []
+            for k, v in fields.items():
+                if k in ("exceptions_json", "conditions_json") and v is not None:
+                    set_clauses.append(f"{k}=%s::jsonb"); params.append(json.dumps(v, ensure_ascii=False))
+                else:
+                    set_clauses.append(f"{k}=%s"); params.append(v)
+            set_clauses.append("updated_at=now()")
+            params += [rule_id, user_id]
+            cur.execute(f"UPDATE trade_rules SET {', '.join(set_clauses)} WHERE id=%s AND user_id=%s", params)
+            if "status" in fields and fields["status"] != row["status"]:
+                cur.execute(
+                    "INSERT INTO trade_rule_history (user_id,rule_id,event_type,old_status,new_status,reason,source) "
+                    "VALUES (%s,%s,'STATUS_CHANGE',%s,%s,%s,%s)",
+                    [user_id, rule_id, row["status"], fields["status"], reason, source])
+            if "confidence" in fields and fields["confidence"] != row["confidence"]:
+                cur.execute(
+                    "INSERT INTO trade_rule_history (user_id,rule_id,event_type,old_confidence,new_confidence,reason,source) "
+                    "VALUES (%s,%s,'CONFIDENCE_CHANGE',%s,%s,%s,%s)",
+                    [user_id, rule_id, row["confidence"], fields["confidence"], reason, source])
+            if "rule_text" in fields and fields["rule_text"] != row["rule_text"]:
+                cur.execute(
+                    "INSERT INTO trade_rule_history (user_id,rule_id,event_type,old_text,new_text,reason,source) "
+                    "VALUES (%s,%s,'TEXT_EDIT',%s,%s,%s,%s)",
+                    [user_id, rule_id, row["rule_text"], fields["rule_text"], reason, source])
+        conn.commit()
+    return True
+
+
+def create_revised_trade_rule(database_url, user_id, parent_rule_id, new_rule_text, reason=None,
+                                category=None, action_text=None):
+    """既存ルールをREVISEDへ落とし、修正版を新規ルール（parent_rule_id/revised_from付き）として
+    派生させる（指示書8番）。元ルールは削除しない。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM trade_rules WHERE id=%s AND user_id=%s", [parent_rule_id, user_id])
+            parent = cur.fetchone()
+            if not parent:
+                return None
+            cur.execute("UPDATE trade_rules SET status='REVISED', updated_at=now() WHERE id=%s AND user_id=%s",
+                        [parent_rule_id, user_id])
+            cur.execute(
+                "INSERT INTO trade_rule_history (user_id,rule_id,event_type,old_status,new_status,reason,source) "
+                "VALUES (%s,%s,'STATUS_CHANGE',%s,'REVISED',%s,'manual')",
+                [user_id, parent_rule_id, parent["status"], reason])
+        conn.commit()
+    return upsert_trade_rule_from_text(
+        database_url, user_id, new_rule_text,
+        category=category or parent["category"], rule_type=parent["rule_type"],
+        action_text=action_text or parent["action_text"],
+        initial_status="TESTING", initial_confidence="LOW",
+        created_from="revised_from_" + str(parent_rule_id),
+        extra_fields={"parent_rule_id": parent_rule_id, "revised_from": parent_rule_id},
+    )
+
+
+def expire_temporary_trade_rules(database_url, user_id):
+    """TEMPORARYルールでexpires_dateを過ぎたものをEXPIREDへ自動遷移する（指示書15番）。
+    list_trade_rulesから毎回呼ばれる軽量チェック（対象0件ならクエリ1本のみ）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    today = datetime.date.today().isoformat()
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id, status FROM trade_rules WHERE user_id=%s AND rule_type='TEMPORARY' "
+                "AND status NOT IN ('EXPIRED','RETIRED') AND expires_date IS NOT NULL AND expires_date < %s",
+                [user_id, today])
+            rows = cur.fetchall()
+            for r in rows:
+                cur.execute("UPDATE trade_rules SET status='EXPIRED', updated_at=now() WHERE id=%s", [r["id"]])
+                cur.execute(
+                    "INSERT INTO trade_rule_history (user_id,rule_id,event_type,old_status,new_status,reason,source) "
+                    "VALUES (%s,%s,'EXPIRED',%s,'EXPIRED','期限切れ（expires_date超過）','auto')",
+                    [user_id, r["id"], r["status"]])
+        conn.commit()
+    return len(rows)
+
+
+def list_trade_rules(database_url, user_id, status=None, confidence=None, category=None, rule_type=None):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    expire_temporary_trade_rules(database_url, user_id)
+    where, params = ["user_id=%s"], [user_id]
+    if status: where.append("status=%s"); params.append(status)
+    if confidence: where.append("confidence=%s"); params.append(confidence)
+    if category: where.append("category=%s"); params.append(category)
+    if rule_type: where.append("rule_type=%s"); params.append(rule_type)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT * FROM trade_rules WHERE {' AND '.join(where)} ORDER BY "
+                f"CASE status WHEN 'ACTIVE' THEN 0 WHEN 'TESTING' THEN 1 WHEN 'REVISED' THEN 2 "
+                f"WHEN 'RETIRED' THEN 3 ELSE 4 END, evidence_count DESC, updated_at DESC", params)
+            return [_trade_rule_row_to_json(r) for r in cur.fetchall()]
+
+
+def get_trade_rule(database_url, user_id, rule_id):
+    """ルール1件を履歴付きで返す（指示書11番：ルール詳細画面用）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM trade_rules WHERE id=%s AND user_id=%s", [rule_id, user_id])
+            row = cur.fetchone()
+            if not row:
+                return None
+            cur.execute("SELECT * FROM trade_rule_history WHERE rule_id=%s AND user_id=%s ORDER BY created_at DESC",
+                        [rule_id, user_id])
+            history = [_row_to_json(h) for h in cur.fetchall()]
+    result = _trade_rule_row_to_json(row)
+    result["history"] = history
+    return result
+
+
+def find_similar_trade_rules(database_url, user_id, rule_text, exclude_id=None, limit=5):
+    """完全一致（rule_key）ではないが意味的に近そうなルールを提示する（指示書3番、自動統合はしない）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    key = _normalize_rule_key(rule_text)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM trade_rules WHERE user_id=%s AND status NOT IN ('RETIRED','EXPIRED')", [user_id])
+            rows = cur.fetchall()
+    scored = []
+    for r in rows:
+        if exclude_id and r["id"] == exclude_id:
+            continue
+        if r["rule_key"] == key:
+            continue
+        sim = _rule_similarity(key, r["rule_key"])
+        if sim >= _RULE_SIMILARITY_THRESHOLD:
+            scored.append((sim, r))
+    scored.sort(key=lambda x: -x[0])
+    return [{"similarity": round(s, 3), **_trade_rule_row_to_json(r)} for s, r in scored[:limit]]
+
+
+def trade_rules_debug_stats(database_url, user_id):
+    """ルールタブのデバッグ折りたたみ表示用（指示書20番）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return {}
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT status, rule_type, COUNT(*) c FROM trade_rules WHERE user_id=%s GROUP BY status, rule_type",
+                        [user_id])
+            rows = cur.fetchall()
+            cur.execute("SELECT id, rule_key FROM trade_rules WHERE user_id=%s AND status NOT IN ('RETIRED','EXPIRED')",
+                        [user_id])
+            all_rows = cur.fetchall()
+            today = datetime.date.today().isoformat()
+            cur.execute(
+                "SELECT eval_result, COUNT(*) c FROM trade_rule_history WHERE user_id=%s AND event_type='EVALUATION' "
+                "AND eval_date=%s GROUP BY eval_result", [user_id, today])
+            today_evals = cur.fetchall()
+    by_status, by_type = {}, {}
+    for r in rows:
+        by_status[r["status"]] = by_status.get(r["status"], 0) + r["c"]
+        by_type[r["rule_type"]] = by_type.get(r["rule_type"], 0) + r["c"]
+    dup_pairs = 0
+    for i in range(len(all_rows)):
+        for j in range(i + 1, len(all_rows)):
+            if _rule_similarity(all_rows[i]["rule_key"], all_rows[j]["rule_key"]) >= _RULE_SIMILARITY_THRESHOLD:
+                dup_pairs += 1
+    return {
+        "byStatus": by_status, "byType": by_type, "totalRules": sum(by_status.values()),
+        "todayEvaluations": {r["eval_result"]: r["c"] for r in today_evals},
+        "duplicateCandidatePairs": dup_pairs,
+    }
+
+
+def relevant_trade_rules_for(database_url, user_id, categories=None, limit=8):
+    """朝一分析・トレード分析・ポジション分析用（指示書12・13番）。ACTIVE＋関連度の高いTESTING
+    ルールだけを返す（全ルールを毎回送らない）。categoriesが指定されればcategory一致または
+    scope='global'のルールのみに絞る。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    expire_temporary_trade_rules(database_url, user_id)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            where = ["user_id=%s", "status IN ('ACTIVE','TESTING')", "rule_type != 'TEMPORARY'"]
+            params = [user_id]
+            if categories:
+                where.append("(category = ANY(%s) OR scope='global')")
+                params.append(list(categories))
+            cur.execute(
+                f"SELECT * FROM trade_rules WHERE {' AND '.join(where)} ORDER BY "
+                f"CASE status WHEN 'ACTIVE' THEN 0 ELSE 1 END, "
+                f"CASE confidence WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END, evidence_count DESC "
+                f"LIMIT %s", params + [limit])
+            return [_trade_rule_row_to_json(r) for r in cur.fetchall()]
+
+
+def sync_rule_updates_to_trade_rules(database_url, user_id, rule_updates, daily_log_id=None, date=None,
+                                       market_condition=None, review_excerpt=None, decision_excerpt=None):
+    """save_chatgpt_import()から呼ばれる（指示書4番）。rule_updates（文字列配列 or {rule,status}
+    配列のどちらも既存互換のまま受け付ける）の各要素をtrade_rulesへ照合・反映する。
+    戻り値: {"newRules":N,"existingSupported":N,"confidenceUp":N,"statusUp":N,"details":[...]}
+    （指示書18番「本日のルール更新」表示用の集計もこの戻り値をそのまま使う）。"""
+    if not rule_updates:
+        return {"newRules": 0, "existingSupported": 0, "confidenceUp": 0, "statusUp": 0, "details": []}
+    source_info = None
+    if daily_log_id or date or market_condition or review_excerpt or decision_excerpt:
+        source_info = {
+            "date": date, "daily_log_id": daily_log_id, "market_condition": market_condition,
+            "review_excerpt": (review_excerpt or "")[:200] or None,
+            "decision_excerpt": (decision_excerpt or "")[:200] or None,
+        }
+    summary = {"newRules": 0, "existingSupported": 0, "confidenceUp": 0, "statusUp": 0, "details": []}
+    for ru in rule_updates:
+        text = ru if isinstance(ru, str) else (ru or {}).get("rule") or (ru or {}).get("text")
+        if not text:
+            continue
+        result = upsert_trade_rule_from_text(
+            database_url, user_id, text, source_info=source_info,
+            initial_status="TESTING", initial_confidence="LOW",
+            created_from="chatgpt_import", seen_date=date,
+        )
+        if not result:
+            continue
+        if result["action"] == "created":
+            summary["newRules"] += 1
+        else:
+            summary["existingSupported"] += 1
+            if result.get("confidenceChanged"):
+                summary["confidenceUp"] += 1
+            if result.get("statusChanged"):
+                summary["statusUp"] += 1
+        summary["details"].append({"rule": text[:60], "action": result["action"], "id": result["id"]})
+    return summary
+
+
+# ---- 既存データからの初期移行（指示書1・5番） ----
+# 恒久ルール一覧のフォールバックseed。investment_rulesに同等の項目が既に無い場合のみ新規作成
+# される（rule_keyのUNIQUE制約により重複は作られない）。
+_PERMANENT_LONGTERM_RULE_SEEDS = [
+    {"text": "決算をまたぐポジションは原則回避する", "category": "earnings",
+     "action_text": "決算発表を跨ぐ保有は避ける、跨ぐ場合はポジションサイズを縮小する"},
+    {"text": "スイングは-10%で損切りする", "category": "risk",
+     "action_text": "SWING建玉の-10%絶対損切りルールを厳守する"},
+    {"text": "デイトレードは逆指値を必ず入れる", "category": "risk",
+     "action_text": "エントリー後は必ず逆指値注文を設定する"},
+    {"text": "持ち越しは原則なし、その日のうちに手仕舞う", "category": "exit",
+     "action_text": "デイトレ建玉はその日のうちに決済する"},
+]
+# 指示書5番で明示された新規ルール候補A〜C（Dは別途temporaryとして登録）。
+_INSTRUCTION_SEED_RULES_ABC = [
+    {"text": "日経・TOPIXが小幅変動でも東証プライムの値下がり銘柄比率が55%以上なら、体感地合いは弱いと評価する。",
+     "category": "market", "confidence": "MEDIUM",
+     "action_text": "新規エントリーのハードルを上げ、指数だけで強気判定しない"},
+    {"text": "200Aが前場高値後に後場安値を更新する日は、個別材料が強くても半導体の新規買いを慎重にする。",
+     "category": "semiconductor", "confidence": "MEDIUM",
+     "action_text": "半導体の新規買いを抑制し、200Aの相対強度回復を待つ"},
+    {"text": "指数寄与度の高い一部大型株だけで指数が支えられている場合、騰落数とセクターヒートマップを併用して判断する。",
+     "category": "market", "confidence": "MEDIUM", "action_text": None},
+]
+
+
+def migrate_legacy_rules_to_trade_rules(database_url, user_id):
+    """既存のdaily_log.raw_payload.rule_updates（全履歴）・investment_rules（既存の長期マイ
+    ルール）をtrade_rulesへ移行し、指示書5番のA〜Dルール・既存の長期ルール（決算跨ぎ回避等）も
+    合わせて登録する（指示書1・5番）。rule_keyのUNIQUE制約により、複数回実行しても重複登録され
+    ない（初回以降は実質no-op、新しい過去データが増えていれば追加で拾う）。既存データは一切
+    削除・上書きしない。戻り値: 移行/登録件数の内訳dict。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return {"migratedFromDailyLog": 0, "migratedFromInvestmentRules": 0, "seededExplicit": 0, "seededPermanent": 0}
+    result = {"migratedFromDailyLog": 0, "migratedFromInvestmentRules": 0, "seededExplicit": 0, "seededPermanent": 0}
+
+    # 2026-09-09修正：指示書5番のA〜D・既存の長期ルール（決算跨ぎ回避等）の明示seedを、
+    # daily_log全履歴の走査より先に実行するよう順序を変更した。upsert_trade_rule_from_text()は
+    # 「既存(rule_key一致)なら評価再計算のみ・confidenceは明示上書きしない」設計のため、
+    # 先にdaily_logスキャンでconfidence=LOW（既定値）として作られてしまうと、後から実行する
+    # 明示seedのconfidence=MEDIUM等の指定が反映されない不具合があった（実データ検証で発覚）。
+    # 明示seedを先に確定させることで、A〜D・長期ルールの初期状態が指示書通りになる。
+
+    # 1) 指示書5番のA〜C
+    for e in _INSTRUCTION_SEED_RULES_ABC:
+        res = upsert_trade_rule_from_text(
+            database_url, user_id, e["text"], category=e["category"],
+            initial_status="TESTING", initial_confidence=e["confidence"],
+            action_text=e.get("action_text"), created_from="instruction_seed",
+        )
+        if res and res["action"] == "created":
+            result["seededExplicit"] += 1
+
+    # 2) 指示書5番のD（一回限りの例外、TEMPORARY・恒久ルール一覧には残るがACTIVE昇格対象外）
+    res_d = upsert_trade_rule_from_text(
+        database_url, user_id,
+        "YE DIGITALの2026-09-09持ち越しは1日限定の例外。2026-09-10中に必ず決済し、持ち越し延長は禁止する。",
+        category="position", scope="stock", rule_type="TEMPORARY",
+        initial_status="TESTING", initial_confidence="MEDIUM",
+        action_text="2026-09-10中にYE DIGITALを手仕舞う。延長禁止。",
+        expires_date="2026-09-10", created_from="instruction_seed",
+    )
+    if res_d and res_d["action"] == "created":
+        result["seededExplicit"] += 1
+
+    # 3) 既存の長期ルール（決算跨ぎ回避等）がinvestment_rulesに存在しない場合のフォールバックseed
+    for pr in _PERMANENT_LONGTERM_RULE_SEEDS:
+        res_p = upsert_trade_rule_from_text(
+            database_url, user_id, pr["text"], category=pr["category"], rule_type="PERMANENT",
+            initial_status="ACTIVE", initial_confidence="HIGH",
+            action_text=pr["action_text"], created_from="instruction_seed_permanent",
+        )
+        if res_p and res_p["action"] == "created":
+            result["seededPermanent"] += 1
+
+    # 4) investment_rules（既存の長期マイルール。ユーザーが既に運用してきた確立済みルールとして
+    #    ACTIVE/HIGH・PERMANENTで登録する）
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM investment_rules WHERE user_id=%s", [user_id])
+            old_rules = cur.fetchall()
+    for r in old_rules:
+        text = r.get("text")
+        if not text:
+            continue
+        res = upsert_trade_rule_from_text(
+            database_url, user_id, text, rule_type="PERMANENT",
+            initial_status="ACTIVE", initial_confidence="HIGH",
+            created_from="legacy_investment_rules",
+        )
+        if res and res["action"] == "created":
+            result["migratedFromInvestmentRules"] += 1
+
+    # 5) daily_log.raw_payload.rule_updates を全履歴分走査（最後に実行。既にA〜D・長期ルールと
+    #    一致するものはevidence_countの加算のみで、confidenceは上書きされない）
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT id, date, raw_payload FROM daily_log WHERE user_id=%s AND raw_payload IS NOT NULL ORDER BY date",
+                        [user_id])
+            logs = cur.fetchall()
+    for log in logs:
+        payload = log.get("raw_payload") or {}
+        rule_updates = payload.get("rule_updates")
+        if not rule_updates:
+            continue
+        market = payload.get("market") or {}
+        for ru in rule_updates:
+            text = ru if isinstance(ru, str) else (ru or {}).get("rule") or (ru or {}).get("text")
+            if not text:
+                continue
+            r = upsert_trade_rule_from_text(
+                database_url, user_id, text,
+                source_info={"date": log.get("date"), "daily_log_id": log.get("id"),
+                              "market_condition": market.get("condition"),
+                              "review_excerpt": (payload.get("review") or "")[:200] or None,
+                              "decision_excerpt": None},
+                initial_status="TESTING", initial_confidence="LOW",
+                created_from="legacy_rule_update", seen_date=str(log.get("date")) if log.get("date") else None,
+            )
+            if r and r["action"] == "created":
+                result["migratedFromDailyLog"] += 1
+
+    return result
+
+
 # ---- investment_profile（投資プロフィール。2026-09-02新規） ----
 
 def get_profile(database_url, user_id):
@@ -1089,7 +1833,19 @@ def save_chatgpt_import(database_url, user_id, payload, force=False):
         })
         n_rules += 1
 
-    return {"dailyLogId": log_id, "importId": import_id, "judgments": n_judgments, "rulesAdded": n_rules}
+    # 2026-09-09新規（ルール学習システム）：上のinvestment_rules（旧・自由テキストの単純追記
+    # 先）への書き込みは既存動作のまま完全に維持しつつ、同じrule_updatesをtrade_rules
+    # （検証→信頼度更新→実戦利用のライフサイクルを持つ新テーブル）へも同期する。
+    # 既存機能を壊さないための「並行稼働」方針（指示書「既存を壊さない」に対応）。
+    rule_sync = sync_rule_updates_to_trade_rules(
+        database_url, user_id, payload.get("rule_updates") or [],
+        daily_log_id=log_id, date=payload.get("date"),
+        market_condition=market.get("condition"),
+        review_excerpt=payload.get("review"),
+    )
+
+    return {"dailyLogId": log_id, "importId": import_id, "judgments": n_judgments, "rulesAdded": n_rules,
+            "ruleSync": rule_sync}
 
 
 # ---- ChatGPT日次JSON（2026-09-05新規、PHASE 6 DAILY CHATGPT JSON IMPORT） ----

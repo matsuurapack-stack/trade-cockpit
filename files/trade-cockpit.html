@@ -236,10 +236,13 @@ function calcTradeTax(grossPnl){
 // することで、何が返ってきても呼び出し元は必ず{error:"..."}かパース済みオブジェクトのどちらか
 // を受け取れるようにする（例外を投げない）。/api/position-live・/api/position-intraday-chart
 // から使用。
-async function fetchJsonSafe(url){
+// 2026-09-09更新（ルール学習システム）：POST呼び出し（/api/trade-rules/*）でも同じ
+// 空body/非JSON応答の安全処理を再利用できるよう、任意の第2引数optionsをfetchへそのまま
+// 渡せるようにした（省略時は従来通りGET、既存の全呼び出し元は無変更で動く）。
+async function fetchJsonSafe(url,options){
   let res;
   try{
-    res=await fetch(url);
+    res=await fetch(url,options);
   }catch(e){
     return {error:`通信に失敗しました: ${e.message}`};
   }
@@ -1684,7 +1687,10 @@ const TAB_GROUPS=[
   {key:"news",label:"ニュース",tabs:[{key:"news",label:"ニュース"}]},
   // 2026-09-08新規（UI全体の説明文整理・タブ順変更）：ユーザー指定により「記録」を必ず
   // 一番右端に配置する。tabキー・グループ構成自体は無変更、配列の並び順のみ変更。
-  {key:"record",label:"記録",tabs:[{key:"journal",label:"記録"},{key:"investlog",label:"投資判断ログ"},{key:"chatgptimport",label:"ChatGPT取込"},{key:"stats",label:"統計"}]},
+  // 2026-09-09新規（ルール学習システム）：既存4サブタブに「ルール」を追加。tabキーは
+  // "traderules"（既存の"rules"に近い名前だが、旧/api/rules・investment_rulesとは別物である
+  // ことを明確にするため衝突しない専用キーにした）。
+  {key:"record",label:"記録",tabs:[{key:"journal",label:"記録"},{key:"investlog",label:"投資判断ログ"},{key:"chatgptimport",label:"ChatGPT取込"},{key:"stats",label:"統計"},{key:"traderules",label:"ルール"}]},
 ];
 
 // v3-6（2026-09-04・Primary/Action 2軸化）：Primary Status＝銘柄そのものの強さ・状態。
@@ -2964,6 +2970,43 @@ function EntryConditionsChecklist({a,enr}){
     </div>
     <div style={{fontSize:11.5,fontWeight:700,color:"var(--inkSoft)",marginTop:6}}>
       {met} / {known.length} 条件成立{known.length<items.length?`（判定不能${items.length-known.length}件を除く）`:""}
+    </div>
+  </div>;
+}
+
+// 2026-09-09新規（ルール学習システム、指示書12・13番）：分析カードへ「適用ルール」を表示する
+// ための、銘柄→関連カテゴリの簡易推定（サーバー側_guess_rule_categoryと同じ考え方の軽量版）。
+// 新規のサーバー計算は追加せず、既存で分かっているsector/themeだけから推定する。
+function guessRuleCategoriesForStock(sector,theme){
+  const t=`${theme||""} ${sector||""}`;
+  const cats=["market","risk","exit","entry","position"]; // どの銘柄にも関連しうる基本カテゴリ
+  if(/半導体|SOX|ソックス/.test(t))cats.push("semiconductor");
+  if(/銀行|金融/.test(t))cats.push("bank");
+  if(sector)cats.push("sector");
+  return cats;
+}
+// 分析カード内に「適用ルール」を表示する共通コンポーネント（指示書13番）。ACTIVE＋関連度の
+// 高いTESTINGルールだけを/api/trade-rules/relevantから取得（全ルールは送らない）。
+function AppliedRulesPanel({sector,theme}){
+  const [rules,setRules]=useState(null);
+  useEffect(()=>{
+    let alive=true;
+    const cats=guessRuleCategoriesForStock(sector,theme);
+    fetchJsonSafe(`/api/trade-rules/relevant?categories=${encodeURIComponent(cats.join(","))}`)
+      .then(d=>{if(alive)setRules((d&&d.rules)||[]);});
+    return ()=>{alive=false;};
+  },[sector,theme]);
+  if(!rules||rules.length===0)return null;
+  return <div style={{border:"1px solid var(--rule)",borderRadius:4,padding:"8px 10px",marginBottom:8,background:"var(--card)"}}>
+    <div style={{fontSize:11.5,fontWeight:700,color:"var(--inkSoft)",marginBottom:6}}>適用ルール {rules.length}件</div>
+    <div style={{display:"flex",flexDirection:"column",gap:4}}>
+      {rules.map(r=>{
+        const cm=TRADE_RULE_CONFIDENCE_META[r.confidence]||{icon:"",color:"var(--ink)"};
+        return <div key={r.id} style={{fontSize:11.5,display:"flex",gap:6,alignItems:"flex-start"}}>
+          <span style={{flexShrink:0}}>{cm.icon} {r.confidence}</span>
+          <span>{r.rule_text}{r.action_text&&<span style={{color:"var(--inkSoft)"}}> → {r.action_text}</span>}</span>
+        </div>;
+      })}
     </div>
   </div>;
 }
@@ -4785,6 +4828,11 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
     const hardStopPrice=calcHardStop(it.average_price,it.trade_style);
     const hsState=hardStopState(pnlPct);
     const a=analysisData?.[it.code];
+    // 2026-09-09新規（ルール学習システム、指示書12番）：exit/position/riskカテゴリと、
+    // この銘柄のsector/themeから推定したカテゴリのACTIVE/TESTINGルールを添える。
+    const cats=[...new Set([...guessRuleCategoriesForStock(it.sector,it.theme),"position","exit"])];
+    const activeRulesForPosition=await fetchJsonSafe(`/api/trade-rules/relevant?categories=${encodeURIComponent(cats.join(","))}`)
+      .then(d=>(d&&d.rules)||[]).catch(()=>[]);
     await copyChatGPTPayload("利確・損切り相談","position_management",{
       stock:{code:it.code,name:it.name,market:it.market},
       position:{
@@ -4801,6 +4849,7 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
         entry_theoretical:a.entry,initial_stop_theoretical:a.stop,
         target_1_theoretical:a.target,target_2_theoretical:a.fullExitTarget??null,
       }:null,
+      active_rules:activeRulesForPosition.map(r=>({rule:r.rule_text,confidence:r.confidence,action:r.action_text||null})),
       question:"今のSLを上げるべきか、TP1で利確すべきか、トレンド継続ならどこまで伸ばすべきか相談したいです。",
     },setPositionConsultMsg);
   };
@@ -5718,6 +5767,13 @@ function ChatGptImportPanel({journal,activeRules}){
           if(catD&&!catD.error)extraMsgs.push(`カタリスト：新規${catD.imported||0}件`);
         }catch(e){}
       }
+      // 2026-09-09新規（ルール学習システム、指示書18番）：「本日のルール更新」を保存結果に
+      // 追加表示する。d.ruleSyncはsave_chatgpt_import()側でsync_rule_updates_to_trade_rules()
+      // の戻り値がそのまま入っている（新規に集計し直さない）。
+      if(d.ruleSync&&((d.ruleSync.newRules||0)+(d.ruleSync.existingSupported||0))>0){
+        const rs=d.ruleSync;
+        extraMsgs.push(`本日のルール更新：新規${rs.newRules}件・既存ルール支持${rs.existingSupported}件・信頼度上昇${rs.confidenceUp}件・ステータス変化${rs.statusUp}件（詳細は「記録」→「ルール」タブで確認できます）`);
+      }
       setSaveMsg(`保存しました（daily_log ID ${d.dailyLogId}・銘柄評価 ${d.judgments}件・追加ルール ${d.rulesAdded}件）`
         +(extraMsgs.length?`\n${extraMsgs.join("\n")}`:""));
       setRawText("");setParsed(null);setParseErrors([]);setConversionInfo(null);setParseWarnings([]);setExtraNote("");loadImports();
@@ -6326,6 +6382,310 @@ function StatsPanel(){
   </div>;
 }
 
+// ============================================================
+// 2026-09-09新規（ルール学習システム）：「記録」グループの新規サブタブ「ルール」。
+// 既存のinvestment_rules（/api/rules、単純な自由テキストのマイルール一覧）とは別の新テーブル
+// trade_rulesを表示する。「蓄積→照合→検証→昇格/修正/弱体化→次回分析へ反映」の循環そのものを
+// 操作できる画面（指示書10・11・16〜18・20番）。
+// ============================================================
+const TRADE_RULE_STATUS_META={
+  ACTIVE:{label:"ACTIVE",color:"var(--up)"},
+  TESTING:{label:"TESTING",color:"var(--accent)"},
+  REVISED:{label:"REVISED",color:"var(--inkSoft)"},
+  RETIRED:{label:"RETIRED",color:"var(--inkFaint)"},
+  EXPIRED:{label:"EXPIRED",color:"var(--inkFaint)"},
+};
+const TRADE_RULE_CONFIDENCE_META={
+  HIGH:{icon:"🟢",label:"HIGH",color:"var(--up)"},
+  MEDIUM:{icon:"🟡",label:"MEDIUM",color:"var(--accent)"},
+  LOW:{icon:"⚪",label:"LOW",color:"var(--inkFaint)"},
+};
+const TRADE_RULE_EVAL_OPTIONS=[
+  {value:"SUPPORTED",label:"✅ SUPPORTED（支持された）"},
+  {value:"FAILED",label:"❌ FAILED（逆効果だった）"},
+  {value:"NEUTRAL",label:"➖ NEUTRAL（判定不能）"},
+  {value:"NOT_APPLICABLE",label:"— NOT_APPLICABLE（条件不発生）"},
+];
+const TRADE_RULE_STATUS_OPTIONS=["TESTING","ACTIVE","REVISED","RETIRED"];
+const TRADE_RULE_CONFIDENCE_OPTIONS=["LOW","MEDIUM","HIGH"];
+
+// ルール1件の詳細（履歴・手動操作）。TradeRulesPanel内から行クリックで開く。
+function TradeRuleDetail({ruleId,onChanged,onClose}){
+  const [rule,setRule]=useState(null);
+  const [loading,setLoading]=useState(true);
+  const [evalDate,setEvalDate]=useState(todayISO());
+  const [evalNote,setEvalNote]=useState("");
+  const [busy,setBusy]=useState(false);
+  const [editText,setEditText]=useState("");
+  const [editAction,setEditAction]=useState("");
+  const [editExceptions,setEditExceptions]=useState("");
+  const [reviseText,setReviseText]=useState("");
+  const [msg,setMsg]=useState("");
+
+  const load=async()=>{
+    setLoading(true);
+    const d=await fetchJsonSafe(`/api/trade-rules/detail?id=${ruleId}`);
+    if(d&&d.rule){
+      setRule(d.rule);
+      setEditText(d.rule.rule_text||"");
+      setEditAction(d.rule.action_text||"");
+      setEditExceptions((d.rule.exceptions_json||[]).join("\n"));
+    }
+    setLoading(false);
+  };
+  useEffect(()=>{load();},[ruleId]);
+
+  const doEvaluate=async(evalResult)=>{
+    setBusy(true);setMsg("");
+    const d=await fetchJsonSafe("/api/trade-rules/evaluate",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({id:ruleId,evalResult,evalDate,note:evalNote||null})});
+    setBusy(false);
+    if(d&&d.newStatus){
+      setMsg(`記録しました（${d.newStatus}/${d.newConfidence}${d.promotionReason?"："+d.promotionReason:""}）`);
+      setEvalNote("");
+      load();onChanged&&onChanged();
+    }else setMsg("記録に失敗しました");
+  };
+  const doUpdate=async(fields,reason)=>{
+    setBusy(true);setMsg("");
+    const d=await fetchJsonSafe("/api/trade-rules/update",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({id:ruleId,fields,reason})});
+    setBusy(false);
+    if(d&&d.ok){setMsg("更新しました");load();onChanged&&onChanged();}
+    else setMsg("更新に失敗しました");
+  };
+  const doRevise=async()=>{
+    if(!reviseText.trim())return;
+    setBusy(true);setMsg("");
+    const d=await fetchJsonSafe("/api/trade-rules/revise",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({parentId:ruleId,newRuleText:reviseText.trim(),reason:"手動修正"})});
+    setBusy(false);
+    if(d&&d.id){setMsg("修正版ルールを作成しました（このルールはREVISEDになりました）");setReviseText("");load();onChanged&&onChanged();}
+    else setMsg("修正版の作成に失敗しました");
+  };
+
+  if(loading)return <div style={{padding:16,fontSize:12,color:"var(--inkSoft)"}}>読み込み中…</div>;
+  if(!rule)return <div style={{padding:16,fontSize:12,color:"var(--inkSoft)"}}>ルールが見つかりませんでした。</div>;
+  const sm=TRADE_RULE_STATUS_META[rule.status]||{label:rule.status,color:"var(--ink)"};
+  const cm=TRADE_RULE_CONFIDENCE_META[rule.confidence]||{icon:"",label:rule.confidence,color:"var(--ink)"};
+
+  return <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.4)",zIndex:60,display:"flex",
+      alignItems:"center",justifyContent:"center",padding:12}} onClick={onClose}>
+    <div style={{background:"var(--card)",borderRadius:8,padding:16,maxWidth:640,width:"100%",
+        maxHeight:"88vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+        <div style={{fontSize:14,fontWeight:800,lineHeight:1.5}}>{rule.rule_text}</div>
+        <button className="iconbtn" onClick={onClose}>×</button>
+      </div>
+      <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:8}}>
+        <span className="chip" style={{color:sm.color,fontWeight:700}}>{sm.label}</span>
+        <span className="chip" style={{color:cm.color,fontWeight:700}}>{cm.icon} {cm.label}</span>
+        <span className="chip">{rule.category||"—"}</span>
+        <span className="chip">{rule.scope||"—"}</span>
+        <span className="chip">{rule.rule_type}</span>
+        {rule.expires_date && <span className="chip">期限 {rule.expires_date}</span>}
+      </div>
+      <div style={{fontSize:12,color:"var(--inkSoft)",marginTop:8,display:"grid",gridTemplateColumns:"1fr 1fr",gap:4}}>
+        <div>検証回数：{rule.total_evaluations}件（支持{rule.success_count}・失敗{rule.failure_count}・判定不能{rule.neutral_count}）</div>
+        <div>成功率：{rule.success_rate!=null?(rule.success_rate*100).toFixed(0)+"%":"—"}</div>
+        <div>evidence_count：{rule.evidence_count}</div>
+        <div>初回確認：{rule.first_seen_date||"—"} ／ 最終検証：{rule.last_verified_date||"—"}</div>
+      </div>
+      {rule.action_text && <div style={{fontSize:12.5,marginTop:8,background:"var(--band)",borderRadius:4,padding:"6px 8px"}}>
+        <b>アクション：</b>{rule.action_text}</div>}
+      {(rule.exceptions_json||[]).length>0 && <div style={{fontSize:12,marginTop:6,color:"var(--inkSoft)"}}>
+        <b>例外条件：</b>{(rule.exceptions_json||[]).join("・")}</div>}
+
+      <div style={{marginTop:12,paddingTop:10,borderTop:"1px solid var(--rule)"}}>
+        <div style={{fontWeight:700,fontSize:12.5,marginBottom:6}}>この日の相場でルールを評価する</div>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+          <input type="date" value={evalDate} onChange={e=>setEvalDate(e.target.value)} style={{fontSize:12,padding:"3px 5px"}}/>
+          <input placeholder="メモ（任意）" value={evalNote} onChange={e=>setEvalNote(e.target.value)}
+            style={{fontSize:12,padding:"3px 6px",flex:1,minWidth:120}}/>
+        </div>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:6}}>
+          {TRADE_RULE_EVAL_OPTIONS.map(o=><button key={o.value} className="action-btn" disabled={busy}
+            onClick={()=>doEvaluate(o.value)}>{o.label}</button>)}
+        </div>
+      </div>
+
+      <div style={{marginTop:12,paddingTop:10,borderTop:"1px solid var(--rule)"}}>
+        <div style={{fontWeight:700,fontSize:12.5,marginBottom:6}}>手動操作</div>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+          {TRADE_RULE_STATUS_OPTIONS.filter(s=>s!==rule.status).map(s=>
+            <button key={s} className="action-btn" disabled={busy}
+              onClick={()=>doUpdate({status:s},`手動でstatusを${rule.status}→${s}へ変更`)}>{s}へ</button>)}
+          {TRADE_RULE_CONFIDENCE_OPTIONS.filter(c=>c!==rule.confidence).map(c=>
+            <button key={c} className="action-btn" disabled={busy}
+              onClick={()=>doUpdate({confidence:c},`手動でconfidenceを${rule.confidence}→${c}へ変更`)}>信頼度{c}へ</button>)}
+        </div>
+        <div style={{marginTop:8}}>
+          <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>ルール文の修正</div>
+          <textarea value={editText} onChange={e=>setEditText(e.target.value)} rows={2}
+            style={{width:"100%",fontSize:12,padding:6,boxSizing:"border-box"}}/>
+          <div style={{fontSize:11.5,color:"var(--inkSoft)",marginTop:4}}>アクション</div>
+          <input value={editAction} onChange={e=>setEditAction(e.target.value)}
+            style={{width:"100%",fontSize:12,padding:6,boxSizing:"border-box"}}/>
+          <div style={{fontSize:11.5,color:"var(--inkSoft)",marginTop:4}}>例外条件（1行1件）</div>
+          <textarea value={editExceptions} onChange={e=>setEditExceptions(e.target.value)} rows={2}
+            style={{width:"100%",fontSize:12,padding:6,boxSizing:"border-box"}}/>
+          <button className="action-btn" style={{marginTop:6}} disabled={busy} onClick={()=>doUpdate({
+            rule_text:editText.trim(), action_text:editAction.trim()||null,
+            exceptions_json:editExceptions.split("\n").map(s=>s.trim()).filter(Boolean),
+          },"手動編集")}>保存</button>
+        </div>
+        <div style={{marginTop:10}}>
+          <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>修正版ルールとして派生（元ルールはREVISEDになります）</div>
+          <textarea value={reviseText} onChange={e=>setReviseText(e.target.value)} rows={2}
+            placeholder="修正後のルール文を入力" style={{width:"100%",fontSize:12,padding:6,boxSizing:"border-box",marginTop:4}}/>
+          <button className="action-btn" style={{marginTop:6}} disabled={busy||!reviseText.trim()} onClick={doRevise}>REVISEDとして派生</button>
+        </div>
+        {msg && <div style={{fontSize:11.5,color:"var(--accent)",marginTop:6}}>{msg}</div>}
+      </div>
+
+      <div style={{marginTop:12,paddingTop:10,borderTop:"1px solid var(--rule)"}}>
+        <div style={{fontWeight:700,fontSize:12.5,marginBottom:6}}>履歴</div>
+        <div style={{display:"flex",flexDirection:"column",gap:4,maxHeight:220,overflowY:"auto"}}>
+          {(rule.history||[]).map(h=><div key={h.id} style={{fontSize:11.5,color:"var(--inkSoft)",
+              borderBottom:"1px solid var(--ruleSoft)",paddingBottom:3}}>
+            <span className="mono">{(h.created_at||"").slice(0,16).replace("T"," ")}</span>
+            {h.event_type==="EVALUATION"&&`評価：${h.eval_result}${h.eval_date?`（${h.eval_date}時点）`:""}`}
+            {h.event_type==="MENTION"&&"再言及"}
+            {h.event_type==="STATUS_CHANGE"&&`ステータス変更：${h.old_status}→${h.new_status}`}
+            {h.event_type==="CONFIDENCE_CHANGE"&&`信頼度変更：${h.old_confidence}→${h.new_confidence}`}
+            {h.event_type==="TEXT_EDIT"&&"文章修正"}
+            {h.event_type==="CREATED"&&"新規作成"}
+            {h.event_type==="EXPIRED"&&"期限切れ"}
+            {h.reason&&`（${h.reason}）`}
+          </div>)}
+        </div>
+      </div>
+    </div>
+  </div>;
+}
+
+function TradeRulesPanel(){
+  const [rules,setRules]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [statusFilter,setStatusFilter]=useState(null);
+  const [confidenceFilter,setConfidenceFilter]=useState(null);
+  const [categoryFilter,setCategoryFilter]=useState("");
+  const [openRuleId,setOpenRuleId]=useState(null);
+  const [debugOpen,setDebugOpen]=useState(false);
+  const [debugStats,setDebugStats]=useState(null);
+  const [migrating,setMigrating]=useState(false);
+  const [migrateMsg,setMigrateMsg]=useState("");
+
+  const load=async()=>{
+    setLoading(true);
+    const params=new URLSearchParams();
+    if(statusFilter)params.set("status",statusFilter);
+    if(confidenceFilter)params.set("confidence",confidenceFilter);
+    if(categoryFilter)params.set("category",categoryFilter);
+    const d=await fetchJsonSafe(`/api/trade-rules?${params.toString()}`);
+    setRules((d&&d.rules)||[]);
+    setLoading(false);
+  };
+  useEffect(()=>{load();},[statusFilter,confidenceFilter,categoryFilter]);
+
+  const loadDebug=async()=>{
+    const d=await fetchJsonSafe("/api/trade-rules/debug-stats");
+    setDebugStats((d&&d.stats)||null);
+  };
+  useEffect(()=>{if(debugOpen)loadDebug();},[debugOpen]);
+
+  const runMigrate=async()=>{
+    setMigrating(true);setMigrateMsg("");
+    const d=await fetchJsonSafe("/api/trade-rules/migrate",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+    setMigrating(false);
+    if(d)setMigrateMsg(`過去ログから${d.migratedFromDailyLog}件・既存マイルールから${d.migratedFromInvestmentRules}件を移行、指示書指定ルール${d.seededExplicit}件・恒久ルール${d.seededPermanent}件を登録しました（既存と重複するものは増えません）`);
+    else setMigrateMsg("移行に失敗しました");
+    load();
+  };
+
+  const categories=[...new Set(rules.map(r=>r.category).filter(Boolean))];
+
+  return <div style={{marginTop:18}}>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+      <div className="sec-head">ルール（学習システム）</div>
+      <div style={{display:"flex",gap:6}}>
+        <button className="action-btn" onClick={load} disabled={loading}>{loading?"更新中…":"更新"}</button>
+        <button className="action-btn" onClick={runMigrate} disabled={migrating}
+          title="過去のrule_updates・既存マイルールから初期登録します。何度実行しても重複登録はされません">
+          {migrating?"移行中…":"過去データから移行"}</button>
+      </div>
+    </div>
+    <div className="sec-note">ChatGPT取込のrule_updatesを蓄積・照合し、支持された回数に応じて信頼度・ステータスを自動更新します。朝一分析・トレード分析には現在ACTIVEなルールだけが自動で参照されます。</div>
+    {migrateMsg && <div style={{fontSize:11.5,color:"var(--accent)",marginTop:6}}>{migrateMsg}</div>}
+
+    <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:10}}>
+      {["ACTIVE","TESTING","REVISED","RETIRED","EXPIRED"].map(s=>
+        <button key={s} className={"chip"+(statusFilter===s?" on":"")} style={{cursor:"pointer"}}
+          onClick={()=>setStatusFilter(v=>v===s?null:s)}>{s}</button>)}
+      <span style={{width:1,background:"var(--rule)"}}/>
+      {["HIGH","MEDIUM","LOW"].map(c=>
+        <button key={c} className={"chip"+(confidenceFilter===c?" on":"")} style={{cursor:"pointer"}}
+          onClick={()=>setConfidenceFilter(v=>v===c?null:c)}>{TRADE_RULE_CONFIDENCE_META[c].icon} {c}</button>)}
+      {categories.length>0 && <select value={categoryFilter} onChange={e=>setCategoryFilter(e.target.value)}
+          style={{fontSize:11.5,padding:"2px 4px"}}>
+        <option value="">カテゴリ：すべて</option>
+        {categories.map(c=><option key={c} value={c}>{c}</option>)}
+      </select>}
+    </div>
+
+    {loading
+      ? <div style={{fontSize:12,color:"var(--inkFaint)",marginTop:10}}>読み込み中…</div>
+      : rules.length===0
+        ? <div style={{padding:20,textAlign:"center",color:"var(--inkSoft)",fontSize:12.5,border:"1px solid var(--rule)",borderRadius:4,marginTop:10}}>
+            該当するルールがありません。「過去データから移行」を押すと、これまでのrule_updates・既存マイルールから初期登録できます。
+          </div>
+        : <div style={{marginTop:10,display:"flex",flexDirection:"column",gap:6}}>
+            {rules.map(r=>{
+              const sm=TRADE_RULE_STATUS_META[r.status]||{label:r.status,color:"var(--ink)"};
+              const cm=TRADE_RULE_CONFIDENCE_META[r.confidence]||{icon:"",label:r.confidence,color:"var(--ink)"};
+              return <div key={r.id} onClick={()=>setOpenRuleId(r.id)}
+                style={{border:"1px solid var(--rule)",borderLeft:`3px solid ${sm.color}`,borderRadius:4,
+                  padding:"8px 10px",cursor:"pointer",background:"var(--card)"}}>
+                <div style={{display:"flex",justifyContent:"space-between",gap:8,alignItems:"flex-start"}}>
+                  <div style={{fontSize:13,fontWeight:700,flex:1}}>{r.rule_text}</div>
+                  <div style={{display:"flex",gap:4,flexShrink:0}}>
+                    <span className="chip" style={{color:sm.color,fontWeight:700,fontSize:10.5}}>{sm.label}</span>
+                    <span className="chip" style={{color:cm.color,fontWeight:700,fontSize:10.5}}>{cm.icon}{cm.label}</span>
+                  </div>
+                </div>
+                <div style={{fontSize:11,color:"var(--inkSoft)",marginTop:4,display:"flex",flexWrap:"wrap",gap:8}}>
+                  <span>{r.category||"—"}</span>
+                  <span>検証{r.total_evaluations}件（支持{r.success_count}/失敗{r.failure_count}）</span>
+                  <span>成功率{r.success_rate!=null?(r.success_rate*100).toFixed(0)+"%":"—"}</span>
+                  <span>初回{r.first_seen_date||"—"}／最終{r.last_verified_date||"—"}</span>
+                  {r.rule_type==="TEMPORARY"&&<span style={{color:"var(--down)"}}>期限{r.expires_date||"—"}</span>}
+                </div>
+                {r.action_text && <div style={{fontSize:11.5,color:"var(--ink)",marginTop:3}}>→ {r.action_text}</div>}
+              </div>;
+            })}
+          </div>}
+
+    <div style={{marginTop:16,borderTop:"1px solid var(--rule)",paddingTop:8}}>
+      <button className="iconbtn" onClick={()=>setDebugOpen(v=>!v)} style={{fontSize:11.5}}>
+        {debugOpen?"▾":"▸"} デバッグ表示
+      </button>
+      {debugOpen && (debugStats
+        ? <div style={{fontSize:11.5,color:"var(--inkSoft)",marginTop:6,display:"flex",flexWrap:"wrap",gap:10}}>
+            <span>総ルール数 {debugStats.totalRules}</span>
+            {Object.entries(debugStats.byStatus||{}).map(([k,v])=><span key={k}>{k} {v}</span>)}
+            <span style={{width:1,background:"var(--rule)"}}/>
+            {Object.entries(debugStats.byType||{}).map(([k,v])=><span key={k}>{k} {v}</span>)}
+            <span style={{width:1,background:"var(--rule)"}}/>
+            <span>本日の評価：{Object.entries(debugStats.todayEvaluations||{}).map(([k,v])=>`${k} ${v}`).join("・")||"なし"}</span>
+            <span>重複候補ペア {debugStats.duplicateCandidatePairs}</span>
+          </div>
+        : <div style={{fontSize:11.5,color:"var(--inkFaint)",marginTop:6}}>読み込み中…</div>)}
+    </div>
+
+    {openRuleId && <TradeRuleDetail ruleId={openRuleId} onChanged={load} onClose={()=>setOpenRuleId(null)}/>}
+  </div>;
+}
+
 // テーマ・セクター強弱の可視化：SectorWatchlist内のsectorGroups集計（平均騰落率・合計売買代金）と
 // 同じ考え方を、JP+US統合した銘柄リストに対して汎用的に適用する。keyFnがnull/""を返す銘柄は
 // 対象外にする（テーマ未設定銘柄をテーマ別ランキングから除外するため）。
@@ -6378,6 +6738,10 @@ function MarketEnvironmentBanner({metrics,watchlistAll,stockQuotes,top5}){
   // 監視銘柄タブと同一ロジック）をJSONにまとめてコピーする。新規のサーバー計算・追加リクエストなし。
   const [morningMsg,setMorningMsg]=useState("");
   const copyMorningAnalysis=async()=>{
+    // 2026-09-09新規（ルール学習システム、指示書12番）：朝一分析はmarket全体を見る画面のため、
+    // market/semiconductor/sectorカテゴリのACTIVE/TESTINGルールを添える（全ルールは送らない）。
+    const activeRulesForMorning=await fetchJsonSafe("/api/trade-rules/relevant?categories=market,semiconductor,sector,event")
+      .then(d=>(d&&d.rules)||[]).catch(()=>[]);
     await copyChatGPTPayload("朝一分析","morning_market",{
       sentiment,
       indices:Object.fromEntries(ENV_ROWS.map(([label,key,dp])=>{
@@ -6394,6 +6758,7 @@ function MarketEnvironmentBanner({metrics,watchlistAll,stockQuotes,top5}){
         pct_change:w.pct,rs_score:w.rsScore,status:w.status,
         grade:lightweightGrade(w),action:lightweightAction(w),reason:lightweightReason(w),
       })),
+      active_rules:activeRulesForMorning.map(r=>({rule:r.rule_text,confidence:r.confidence,action:r.action_text||null})),
     },setMorningMsg);
   };
 
@@ -7629,6 +7994,12 @@ function App(){
     // 相談内容も画面表示と食い違わないようにする（指示書1番の共通化を相談用コピーにも適用）。
     const strategy=classifyEntryStrategy(a,analysisEnrichedMap.get(w.code));
     const rr=(a.entry!=null&&a.stop!=null&&a.target!=null&&(a.entry-a.stop)>0)?(a.target-a.entry)/(a.entry-a.stop):null;
+    // 2026-09-09新規（ルール学習システム、指示書12番）：ACTIVE＋関連度の高いTESTINGルールを
+    // ChatGPT相談payloadにも添える。全ルールは送らず、この銘柄のsector/themeから推定した
+    // カテゴリに関連するものだけ（画面の「適用ルール」表示と同じ抽出条件）。
+    const cats=guessRuleCategoriesForStock(w.sector,w.theme);
+    const activeRulesForConsult=await fetchJsonSafe(`/api/trade-rules/relevant?categories=${encodeURIComponent(cats.join(","))}`)
+      .then(d=>(d&&d.rules)||[]).catch(()=>[]);
     await copyChatGPTPayload("詳細分析を相談","trade_analysis",{
       stock:{code:w.code,name:w.name,market:w.market,sector:w.sector||null},
       price:{current:a.current,note:"currentは現在値（実勢価格）。levels.entry_theoreticalはテクニカルから算出した押し目エントリー価格帯の理論値で、現在値と同じとは限らない。"},
@@ -7642,6 +8013,7 @@ function App(){
       margin:{ratio:a.tradeRules?.marginRatio??null,badge:a.tradeRules?.marginBadge??null},
       market_environment:a.marketEnv||null,
       recent_catalysts:recentCatalystsForConsult(w.code,w.sector),
+      active_rules:activeRulesForConsult.map(r=>({rule:r.rule_text,confidence:r.confidence,action:r.action_text||null})),
       comment:[a.entryReason,a.stopReason,a.targetReason].filter(Boolean),
     },setAnalysisConsultMsg);
   };
@@ -8305,6 +8677,10 @@ function App(){
                           {/* 総合評価・Action Status・Market Risk・RS（対市場・対セクター）は
                               既存AssessmentCardが既に1枚でまとめて表示している（新規計算なし）。 */}
                           {a.assessment && enr && <AssessmentCard assessment={a.assessment} marginBadge={a.tradeRules?.marginBadge} marginRatio={a.tradeRules?.marginRatio} enr={enr} sectorRank={sectorRankMap.get(w.sector)}/>}
+                          {/* 2026-09-09新規（ルール学習システム、指示書13番）：「なぜこの分析結果になったか」を
+                              確認できるよう、関連するACTIVE/TESTINGルールを表示する。既存の売買判定
+                              ロジックへは一切混ぜない（指示書14番：補助表示のみ）。 */}
+                          <AppliedRulesPanel sector={w.sector} theme={w.theme}/>
                           {/* 重要な理由3件以内：StatusReasonPanel側で表示件数を3件にキャップ済み（既存の
                               riskReasons/waitReasons自体は無変更、表示だけ絞る）。 */}
                           {enr && <StatusReasonPanel enr={enr} a={a}/>}
@@ -8700,6 +9076,9 @@ function App(){
 
       {/* ===== 統計ダッシュボード（2026-09-02新規） ===== */}
       {tab==="stats" && <StatsPanel/>}
+
+      {/* ===== ルール（学習システム、2026-09-09新規） ===== */}
+      {tab==="traderules" && <TradeRulesPanel/>}
 
       {/* ===== NEWS（9章・9-1章・9-2章） ===== */}
       {tab==="news" && (()=>{
