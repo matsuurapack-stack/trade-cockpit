@@ -342,6 +342,9 @@ const addDaysISO = (days) => { const d = new Date(); d.setDate(d.getDate()+days)
 const ANALYSIS_STALE_MINUTES = 15; // 銘柄分析結果：この分数を超えたら陳腐化とみなし自動再取得を試みる
 const QUOTE_STALE_MINUTES = 10; // 現在値：日次モニターが30秒おきに自動更新しているため、これより古ければ何らかの理由で更新が止まっている
 const MARKET_STALE_MINUTES = 15; // 市場指標（日経・ドル円等の分析開始時サマリー表示用）
+// 2026-09-09更新（ユーザー要望）：ニュース自動更新間隔。旧60分→20分。表示文言・setIntervalの
+// 両方がこの定数を参照するため、値を変える際はここ1箇所だけでよい（マジックナンバー化しない）。
+const NEWS_AUTO_REFRESH_MINUTES = 20;
 const isStaleFetchedAt = (iso, staleMinutes) => {
   if (!iso) return true;
   const t = new Date(iso).getTime();
@@ -901,7 +904,7 @@ const classifyNewsCategory=(title)=>{
 };
 
 function NewsList({items,showName,emptyText,priorityOf}){
-  if(!items||!items.length) return <div className="news-empty">{emptyText||"まだ取得していません。自動更新（起動直後・1時間おき）をお待ちください。"}</div>;
+  if(!items||!items.length) return <div className="news-empty">{emptyText||`まだ取得していません。自動更新（起動直後・${NEWS_AUTO_REFRESH_MINUTES}分おき）をお待ちください。`}</div>;
   return <div className="news-list">
     {items.map((it,i)=>{
       const meta=[showName?it.name:null,it.source,it.published].filter(Boolean).join(" ・ ");
@@ -922,14 +925,10 @@ function NewsList({items,showName,emptyText,priorityOf}){
       const srcLabel=NEWS_SOURCE_LABELS[srcRank];
       const showSrcBadge=srcRank!==3; // 3=その他国内はノイズになるため表示しない
       const isIrContent=(category==="IR"||category==="EARNINGS")&&srcRank!==0;
-      // v3 Phase4（設計案48番）：「不要」フィードバック。AI不使用、ログ化するだけ（将来のキーワード
-      // 辞書見直し用）。<a>タグ内のボタンのためクリック伝播でページ遷移しないようstopPropagation。
-      const sendFeedback=(e)=>{
-        e.preventDefault();e.stopPropagation();
-        fetch("/api/news-feedback/save",{method:"POST",headers:{"Content-Type":"application/json"},
-          body:JSON.stringify({title:it.title,source:it.source,matched_stock_code:it.code||null,category})}).catch(()=>{});
-        e.currentTarget.textContent="✓";
-      };
+      // 2026-09-09削除（ユーザー要望）：「不要」フィードバックボタンはユーザーに意味が伝わらず
+      // 表示価値がないため一覧UIから削除した（v3 Phase4・設計案48番で追加したもの）。
+      // バックエンドの/api/news-feedback/save・ログテーブル自体は変更していない（このUIの
+      // 削除に伴い現状呼び出し元は無くなったが、他機能への影響を避けるためサーバー側は無変更）。
       return <Tag key={i} className={"news-item"+(important?" important":"")} {...linkProps}>
         {important&&<span className="news-alert-badge">⚠ 重要</span>}
         {prio<5&&<span className="chip" style={{fontSize:10,marginRight:4}}>{NEWS_PRIORITY_LABELS[prio]}</span>}
@@ -944,7 +943,6 @@ function NewsList({items,showName,emptyText,priorityOf}){
           {meta&&<span className="news-meta">{meta}</span>}
         </span>
         <SourceThumb source={it.source}/>
-        <button className="iconbtn" title="このニュースは不要（フィードバックとして記録します）" style={{fontSize:11,marginLeft:4}} onClick={sendFeedback}>不要</button>
       </Tag>;
     })}
   </div>;
@@ -6557,8 +6555,15 @@ function App(){
   const sRef=useRef(s);
   useEffect(()=>{sRef.current=s;},[s]);
 
-  // ニュース（登録銘柄IR＋国内/海外市況）を取得する。1時間おきの自動更新から呼ばれる。
+  // ニュース（登録銘柄IR＋国内/海外市況）を取得する。NEWS_AUTO_REFRESH_MINUTESおきの
+  // 自動更新から呼ばれる。2026-09-09追記：更新間隔を60分→20分に短縮した際、前回の取得が
+  // 終わる前に次回が重なるリスクが増すため、fetchMonitorAndJPのmonitorFetchingRefと同じ
+  // パターンで同時実行防止ガードを追加した（重複ニュースの増加やAPIへの連続アクセスを防ぐ）。
+  const newsFetchingRef=useRef(false);
   const fetchNewsOnly=async()=>{
+    if(newsFetchingRef.current)return;
+    newsFetchingRef.current=true;
+    setNewsFetching(true);
     const cur=sRef.current;
     try{
       const nr=await fetch("/api/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(cur.watchlist)});
@@ -6581,6 +6586,8 @@ function App(){
           usDisclosureNewsList:Array.isArray(ndu.disclosureNews)?ndu.disclosureNews:p.usDisclosureNewsList}));}
     }catch(e){}
     setNewsMsg(nowHHMM()+" 自動更新");
+    setNewsFetching(false);
+    newsFetchingRef.current=false;
   };
   const [newsFetching,setNewsFetching]=useState(false);
   const [newsMsg,setNewsMsg]=useState("");
@@ -6769,7 +6776,7 @@ function App(){
 
   useEffect(()=>{
     fetchNewsOnly();
-    const id=setInterval(fetchNewsOnly,60*60*1000);
+    const id=setInterval(fetchNewsOnly,NEWS_AUTO_REFRESH_MINUTES*60*1000);
     return ()=>clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
@@ -8510,7 +8517,7 @@ function App(){
         return <div style={{marginTop:18}}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
             <div className="sec-head">ニュース</div>
-            <span style={{fontSize:11,color:"var(--inkSoft)"}}>{newsFetching?"更新中…":newsMsg?newsMsg+"（1時間おき自動更新）":"1時間おきに自動更新"}</span>
+            <span style={{fontSize:11,color:"var(--inkSoft)"}}>{newsFetching?"更新中…":newsMsg?newsMsg+`（${NEWS_AUTO_REFRESH_MINUTES}分おき自動更新）`:`${NEWS_AUTO_REFRESH_MINUTES}分おきに自動更新`}</span>
           </div>
           <div className="subtabs">
             {NEWS_SUBTABS.map(t=><button key={t.key} className={"chip"+(newsSubTab===t.key?" on":"")} onClick={()=>{setNewsSubTab(t.key);setNewsShowCount(NEWS_PAGE_SIZE);}}>{t.label}</button>)}
