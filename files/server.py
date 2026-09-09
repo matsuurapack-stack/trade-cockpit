@@ -1547,13 +1547,18 @@ SECTOR_PROXY_METRICS = {"nikkei_semi": "200A.T"}
 # の配列だけを前提に使っており、そちらを変更するとentry_pattern等の既存判断が壊れるリスクが
 # あるため、Open値・時刻（LightweightChartsが必要とするUNIXタイムスタンプ秒）が必要な
 # チャート用途向けに別関数として新設した（既存呼び出し元・既存ロジックへの影響ゼロ）。
-def _fetch_intraday_bars(symbol, interval="5m"):
-    """当日の5分足OHLCVをローソク足チャート用の形式（古い順のリスト、要素は
+# 2026-09-09更新（監視銘柄/市場チャートの時間足切替）：periodを省略時"1d"固定だったのを、
+# 呼び出し側が明示的に指定できるよう拡張した（省略時は従来通り"1d"＝ポジション画面の
+# 既存「当日の5分足」動作を完全に維持）。共通チャートモーダル側は、時間足ごとに
+# 「初期表示範囲＋スクロール用の余裕」を確保できるperiodを明示的に渡す
+# （例：5分足→"5d"で直近数営業日分を取得しておき、表示は当日〜直近2営業日にズームする）。
+def _fetch_intraday_bars(symbol, interval="5m", period=None):
+    """指定期間・時間足のOHLCVをローソク足チャート用の形式（古い順のリスト、要素は
     {time, open, high, low, close, volume}、timeはUNIX秒）で返す。市場時間外・取得失敗時は
-    空リストを返す（推測値・補完値は作らない）。"""
+    空リストを返す（推測値・補完値は作らない）。periodを省略すると"1d"（当日のみ、既存動作）。"""
     try:
         tk = yf.Ticker(symbol)
-        h = tk.history(period="1d", interval=interval)
+        h = tk.history(period=period or "1d", interval=interval)
         if h is None or h.empty:
             return []
         h = h.dropna(subset=["Open", "High", "Low", "Close"])
@@ -1569,7 +1574,7 @@ def _fetch_intraday_bars(symbol, interval="5m"):
             })
         return bars
     except Exception as e:
-        print("  5分足チャート取得失敗", symbol, e)
+        print("  短期足チャート取得失敗", symbol, interval, period, e)
         return []
 
 
@@ -3691,12 +3696,21 @@ def get_position_live_detail(code, market="JP"):
 # 2026-09-07新規（ポジション→リアルタイム売却判断画面 Phase2）：ポジション詳細エリアの
 # 5分足チャート専用API。get_position_live_detailとは別関数にし、価格・出来高判定（Phase1）と
 # チャート取得（Phase2）を分離したまま呼び出せるようにする（フロント側も個別にpollingできる）。
-def get_position_intraday_chart(code, market="JP", interval="5m"):
+# 2026-09-09更新（監視銘柄/市場チャートの時間足切替）：periodを追加。省略時は従来通り
+# "1d"（ポジション画面の既存呼び出しは無変更のまま動く）。監視銘柄/日本市場一覧等の共通
+# チャートモーダルは、この同じAPI・同じ関数をperiod指定付きで再利用する（新しい取得経路を
+# 作らない、指示書「共通チャート取得関数を利用」対応）。
+INTRADAY_CHART_ALLOWED_PERIODS = {"1d", "5d", "1mo", "3mo"}
+
+
+def get_position_intraday_chart(code, market="JP", interval="5m", period=None):
     symbol = _yf_symbol({"code": code, "market": market})
-    bars = _fetch_intraday_bars(symbol, interval)
+    if period is not None and period not in INTRADAY_CHART_ALLOWED_PERIODS:
+        period = None  # 未知のperiodは無視して既定値(1d)にフォールバック（不正値を素通ししない）
+    bars = _fetch_intraday_bars(symbol, interval, period)
     if not bars:
         return {"bars": [], "interval": interval,
-                "error": "当日の5分足データを取得できませんでした（市場時間外、または対象外銘柄の可能性があります）"}
+                "error": "指定期間の短期足データを取得できませんでした（市場時間外、または対象外銘柄の可能性があります）"}
     return {"bars": bars, "interval": interval}
 
 
@@ -5167,16 +5181,26 @@ class Handler(SimpleHTTPRequestHandler):
             # 当日5分足チャート。/api/position-liveとは別経路・別ポーリング間隔にする
             # （チャートはyfinance側のレート制限がより厳しいため、価格ティッカーより低頻度で
             # フロント側がポーリングする設計）。
+            # 2026-09-09更新（監視銘柄/市場チャートの時間足切替）：periodを追加受付。省略時は
+            # 従来通り"1d"（ポジション画面の呼び出しは変更していないため挙動は完全に不変）。
+            # 監視銘柄・日本市場一覧等の共通チャートモーダルも、名称は"position-intraday-chart"
+            # のままだがcode/market/interval/periodだけのポジション非依存API（実データはget_
+            # position_intraday_chart内でも銘柄コード・市場からシンボル解決するだけ）のため、
+            # 新しいエンドポイントを増やさずそのまま再利用する（指示書「共通チャート取得関数を
+            # 利用」対応）。intervalは既知の値のみ許可する。
             qs = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(qs)
             code = (params.get("code", [""])[0] or "").strip()
             market = params.get("market", ["JP"])[0] or "JP"
             interval = params.get("interval", ["5m"])[0] or "5m"
+            if interval not in ("1m", "5m", "15m", "60m"):
+                interval = "5m"
+            period = params.get("period", [None])[0] or None
             if not code:
                 self._send_json({"error": "codeは必須です"})
             else:
                 try:
-                    self._send_json(get_position_intraday_chart(code, market, interval))
+                    self._send_json(get_position_intraday_chart(code, market, interval, period))
                 except Exception as e:
                     print("  /api/position-intraday-chart 想定外のエラー", code, e)
                     self._send_json({"error": f"サーバー内部エラー: {e}", "bars": []})

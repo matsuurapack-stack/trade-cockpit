@@ -264,18 +264,97 @@ async function fetchJsonSafe(url){
 // localStorageキーでの保存・復元。「日次モニターで以前銘柄分析タブで使った日足が残ってしまう」
 // ことを避けるため、用途ごとにキーを分ける（monitorChartInterval／stockChartInterval）。
 const CHART_INTERVALS=[["1","1分"],["3","3分"],["5","5分"],["15","15分"],["30","30分"],["60","1時間"],["D","日足"]];
+// 2026-09-09新規（監視銘柄・市場チャートの時間足切替）：日本個別株の自前描画チャート
+// （TradingView無料埋め込み不可のため立花証券/yfinanceで自前描画している側）が選べる時間足。
+// TradingView側（CHART_INTERVALS、米国株・指数の埋め込み用）は3分・30分にも対応しているが、
+// JP側は指示書が明示した1分/5分/15分/60分/日足の5つに絞る（yfinanceで安定して取得できる
+// 標準interval、既存のstockChartInterval状態・localStorageキーはそのまま共用する）。
+const JP_CHART_INTERVALS=[["1","1分"],["5","5分"],["15","15分"],["60","1時間"],["D","日足"]];
+// JP側interval値("1"/"5"/"15"/"60")→yfinanceのinterval文字列("1m"等)。
+const JP_CHART_INTERVAL_TO_YF={"1":"1m","5":"5m","15":"15m","60":"60m"};
+// 時間足ごとの取得period（指示書5番：初期表示範囲の目安に十分な余裕を持たせて取得し、
+// 表示側でsetVisibleRangeにより初期ズームだけを絞る。取得自体を絞りすぎるとスクロール
+// バックで見える範囲が狭くなるため、初期表示範囲より少し広めに取得する）。
+// 1分足は当日のみ（Yahoo Financeの1分足提供期間がそもそも短いため・指示書も「当日」指定）。
+const JP_CHART_INTERVAL_TO_PERIOD={"1":null,"5":"5d","15":"1mo","60":"3mo"};
 function loadChartInterval(key,fallback){
   try{const v=localStorage.getItem(key);return v||fallback;}catch(e){return fallback;}
 }
-function IntervalSwitcher({value,onChange}){
+function IntervalSwitcher({value,onChange,options}){
+  const opts=options||CHART_INTERVALS;
   return <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
-    {CHART_INTERVALS.map(([v,label])=>
+    {opts.map(([v,label])=>
       <button key={v} onClick={()=>onChange(v)}
         style={{fontSize:11,padding:"3px 8px",borderRadius:3,cursor:"pointer",
           border:`1px solid ${value===v?"var(--accent)":"var(--rule)"}`,
           background:value===v?"var(--accent)":"var(--card)",
           color:value===v?"#fff":"var(--inkSoft)",fontWeight:value===v?700:400}}>{label}</button>)}
   </div>;
+}
+// 2026-09-09新規：短期足チャート専用の軽量キャッシュ（指示書10番）。同一銘柄・同一時間足を
+// 短時間で何度も開く操作（チャートモーダルの開閉、時間足の行き来）でAPIを叩きすぎないよう
+// メモリ上に保持する。ページを閉じれば消える（永続化しない＝リアルタイム性を損なわない）。
+// TTLは時間足が短いほど短く（値動きの鮮度が重要）、長いほど長くする。
+const _chartBarsCache=new Map(); // key: "code|market|interval" -> {at, promise|data}
+const CHART_CACHE_TTL_MS={"1":30000,"5":45000,"15":90000,"60":180000};
+async function fetchChartBarsCached(code,market,interval,period){
+  const key=`${code}|${market}|${interval}`;
+  const ttl=CHART_CACHE_TTL_MS[interval]||60000;
+  const hit=_chartBarsCache.get(key);
+  if(hit&&(Date.now()-hit.at)<ttl)return hit.data;
+  const params=new URLSearchParams({code,market,interval:JP_CHART_INTERVAL_TO_YF[interval]||"5m"});
+  if(period)params.set("period",period);
+  const d=await fetchJsonSafe(`/api/position-intraday-chart?${params.toString()}`);
+  _chartBarsCache.set(key,{at:Date.now(),data:d});
+  return d;
+}
+// 以下、短期足チャート専用のヘルパー（VWAP・前日高値安値・当日始値・初期表示範囲）。
+// いずれも取得済みのbars配列だけから計算する軽量処理で、新しいAPI呼び出しは発生しない。
+// 日付の区切りはJST基準（サーバーのタイムスタンプはUNIX秒＝UTC基準のため、JSTへ変換してから
+// 日付キーを作る。日本市場のみが対象のため、このJST変換で十分）。
+function jstDateKey(unixSec){
+  const jst=new Date(unixSec*1000+9*3600*1000);
+  return `${jst.getUTCFullYear()}-${String(jst.getUTCMonth()+1).padStart(2,"0")}-${String(jst.getUTCDate()).padStart(2,"0")}`;
+}
+// セッション（取引日）ごとにリセットするVWAP（出来高加重平均価格）のライン系列を作る
+// （指示書7番：1分・5分・15分足に表示）。複数日分のbarsが混在していても、日付が変わった
+// 時点で累積を0からやり直す＝各日の寄り付きからの本来のVWAPになる。
+function computeSessionVwapSeries(bars){
+  let dayKey=null,cumPV=0,cumVol=0;
+  return bars.map(b=>{
+    const k=jstDateKey(b.time);
+    if(k!==dayKey){dayKey=k;cumPV=0;cumVol=0;}
+    cumPV+=b.close*(b.volume||0);cumVol+=(b.volume||0);
+    return {time:b.time,value:cumVol>0?cumPV/cumVol:b.close};
+  });
+}
+// 直近の取引日より前の、最も新しい取引日（＝前営業日）のhigh/lowを求める（指示書8番）。
+// barsが当日分しか無い場合（1分足＝period未指定）はnullを返す（捏造しない）。
+function computePrevDayLevels(bars){
+  if(!bars||!bars.length)return null;
+  const lastKey=jstDateKey(bars[bars.length-1].time);
+  const priorBars=bars.filter(b=>jstDateKey(b.time)!==lastKey);
+  if(!priorBars.length)return null;
+  const prevKey=jstDateKey(priorBars[priorBars.length-1].time);
+  const prevDayBars=priorBars.filter(b=>jstDateKey(b.time)===prevKey);
+  return {high:Math.max(...prevDayBars.map(b=>b.high)),low:Math.min(...prevDayBars.map(b=>b.low))};
+}
+// 当日（＝barsの最終日）の始値（指示書8番）。
+function computeTodayOpen(bars){
+  if(!bars||!bars.length)return null;
+  const lastKey=jstDateKey(bars[bars.length-1].time);
+  const todayBars=bars.filter(b=>jstDateKey(b.time)===lastKey);
+  return todayBars.length?todayBars[0].open:null;
+}
+// 初期表示範囲（指示書5番）：直近nDays営業日分だけを画面にズームする。取得自体は
+// より広いperiodで行っているため、ユーザーは左へスクロールすればそれ以前も見られる。
+function computeVisibleRangeByDays(bars,nDays){
+  if(!bars||!bars.length)return null;
+  const keys=[...new Set(bars.map(b=>jstDateKey(b.time)))];
+  const wantedKeys=new Set(keys.slice(-nDays));
+  const windowBars=bars.filter(b=>wantedKeys.has(jstDateKey(b.time)));
+  if(!windowBars.length)return null;
+  return {from:windowBars[0].time,to:windowBars[windowBars.length-1].time};
 }
 const copyText = async (text) => {
   try { await navigator.clipboard.writeText(text); return true; }
@@ -3256,6 +3335,11 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                 {grade && <span style={{fontSize:11,fontWeight:800,color:GRADE_COLOR[grade],border:`1px solid ${GRADE_COLOR[grade]}`,borderRadius:3,padding:"1px 6px"}}>{grade}</span>}
                 {actionMeta && <span style={{fontSize:10.5,fontWeight:700,color:actionMeta.color,border:`1px solid ${actionMeta.color}`,borderRadius:3,padding:"1px 6px",whiteSpace:"nowrap"}}>{actionMeta.label}</span>}
                 <div style={{flex:"1 1 140px",minWidth:0,fontSize:11,color:"var(--inkSoft)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{lightweightReason(w)}</div>
+                {/* 2026-09-09新規（監視銘柄・市場チャートの時間足切替、対象画面「TOP5」対応）：
+                    既存のonOpenChart（監視銘柄一覧の「⋮」チャートボタンと同じ、共通ChartModalを開くだけ）
+                    をそのまま再利用。行クリック（トレード分析へ）と競合しないようstopPropagation。 */}
+                <button className="iconbtn" style={{fontSize:11}} title="チャートを開く"
+                  onClick={e=>{e.stopPropagation();onOpenChart(w);}}>📈</button>
               </div>;
             })}
           </div>}
@@ -4463,7 +4547,7 @@ function PositionLiveDetail({item,onOpenExit,posFlags,posIndicators,enrStatus}){
   </div>;
 }
 
-function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEvents,newsCatalysts,expertViews,candidatesJP,candidatesUS,onAddToWatchlist}){
+function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEvents,newsCatalysts,expertViews,candidatesJP,candidatesUS,onAddToWatchlist,onOpenChart}){
   const [items,setItems]=useState([]);
   const [loading,setLoading]=useState(true);
   // v3-8（ポジション管理ロジック再設計 Step1）：取引タイプ（DAY/SWING）を新規登録時に必須化。
@@ -4991,6 +5075,9 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
                       更新・全株売却時の自動削除はサーバー側（add_position_exit）が行う。 */}
                   <button className="action-btn" style={{fontSize:11}} onClick={()=>openExit(it)}>💰 売却</button>
                   <button className="action-btn" style={{fontSize:11}} onClick={()=>setEntryModalFor({code:it.code,name:it.name,market:it.market})}>➕ 買い増し</button>
+                  {/* 2026-09-09新規（監視銘柄・市場チャートの時間足切替、対象画面「ポジション画面」対応）：
+                      他画面と全く同じ共通ChartModalをここからも開けるようにした。 */}
+                  {onOpenChart && <button className="action-btn" style={{fontSize:11}} onClick={()=>onOpenChart(it)}>📈 チャート</button>}
                 </div>
                 {enr && <div style={{fontSize:10,color:"var(--inkFaint)",marginTop:4}}>
                   （参考・新規エントリー判断用の指標であり保有判断には使用していません：銘柄分析 {PRIMARY_STATUS_META[enr.status]?.label||enr.status}
@@ -6591,7 +6678,8 @@ function App(){
   const [jpHistoryMsg,setJpHistoryMsg]=useState(""); // 立花証券API日足チャートの読み込み状態
   const fileRef=useRef();
   const modalChartRef=useRef();
-  const jpChartRef=useRef(); // 立花証券APIの日足データで描くJP個別株チャート（TradingView埋め込み不可の代替）
+  const jpChartRef=useRef(); // 立花証券APIの日足データ／短期足データで描くJP個別株チャート（TradingView埋め込み不可の代替）
+  const chartFetchGenRef=useRef(0); // 2026-09-09新規：時間足を素早く切り替えた時に古いfetchの結果で上書きしないための世代カウンタ（指示書9番「多重fetch防止」）
   const metricRefs=useRef({});
   const [monitorFetching,setMonitorFetching]=useState(false);
   const [monitorMsg,setMonitorMsg]=useState("");
@@ -7705,47 +7793,108 @@ function App(){
     sc.innerHTML=JSON.stringify({symbol:chartModal.symbol,interval:stockChartInterval,timezone:"Asia/Tokyo",theme:"light",style:"1",locale:"ja",studies,width:"100%",height:480,allow_symbol_change:false});
     c.appendChild(sc);},[chartModal,cBB,cRSI,cMA,stockChartInterval]);
 
-  // 5-2章：JP個別株（TradingView無料埋め込み不可）は立花証券APIの日足データで自前描画する。
+  // 5-2章：JP個別株（TradingView無料埋め込み不可）は立花証券API／yfinanceのデータで自前描画する。
+  // 2026-09-09更新（監視銘柄・市場チャートの時間足切替）：stockChartIntervalが"D"（日足）なら
+  // 従来通り/api/stock-history（立花証券API・分割調整済み・上場来）をそのまま使用（指示書12番
+  // 「日足機能は削除しない」）。1/5/15/60分足が選ばれた場合のみ、新設の共通短期足取得
+  // （fetchChartBarsCached→/api/position-intraday-chart、ポジション画面と同じAPI・同じ
+  // サーバー関数を再利用）に切り替える。依存配列にstockChartIntervalを含めることで、
+  // モーダルを閉じずに時間足ボタンを押すだけで再取得・再描画される（指示書9番）。
   useEffect(()=>{
     if(!chartModal||embeddable(chartModal.symbol)||chartModal.market!=="JP"||!chartModal.code)return;
     if(typeof LightweightCharts==="undefined"){setJpHistoryMsg("チャート描画ライブラリの読み込みに失敗しました。通信環境をご確認ください。");return;}
+    const myGen=++chartFetchGenRef.current; // 指示書9番：多重fetch防止（古い世代の結果は無視する）
     let cancelled=false;
     setJpHistoryMsg("読み込み中…");
-    fetch("/api/stock-history?code="+encodeURIComponent(chartModal.code))
-      .then(r=>r.json())
-      .then(d=>{
-        if(cancelled)return;
-        const hist=d.history||[];
-        const el=jpChartRef.current;
-        if(!el)return;
-        el.innerHTML="";
-        if(hist.length===0){setJpHistoryMsg("立花証券APIからチャートデータを取得できませんでした（未接続、または銘柄が対象外の可能性があります）。下のボタンからTradingView本体でご確認ください。");return;}
-        setJpHistoryMsg("");
-        const chart=LightweightCharts.createChart(el,{width:el.clientWidth||680,height:440,
-          layout:{background:{color:"transparent"},textColor:"#565A52"},
-          grid:{vertLines:{color:"#D6D8CF"},horzLines:{color:"#D6D8CF"}},
-          timeScale:{borderColor:"#C6C8BF"},rightPriceScale:{borderColor:"#C6C8BF"}});
-        const series=chart.addCandlestickSeries({upColor:"#AE3A34",downColor:"#2C6A48",borderVisible:false,
-          wickUpColor:"#AE3A34",wickDownColor:"#2C6A48"}); // 日本の相場慣習に合わせ赤=上昇・緑=下落
-        series.setData(hist.map(r=>({time:r.date,open:r.open,high:r.high,low:r.low,close:r.close})));
-        chart.timeScale().fitContent();
-        // モーダル表示直後はレイアウト確定前でclientWidthが0のことがあるため、
-        // ResizeObserverで実測幅が変わるたびに追従させる（ウィンドウリサイズも含めて一本化）。
-        const ro=new ResizeObserver(entries=>{
-          const w=entries[0]?.contentRect?.width;
-          if(w)chart.applyOptions({width:Math.floor(w)});
-        });
-        ro.observe(el);
-        // モーダルのレイアウトが1フレーム遅れて確定する環境向けの保険（ResizeObserverだけでは
-        // 追従しないケースがあったため、初期化直後に実測幅で明示的にも合わせておく）。
-        requestAnimationFrame(()=>{if(el.clientWidth)chart.applyOptions({width:el.clientWidth});});
-        el._cleanup=()=>{ro.disconnect();chart.remove();};
-      })
-      .catch(()=>{if(!cancelled)setJpHistoryMsg("取得に失敗しました。start.batのサーバーが起動しているかご確認ください。");});
-    return()=>{cancelled=true;if(jpChartRef.current&&jpChartRef.current._cleanup)jpChartRef.current._cleanup();};
-  },[chartModal]);
+    const isDaily=stockChartInterval==="D";
 
-  const openTV=(tv)=>{if(tv)window.open("https://jp.tradingview.com/chart/?symbol="+encodeURIComponent(tv),"_blank");};
+    const renderChart=({candles,volumes,vwapLine,priceLines,visibleRange})=>{
+      if(cancelled||myGen!==chartFetchGenRef.current)return;
+      const el=jpChartRef.current;
+      if(!el)return;
+      if(el._cleanup)el._cleanup();
+      el.innerHTML="";
+      const hasVolume=Array.isArray(volumes)&&volumes.length>0;
+      const chart=LightweightCharts.createChart(el,{width:el.clientWidth||680,height:440,
+        layout:{background:{color:"transparent"},textColor:"#565A52"},
+        grid:{vertLines:{color:"#D6D8CF"},horzLines:{color:"#D6D8CF"}},
+        timeScale:{borderColor:"#C6C8BF",timeVisible:!isDaily,secondsVisible:false},
+        rightPriceScale:{borderColor:"#C6C8BF"}});
+      const series=chart.addCandlestickSeries({upColor:"#AE3A34",downColor:"#2C6A48",borderVisible:false,
+        wickUpColor:"#AE3A34",wickDownColor:"#2C6A48"}); // 日本の相場慣習に合わせ赤=上昇・緑=下落
+      series.setData(candles);
+      if(hasVolume){
+        const volSeries=chart.addHistogramSeries({priceFormat:{type:"volume"},priceScaleId:"volPane",color:"#8a8f80"});
+        volSeries.priceScale().applyOptions({scaleMargins:{top:0.82,bottom:0}});
+        volSeries.setData(volumes);
+      }
+      if(vwapLine&&vwapLine.length){
+        const vwapSeries=chart.addLineSeries({color:"#3A6EA5",lineWidth:1,priceLineVisible:false,lastValueVisible:false});
+        vwapSeries.setData(vwapLine);
+      }
+      (priceLines||[]).forEach(({price,color,title})=>{
+        if(price==null)return;
+        series.createPriceLine({price,color,lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title});
+      });
+      if(visibleRange)chart.timeScale().setVisibleRange(visibleRange);
+      else chart.timeScale().fitContent();
+      // モーダル表示直後はレイアウト確定前でclientWidthが0のことがあるため、
+      // ResizeObserverで実測幅が変わるたびに追従させる（ウィンドウリサイズも含めて一本化）。
+      const ro=new ResizeObserver(entries=>{
+        const w=entries[0]?.contentRect?.width;
+        if(w)chart.applyOptions({width:Math.floor(w)});
+      });
+      ro.observe(el);
+      // モーダルのレイアウトが1フレーム遅れて確定する環境向けの保険（ResizeObserverだけでは
+      // 追従しないケースがあったため、初期化直後に実測幅で明示的にも合わせておく）。
+      requestAnimationFrame(()=>{if(el.clientWidth)chart.applyOptions({width:el.clientWidth});});
+      el._cleanup=()=>{ro.disconnect();chart.remove();};
+    };
+
+    if(isDaily){
+      fetch("/api/stock-history?code="+encodeURIComponent(chartModal.code))
+        .then(r=>r.json())
+        .then(d=>{
+          if(cancelled||myGen!==chartFetchGenRef.current)return;
+          const hist=d.history||[];
+          if(hist.length===0){setJpHistoryMsg("立花証券APIからチャートデータを取得できませんでした（未接続、または銘柄が対象外の可能性があります）。下のボタンからTradingView本体でご確認ください。");return;}
+          setJpHistoryMsg("");
+          renderChart({candles:hist.map(r=>({time:r.date,open:r.open,high:r.high,low:r.low,close:r.close}))});
+        })
+        .catch(()=>{if(!cancelled&&myGen===chartFetchGenRef.current)setJpHistoryMsg("取得に失敗しました。start.batのサーバーが起動しているかご確認ください。");});
+    }else{
+      const period=JP_CHART_INTERVAL_TO_PERIOD[stockChartInterval];
+      fetchChartBarsCached(chartModal.code,chartModal.market,stockChartInterval,period)
+        .then(d=>{
+          if(cancelled||myGen!==chartFetchGenRef.current)return;
+          if(d.error&&!(d.bars&&d.bars.length)){setJpHistoryMsg(d.error+"（下のボタンからTradingView本体でご確認いただけます）");return;}
+          const bars=d.bars||[];
+          if(bars.length===0){setJpHistoryMsg("短期足データを取得できませんでした（市場時間外、または対象外銘柄の可能性があります）。下のボタンからTradingView本体でご確認ください。");return;}
+          setJpHistoryMsg("");
+          const nDays={"1":1,"5":2,"15":5,"60":22}[stockChartInterval]||2;
+          const showVwap=stockChartInterval==="1"||stockChartInterval==="5"||stockChartInterval==="15"; // 指示書7番
+          const prevLevels=computePrevDayLevels(bars); // 指示書8番（データが1日分しか無い時はnull＝表示しない）
+          const todayOpen=computeTodayOpen(bars);
+          const current=num(sRef.current.stockQuotes?.[chartModal.code]?.t);
+          renderChart({
+            candles:bars.map(b=>({time:b.time,open:b.open,high:b.high,low:b.low,close:b.close})),
+            volumes:bars.map(b=>({time:b.time,value:b.volume,color:b.close>=b.open?"rgba(174,58,52,.5)":"rgba(44,106,72,.5)"})),
+            vwapLine:showVwap?computeSessionVwapSeries(bars):null,
+            priceLines:[
+              {price:prevLevels?.high,color:"#8a8f80",title:"前日高値"},
+              {price:prevLevels?.low,color:"#8a8f80",title:"前日安値"},
+              {price:todayOpen,color:"#D98C3F",title:"当日始値"},
+              {price:current,color:"#565A52",title:"現在値"},
+            ],
+            visibleRange:computeVisibleRangeByDays(bars,nDays),
+          });
+        })
+        .catch(()=>{if(!cancelled&&myGen===chartFetchGenRef.current)setJpHistoryMsg("取得に失敗しました。start.batのサーバーが起動しているかご確認ください。");});
+    }
+    return()=>{cancelled=true;if(jpChartRef.current&&jpChartRef.current._cleanup)jpChartRef.current._cleanup();};
+  },[chartModal,stockChartInterval]);
+
+  const openTV=(tv,interval)=>{if(tv)window.open("https://jp.tradingview.com/chart/?symbol="+encodeURIComponent(tv)+(interval?"&interval="+encodeURIComponent(interval):""),"_blank");};
 
   // 8章：日次モニターの項目クリックでチャートをトグル開閉
   const toggleMetric=(key)=>setOpenMetrics(prev=>{const n=new Set(prev);n.has(key)?n.delete(key):n.add(key);return n;});
@@ -8083,6 +8232,11 @@ function App(){
                       <div><div className="card-t">{w.name}</div><div className="card-n mono">{w.code}</div></div>
                       <div style={{display:"flex",alignItems:"center",gap:6}}>
                         {analysisConsultMsg && <span style={{fontSize:11,color:"var(--accent)",fontWeight:700}}>{analysisConsultMsg}</span>}
+                        {/* 2026-09-09新規（監視銘柄・市場チャートの時間足切替、対象画面「銘柄分析画面」対応）：
+                            既存の監視銘柄一覧と同じ共通ChartModalをこのカードからも開けるようにした。
+                            新しいチャートロジックは作らず、setChartModalへ渡すオブジェクトの形も
+                            監視銘柄一覧のonOpenChart呼び出しと完全に同じにする。 */}
+                        <button className="action-btn" onClick={()=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}>📈 チャート</button>
                         {a && <button className="action-btn" title="現在値・市場指標を取り直してから分析を再計算する" onClick={()=>refreshAnalysisContext([w])} disabled={a._refreshing}>{a._refreshing?"更新中…":"🔄 今すぐ最新化"}</button>}
                         {a && <button className="action-btn" onClick={()=>copyAnalysisConsult(w,a)}>🤖 詳細分析を相談</button>}
                         {a && <button className="action-btn" onClick={()=>openJournalDraft(w,a)}>記録に追加</button>}
@@ -8528,7 +8682,8 @@ function App(){
         <div className="sec-head">ポジション</div>
         <div className="sec-note">保有中の建玉のみを表示します。売買記録・振り返りは「記録」タブへ。</div>
         <PortfolioPanel stockQuotes={s.stockQuotes} analysisData={s.analysisData} analysisEnrichedMap={analysisEnrichedMap} marketEvents={marketEvents} newsCatalysts={newsCatalysts} expertViews={expertViews}
-          candidatesJP={masterJP} candidatesUS={masterUS} onAddToWatchlist={addToWatchlistDirect}/>
+          candidatesJP={masterJP} candidatesUS={masterUS} onAddToWatchlist={addToWatchlistDirect}
+          onOpenChart={it=>setChartModal({symbol:it.market==="JP"?"TSE:"+it.code:it.code,name:it.name,code:it.code,market:it.market})}/>
       </div>}
 
       {/* ===== 投資判断ログ（2026-09-02新規） ===== */}
@@ -8606,22 +8761,29 @@ function App(){
               <div className="mono" style={{fontSize:11.5,color:"var(--inkSoft)"}}>{chartModal.symbol}</div></div>
             <button className="iconbtn" style={{fontSize:20}} onClick={()=>setChartModal(null)}>×</button>
           </div>
-          {embeddable(chartModal.symbol) && <div style={{marginBottom:10}}>
-            <IntervalSwitcher value={stockChartInterval} onChange={setStockChartInterval}/>
-            <div style={{display:"flex",gap:14,flexWrap:"wrap",marginTop:8}}>
+          {/* 2026-09-09更新（監視銘柄・市場チャートの時間足切替）：IntervalSwitcher自体は
+              embeddable/JP自前描画のどちらでも共通で表示する（旧実装はembeddable限定だった
+              ため、JP個別株のチャートには時間足切替が一切出ず「日足しか出ない」原因になって
+              いた）。JP自前描画側はoptionsにJP_CHART_INTERVALS（1/5/15/60分・日足のみ）を渡し、
+              yfinanceで安定取得できる範囲に絞る。ボリンジャー/RSI/移動平均のチェックボックスは
+              TradingView埋め込み専用のスタディ指定のため、embeddable限定のまま維持する。 */}
+          <div style={{marginBottom:10}}>
+            <IntervalSwitcher value={stockChartInterval} onChange={setStockChartInterval}
+              options={embeddable(chartModal.symbol)?undefined:JP_CHART_INTERVALS}/>
+            {embeddable(chartModal.symbol) && <div style={{display:"flex",gap:14,flexWrap:"wrap",marginTop:8}}>
               <label style={{fontSize:12.5,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cBB} onChange={e=>setCBB(e.target.checked)}/>ボリンジャー</label>
               <label style={{fontSize:12.5,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cRSI} onChange={e=>setCRSI(e.target.checked)}/>RSI</label>
               <label style={{fontSize:12.5,display:"flex",gap:6,alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={cMA} onChange={e=>setCMA(e.target.checked)}/>移動平均</label>
-            </div>
-          </div>}
+            </div>}
+          </div>
           {embeddable(chartModal.symbol)
             ? <div key="modaltvchart" ref={modalChartRef} style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",background:"var(--card)",minHeight:484}}></div>
             : <div key="modaljpchart">
-                <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>日本の個別株はTradingViewの無料埋め込みチャートでは表示できないため（東証データの再配信制限）、立花証券APIの日足データ（分割調整済み・上場来）で描画しています。</div>
+                <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:8}}>日本の個別株はTradingViewの無料埋め込みチャートでは表示できないため（東証データの再配信制限）、{stockChartInterval==="D"?"立花証券APIの日足データ（分割調整済み・上場来）":"yfinanceの短期足データ（当日〜直近営業日）"}で描画しています。{stockChartInterval!=="D"&&"VWAP（青線）・前日高値安値・当日始値・現在値の水平線付き。"}</div>
                 {jpHistoryMsg && <div style={{fontSize:12.5,color:"var(--inkSoft)",padding:"10px 2px"}}>{jpHistoryMsg}</div>}
                 {/* 読み込み中もdisplay:noneにしない（非表示状態でチャート初期化するとサイズが0のまま固定される問題があったため、常にレイアウトに乗せておく） */}
                 <div ref={jpChartRef} style={{border:"1px solid var(--rule)",borderRadius:4,overflow:"hidden",background:"var(--card)",minHeight:440}}></div>
-                <div style={{marginTop:10,textAlign:"right"}}><button className="ghost" onClick={()=>openTV(chartModal.symbol)}>↗ TradingViewで開く</button></div>
+                <div style={{marginTop:10,textAlign:"right"}}><button className="ghost" onClick={()=>openTV(chartModal.symbol,stockChartInterval)}>↗ TradingViewで開く</button></div>
               </div>}
         </div>
       </div>}
