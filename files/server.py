@@ -2139,19 +2139,74 @@ def _vwap(closes, volumes):
 
 
 # ============================================================
-# Market Intelligence Timeline（場中定時レポート）。2026-09-10新規、Phase2-A。
+# Market Intelligence Timeline（場中定時レポート）。2026-09-10新規、Phase2-A→Phase2-Bで拡張。
 # 08:50 MorningMarketCheckを起点に、09:30寄り30分/11:30前場終了/13:00後場30分/15:30大引けを
-# 「1本のタイムライン」として積み上げる。指示書の実装順どおりPhase2-Aでは09:30 OPENING_30Mの
-# みを実装し（11:30以降はPhase2-B、見逃し銘柄・セクターローテーションはPhase2-D、予想成績DBは
-# Phase2-Eで追加予定）、既存のmorning_analysis_engine（classify_morning_regime・
-# compute_macro_sector_strength・generate_morning_watchlist_focus・_rs_resilience_tier）・
+# 「1本のタイムライン」として積み上げる。Phase2-Aで作った共通レポートエンジン
+# （generate_opening_30m_report）をPhase2-Bでgenerate_intraday_report()へ一般化し、
+# report_typeによる分岐だけで4つの時間帯すべてに対応する（09:30専用ロジックを他の時間帯へ
+# コピーしない、指示書「実装方針」）。見逃し銘柄本格抽出・momentum_score・セクターローテー
+# ション詳細統計・予想成績DBはPhase2-C/D/Eへ引き続き先送り。既存のmorning_analysis_engine・
 # position_risk_rules・投資判断エンジン（catalysts/events）を最大限再利用し、判定基準を
 # 重複実装しない（指示書30番）。
 # ============================================================
 
-INTRADAY_REPORT_SNAPSHOT_TIMES = {  # 指示書4番：将来のPhase2-Bで11:30/13:00/15:30を追加する
-    "OPENING_30M": "09:30",         # 際もテーブル・生成関数の形は変えずキーを増やすだけでよい設計。
+INTRADAY_REPORT_SNAPSHOT_TIMES = {  # 指示書6番：JST、24h表記
+    "OPENING_30M": "09:30", "MORNING_CLOSE": "11:30", "AFTERNOON_30M": "13:00", "MARKET_CLOSE": "15:30",
 }
+INTRADAY_REPORT_ORDER = ["OPENING_30M", "MORNING_CLOSE", "AFTERNOON_30M", "MARKET_CLOSE"]
+
+# 朝TOP5の答え合わせ結果の強さ順（指示書1番：STRENGTHENED/MAINTAINED/WEAKENED/FAILEDの判定に使う）
+_THESIS_RESULT_RANK = {"INVALIDATED": 0, "NOT_TRIGGERED": 1, "PARTIAL": 2, "CONFIRMED": 3}
+
+
+def _thesis_transition_status(prev_result, new_result):
+    """前回レポート時点のthesis_resultから今回への変化を判定する（指示書1番）。データ不足時は
+    無理に強弱を判定せずDATA_INSUFFICIENTとする（指示書29番）。INVALIDATEDへ転落した場合は、
+    強弱の方向に関わらず明確な失敗として一律FAILEDにする（「何が外れたか」を明確にするため）。"""
+    if not prev_result or prev_result == "DATA_INSUFFICIENT" or new_result == "DATA_INSUFFICIENT":
+        return "DATA_INSUFFICIENT"
+    if new_result == "INVALIDATED":
+        return "FAILED"
+    prev_rank, new_rank = _THESIS_RESULT_RANK.get(prev_result), _THESIS_RESULT_RANK.get(new_result)
+    if prev_rank is None or new_rank is None:
+        return "DATA_INSUFFICIENT"
+    if new_rank > prev_rank:
+        return "STRENGTHENED"
+    if new_rank < prev_rank:
+        return "WEAKENED"
+    return "MAINTAINED"
+
+
+def _final_top5_result(thesis_history):
+    """1銘柄分の当日全時間帯のthesis_result履歴（古い→新しい、現在の評価を含む）から、
+    大引け時点の最終結果を判定する（指示書3番）。重要：triggerが一度も発動していない
+    （常にNOT_TRIGGERED/DATA_INSUFFICIENTのみ）場合は、株価が下落していてもFAILにせず
+    NO_ENTRYとする——朝の仮説と実際のエントリー機会を分けて評価する（ユーザー指示）。"""
+    triggered = any(r in ("CONFIRMED", "PARTIAL", "INVALIDATED") for r in thesis_history)
+    if not triggered:
+        return "NO_ENTRY" if any(r == "NOT_TRIGGERED" for r in thesis_history) else "DATA_INSUFFICIENT"
+    final = thesis_history[-1]
+    if final == "CONFIRMED":
+        return "SUCCESS"
+    if final == "PARTIAL":
+        return "PARTIAL_SUCCESS"
+    if final == "INVALIDATED":
+        return "FAIL"
+    # 一度は発動したのに最後がNOT_TRIGGERED/DATA_INSUFFICIENTに戻る想定外パターン→安全側でPARTIAL_SUCCESS扱い
+    return "PARTIAL_SUCCESS"
+
+
+def _previous_intraday_reference(database_url, user_id, trade_date, report_type, morning_check):
+    """指示書4番「全レポートでprevious_reportを参照する」。直前の時間帯のmarket_intelligence_
+    reportsがあればそれを、無ければMorningMarketCheckまで遡る（順序：MorningCheck→09:30→
+    11:30→13:00→15:30）。戻り値：(前回レポートdict_or_None, "morning_check"|report_type|None)。"""
+    idx = INTRADAY_REPORT_ORDER.index(report_type)
+    if investment_db is not None and database_url:
+        for prior_type in reversed(INTRADAY_REPORT_ORDER[:idx]):
+            rep = investment_db.get_market_intelligence_report(database_url, user_id, trade_date, prior_type)
+            if rep:
+                return rep, prior_type
+    return (morning_check, "morning_check") if morning_check else (None, None)
 
 
 def _intraday_stock_snapshot(watchlist_item):
@@ -2200,13 +2255,25 @@ def evaluate_morning_thesis(morning_top5_item, snapshot, nikkei_chg):
 
 
 def generate_opening_30m_report(database_url, user_id, trade_date=None):
-    """09:30寄り30分レポートを生成・保存する（market_report_serviceの中核、指示書5番）。
+    """後方互換の薄いラッパー（Phase2-A時点の呼び出し名をそのまま維持）。実体は
+    generate_intraday_report()に一般化した（指示書「実装方針」：09:30専用ロジックを
+    11:30/13:00/15:30へコピーせず、report_typeによる分岐で共通処理する）。"""
+    return generate_intraday_report(database_url, user_id, "OPENING_30M", trade_date)
+
+
+def generate_intraday_report(database_url, user_id, report_type, trade_date=None):
+    """Market Intelligence Timelineの共通レポートエンジン（market_report_serviceの中核）。
+    report_typeはOPENING_30M/MORNING_CLOSE/AFTERNOON_30M/MARKET_CLOSEのいずれか。
     朝一予想（MorningMarketCheckのT0850）が無くても、その日の実市場スナップショットだけは
     残す（DATA_INSUFFICIENTを使い、レポート自体は落とさない方針、指示書29番）。"""
+    if report_type not in INTRADAY_REPORT_SNAPSHOT_TIMES:
+        raise ValueError(f"未対応のreport_type: {report_type}")
     data_health = {}
     trade_date = trade_date or _jst_today_date_str()
     morning_check = investment_db.get_latest_morning_check(database_url, user_id, check_date=trade_date) if investment_db else None
     data_health["morning_check"] = "ok" if morning_check else "missing"
+    previous_report, previous_kind = _previous_intraday_reference(database_url, user_id, trade_date, report_type, morning_check)
+    data_health["previous_report"] = previous_kind or "missing"
 
     index_keys = ["nikkei", "topix_etf", "growth250_etf", "nikkei_vi_etn", "usdjpy", "nasdaq", "sox", "us10y"]
     try:
@@ -2231,10 +2298,25 @@ def generate_opening_30m_report(database_url, user_id, trade_date=None):
     regime_transition = None
     if morning_check:
         regime_transition = {"from": morning_check.get("market_regime"), "to": market_regime}
+    # 指示書4番：前回レポート（直前の時間帯）との地合い比較。MorningCheckとの差分（regime_transition）
+    # とは別に、「直前の時間帯から何が変わったか」も見る（例：09:30 MILD_RISK_OFF→11:30 NEUTRAL）。
+    previous_regime = previous_report.get("market_regime") if previous_report else None
+    regime_changed_since_previous = previous_kind not in (None, "morning_check") and previous_regime is not None and previous_regime != market_regime
 
-    # ---- 朝TOP5の答え合わせ（指示書5・6番） ----
+    # 指示書4番：セクターの簡易ローテーション差分（本格的な順位統計はPhase2-D）。前回レポートの
+    # 強い/弱いセクターと比べ、新規に強く/弱くなったセクターだけを検出する。
+    previous_strong = set((previous_report.get("strong_sectors_json") or [])) if previous_report and previous_kind != "morning_check" else set()
+    previous_weak = set((previous_report.get("weak_sectors_json") or [])) if previous_report and previous_kind != "morning_check" else set()
+    newly_strong_sectors = [s for s in strong_sectors if s not in previous_strong]
+    newly_weak_sectors = [s for s in weak_sectors if s not in previous_weak]
+
+    # ---- 朝TOP5の答え合わせ＋前回レポートからの変化（指示書1・5・6番） ----
     thesis_stocks = []
     morning_top5 = (morning_check.get("watchlist_top5_json") or []) if morning_check else []
+    prev_thesis_by_code = {}
+    if previous_report and previous_kind != "morning_check":
+        for s in (previous_report.get("morning_thesis_evaluation_json") or {}).get("stocks", []):
+            prev_thesis_by_code[s.get("code")] = s.get("thesis_result")
     for item in morning_top5:
         w_item = {"code": item.get("code"), "name": item.get("name"), "market": "JP"}
         try:
@@ -2244,12 +2326,34 @@ def generate_opening_30m_report(database_url, user_id, trade_date=None):
             snap = {"current": None, "currentChangePct": None, "aboveVwap": None,
                     "fiveMinStructure": None, "dataStatus": "failed"}
         result = evaluate_morning_thesis(item, snap, nikkei_chg)
-        thesis_stocks.append({
+        entry = {
             "code": item.get("code"), "name": item.get("name"), "morning_rank": item.get("rank"),
             "morning_stance": "WATCH_LONG", "current_change_pct": snap["currentChangePct"],
             "above_vwap": snap["aboveVwap"], "five_min_structure": snap["fiveMinStructure"],
             "thesis_result": result,
-        })
+        }
+        if report_type != "OPENING_30M":
+            # 09:30は「初回評価」のため変化なし。11:30以降のみSTRENGTHENED/MAINTAINED/WEAKENED/FAILEDを付与
+            prev_result = prev_thesis_by_code.get(item.get("code"))
+            entry["prior_result"] = prev_result
+            entry["status"] = _thesis_transition_status(prev_result, result)
+        thesis_stocks.append(entry)
+
+    # ---- 15:30大引けのみ：当日全時間帯の履歴からTOP5の最終結果を判定（指示書3番） ----
+    if report_type == "MARKET_CLOSE" and morning_top5:
+        try:
+            day_reports = investment_db.list_market_intelligence_reports(database_url, user_id, trade_date) if investment_db else []
+        except Exception as e:
+            print("  IntradayReport: 当日レポート履歴取得で例外", e)
+            day_reports = []
+        history_by_code = {}
+        for rep in day_reports:
+            for s in (rep.get("morning_thesis_evaluation_json") or {}).get("stocks", []):
+                history_by_code.setdefault(s.get("code"), []).append(s.get("thesis_result"))
+        for entry in thesis_stocks:
+            hist = history_by_code.get(entry["code"], []) + [entry["thesis_result"]]
+            entry["final_result"] = _final_top5_result(hist)
+
     if morning_top5:
         data_health["thesis_evaluation"] = "ok" if any(s["thesis_result"] != "DATA_INSUFFICIENT" for s in thesis_stocks) else "failed"
     else:
@@ -2264,7 +2368,31 @@ def generate_opening_30m_report(database_url, user_id, trade_date=None):
         focus = {"top5": [], "avoid": [], "resilience": []}
         data_health["resilience"] = "failed"
 
-    # ---- 保有ポジションのリスク（既存position_risk_rulesをそのまま使用、指示書18番） ----
+    # ---- 13:00後場30分のみ：資金移動の簡易分類（指示書2番）。根拠が弱い場合は推測せずUNKNOWN
+    # （REVERSAL/SHORT_COVER/WEAKENINGは信用残高等のデータが無いと判定できないためPhase2-C以降）。
+    afternoon_flow = []
+    if report_type == "AFTERNOON_30M":
+        previous_resilience_codes = {r.get("code") for r in (previous_report.get("resilience_stocks_json") or [])} \
+            if previous_report and previous_kind != "morning_check" else set()
+        for r in focus["resilience"]:
+            code = r.get("code")
+            try:
+                cats = investment_db.relevant_catalysts_for(database_url, user_id, code=code, limit=1) if investment_db else []
+            except Exception:
+                cats = []
+            has_fresh_catalyst = bool(cats) and cats[0].get("freshness") in ("LIVE", "CURRENT")
+            if code in previous_resilience_codes:
+                classification, reason = "CONTINUATION", None
+            elif has_fresh_catalyst:
+                classification, reason = "NEWS_DRIVEN", cats[0].get("title", "")[:30]
+            elif previous_kind not in (None,):
+                classification, reason = "NEW_FLOW", None
+            else:
+                classification, reason = "UNKNOWN", "根拠不十分なため推測しない"
+            afternoon_flow.append({"code": code, "name": r.get("name"), "classification": classification, "reason": reason})
+
+    # ---- 保有ポジションのリスク（既存position_risk_rulesをそのまま使用、指示書10番） ----
+    positions_all = []  # try節で例外が起きても後段のルール違反検出（15:30のみ）がNameErrorにならないよう初期化
     try:
         watchlist_all = investment_db.list_watchlist(database_url, user_id, market="JP") if investment_db else []
         positions_all = investment_db.list_portfolio(database_url, user_id) if investment_db else []
@@ -2279,41 +2407,80 @@ def generate_opening_30m_report(database_url, user_id, trade_date=None):
         position_alerts = []
         data_health["positions"] = "failed"
 
-    # ---- イベント・ニュース（既存判断エンジンをそのまま再利用、指示書16・17・30番） ----
+    # ---- イベント・ニュース（既存判断エンジンをそのまま再利用、指示書5・17番） ----
     try:
         event_info = investment_db.upcoming_event_signals(database_url, user_id) if investment_db else {"events": [], "signals": []}
     except Exception as e:
         print("  IntradayReport: イベント取得で例外", e)
         event_info = {"events": [], "signals": []}
     try:
-        news_changes = investment_db.relevant_catalysts_for(database_url, user_id, limit=8) if investment_db else []
+        # 指示書5番：厳密な「前回レポート生成時刻以降」の差分は現状のcatalyst_date（日付粒度）
+        # では断定できないため、直近のLIVE/CURRENT鮮度のものだけに絞り、断定表現は避ける
+        # （possible_driver程度に留める、指示書5番）。
+        news_changes_raw = investment_db.relevant_catalysts_for(database_url, user_id, limit=8) if investment_db else []
+        news_changes = [{**c, "possible_driver": True} if c.get("freshness") in ("LIVE", "CURRENT") else c for c in news_changes_raw]
         data_health["news"] = "ok"
     except Exception as e:
         print("  IntradayReport: ニュース差分取得で例外", e)
         news_changes = []
         data_health["news"] = "failed"
 
+    # ---- 15:30大引けのみ：ルール違反検出（既存_check_known_risk_ignoredを再利用、指示書3番） ----
+    rule_violations = []
+    if report_type == "MARKET_CLOSE":
+        try:
+            rule_violations = investment_db._check_known_risk_ignored(
+                database_url, user_id, trade_date, positions_all, new_positions=[]) if investment_db else []
+        except Exception as e:
+            print("  IntradayReport: ルール違反検出で例外", e)
+            rule_violations = []
+
     risk_alerts = []
+    major_changes = []
     if any(a["level"] == "CRITICAL" for a in position_alerts):
         risk_alerts.append({"level": "CRITICAL", "message": "保有銘柄が損切りルール（EXIT RULE）に到達"})
+        major_changes.append("EXIT_RULE_HIT")
     if "EVENT_RISK_HIGH" in event_info.get("signals", []):
         risk_alerts.append({"level": "WARNING", "message": "重要イベントが目前"})
+    for v in rule_violations:
+        risk_alerts.append({"level": "WARNING", "message": f"ルール違反：{v.get('reason')}", "type": "RULE_VIOLATION"})
     confirmed_n = sum(1 for s in thesis_stocks if s["thesis_result"] == "CONFIRMED")
     invalidated_n = sum(1 for s in thesis_stocks if s["thesis_result"] == "INVALIDATED")
+    failed_n = sum(1 for s in thesis_stocks if s.get("status") == "FAILED")
     if morning_top5 and invalidated_n > confirmed_n:
         risk_alerts.append({"level": "WARNING", "message": "朝の仮説が実市場で崩れている銘柄が優勢"})
+    if report_type != "OPENING_30M" and regime_changed_since_previous:
+        risk_alerts.append({"level": "WATCH", "message": f"前回レポートから地合いが変化（{previous_regime}→{market_regime}）"})
+        major_changes.append("REGIME_SHIFTED")
+    if newly_strong_sectors:
+        risk_alerts.append({"level": "WATCH", "message": f"新しい強いセクターを検出：{'・'.join(newly_strong_sectors)}"})
+        major_changes.append("NEW_STRONG_SECTOR")
+    if report_type != "OPENING_30M" and failed_n > 0:
+        major_changes.append("THESIS_FAILED")
+    # 15:30のみ：翌営業日イベントリスク・持ち越し注意（指示書3番）
+    overnight_notes = []
+    if report_type == "MARKET_CLOSE":
+        if "NO_OVERNIGHT" in event_info.get("signals", []) or "EVENT_RISK_HIGH" in event_info.get("signals", []):
+            overnight_notes.append("翌営業日に重要イベントがあるため持ち越しに注意")
+        if any(a["tier"] in ("WARNING", "EXIT") for a in position_alerts):
+            overnight_notes.append("損切りライン接近/到達中の保有銘柄あり。持ち越し判断は個別に再確認")
 
     strategy, _ = generate_morning_strategy(market_regime, volatility_regime, risk["score"], event_info.get("signals", []))
+    _report_label = {"OPENING_30M": "寄り30分", "MORNING_CLOSE": "前場終了", "AFTERNOON_30M": "後場30分", "MARKET_CLOSE": "大引け"}[report_type]
     if morning_top5:
-        summary_text = (f"寄り30分：朝の想定TOP5のうち{confirmed_n}/{len(thesis_stocks)}件が現時点で成立(CONFIRMED)。"
+        summary_text = (f"{_report_label}：朝の想定TOP5のうち{confirmed_n}/{len(thesis_stocks)}件が現時点で成立(CONFIRMED)。"
                          f"地合いは{market_regime}"
                          + ("（朝の想定から変化）" if regime_transition and regime_transition["from"] != market_regime else "")
+                         + ("（直前レポートから地合い変化）" if regime_changed_since_previous else "")
                          + "。指数への逆張りは避け、地合い耐性銘柄を優先。")
     else:
-        summary_text = f"寄り30分：MorningMarketCheck未生成のため答え合わせ対象なし。地合いは{market_regime}。"
+        summary_text = f"{_report_label}：MorningMarketCheck未生成のため答え合わせ対象なし。地合いは{market_regime}。"
+    if report_type == "MARKET_CLOSE" and morning_top5:
+        success_n = sum(1 for s in thesis_stocks if s.get("final_result") == "SUCCESS")
+        summary_text += f"　本日の朝TOP5最終結果：SUCCESS {success_n}/{len(thesis_stocks)}件。"
 
     payload = {
-        "scheduled_time": INTRADAY_REPORT_SNAPSHOT_TIMES["OPENING_30M"],
+        "scheduled_time": INTRADAY_REPORT_SNAPSHOT_TIMES[report_type],
         "morning_check_id": morning_check.get("id") if morning_check else None,
         "market_regime": market_regime, "volatility_regime": volatility_regime, "market_summary": summary_text,
         "nikkei_change_pct": nikkei_chg,
@@ -2321,18 +2488,28 @@ def generate_opening_30m_report(database_url, user_id, trade_date=None):
         "growth250_change_pct": indices.get("growth250_etf", {}).get("changePct"),
         "nikkei_vi": indices.get("nikkei_vi_etn", {}).get("value"),
         "usdjpy": indices.get("usdjpy", {}).get("value"),
-        "sector_snapshot_json": {"strong": strong_sectors, "weak": weak_sectors},
+        "sector_snapshot_json": {"strong": strong_sectors, "weak": weak_sectors,
+                                  "newly_strong": newly_strong_sectors, "newly_weak": newly_weak_sectors},
         "strong_sectors_json": strong_sectors, "weak_sectors_json": weak_sectors,
         "top_stocks_json": focus["top5"], "resilience_stocks_json": focus["resilience"],
-        "momentum_stocks_json": [],  # Phase2-C以降でmomentum_score（出来高急増・高値更新等）を実装予定
+        # momentum_stocks_json：本格的な0-100 momentum_scoreはPhase2-C予定。Phase2-Bでは13:00の
+        # 簡易資金流入分類（afternoon_flow）だけを載せ、15:30は13:00の分類をそのまま引き継ぐ。
+        "momentum_stocks_json": (afternoon_flow if report_type == "AFTERNOON_30M"
+                                  else ((previous_report.get("momentum_stocks_json") or [])
+                                        if report_type == "MARKET_CLOSE" and previous_kind == "AFTERNOON_30M" else [])),
         "missed_opportunities_json": [],  # Phase2-Dで実装予定（指示書13番）
-        "morning_thesis_evaluation_json": {"regime_transition": regime_transition, "stocks": thesis_stocks},
+        "morning_thesis_evaluation_json": {
+            "regime_transition": regime_transition,
+            "previous_report_regime": previous_regime, "regime_changed_since_previous": regime_changed_since_previous,
+            "stocks": thesis_stocks,
+        },
         "risk_alerts_json": risk_alerts, "position_alerts_json": position_alerts,
         "news_changes_json": news_changes, "event_risk_json": event_info.get("events", [])[:5],
-        "strategy_update_json": {"strategy": strategy, "text": summary_text},
+        "strategy_update_json": {"strategy": strategy, "text": summary_text, "major_changes": major_changes,
+                                  "overnight_notes": overnight_notes, "previous_report_kind": previous_kind},
         "data_health_json": data_health,
     }
-    saved = investment_db.save_market_intelligence_report(database_url, user_id, trade_date, "OPENING_30M", payload) if investment_db else None
+    saved = investment_db.save_market_intelligence_report(database_url, user_id, trade_date, report_type, payload) if investment_db else None
     return saved
 
 
@@ -2342,8 +2519,10 @@ def _intraday_report_scheduler_users():
 
 
 def _intraday_report_scheduler_loop():
-    """指示書4番の定時（現状09:30のみ、Phase2-Aの範囲）にOPENING_30Mを自動生成するデーモン
-    スレッド。MorningMarketCheckと同じ発火済みセット方式＋DBのUNIQUE制約による二重防止。"""
+    """指示書6番の定時（09:30/11:30/13:00/15:30、Phase2-Bで全4本に拡張）に各report_typeを
+    自動生成するデーモンスレッド。MorningMarketCheckと同じ発火済みセット方式＋DBのUNIQUE制約
+    による二重防止。前の時間帯のレポートが未生成でも（例：11:30時点で09:30が無い）
+    generate_intraday_report内部でMorningCheckまで遡るためエラーにはならない。"""
     fired = set()  # {(trade_date, report_type, user_id)}
     JST = datetime.timezone(datetime.timedelta(hours=9))
     while True:
@@ -2360,7 +2539,7 @@ def _intraday_report_scheduler_loop():
                                 continue
                             fired.add(key)
                             try:
-                                generate_opening_30m_report(DATABASE_URL, user_id, trade_date)
+                                generate_intraday_report(DATABASE_URL, user_id, report_type, trade_date)
                                 print(f"  [IntradayReport] {user_id} {report_type}（{target_hhmm}）生成完了")
                             except Exception as e:
                                 print(f"  [IntradayReport] {user_id} {report_type} 生成失敗", e)
@@ -6435,18 +6614,18 @@ class Handler(SimpleHTTPRequestHandler):
             ok = investment_db.mark_morning_check_read(DATABASE_URL, self.current_user, body.get("id"))
             self._send_json({"ok": ok})
         elif self.path == "/api/market-intelligence/generate":
-            # 2026-09-10新規（Market Intelligence Timeline、Phase2-A）：指示書4番「今すぐ分析」
-            # 手動再生成。UPSERTなので同一report_typeの重複レコードは作らない。
+            # 2026-09-10新規（Market Intelligence Timeline、Phase2-Bで4時間帯すべてに対応）：
+            # 指示書6番「今すぐ分析」手動再生成。UPSERTなので同一report_typeの重複レコードは
+            # 作らない。
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
             report_type = body.get("reportType") or "OPENING_30M"
+            if report_type not in INTRADAY_REPORT_SNAPSHOT_TIMES:
+                self._send_json({"fatalError": f"未対応のreport_type: {report_type}"})
+                return
             try:
-                if report_type == "OPENING_30M":
-                    report = generate_opening_30m_report(DATABASE_URL, self.current_user)
-                else:
-                    self._send_json({"fatalError": f"未実装のreport_type: {report_type}（Phase2-Bで対応予定）"})
-                    return
+                report = generate_intraday_report(DATABASE_URL, self.current_user, report_type)
             except Exception as e:
                 import traceback
                 print("  /api/market-intelligence/generate 想定外のエラー")
