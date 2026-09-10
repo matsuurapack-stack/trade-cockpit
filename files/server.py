@@ -2110,6 +2110,30 @@ def generate_morning_market_check(database_url, user_id, snapshot_time):
         focus = {"top5": [], "avoid": [], "resilience": []}
         data_quality["watchlist"] = "failed"
 
+    # 2026-09-10更新（Phase2-C「TOP5選考基準の全面見直し」）：watchlist_top5_jsonは、
+    # ①当日騰落率がプラス（または逆行耐性例外）②VWAP/5分足構造/対市場RS等の根拠がある
+    # ③ENTRY_READY/NOW_BUYABLE状態、の3条件を満たすentry_score版TOP5に置き換える（旧
+    # generate_morning_watchlist_focus()の単純スコアではマイナス銘柄が混入し得たため）。
+    # avoid/resilience（地合い耐性ランキング）は既存のfocusをそのまま使い続ける（この2つは
+    # 今回の指示書の対象外、既存の別用途の判定のため無変更）。
+    try:
+        morning_entry_result = generate_morning_entry_top5(database_url, user_id)
+        entry_ready_top5 = morning_entry_result["entryReadyTop5"]
+        data_quality["entry_top5"] = "ok"
+    except Exception as e:
+        print("  MorningCheck: entry_score版TOP5算出で例外", e)
+        entry_ready_top5 = []
+        data_quality["entry_top5"] = "failed"
+    watchlist_top5_json = [{
+        "code": c["code"], "name": c["name"], "rank": c["rank"],
+        "entryScore": c["entryScore"], "score": c["entryScore"], "entryState": c["entryState"],
+        "reason": c["reasons"], "risks": c["risks"], "current": c["current"],
+        "changePct": c["changePct"], "marketRS": c["marketRS"], "resilience": c.get("resilience"),
+        "analysisConfidence": c["analysisConfidence"], "dataQuality": c["dataQuality"],
+        "trigger": "寄り後VWAP維持＋5分足安値切り上げを確認してからのエントリーを推奨",
+        "avoidCondition": "寄り天・出来高を伴わない上昇・悪材料の追加",
+    } for c in entry_ready_top5]
+
     try:
         stock_quotes_for_positions = get_stock_quotes(watchlist_all) if watchlist_all else {}
         # ポジション銘柄がwatchlist外の場合も拾えるよう、保有銘柄も追加取得する
@@ -2151,13 +2175,20 @@ def generate_morning_market_check(database_url, user_id, snapshot_time):
         "indices_json": indices, "fx_json": {k: indices[k] for k in ("usdjpy", "eurjpy", "dxy") if k in indices},
         "commodities_json": commodities, "adr_json": adr, "data_quality_json": data_quality,
         "strong_sectors_json": strong_sectors, "weak_sectors_json": weak_sectors,
-        "watchlist_top5_json": focus["top5"], "avoid_stocks_json": focus["avoid"],
+        "watchlist_top5_json": watchlist_top5_json, "avoid_stocks_json": focus["avoid"],
         "resilience_json": focus["resilience"], "risk_warnings_json": risk_warnings[:3],
         "event_risk_json": event_info["events"][:5], "position_risk_json": position_risk,
         "strategy_json": strategy, "strategy_text": strategy_text,
         "raw_payload_json": {"feargreed": fear_greed, "generatedAt": now.isoformat(), "missing": vol_missing + trend_missing},
     }
     saved = investment_db.save_morning_check(database_url, user_id, check_date, snapshot_time, payload) if investment_db else None
+    # 朝TOP5をstock_thesesへ永続化（source='MORNING'固定、以後書き換えない成績評価用スナップ
+    # ショット）。保存済みMorningCheckのidをmorning_check_idとして使う（指示書11・12番）。
+    if saved and entry_ready_top5:
+        try:
+            persist_morning_theses(database_url, user_id, check_date, saved.get("id"), entry_ready_top5)
+        except Exception as e:
+            print("  MorningCheck: 朝TOP5 thesis永続化で例外", e)
     return saved
 
 
@@ -2565,55 +2596,91 @@ def _entry_score_components(row, stage2, snapshot, auto_rs_current, auto_sector_
     }
 
 
-def _classify_entry_state(entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present):
-    """ENTRY_STATE（9種）をルールベースで決定する（AI不使用、既存AUTO系エンジンと同じ方針）。
+def _classify_entry_state(entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present, nikkei_chg=None):
+    """ENTRY_STATE（8種＋PROVISIONAL）をルールベースで決定する（AI不使用、既存AUTO系エンジンと
+    同じ方針）。2026-09-10更新（Phase2-C「TOP5選考基準の全面見直し」指示書2・3・24番）：
+    「原則プラス銘柄からしか選ばない」ゲートを追加した。当日騰落率がマイナスの銘柄は、以下を
+    "すべて"満たす例外（逆行耐性例外）でない限りNOW_BUYABLE/ENTRY_READYにはならない
+    （WATCH/WEAKへ回り、Watchlist側で「反転待ち」等として扱われる想定）：
+      ①市場全体が大幅安（nikkei_chg<=-1.0%）②銘柄は小幅マイナス（changePct>=-1.0%）
+      ③対市場RSが極めて強い（marketRS>=+2.0pt）④VWAP回復済み（aboveVwap）
+      ⑤5分足で明確な反転（fiveMinStructure=="higher_highs"）⑥出来高増加
+      （POSITIVE_VOLUME、または時間帯補正済み出来高倍率>=1.3）
+    戻り値：(entry_state, exception_applied)。exception_applied=Trueの時、呼び出し側は
+    reasonsに「逆行耐性例外」を明示する（指示書3番「その場合UIで理由を明示」）。
     data_quality=DEGRADED（Stage2・5分足スナップショットの両方が欠落）の場合はPROVISIONAL固定
-    ＝confidence=LOWの銘柄をNOW_BUYABLEにしない（指示書要件）。"""
+    ＝confidence=LOWの銘柄をNOW_BUYABLEにしない（指示書26番）。"""
     if data_quality == "DEGRADED":
-        return "PROVISIONAL"
+        return "PROVISIONAL", False
     above_vwap = snapshot.get("aboveVwap") if snapshot else None
     structure = snapshot.get("fiveMinStructure") if snapshot else None
     market_rs = row.get("marketRS")
+    day_change = row.get("changePct")
     volume_type = _volume_type(stage2, row) if stage2 else "NEUTRAL_VOLUME"
+    tavr = stage2.get("timeAdjustedVolumeRatio") if stage2 else None
     making_new_low = bool(stage2 and stage2.get("makingNewLowToday"))
     overheated = volume_type == "CLIMAX_UP" or bool(
         stage2 and stage2.get("aboveRecentHigh") and (stage2.get("distanceFromHighPct") or 0) >= 5)
 
+    exception_applied = False
+    if day_change is not None and day_change <= 0:
+        market_selloff = nikkei_chg is not None and nikkei_chg <= -1.0
+        small_decline = day_change >= -1.0
+        strong_market_rs = market_rs is not None and market_rs >= 2.0
+        vwap_recovered = above_vwap is True
+        reversal_structure = structure == "higher_highs"
+        volume_up = volume_type == "POSITIVE_VOLUME" or (tavr is not None and tavr >= 1.3)
+        exception_applied = all([market_selloff, small_decline, strong_market_rs,
+                                  vwap_recovered, reversal_structure, volume_up])
+        if not exception_applied:
+            # プラス転換の根拠が無いマイナス銘柄はNOW_BUYABLE/ENTRY_READYの対象から除外
+            # （後段のCHASE_RISK/INVALID/WEAKの判定はこの後も通常どおり行う）。
+            if neg_cat_present and (making_new_low or (market_rs is not None and market_rs < 0)):
+                return "INVALID", False
+            return ("WATCH" if entry_score >= 30 else "WEAK"), False
+
     if neg_cat_present and (making_new_low or (market_rs is not None and market_rs < 0)):
-        return "INVALID"
+        return "INVALID", False
     if overheated:
-        return "CHASE_RISK"
+        return "CHASE_RISK", exception_applied
     if entry_score < 30:
-        return "WEAK"
+        return "WEAK", exception_applied
     if "EVENT_RISK_HIGH" in (event_signals or []) and entry_score < 60:
-        return "WATCH"
+        return "WATCH", exception_applied
     if above_vwap and structure == "higher_highs" and (market_rs is not None and market_rs > 0) and entry_score >= 70:
-        return "NOW_BUYABLE"
+        return "NOW_BUYABLE", exception_applied
     if above_vwap and structure in ("higher_highs", "mixed") and entry_score >= 55:
-        return "ENTRY_READY"
+        return "ENTRY_READY", exception_applied
     if entry_score >= 40 and above_vwap is False:
-        return "WAIT_BREAKOUT"
+        return "WAIT_BREAKOUT", exception_applied
     if entry_score >= 40 and above_vwap:
-        return "WAIT_PULLBACK"
+        return "WAIT_PULLBACK", exception_applied
     if entry_score >= 30:
-        return "WATCH"
-    return "WEAK"
+        return "WATCH", exception_applied
+    return "WEAK", exception_applied
 
 
-def compute_entry_ready_candidates(database_url, user_id):
-    """今買い時TOP5（entry_ready_top5）とWatch候補を算出する。既存の共有Stage1
-    （run_momentum_stage1、複数AUTOエンジンとキャッシュ共有）・AUTO_RS/AUTO_SECTOR_LEADERの
-    CURRENT登録・AUTO_VOLUMEのStage2（_volume_stage2_detail）・Market Intelligence
-    Timelineの個別銘柄5分足判定（_intraday_stock_snapshot）をそのまま再利用する（新規の
-    全市場スキャン・新規の分足取得経路は追加しない）。対象は監視銘柄（watchlist）のみ
-    （全市場4000銘柄には広げない。「Watch候補との分離」は監視銘柄内での話）。"""
+def _score_entry_candidates(database_url, user_id):
+    """今買い時TOP5（entry_ready_top5）とWatch候補を算出する純粋関数（DB書き込みなし）。
+    既存の共有Stage1（run_momentum_stage1、複数AUTOエンジンとキャッシュ共有）・
+    AUTO_RS/AUTO_SECTOR_LEADERのCURRENT登録・AUTO_VOLUMEのStage2（_volume_stage2_detail）・
+    Market Intelligence Timelineの個別銘柄5分足判定（_intraday_stock_snapshot）をそのまま
+    再利用する（新規の全市場スキャン・新規の分足取得経路は追加しない）。対象は監視銘柄
+    （watchlist）のみ（全市場4000銘柄には広げない。「Watch候補との分離」は監視銘柄内での話）。
+    2026-09-10更新（Phase2-C）：「Current TOP5」（/api/entry-candidates、いつでも再計算）と
+    「朝TOP5」（MorningMarketCheck、08:50固定・成績評価用）の両方がこの同じ関数を使う——
+    永続化（stock_thesesへの書き込み）はしない副作用フリーな関数にし、呼び出し側
+    （generate_morning_market_check）だけが朝TOP5として結果を保存する設計にした（指示書
+    22・23番「Current TOP5とMorning TOP5は別物、Morning TOP5は後から書き換えない」）。"""
+    empty = {"entryReadyTop5": [], "watchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None}
     if investment_db is None or not database_url:
-        return {"entryReadyTop5": [], "watchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None}
+        return empty
     watchlist = investment_db.list_watchlist(database_url, user_id, market="JP")
     if not watchlist:
-        return {"entryReadyTop5": [], "watchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None}
+        return empty
     stage1 = run_momentum_stage1()
     stage1_rows = stage1.get("rows", {})
+    nikkei_chg = stage1.get("nikkeiChangePct")
     auto_rs_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_RS_CURRENT", market="JP")
     auto_sector_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_SECTOR_LEADER_CURRENT", market="JP")
 
@@ -2653,7 +2720,9 @@ def compute_entry_ready_candidates(database_url, user_id):
         comp = _entry_score_components(row, stage2, snapshot or {}, auto_rs_current, auto_sector_current, catalysts, event_signals)
         neg_cat_present = bool(comp["negativeCatalysts"])
         entry_score = comp["total"]
-        entry_state = _classify_entry_state(entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present)
+        entry_state, exception_applied = _classify_entry_state(
+            entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present, nikkei_chg)
+        resilience = _rs_resilience_tier({"changePct": row.get("changePct"), "marketRS": row.get("marketRS")}, nikkei_chg)
 
         reasons = []
         if comp["momentum"] > 0:
@@ -2670,6 +2739,8 @@ def compute_entry_ready_candidates(database_url, user_id):
             reasons.append("セクター内優位（AUTO_SECTOR_LEADER）")
         if comp["positiveCatalysts"]:
             reasons.append(f"好材料：{comp['positiveCatalysts'][0].get('title','')[:20]}")
+        if exception_applied:
+            reasons.append("⚠逆行耐性例外（地合い逆風下でも対市場優位・VWAP回復・反転構造・出来高増を確認）")
         risks = []
         if comp["negativeCatalysts"]:
             risks.append(f"悪材料：{comp['negativeCatalysts'][0].get('title','')[:20]}")
@@ -2683,11 +2754,13 @@ def compute_entry_ready_candidates(database_url, user_id):
             "current": row.get("current"),
             "changePct": round(row.get("changePct"), 2) if row.get("changePct") is not None else None,
             "marketRS": round(row.get("marketRS"), 2) if row.get("marketRS") is not None else None,
-            "entryScore": round(entry_score), "entryState": entry_state,
+            "entryScore": round(entry_score), "entryState": entry_state, "resilience": resilience,
             "analysisConfidence": analysis_confidence, "dataQuality": data_quality,
             "scoreBreakdown": comp, "reasons": reasons or ["総合スコア上位"], "risks": risks,
         })
 
+    # 指示書6番「値上がり率だけでは選ばない」：ソート基準はentry_score（既に過熱ペナルティ・
+    # VWAP/構造/RS等を織り込み済み）であり、changePct単純降順ではない。
     candidates.sort(key=lambda c: -c["entryScore"])
     entry_ready_top5 = [c for c in candidates if c["entryState"] in ("NOW_BUYABLE", "ENTRY_READY")][:5]
     top5_codes = {c["code"] for c in entry_ready_top5}
@@ -2697,23 +2770,49 @@ def compute_entry_ready_candidates(database_url, user_id):
     overall_quality = "FULL" if quality_counts["DEGRADED"] == 0 and quality_counts["PARTIAL"] == 0 else (
         "DEGRADED" if quality_counts["FULL"] == 0 else "PARTIAL")
 
-    # 選出時点の仮説をstock_thesesへ新規登録（既に今日のACTIVEな仮説がある銘柄は上書きしない、
-    # ensure_stock_thesis側のUNIQUE制約に任せる＝「選出時点の仮説」を保持し続ける）。
-    trade_date = datetime.date.today().isoformat()
-    for i, c in enumerate(entry_ready_top5):
-        try:
-            investment_db.ensure_stock_thesis(
-                database_url, user_id, c["code"], "JP", trade_date, c["name"],
-                c["entryScore"], c["entryState"], c["reasons"], c["analysisConfidence"])
-        except Exception as e:
-            print("  entry-candidates: thesis新規作成失敗", c["code"], e)
-
     return {
         "entryReadyTop5": [{**c, "rank": i + 1} for i, c in enumerate(entry_ready_top5)],
         "watchCandidates": watch_candidates,
         "dataQuality": overall_quality,
         "generatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
+
+
+def compute_entry_ready_candidates(database_url, user_id):
+    """Current TOP5（/api/entry-candidates、いつでも再計算できる表示用）。_score_entry_
+    candidates()をそのまま返すだけで、stock_thesesへの永続化は行わない（永続化は朝TOP5＝
+    generate_morning_entry_top5+persist_morning_thesesの専任、指示書22・23番）。"""
+    return _score_entry_candidates(database_url, user_id)
+
+
+def generate_morning_entry_top5(database_url, user_id):
+    """朝TOP5（entry_ready_top5、08:50MorningMarketCheck生成時点のスナップショット）を算出
+    する。Current TOP5と全く同じ_score_entry_candidates()を使う（指示書「同じ選考基準」）。
+    永続化はしない（呼び出し側でsave_morning_check後にpersist_morning_thesesを呼ぶ）。"""
+    return _score_entry_candidates(database_url, user_id)
+
+
+def persist_morning_theses(database_url, user_id, trade_date, morning_check_id, entry_ready_top5):
+    """朝TOP5（generate_morning_entry_top5の結果のentryReadyTop5）をstock_thesesへ永続化する
+    （source='MORNING'固定、指示書11・12番）。同じ(user_id, code, market, entry_date)が既に
+    あれば何もしない＝1日1仮説・後から書き換えない。"""
+    if investment_db is None or not database_url or not entry_ready_top5:
+        return
+    for c in entry_ready_top5:
+        bd = c.get("scoreBreakdown", {})
+        try:
+            investment_db.ensure_stock_thesis(
+                database_url, user_id, c["code"], "JP", trade_date, c["name"],
+                c["entryScore"], c["entryState"], c["reasons"], c["analysisConfidence"],
+                source="MORNING", morning_check_id=morning_check_id, morning_rank=c.get("rank"),
+                vwap_state=("ABOVE" if bd.get("vwap", 0) > 0 else "BELOW_OR_UNKNOWN"),
+                auto_rs=bd.get("autoRs", 0) > 0, auto_sector=bd.get("autoSector", 0) > 0,
+                resilience=c.get("resilience"),
+                trigger_text="寄り後VWAP維持＋5分足安値切り上げを確認してからのエントリーを推奨",
+                avoid_condition="寄り天・出来高を伴わない上昇・悪材料の追加",
+                morning_price=c.get("current"))
+        except Exception as e:
+            print("  朝TOP5 thesis永続化失敗", c.get("code"), e)
 
 
 def _reevaluate_active_stock_theses(database_url, user_id, trade_date, report_type, nikkei_chg):

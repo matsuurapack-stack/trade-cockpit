@@ -1781,6 +1781,23 @@ const ENTRY_STATE_META = {
   PROVISIONAL:   {label:"データ不足",       color:"var(--inkFaint)"},
 };
 
+// Phase2-C改訂（TOP5選考基準の全面見直し、指示書21番）：ENTRY SCOREの内訳を「X/満点」の形で
+// 透明表示するための配点表。サーバー側_entry_score_components()の配点と1対1で対応させる
+// （サーバー側の配点を変更したらここも合わせて変更すること）。RiskEvent/Overheatは満点ではなく
+// 減点項目のため上限を持たない（max:null）。
+const ENTRY_SCORE_COMPONENT_META = [
+  {key:"momentum",       label:"Momentum",   max:20},
+  {key:"vwap",           label:"VWAP",       max:15},
+  {key:"fiveMinStructure",label:"5m構造",     max:15},
+  {key:"marketRelative", label:"RS",         max:15},
+  {key:"volume",         label:"出来高",      max:10},
+  {key:"autoRs",         label:"AUTO_RS",    max:10},
+  {key:"autoSector",     label:"Sector",     max:5},
+  {key:"catalyst",       label:"Catalyst",   max:5},
+  {key:"riskEvent",      label:"RiskEvent",  max:null},
+  {key:"overheat",       label:"Overheat",   max:null},
+];
+
 // v3-9（監視銘柄自動登録エンジン）：🐒 MOMENTUM DAY専用バッジ。「買い推奨」ではないことを
 // 徹底するため、Primary/Action Status（enrichWatchRow、SSoT）の判定には一切影響しない完全に
 // 独立した表示のみ。
@@ -3517,7 +3534,8 @@ function rankTop5(enriched,stockQuotes){
     .slice(0,5);
 }
 
-function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan,newsCatalysts,entryScanning,entryResult,onEntryScan,thesisStats}){
+function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan,newsCatalysts,entryScanning,entryResult,onEntryScan,thesisStats,todayTheses}){
+  const [expandedScoreCode,setExpandedScoreCode]=useState(null); // スコア内訳の折りたたみ展開（指示書21番）
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
 
@@ -3837,42 +3855,62 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         無変更のまま残し、新しい仕組みは追加パネルとして併存させる（破壊しない）。 */}
     <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:6,padding:"12px 14px",marginTop:12}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6,marginBottom:8}}>
-        <div style={{fontWeight:800,fontSize:13.5}}>🎯 ENTRY TOP5（entry_score版）</div>
+        <div style={{fontWeight:800,fontSize:13.5}}>🎯 今買い時TOP5<span style={{fontWeight:400,fontSize:11,color:"var(--inkFaint)"}}>（entry_score・Current）</span></div>
         <div style={{display:"flex",alignItems:"center",gap:8}}>
           {thesisStats && thesisStats.totalFinalized>0 && <span style={{fontSize:11,color:"var(--inkFaint)"}}>
             直近30日 勝率{thesisStats.winRate}%（確定{thesisStats.totalFinalized}件）
           </span>}
           <button className="action-btn" style={{fontSize:12}} disabled={entryScanning} onClick={onEntryScan}>
-            {entryScanning?"🎯 スキャン中…":"🎯 ENTRY TOP5を更新"}
+            {entryScanning?"🎯 スキャン中…":"🎯 今買い時TOP5を更新"}
           </button>
         </div>
       </div>
+      <div style={{fontSize:10.5,color:"var(--inkFaint)",marginBottom:8}}>
+        「一番上がっている銘柄」ではなく「今から入ってもリスクリワードが良い銘柄」を上位表示します。原則プラス銘柄のみ、マイナス銘柄は逆行耐性の根拠がある場合のみ例外表示。
+      </div>
       {!entryResult
-        ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>「ENTRY TOP5を更新」を押すと、監視銘柄の中から現在最もエントリー条件が整っている候補をENTRY SCOREで算出します。</div>
+        ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>「今買い時TOP5を更新」を押すと、監視銘柄の中から現在最もエントリー条件が整っている候補をENTRY SCOREで算出します。</div>
         : <>
           {entryResult.dataQuality==="DEGRADED" && <div style={{fontSize:11,color:"var(--down)",fontWeight:700,marginBottom:6}}>⚠ データ取得が不十分なため、一部の判定は暫定（PROVISIONAL）です。</div>}
           {entryResult.entryReadyTop5.length===0
-            ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>現時点でENTRY READY以上の候補はありません。</div>
+            ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>現時点でNOW_BUYABLE/ENTRY_READYの候補はありません（マイナス銘柄・条件不足の銘柄はTOP5に表示しません）。</div>
             : <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:entryResult.watchCandidates.length>0?10:0}}>
                 {entryResult.entryReadyTop5.map(c=>{
                   const stMeta=ENTRY_STATE_META[c.entryState]||{label:c.entryState,color:"var(--inkFaint)"};
-                  return <div key={c.code} style={{display:"flex",alignItems:"center",gap:10,padding:"7px 8px",borderRadius:4,
-                    background:"var(--bg)",border:"1px solid var(--rule)",flexWrap:"wrap"}}>
-                    <div style={{fontSize:13,fontWeight:800,color:"var(--inkFaint)",width:16,textAlign:"center"}}>{c.rank}</div>
-                    <div style={{width:56,fontSize:11.5,color:"var(--inkSoft)"}} className="mono">{c.code}</div>
-                    <div style={{flex:"0 0 auto",minWidth:90,fontSize:12.5,fontWeight:700}}>{c.name}</div>
-                    <div className="mono" style={{width:70,fontSize:12.5,textAlign:"right"}}>{c.current!=null?c.current.toLocaleString():"—"}</div>
-                    <span style={{fontSize:12,fontWeight:800,color:"var(--accent)",border:"1px solid var(--accent)",borderRadius:3,padding:"1px 6px"}}>SCORE {c.entryScore}</span>
-                    <span style={{fontSize:10.5,fontWeight:700,color:stMeta.color,border:`1px solid ${stMeta.color}`,borderRadius:3,padding:"1px 6px",whiteSpace:"nowrap"}}>{stMeta.label}</span>
-                    {c.analysisConfidence==="LOW" && <span style={{fontSize:10,color:"var(--down)"}}>確信度LOW</span>}
-                    <div style={{flex:"1 1 140px",minWidth:0,fontSize:11,color:"var(--inkSoft)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                      {(c.reasons||[]).join("・")}{c.risks&&c.risks.length>0?"　⚠"+c.risks.join("・"):""}
+                  const isException=(c.reasons||[]).some(r=>r.includes("逆行耐性例外"));
+                  const bd=c.scoreBreakdown||{};
+                  const expanded=expandedScoreCode===c.code;
+                  return <div key={c.code} style={{padding:"7px 8px",borderRadius:4,
+                    background:"var(--bg)",border:isException?"1px solid var(--accent)":"1px solid var(--rule)"}}>
+                    <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap",cursor:"pointer"}}
+                      onClick={()=>setExpandedScoreCode(expanded?null:c.code)} title="クリックでスコア内訳を表示">
+                      <div style={{fontSize:13,fontWeight:800,color:"var(--inkFaint)",width:16,textAlign:"center"}}>{c.rank}</div>
+                      <div style={{width:56,fontSize:11.5,color:"var(--inkSoft)"}} className="mono">{c.code}</div>
+                      <div style={{flex:"0 0 auto",minWidth:90,fontSize:12.5,fontWeight:700}}>{c.name}</div>
+                      <div className="mono" style={{width:70,fontSize:12.5,textAlign:"right"}}>{c.current!=null?c.current.toLocaleString():"—"}</div>
+                      <span className="mono" style={{width:56,fontSize:12,textAlign:"right",color:c.changePct==null?"var(--inkFaint)":c.changePct>0?"var(--up)":c.changePct<0?"var(--down)":"var(--inkFaint)"}}>
+                        {c.changePct!=null?(c.changePct>0?"+":"")+c.changePct.toFixed(2)+"%":"—"}
+                      </span>
+                      <span style={{fontSize:12,fontWeight:800,color:"var(--accent)",border:"1px solid var(--accent)",borderRadius:3,padding:"1px 6px"}}>SCORE {c.entryScore}</span>
+                      <span style={{fontSize:10.5,fontWeight:700,color:stMeta.color,border:`1px solid ${stMeta.color}`,borderRadius:3,padding:"1px 6px",whiteSpace:"nowrap"}}>{stMeta.label}</span>
+                      {c.analysisConfidence==="LOW" && <span style={{fontSize:10,color:"var(--down)"}}>確信度LOW</span>}
+                      {isException && <span style={{fontSize:10,fontWeight:700,color:"var(--accent)"}}>⚠逆行耐性例外</span>}
+                      <div style={{flex:"1 1 140px",minWidth:0,fontSize:11,color:"var(--inkSoft)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                        {(c.reasons||[]).filter(r=>!r.includes("逆行耐性例外")).join("・")}{c.risks&&c.risks.length>0?"　⚠"+c.risks.join("・"):""}
+                      </div>
+                      <span style={{fontSize:10,color:"var(--inkFaint)"}}>{expanded?"▲内訳を閉じる":"▼内訳"}</span>
                     </div>
+                    {expanded && <div style={{marginTop:6,paddingTop:6,borderTop:"1px dashed var(--rule)",display:"flex",flexWrap:"wrap",gap:"4px 14px",fontSize:11}}>
+                      {ENTRY_SCORE_COMPONENT_META.map(m=><span key={m.key} className="mono">
+                        {m.label} {bd[m.key]!=null?bd[m.key]:0}{m.max!=null?`/${m.max}`:""}
+                      </span>)}
+                      <span className="mono" style={{fontWeight:800}}>合計 {c.entryScore}</span>
+                    </div>}
                   </div>;
                 })}
               </div>}
           {entryResult.watchCandidates.length>0 && <>
-            <div style={{fontSize:11,fontWeight:700,color:"var(--inkSoft)",marginBottom:4}}>Watch候補（まだENTRY READYではない）</div>
+            <div style={{fontSize:11,fontWeight:700,color:"var(--inkSoft)",marginBottom:4}}>監視候補（BREAKOUT待ち・押し目待ち・反転待ち等、まだENTRY READYではない）</div>
             <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
               {entryResult.watchCandidates.map(c=>{
                 const stMeta=ENTRY_STATE_META[c.entryState]||{label:c.entryState,color:"var(--inkFaint)"};
@@ -3883,6 +3921,30 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
             </div>
           </>}
         </>}
+      {/* 指示書18・19番：📊 朝TOP5結果。08:50 MorningMarketCheckで確定したentry_ready_top5
+          （stock_theses、source='MORNING'）の本日分だけを表示する。Current TOP5（上記）とは
+          別物＝再計算しても朝の記録は書き換わらない。 */}
+      {todayTheses && todayTheses.length>0 && <div style={{marginTop:12,paddingTop:10,borderTop:"1px solid var(--rule)"}}>
+        <div style={{fontSize:12,fontWeight:800,marginBottom:6}}>📊 朝TOP5結果（{todayISO()}）</div>
+        <div style={{display:"flex",flexDirection:"column",gap:4}}>
+          {[...todayTheses].sort((a,b)=>(a.morning_rank||99)-(b.morning_rank||99)).map(t=>{
+            const resultLabel=t.final_result||t.thesis_status;
+            // ACTIVE（判定待ち）だけこのパネル専用、他は既存3種のメタ（Market Intelligence
+            // Timelineで既に使っているTHESIS_RESULT_META/THESIS_STATUS_META/
+            // TOP5_FINAL_RESULT_META、語彙が重ならないので順に探すだけで済む）を再利用する。
+            const resultMeta=resultLabel==="ACTIVE"?{icon:"⏳",label:"ACTIVE（判定待ち）",color:"var(--inkSoft)"}
+              :THESIS_RESULT_META[resultLabel]||THESIS_STATUS_META[resultLabel]||TOP5_FINAL_RESULT_META[resultLabel]
+              ||{icon:"",label:resultLabel,color:"var(--inkFaint)"};
+            return <div key={t.id} style={{display:"flex",alignItems:"center",gap:8,fontSize:11.5,flexWrap:"wrap"}}>
+              <span style={{width:16,textAlign:"center",color:"var(--inkFaint)"}}>{t.morning_rank||"—"}</span>
+              <span className="mono" style={{width:56}}>{t.code}</span>
+              <span style={{fontWeight:700,minWidth:80}}>{t.name}</span>
+              <span style={{color:"var(--inkFaint)"}}>朝score {t.initial_entry_score}</span>
+              <span style={{fontWeight:700,color:resultMeta.color,border:`1px solid ${resultMeta.color}`,borderRadius:3,padding:"1px 6px"}}>{resultMeta.icon} {resultMeta.label}</span>
+            </div>;
+          })}
+        </div>
+      </div>}
     </div>
 
     {/* 2026-09-07更新（監視銘柄画面・情報整理/UI整理のみ、ロジック無変更）：②今日の状況／
@@ -9280,21 +9342,32 @@ function App(){
     setVolumeScanning(false);
   };
 
-  // Market Intelligence Timeline Phase2-C（今買い時TOP5＋Thesis永続化、2026-09-10新規）：
-  // 「今日の注目TOP5」（enrichWatchRow()だけを使うクライアント側の既存軽量ロジック、v3-4）とは
-  // 別物。サーバー側で算出したENTRY SCORE（0-100）に基づくentry_ready_top5・Watch候補を表示する
-  // 独立パネル。既存の今日の注目TOP5は無変更のまま残す（破壊しない、指示書の進め方に合わせて
-  // 追加のみ）。
+  // Market Intelligence Timeline Phase2-C（今買い時TOP5＋Thesis永続化、2026-09-10新規、
+  // 2026-09-10改訂：TOP5選考基準の全面見直し）：「今日の注目TOP5」（enrichWatchRow()だけを
+  // 使うクライアント側の既存軽量ロジック、v3-4）とは別物。サーバー側で算出したENTRY SCORE
+  // （0-100）に基づくentry_ready_top5（Current TOP5、いつでも再計算可）・Watch候補を表示する
+  // 独立パネル。既存の今日の注目TOP5は無変更のまま残す（破壊しない）。
+  // 「朝TOP5」（08:50 MorningMarketCheck生成時点で確定・以後書き換えないentry_ready_top5の
+  // スナップショット、成績評価専用）は、Current TOP5とは別物としてstock_theses（source=
+  // 'MORNING'）に永続化される——本日分をtodayThesesとして同時に取得し、「📊 朝TOP5結果」
+  // として表示する。
   const [entryScanning,setEntryScanning]=useState(false);
   const [entryResult,setEntryResult]=useState(null);
   const [thesisStats,setThesisStats]=useState(null);
+  const [todayTheses,setTodayTheses]=useState([]);
   const runEntryScan=async()=>{
     setEntryScanning(true);
     try{
       const r=await fetch("/api/entry-candidates");
       if(r.ok)setEntryResult(await r.json());
-      const sr=await fetch("/api/stock-theses?days=30");
-      if(sr.ok){const sd=await sr.json();setThesisStats(sd.stats);}
+      const sr=await fetch(`/api/stock-theses?days=30&from=${todayISO()}&to=${todayISO()}`);
+      if(sr.ok){
+        const sd=await sr.json();
+        // statsは?days=30の期間集計、theses一覧は?from=&to=で本日分だけに絞る（別々の意味の
+        // パラメータを1回のfetchで併用、APIは無変更）。
+        setThesisStats(sd.stats);
+        setTodayTheses(Array.isArray(sd.theses)?sd.theses.filter(t=>t.entry_date===todayISO()):[]);
+      }
     }catch(e){}
     setEntryScanning(false);
   };
@@ -9792,7 +9865,7 @@ function App(){
         pullbackScanning={pullbackScanning} pullbackResult={pullbackResult} onPullbackScan={runPullbackScan}
         reversalScanning={reversalScanning} reversalResult={reversalResult} onReversalScan={runReversalScan}
         volumeScanning={volumeScanning} volumeResult={volumeResult} onVolumeScan={runVolumeScan}
-        entryScanning={entryScanning} entryResult={entryResult} onEntryScan={runEntryScan} thesisStats={thesisStats}/>}
+        entryScanning={entryScanning} entryResult={entryResult} onEntryScan={runEntryScan} thesisStats={thesisStats} todayTheses={todayTheses}/>}
 
       {/* ===== BRIEFING（日本市場） ===== */}
       {tab==="briefing" && <div>

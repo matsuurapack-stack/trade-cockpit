@@ -859,6 +859,25 @@ CREATE INDEX IF NOT EXISTS idx_stock_theses_user_date ON stock_theses(user_id, e
 CREATE INDEX IF NOT EXISTS idx_stock_theses_user_status ON stock_theses(user_id, thesis_status);
 """
 
+# 2026-09-10追加（Phase2-C「朝TOP5成績評価＋TOP5選考基準の全面見直し」指示書11・12番）：
+# 「朝TOP5」（08:50 MorningMarketCheck生成時点で確定・以後書き換えない、成績評価専用）と
+# 「Current TOP5」（09:30以降いつでも再計算できる、その場限りの表示用）を明確に分離する。
+# stock_thesesは今後「朝TOP5」だけが行を作る（source='MORNING'固定）——Current TOP5の
+# 都度更新では行を作らない・書き換えない設計に変更した（既存重複テーブルを増やさず、
+# 最低限のALTER COLUMNで対応、指示書27番「最小変更を優先」）。
+_MIGRATE_STOCK_THESES_MORNING_COLUMNS_SQL = """
+ALTER TABLE stock_theses ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'MORNING';
+ALTER TABLE stock_theses ADD COLUMN IF NOT EXISTS morning_check_id INTEGER;
+ALTER TABLE stock_theses ADD COLUMN IF NOT EXISTS morning_rank INTEGER;
+ALTER TABLE stock_theses ADD COLUMN IF NOT EXISTS vwap_state TEXT;
+ALTER TABLE stock_theses ADD COLUMN IF NOT EXISTS auto_rs BOOLEAN;
+ALTER TABLE stock_theses ADD COLUMN IF NOT EXISTS auto_sector BOOLEAN;
+ALTER TABLE stock_theses ADD COLUMN IF NOT EXISTS resilience TEXT;
+ALTER TABLE stock_theses ADD COLUMN IF NOT EXISTS trigger_text TEXT;
+ALTER TABLE stock_theses ADD COLUMN IF NOT EXISTS avoid_condition TEXT;
+ALTER TABLE stock_theses ADD COLUMN IF NOT EXISTS morning_price NUMERIC;
+"""
+
 
 def init_schema(database_url):
     """テーブルを（無ければ）作成し、マルチユーザー化・ChatGPT連携の移行SQLも実行する。
@@ -878,6 +897,7 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_POSITION_RISK_RULES_SQL)
         conn.execute(_SCHEMA_MARKET_INTELLIGENCE_SQL)
         conn.execute(_SCHEMA_STOCK_THESES_SQL)
+        conn.execute(_MIGRATE_STOCK_THESES_MORNING_COLUMNS_SQL)
         conn.commit()
 
 
@@ -3777,27 +3797,34 @@ def get_market_intelligence_report(database_url, user_id, trade_date, report_typ
 
 # ---- stock_theses（Market Intelligence Timeline Phase2-C「今買い時TOP5＋Thesis永続化」） ----
 
-def ensure_stock_thesis(database_url, user_id, code, market, entry_date, name, entry_score, entry_state, reasons, analysis_confidence):
-    """entry_ready_top5に選ばれた銘柄の仮説を新規作成する。同じ(user_id, code, market,
-    entry_date)が既にあれば何もしない（同日に何度TOP5へ選ばれても仮説は1つのまま、既存の
-    仮説を上書きしない＝「選出時点の仮説」を保持し続けるのが目的）。戻り値：作成したら
-    新規行(dict)、既存行があればNone。"""
+def ensure_stock_thesis(database_url, user_id, code, market, entry_date, name, entry_score, entry_state, reasons, analysis_confidence,
+                          source="MORNING", morning_check_id=None, morning_rank=None, vwap_state=None,
+                          auto_rs=None, auto_sector=None, resilience=None, trigger_text=None, avoid_condition=None, morning_price=None):
+    """朝TOP5（08:50 MorningMarketCheck生成時点で確定するentry_ready_top5）に選ばれた銘柄の
+    仮説を新規作成する。2026-09-10更新（Phase2-C「朝TOP5成績評価」）：以後はMorningMarketCheck
+    経由（source='MORNING'）だけが仮説を作る——Current TOP5（日中いつでも再計算できる表示用の
+    一覧）は仮説を作らない設計に変更した（「朝TOP5は成績評価用として固定し、後から書き換えない」
+    「Current TOP5は朝TOP5とは別物」という指示書22・23番の要件）。同じ(user_id, code, market,
+    entry_date)が既にあれば何もしない（1日1仮説）。戻り値：作成したら新規行(dict)、既存行が
+    あればNone。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
-    history = [{"at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "status": "ACTIVE", "entry_score": entry_score, "note": "entry_ready_top5選出"}]
+    history = [{"at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "status": "ACTIVE", "entry_score": entry_score, "note": "朝TOP5選出"}]
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "INSERT INTO stock_theses (user_id, code, market, entry_date, name, initial_entry_score, "
                 "initial_entry_state, initial_reasons_json, latest_entry_score, analysis_confidence, "
-                "thesis_status, status_history_json) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,'ACTIVE',%s::jsonb) "
+                "thesis_status, status_history_json, source, morning_check_id, morning_rank, vwap_state, "
+                "auto_rs, auto_sector, resilience, trigger_text, avoid_condition, morning_price) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,'ACTIVE',%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                 "ON CONFLICT (user_id, code, market, entry_date) DO NOTHING "
                 "RETURNING *",
                 [user_id, code, market, entry_date, name, entry_score, entry_state,
                  json.dumps(reasons or [], ensure_ascii=False), entry_score, analysis_confidence,
-                 json.dumps(history, ensure_ascii=False)])
+                 json.dumps(history, ensure_ascii=False), source, morning_check_id, morning_rank, vwap_state,
+                 auto_rs, auto_sector, resilience, trigger_text, avoid_condition, morning_price])
             row = cur.fetchone()
         conn.commit()
     return _row_to_json(row) if row else None
@@ -3888,7 +3915,11 @@ def list_stock_theses(database_url, user_id, from_date=None, to_date=None, limit
 
 def get_stock_thesis_stats(database_url, user_id, days=30):
     """直近days日分のfinal_result内訳（成績評価）を集計する。final_result未確定（当日進行中）
-    の仮説は集計に含めない。"""
+    の仮説は集計に含めない。2026-09-10更新（Phase2-C指示書19番）：hit_rateはSUCCESS=1点・
+    PARTIAL_SUCCESS=0.5点・FAIL=0点のsuccess_equivalentを(SUCCESS+PARTIAL+FAIL)で割る
+    （PARTIAL_SUCCESSを満点扱いしていた旧実装から修正）。NO_ENTRY/DATA_INSUFFICIENTは
+    「そもそもエントリー機会が無かった/判定不能」であり狙いが外れたわけではないため、
+    分母から除外する（指示書「NO_ENTRYは分母から除外」）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return {"totalFinalized": 0, "byResult": {}, "winRate": None}
@@ -3902,8 +3933,12 @@ def get_stock_thesis_stats(database_url, user_id, days=30):
             rows = cur.fetchall()
     by_result = {r["final_result"]: r["n"] for r in rows}
     total = sum(by_result.values())
-    decided = by_result.get("SUCCESS", 0) + by_result.get("PARTIAL_SUCCESS", 0) + by_result.get("FAIL", 0)
-    win_rate = round((by_result.get("SUCCESS", 0) + by_result.get("PARTIAL_SUCCESS", 0)) / decided * 100, 1) if decided else None
+    success_n = by_result.get("SUCCESS", 0)
+    partial_n = by_result.get("PARTIAL_SUCCESS", 0)
+    fail_n = by_result.get("FAIL", 0)
+    decided = success_n + partial_n + fail_n
+    success_equivalent = success_n * 1.0 + partial_n * 0.5 + fail_n * 0.0
+    win_rate = round(success_equivalent / decided * 100, 1) if decided else None
     return {"totalFinalized": total, "byResult": by_result, "winRate": win_rate, "sinceDate": since}
 
 
