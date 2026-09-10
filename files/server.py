@@ -6119,6 +6119,300 @@ def _macro_text(items):
     return "\n".join(f"・{it['title']}\n  {it['url']}" for it in items)
 
 
+# ============================================================
+# Unified Smart Import（SmartImportEngine）。2026-09-10新規、Phase SI-A。
+# 目的：カタリスト・有識者意見・イベント等、入力経路ごとに異なるJSON schemaをユーザーが
+# 意識しなくても、「文章・JSON・箇条書き・記事本文・ChatGPT出力」をそのまま貼るだけで
+# 自動判別・分類・プレビュー・保存できるようにする。指示書の実装順どおりPhase SI-Aでは
+# 共通classify/normalize基盤＋CATALYST／EVENT／EXPERT_OPINIONの3カテゴリのみ実装する
+# （MARKET_ANALYSIS・MORNING_MARKET_CHECK・INTRADAY_REPORT・TRADE_RULE・WATCHLIST_UPDATE・
+# POSITION_UPDATE・NEWSはPhase SI-B/C予定、現時点ではUNKNOWNに分類され保存されない）。
+# 既存のimport_news_catalysts()・import_market_events()・import_expert_views()
+# （investment_db.py）をそのまま呼び出し、保存ロジックを重複実装しない（指示書33番）。
+# ============================================================
+
+SMART_IMPORT_CATEGORIES = [  # 指示書2番。将来カテゴリ追加時はここへ追加するだけでよい構造
+    "CATALYST", "EXPERT_OPINION", "EVENT", "MARKET_ANALYSIS", "MORNING_MARKET_CHECK",
+    "INTRADAY_REPORT", "TRADE_RULE", "NEWS", "WATCHLIST_UPDATE", "POSITION_UPDATE", "UNKNOWN",
+]
+SMART_IMPORT_IMPLEMENTED_CATEGORIES = {"CATALYST", "EVENT", "EXPERT_OPINION"}  # Phase SI-Aの範囲
+
+_JSON_CODEBLOCK_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
+
+
+def _extract_json_candidates(raw_text):
+    """raw_textから解析可能なJSON（正規JSON全体・```json コードブロック内・文中に埋め込まれた
+    最初のbalanced {...}/[...]断片）を取り出す（指示書3・4番STEP1）。パースできなければ
+    Noneを返すだけで例外は投げない（指示書30番：JSON parse失敗をエラー扱いにしない）。"""
+    text = (raw_text or "").strip()
+    if not text:
+        return None
+    candidates_text = [text]
+    for m in _JSON_CODEBLOCK_RE.finditer(text):
+        candidates_text.append(m.group(1).strip())
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
+        start = text.find(open_ch)
+        if start != -1:
+            end = text.rfind(close_ch)
+            if end > start:
+                candidates_text.append(text[start:end + 1])
+    for t in candidates_text:
+        if not t:
+            continue
+        try:
+            return json.loads(t)
+        except Exception:
+            continue
+    return None
+
+
+def _classify_json_item(item):
+    """dict1件をCATALYST/EVENT/EXPERT_OPINION/UNKNOWNへ分類する（フィールド形状ベース、
+    指示書4番STEP2）。既存の各schemaのキー名をそのまま使い、新しいschemaは増やさない。"""
+    if not isinstance(item, dict):
+        return "UNKNOWN", "LOW", {}
+    t = str(item.get("type") or "").strip().lower()
+    if t in ("catalyst", "news_catalyst"):
+        return "CATALYST", "HIGH", item
+    if t in ("event", "market_event"):
+        return "EVENT", "HIGH", item
+    if t in ("expert_opinion", "expert_view"):
+        return "EXPERT_OPINION", "HIGH", item
+    if "expert_name" in item and ("published_at" in item or "date" in item):
+        return "EXPERT_OPINION", ("HIGH" if item.get("published_at") else "MEDIUM"), item
+    if "title" in item and ("catalyst_date" in item or "category" in item):
+        return "CATALYST", ("HIGH" if item.get("catalyst_date") else "MEDIUM"), item
+    if ("event_date" in item or "event" in item) and ("title" in item or "event" in item):
+        return "EVENT", ("HIGH" if item.get("event_date") else "MEDIUM"), item
+    return "UNKNOWN", "LOW", item
+
+
+# 指示書9番のイベント種別を中心とした簡易キーワード分類（AI不使用、他のAUTO系エンジンと
+# 同じ方針）。日付が併記されているかどうかでconfidenceを分ける（指示書21番：勝手に日付を
+# 補完しない、無ければMEDIUM/LOWに留める）。
+_SMART_IMPORT_EVENT_KEYWORDS = ["FOMC", "日銀", "日銀会合", "金融政策決定会合", "CPI", "PPI",
+    "雇用統計", "GDP", "SQ", "MSQ", "決算発表", "決算", "要人発言", "製品発表", "ロックアップ解除"]
+_SMART_IMPORT_DATE_PATTERNS = [
+    re.compile(r"\d{4}年\d{1,2}月\d{1,2}日"), re.compile(r"\d{1,2}月\d{1,2}日"),
+    re.compile(r"\d{1,2}/\d{1,2}"), re.compile(r"今日|明日|明後日|今週|来週|今月|来月"),
+]
+# 指示書8番：話者名＋意見動詞の組み合わせで有識者意見を検出する。事実の羅列（指示書22番）と
+# 区別するため、名前だけ・動詞だけでは判定しない（両方揃って初めてEXPERT_OPINION）。
+_SMART_IMPORT_EXPERT_NAME_RE = re.compile(r"([一-龠ぁ-んァ-ヶー]{2,8}(?:氏|さん|アナリスト))")
+_SMART_IMPORT_OPINION_VERBS = ["との見方", "との見解", "と述べ", "と分析", "とコメント", "予想",
+    "慎重", "強気", "弱気", "有効", "注目", "示唆", "と語った", "とみる"]
+_SMART_IMPORT_CATALYST_KEYWORDS = [
+    "新製品", "新サービス", "大型受注", "提携", "業務提携", "資本提携", "協業", "事業化",
+    "量産開始", "量産化", "採用決定", "上方修正", "自社株買い", "増配", "下方修正", "減配",
+    "不祥事", "事故", "訴訟", "公募増資", "希薄化", "売出し", "出荷", "受注", "サンプル出荷",
+]
+_SMART_IMPORT_STOCK_CODE_RE = re.compile(r"\b(\d{4})\b")
+
+
+def _classify_text_chunk(chunk):
+    """自然文の1塊をEVENT/EXPERT_OPINION/CATALYST/UNKNOWNへ分類する簡易ヒューリスティック
+    （指示書4番STEP3・4、指示書22・23番：事実と意見の区別を試みるが、あくまで簡易判定であり
+    確信が持てなければLOW・UNKNOWNに倒す）。AIモデルは使わず、キーワード・正規表現のみで
+    判定する（他のAUTO系エンジンと同じ設計方針）。"""
+    chunk = chunk.strip()
+    if not chunk:
+        return "UNKNOWN", "LOW", {}
+    has_date = any(p.search(chunk) for p in _SMART_IMPORT_DATE_PATTERNS)
+    has_event_kw = any(kw in chunk for kw in _SMART_IMPORT_EVENT_KEYWORDS)
+    expert_match = _SMART_IMPORT_EXPERT_NAME_RE.search(chunk)
+    has_opinion_verb = any(v in chunk for v in _SMART_IMPORT_OPINION_VERBS)
+    has_catalyst_kw = any(kw in chunk for kw in _SMART_IMPORT_CATALYST_KEYWORDS)
+    stock_code = _SMART_IMPORT_STOCK_CODE_RE.search(chunk)
+
+    # 話者名＋意見動詞（より具体的なシグナル）を、単なるイベントキーワード一致より優先する。
+    # 例：「木野内氏はFOMCまでは慎重との見方」はFOMCという語を含むが、これはイベント告知では
+    # なく有識者の見解についての文であるため、EXPERT_OPINIONを優先する。
+    if expert_match and has_opinion_verb:
+        return "EXPERT_OPINION", "MEDIUM", {
+            "expert_name": expert_match.group(1), "opinion_summary": chunk, "outlook": chunk}
+    if has_event_kw:
+        return "EVENT", ("MEDIUM" if has_date else "LOW"), {
+            "title": chunk[:80], "event_date": None, "notes": chunk}
+    if has_catalyst_kw:
+        return "CATALYST", ("MEDIUM" if stock_code else "LOW"), {
+            "title": chunk[:80], "summary": chunk, "ticker": stock_code.group(1) if stock_code else None}
+    return "UNKNOWN", "LOW", {}
+
+
+def classify_content(raw_text):
+    """SmartImportEngineの入口（指示書4番の全STEP）。1回の貼り付けに複数種類の情報が
+    あっても対応し、1入力＝1レコードに固定しない（指示書5番）。
+    戻り値：[{category, confidence, source_kind, raw_text, draft}, ...]。
+    draftはnormalize_*()にそのまま渡せる形（JSON由来ならそのdict、自然文由来なら
+    抽出したフィールドのdict）。"""
+    raw_text = (raw_text or "").strip()
+    if not raw_text:
+        return []
+    parsed = _extract_json_candidates(raw_text)
+    if parsed is not None:
+        items = parsed if isinstance(parsed, list) else [parsed]
+        # {"catalysts":[...]}/{"events":[...]}/{"expert_views":[...]}等の既存ラッパー形式も吸収する
+        if len(items) == 1 and isinstance(items[0], dict):
+            wrapper = items[0]
+            for key in ("catalysts", "events", "market_events", "expert_views", "views"):
+                if isinstance(wrapper.get(key), list) and wrapper[key]:
+                    items = wrapper[key]
+                    break
+        candidates = []
+        for item in items:
+            category, confidence, draft = _classify_json_item(item)
+            candidates.append({"category": category, "confidence": confidence, "source_kind": "json",
+                                "raw_text": json.dumps(item, ensure_ascii=False)[:500], "draft": draft})
+        if candidates:
+            return candidates
+    # JSONとして解釈できない、または要素0件→自然文解析（指示書3・30番：エラーにしない）
+    chunks = [c.strip() for c in re.split(r"[。\n]", raw_text) if c.strip()]
+    if not chunks:
+        chunks = [raw_text]
+    candidates = []
+    for chunk in chunks:
+        category, confidence, draft = _classify_text_chunk(chunk)
+        if category != "UNKNOWN":
+            candidates.append({"category": category, "confidence": confidence, "source_kind": "natural_text",
+                                "raw_text": chunk, "draft": draft})
+    if not candidates:
+        # 完全に判別不能な場合のみ（指示書30番の「登録候補を特定できませんでした」に対応）
+        candidates.append({"category": "UNKNOWN", "confidence": "LOW", "source_kind": "natural_text",
+                            "raw_text": raw_text[:500], "draft": {}})
+    return candidates
+
+
+def normalize_catalyst(draft, raw_text=None, import_source="unknown"):
+    """draft（JSON由来 or 自然文由来）をinvestment_db.import_news_catalysts()が受け付ける
+    形へ正規化する（指示書6・7・19番）。titleが無ければNoneを返す（呼び出し側でスキップ）。"""
+    draft = draft or {}
+    title = draft.get("title") or draft.get("summary")
+    if not title:
+        return None
+    out = dict(draft)
+    out["title"] = title
+    out.setdefault("catalyst_date", draft.get("catalyst_date") or draft.get("published_at")
+                    or datetime.date.today().isoformat())
+    if draft.get("ticker") and not out.get("affected_stocks"):
+        out["affected_stocks"] = [draft["ticker"]]
+    out.setdefault("category", draft.get("catalyst_type") or "OTHER")
+    payload = dict(out.get("raw_payload") or {})
+    payload.update({"raw_text": raw_text, "import_source": import_source, "smart_import": True})
+    out["raw_payload"] = payload
+    return out
+
+
+def normalize_event(draft, raw_text=None, import_source="unknown"):
+    """draftをinvestment_db.import_market_events()が受け付ける形へ正規化する（指示書6・9・
+    19番）。既存の_normalize_market_event()（legacy JSON互換の日付/importance変換）を
+    そのまま再利用し、変換ロジックを重複実装しない。titleが無ければNoneを返す。
+    event_dateが不明確な場合も勝手に補完せずNoneのまま返す（呼び出し側・プレビューで警告）。"""
+    draft = draft or {}
+    title = draft.get("title") or draft.get("event")
+    if not title:
+        return None
+    out = investment_db._normalize_market_event(draft) if investment_db else dict(draft)
+    out["title"] = title
+    payload = dict(out.get("raw_payload") or {})
+    payload.update({"raw_text": raw_text, "import_source": import_source, "smart_import": True})
+    out["raw_payload"] = payload
+    return out
+
+
+def normalize_expert_opinion(draft, raw_text=None, import_source="unknown"):
+    """draftをinvestment_db.import_expert_views()が受け付ける形へ正規化する（指示書6・8・
+    19番）。expert_nameが無ければNoneを返す。指示書22番：opinion系フィールド（outlook等）に
+    入れるだけで、事実データのテーブル（news_catalysts/market_events）とは混同しない。"""
+    draft = draft or {}
+    expert_name = draft.get("expert_name") or draft.get("speaker")
+    if not expert_name:
+        return None
+    out = dict(draft)
+    out["expert_name"] = expert_name
+    out.setdefault("published_at", draft.get("published_at") or draft.get("date")
+                    or datetime.date.today().isoformat())
+    out.setdefault("outlook", draft.get("opinion_summary") or draft.get("outlook"))
+    payload = dict(out.get("raw_payload") or {})
+    payload.update({"raw_text": raw_text, "import_source": import_source, "smart_import": True})
+    out["raw_payload"] = payload
+    return out
+
+
+def smart_import_check_duplicates(database_url, user_id, candidates):
+    """CATALYST/EVENTの候補について、既存データとタイトルが一致する可能性があるものに
+    possible_duplicate=Trueを付与する（指示書20番。厳密なcontent hash照合ではなく簡易な
+    タイトル一致判定——自動で二重登録はしない、あくまでプレビュー警告用）。"""
+    if investment_db is None or not database_url:
+        return candidates
+    existing_catalyst_titles, existing_event_titles = None, None
+    for c in candidates:
+        title = (c.get("draft") or {}).get("title")
+        if not title:
+            continue
+        if c.get("category") == "CATALYST":
+            if existing_catalyst_titles is None:
+                try:
+                    existing_catalyst_titles = {x.get("title") for x in investment_db.list_news_catalysts(database_url, user_id, limit=300)}
+                except Exception:
+                    existing_catalyst_titles = set()
+            if title in existing_catalyst_titles:
+                c["possible_duplicate"] = True
+        elif c.get("category") == "EVENT":
+            if existing_event_titles is None:
+                try:
+                    existing_event_titles = {x.get("title") for x in investment_db.list_market_events(database_url, user_id, limit=200)}
+                except Exception:
+                    existing_event_titles = set()
+            if title in existing_event_titles:
+                c["possible_duplicate"] = True
+    return candidates
+
+
+def smart_import_confirm(database_url, user_id, candidates, import_source="unknown"):
+    """プレビュー画面でユーザーが確定した候補群を、カテゴリごとに既存のimport_*関数へ
+    振り分けて保存する（指示書18番：SmartImportは入口・変換・振り分けのみを担当し、
+    独自の巨大DBは作らない）。LOW confidenceの候補はforce指定が無い限り保存しない
+    （指示書16番：LOWは自動保存禁止）。
+    戻り値：{"results": {"CATALYST": {...}, "EVENT": {...}, "EXPERT_OPINION": {...}},
+    "rejected_low_confidence": N, "skipped_unimplemented": M}"""
+    if investment_db is None or not database_url:
+        return {"results": {}, "rejected_low_confidence": 0, "skipped_unimplemented": 0}
+    buckets = {"CATALYST": [], "EVENT": [], "EXPERT_OPINION": []}
+    rejected = 0
+    skipped_unimplemented = 0
+    for c in candidates or []:
+        category = c.get("category")
+        if category not in SMART_IMPORT_IMPLEMENTED_CATEGORIES:
+            skipped_unimplemented += 1
+            continue
+        if c.get("confidence") == "LOW" and not c.get("force"):
+            rejected += 1
+            continue
+        draft = c.get("draft") or {}
+        raw_text = c.get("raw_text")
+        normalized = None
+        try:
+            if category == "CATALYST":
+                normalized = normalize_catalyst(draft, raw_text, import_source)
+            elif category == "EVENT":
+                normalized = normalize_event(draft, raw_text, import_source)
+            elif category == "EXPERT_OPINION":
+                normalized = normalize_expert_opinion(draft, raw_text, import_source)
+        except Exception as e:
+            print("  SmartImport: 正規化失敗", category, e)
+            normalized = None
+        if normalized is not None:
+            buckets[category].append(normalized)
+    results = {}
+    if buckets["CATALYST"]:
+        results["CATALYST"] = investment_db.import_news_catalysts(database_url, user_id, buckets["CATALYST"])
+    if buckets["EVENT"]:
+        results["EVENT"] = investment_db.import_market_events(database_url, user_id, buckets["EVENT"])
+    if buckets["EXPERT_OPINION"]:
+        results["EXPERT_OPINION"] = investment_db.import_expert_views(database_url, user_id, buckets["EXPERT_OPINION"])
+    return {"results": results, "rejected_low_confidence": rejected, "skipped_unimplemented": skipped_unimplemented}
+
+
 class Handler(SimpleHTTPRequestHandler):
     def log_message(self, *a):
         pass  # アクセスログは静かに
@@ -7123,6 +7417,37 @@ class Handler(SimpleHTTPRequestHandler):
             body = self._read_json_body()
             investment_db.delete_expert_view(DATABASE_URL, self.current_user, body.get("id"))
             self._send_json({"ok": True})
+        elif self.path == "/api/smart-import/preview":
+            # 2026-09-10新規（Unified Smart Import、Phase SI-A）：文章・JSON・箇条書き・
+            # ChatGPT出力等をそのまま貼り付け、自動判別した候補一覧を返す（DB保存はしない、
+            # 指示書4番STEP1〜6のプレビュー段階）。
+            body = self._read_json_body()
+            raw_text = body.get("text") or ""
+            try:
+                candidates = classify_content(raw_text)
+                if investment_db is not None and DATABASE_URL:
+                    candidates = smart_import_check_duplicates(DATABASE_URL, self.current_user, candidates)
+            except Exception as e:
+                import traceback
+                print("  /api/smart-import/preview 想定外のエラー")
+                traceback.print_exc()
+                self._send_json({"fatalError": f"{type(e).__name__}: {e}"})
+                return
+            self._send_json({"candidates": candidates})
+        elif self.path == "/api/smart-import/confirm":
+            # 2026-09-10新規（Unified Smart Import、Phase SI-A）：プレビューでユーザーが選択・
+            # 編集した候補を確定保存する（指示書4番STEP7）。カテゴリごとに既存のimport_*へ
+            # 振り分けるだけで、SmartImport独自のテーブルは持たない（指示書18番）。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            candidates = body.get("candidates")
+            if not isinstance(candidates, list):
+                self._send_json({"error": "candidatesは配列で指定してください"})
+                return
+            import_source = body.get("importSource") or "manual"
+            result = smart_import_confirm(DATABASE_URL, self.current_user, candidates, import_source)
+            self._send_json(result)
         elif self.path == "/api/watchlist/migrate":
             # 既存ユーザーのlocalStorage watchlistを1回だけNeonへ取り込む（investmentLogMigratedと
             # 同じパターン）。冪等（同じcode+marketは上書きになるだけ）。

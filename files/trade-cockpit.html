@@ -2550,6 +2550,137 @@ function CatalystsPanel({catalysts,onReload}){
 // v3-9続き（PHASE 5 EXPERT INTELLIGENCE）：有識者見解一覧タブ。EventsPanel/CatalystsPanelと
 // 全く同じ「貼り付け→保存→リロード」パターン。重複判定キー（expert_name/source_title/
 // published_at）はサーバー側のupsertで保証されるため、ここではimportして結果を表示するだけ。
+// 2026-09-10新規（Unified Smart Import、Phase SI-A）：カタリスト・イベント・有識者意見など
+// 入力経路ごとに異なるJSON schemaをユーザーが意識しなくてよいよう、「何でも貼る→解析→
+// プレビュー→確定」の統一フローを提供する。既存のCatalystsPanel/EventsPanel/ExpertViewsPanel
+// 内の「JSONを取り込む」欄は引き続き残す（指示書1・25番：既存入力経路も残してよい）。
+// Phase SI-Aの実装範囲はCATALYST/EVENT/EXPERT_OPINIONの3カテゴリのみ（それ以外は
+// UNKNOWN扱いになり保存されない、Phase SI-B以降で拡張予定）。
+const SMART_IMPORT_CATEGORY_META={
+  CATALYST:{icon:"✅",label:"CATALYST（カタリスト）",color:"var(--up)"},
+  EXPERT_OPINION:{icon:"✅",label:"EXPERT OPINION（有識者意見）",color:"var(--up)"},
+  EVENT:{icon:"✅",label:"EVENT（イベント）",color:"var(--up)"},
+  UNKNOWN:{icon:"❔",label:"判別不能",color:"var(--inkFaint)"},
+};
+const SMART_IMPORT_CONFIDENCE_META={
+  HIGH:{label:"HIGH", color:"var(--up)"}, MEDIUM:{label:"MEDIUM", color:"var(--accent)"},
+  LOW:{label:"LOW（要確認）", color:"var(--down)"},
+};
+const SMART_IMPORT_IMPLEMENTED=["CATALYST","EVENT","EXPERT_OPINION"];
+
+function SmartImportPanel({onReload}){
+  const [text,setText]=useState("");
+  const [analyzing,setAnalyzing]=useState(false);
+  const [candidates,setCandidates]=useState(null);  // null=未解析
+  const [selected,setSelected]=useState({});         // index -> bool
+  const [saving,setSaving]=useState(false);
+  const [resultMsg,setResultMsg]=useState("");
+
+  const analyze=async()=>{
+    if(!text.trim())return;
+    setAnalyzing(true);setResultMsg("");
+    const d=await fetchJsonSafe("/api/smart-import/preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})});
+    setAnalyzing(false);
+    if(d&&d.candidates){
+      setCandidates(d.candidates);
+      // 指示書16番：LOW confidenceは既定で未選択にする（自動保存しない、ユーザーの明示確認必須）
+      const init={};
+      d.candidates.forEach((c,i)=>{init[i]=c.confidence!=="LOW"&&SMART_IMPORT_IMPLEMENTED.includes(c.category);});
+      setSelected(init);
+    }else{
+      setResultMsg("解析に失敗しました");
+    }
+  };
+
+  const updateDraft=(i,key,value)=>{
+    setCandidates(prev=>prev.map((c,idx)=>idx===i?{...c,draft:{...c.draft,[key]:value}}:c));
+  };
+  const updateCategory=(i,category)=>{
+    setCandidates(prev=>prev.map((c,idx)=>idx===i?{...c,category}:c));
+  };
+
+  const saveSelected=async()=>{
+    const toSave=candidates.filter((c,i)=>selected[i]).map(c=>({...c,force:c.confidence==="LOW"}));
+    if(!toSave.length)return;
+    setSaving(true);
+    const d=await fetchJsonSafe("/api/smart-import/confirm",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({candidates:toSave,importSource:"manual"})});
+    setSaving(false);
+    if(d&&d.results){
+      const parts=Object.entries(d.results).map(([cat,r])=>`${cat} ${r.imported}件`);
+      setResultMsg(`登録完了：${parts.join("　")}`+(d.rejected_low_confidence?`　（LOW confidence除外 ${d.rejected_low_confidence}件）`:""));
+      setText("");setCandidates(null);setSelected({});
+      onReload?.();
+    }else{
+      setResultMsg("登録に失敗しました");
+    }
+  };
+
+  return <div style={{marginTop:18}}>
+    <div className="sec-head">📥 内容を解析して取り込む</div>
+    <div style={{fontSize:11.5,color:"var(--inkFaint)",marginBottom:8}}>
+      JSON・記事・箇条書き・ChatGPT出力・自然文に対応。カタリスト・イベント・有識者意見を自動判別します。
+    </div>
+    <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 12px"}}>
+      <textarea value={text} onChange={e=>setText(e.target.value)} rows={7}
+        placeholder="ここに何でも貼り付けてください（JSON・ニュース記事・ChatGPT分析・箇条書き・自然文 等）"
+        style={{width:"100%",fontSize:12.5,padding:8,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",fontFamily:"inherit",boxSizing:"border-box"}}/>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8}}>
+        <button className="btn primary" disabled={analyzing||!text.trim()} onClick={analyze}>{analyzing?"解析中…":"解析"}</button>
+        {resultMsg && <span style={{fontSize:12,color:"var(--inkSoft)"}}>{resultMsg}</span>}
+      </div>
+    </div>
+
+    {candidates && <div style={{marginTop:14}}>
+      <div style={{fontSize:12.5,fontWeight:700,marginBottom:8}}>解析結果：{candidates.length}件</div>
+      <div style={{display:"flex",flexDirection:"column",gap:8}}>
+        {candidates.map((c,i)=>{
+          const meta=SMART_IMPORT_CATEGORY_META[c.category]||SMART_IMPORT_CATEGORY_META.UNKNOWN;
+          const confMeta=SMART_IMPORT_CONFIDENCE_META[c.confidence]||{};
+          const implemented=SMART_IMPORT_IMPLEMENTED.includes(c.category);
+          return <div key={i} className="card" style={{padding:"10px 12px",opacity:implemented?1:0.6}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+              {implemented && <input type="checkbox" checked={!!selected[i]} onChange={e=>setSelected(s=>({...s,[i]:e.target.checked}))}/>}
+              <span>{meta.icon}</span>
+              <select value={c.category} onChange={e=>updateCategory(i,e.target.value)}
+                style={{fontSize:11.5,padding:"2px 4px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}>
+                {SMART_IMPORT_CATEGORIES_UI.map(cat=><option key={cat} value={cat}>{cat}</option>)}
+              </select>
+              <span style={{fontSize:11,fontWeight:700,color:confMeta.color}}>confidence: {confMeta.label||c.confidence}</span>
+              {c.possible_duplicate && <span style={{fontSize:11,color:"var(--down)",fontWeight:700}}>⚠ 登録済みの可能性</span>}
+              {!implemented && <span style={{fontSize:11,color:"var(--inkFaint)"}}>（このカテゴリは今後のフェーズで対応予定）</span>}
+            </div>
+            <div style={{marginTop:6,fontSize:12}}>
+              {c.category==="CATALYST" && <>
+                <input value={c.draft.title||""} onChange={e=>updateDraft(i,"title",e.target.value)} placeholder="タイトル"
+                  style={{width:"100%",fontSize:12,padding:4,marginBottom:4,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",boxSizing:"border-box"}}/>
+                <span style={{fontSize:11,color:"var(--inkFaint)"}}>銘柄:{c.draft.ticker||"（不明）"}　日付:{c.draft.catalyst_date||"（未指定＝当日）"}</span>
+              </>}
+              {c.category==="EVENT" && <>
+                <input value={c.draft.title||""} onChange={e=>updateDraft(i,"title",e.target.value)} placeholder="イベント名"
+                  style={{width:"100%",fontSize:12,padding:4,marginBottom:4,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",boxSizing:"border-box"}}/>
+                {!c.draft.event_date && <span style={{fontSize:11,color:"var(--down)",fontWeight:700}}>⚠ 日付未確定（自動補完しません。編集して指定してください）</span>}
+                <input value={c.draft.event_date||""} onChange={e=>updateDraft(i,"event_date",e.target.value)} placeholder="YYYY-MM-DD"
+                  style={{width:140,fontSize:12,padding:4,marginTop:4,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}/>
+              </>}
+              {c.category==="EXPERT_OPINION" && <>
+                <input value={c.draft.expert_name||""} onChange={e=>updateDraft(i,"expert_name",e.target.value)} placeholder="有識者名"
+                  style={{width:"100%",fontSize:12,padding:4,marginBottom:4,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",boxSizing:"border-box"}}/>
+                <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>{c.draft.opinion_summary}</div>
+              </>}
+              {!implemented && <div style={{fontSize:11.5,color:"var(--inkFaint)",whiteSpace:"pre-wrap"}}>{c.raw_text}</div>}
+            </div>
+          </div>;
+        })}
+      </div>
+      <button className="btn primary" style={{marginTop:10}} disabled={saving||!Object.values(selected).some(Boolean)} onClick={saveSelected}>
+        {saving?"登録中…":"選択した項目を登録"}
+      </button>
+    </div>}
+  </div>;
+}
+const SMART_IMPORT_CATEGORIES_UI=["CATALYST","EVENT","EXPERT_OPINION","UNKNOWN"];
+
 function ExpertViewsPanel({views,onReload}){
   const [pasteText,setPasteText]=useState("");
   const [importing,setImporting]=useState(false);
@@ -10007,6 +10138,10 @@ function App(){
           {key:"disclosure",label:"適時開示"},
           {key:"catalyst",label:"カタリスト"},
           {key:"expert",label:"有識者"},
+          // 2026-09-10新規（Unified Smart Import、Phase SI-A）：カタリスト・イベント・有識者
+          // 意見をまたいだ統一取り込み口。既存の各サブタブ内「JSONを取り込む」欄は維持したまま
+          // 追加する（指示書25・26番）。
+          {key:"smartimport",label:"📥 スマート取り込み"},
         ];
         // v3-9続き（PHASE 4・PHASE 5）：「カタリスト」「有識者」サブタブだけはニュース本体
         // （RSS/TDnet）ではなく、それぞれnews_catalysts／expert_views（構造化情報）を表示する。
@@ -10014,7 +10149,8 @@ function App(){
         // （chip barを早期returnで消すと元のサブタブへ戻る手段が無くなるため）。
         const isCatalyst=newsSubTab==="catalyst";
         const isExpert=newsSubTab==="expert";
-        const isStructured=isCatalyst||isExpert;
+        const isSmartImport=newsSubTab==="smartimport";
+        const isStructured=isCatalyst||isExpert||isSmartImport;
         let listFor=isStructured?[]:{summary:newsSummary,domestic:s.macroNewsDomestic,overseas:overseasAll,registered:stockNameNewsAll,disclosure:disclosureAll}[newsSubTab];
         const showCode=newsSubTab==="summary"||newsSubTab==="disclosure"||newsSubTab==="registered";
         // Trade Cockpit v2 Phase4（設計案30番）：銘柄コードを持つニュース一覧は、保有＞今日の候補＞
@@ -10032,6 +10168,7 @@ function App(){
           </div>
           {isCatalyst && <CatalystsPanel catalysts={newsCatalysts} onReload={loadNewsCatalysts}/>}
           {isExpert && <ExpertViewsPanel views={expertViews} onReload={loadExpertViews}/>}
+          {isSmartImport && <SmartImportPanel onReload={()=>{loadNewsCatalysts();loadExpertViews();loadMarketEvents();}}/>}
           {!isStructured && <>
                 {hasImportant && <div style={{display:"flex",alignItems:"center",gap:10,background:"var(--upBg)",border:"1px solid var(--up)",borderRadius:4,padding:"10px 14px",marginBottom:12}}>
                   <span style={{fontSize:13,fontWeight:700,color:"var(--up)"}}>⚠ 重要ニュースを含みます</span>
