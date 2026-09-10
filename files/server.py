@@ -3215,11 +3215,227 @@ def _build_social_post_record(database_url, user_id, tweet, media_by_key, source
     }, posted_at.date()
 
 
+# ============================================================
+# にこそくX連携 Phase2（2026-09-10）：診断機能・優先度スコア・画像解析待ちキューの状態管理強化。
+# 既存の売買スコア・AUTO_RS・ENTRY TOP5等には一切加点しない（指示書冒頭・20番）。
+# ============================================================
+
+# プロセス内メモリの診断情報（指示書17番）。トークン等の秘密情報は絶対に入れない。
+# last_success_at・last_errorはmarket_sources側（DB永続化済み）を正とし、ここは
+# 「直近1回の呼び出し」の詳細（プロセス再起動で消えても実害が無い情報）だけを持つ。
+_nicosoku_diag = {
+    "last_fetch_started_at": None, "last_fetch_finished_at": None,
+    "last_error_at": None, "last_error_message": None,
+    "fetched_count": 0, "inserted_count": 0, "duplicate_count": 0,
+    "last_http_status": None, "poller_running": False,
+}
+
+SOCIAL_IMAGE_ANALYSIS_STATUSES = ("NONE", "PENDING", "ANALYZED", "SKIPPED", "FAILED")
+
+
+def _initial_image_analysis_status(media):
+    """指示書1番：新規X投稿保存時のimage_analysis_status初期値。image_urls（media）が
+    1件以上あればPENDING、無ければNONE。"""
+    return "PENDING" if media else "NONE"
+
+
+# 指示書5番：解析優先度スコアの配点。同じ理由を重複加点しないよう、「言及」区分（保有/監視/
+# テーマ）と「カテゴリ」区分はそれぞれ最も高い1件のみを加点する。
+_SOCIAL_PRIORITY_IMPORTANCE = {"CRITICAL": 35, "HIGH": 25, "MEDIUM": 10}
+_SOCIAL_PRIORITY_CATEGORY = {
+    "ECONOMIC_EVENT": 15, "CENTRAL_BANK": 15, "MARKET_HEATMAP": 12,
+    "INDEX_TECHNICAL": 10, "STOCK_TECHNICAL": 10, "MARKET_SENTIMENT": 8,
+}
+
+
+def _post_age_minutes(posted_at, now=None):
+    """posted_at（ISO文字列）から現在までの経過分。解析不能ならNone。"""
+    if not posted_at:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(str(posted_at).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+    except Exception:
+        return None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return (now - dt).total_seconds() / 60
+
+
+def compute_social_post_priority_score(post, watch_codes=None, position_codes=None, now=None):
+    """指示書5番：投稿1件のanalysis_priority_score（0〜100）を動的計算する。DBへ新規列を
+    足さず、APIレスポンス生成時に都度計算する方針（指示書「必須保存する必要はない」）。"""
+    watch_codes = watch_codes or set()
+    position_codes = position_codes or set()
+    score = 0
+    score += _SOCIAL_PRIORITY_IMPORTANCE.get(post.get("importance"), 0)
+    age_min = _post_age_minutes(post.get("posted_at"), now=now)
+    if age_min is not None:
+        if age_min <= 30:
+            score += 20
+        elif age_min <= 60:
+            score += 10
+    direct = set(post.get("direct_mentions_json") or [])
+    theme = set(post.get("theme_related_json") or [])
+    if direct & position_codes:
+        score += 20
+    elif direct & watch_codes:
+        score += 15
+    elif theme:
+        score += 8
+    cats = set(post.get("categories_json") or [])
+    cat_bonus = max((_SOCIAL_PRIORITY_CATEGORY[c] for c in cats if c in _SOCIAL_PRIORITY_CATEGORY), default=0)
+    score += cat_bonus
+    if len(post.get("media_json") or []) > 1:
+        score += 5
+    return min(score, 100)
+
+
+def social_post_priority_label(score):
+    """指示書6番：スコアからURGENT/HIGH/NORMAL/LOWラベルを生成する。"""
+    if score >= 80:
+        return "URGENT"
+    if score >= 60:
+        return "HIGH"
+    if score >= 30:
+        return "NORMAL"
+    return "LOW"
+
+
+def _enrich_social_post_priority(post, watch_codes=None, position_codes=None, now=None):
+    """指示書5・6・9番：投稿dictにanalysis_priority_score・priority_label・
+    related_positions・related_watchlist を追加専用フィールドとして付与する（既存キーは
+    一切変更しない）。"""
+    watch_codes = watch_codes or set()
+    position_codes = position_codes or set()
+    score = compute_social_post_priority_score(post, watch_codes, position_codes, now=now)
+    direct = set(post.get("direct_mentions_json") or [])
+    theme = set(post.get("theme_related_json") or [])
+    mentions = direct | theme
+    post = dict(post)
+    post["analysis_priority_score"] = score
+    post["priority_label"] = social_post_priority_label(score)
+    post["related_positions"] = sorted(mentions & position_codes)
+    post["related_watchlist"] = sorted(mentions & watch_codes)
+    return post
+
+
+def sort_pending_posts_by_priority(posts):
+    """指示書7番：PENDING投稿をanalysis_priority_score DESC・posted_at DESCで並べる。
+    posts中の各要素は事前にanalysis_priority_scoreが付与済みである前提（未付与は0扱い）。
+    PENDING以外の投稿は並び替えの対象にせずそのままの順序で末尾に残す（安定ソート）。"""
+    def key(p):
+        return (p.get("image_analysis_status") != "PENDING",
+                -(p.get("analysis_priority_score") or 0),
+                "" if not p.get("posted_at") else "")
+    pending = [p for p in posts if p.get("image_analysis_status") == "PENDING"]
+    others = [p for p in posts if p.get("image_analysis_status") != "PENDING"]
+    pending.sort(key=lambda p: (p.get("posted_at") or ""), reverse=True)
+    pending.sort(key=lambda p: p.get("analysis_priority_score") or 0, reverse=True)
+    return pending + others
+
+
+def _normalize_confidence(value):
+    """指示書10番：画像解析結果のconfidenceを0.0〜1.0へ正規化する。値が無い/変換不能なら
+    None（無理に0埋めしない）。"""
+    if value is None or value == "":
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if v != v:  # NaN
+        return None
+    return max(0.0, min(1.0, v))
+
+
+def _nicosoku_market_hours_jst(now_jst=None):
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    now_jst = now_jst or datetime.datetime.now(jst)
+    hhmm = now_jst.strftime("%H:%M")
+    return "08:00" <= hhmm <= "15:40"
+
+
+def _nicosoku_source_is_stale(source, now=None):
+    """指示書14番：last_success_atをもとにSTALE判定する。市場時間中(08:00-15:40 JST)は
+    15分、それ以外は30分を閾値とする。last_success_atが無ければ（一度も成功していない）
+    STALE扱い。"""
+    last_success_at = (source or {}).get("last_success_at")
+    if not last_success_at:
+        return True
+    try:
+        dt = datetime.datetime.fromisoformat(str(last_success_at).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+    except Exception:
+        return True
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    age_min = (now - dt).total_seconds() / 60
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    threshold = 15 if _nicosoku_market_hours_jst(now.astimezone(jst)) else 30
+    return age_min > threshold
+
+
+def build_social_posts_response(database_url, user_id, limit=10, min_importance=None):
+    """GET /api/social-posts の実体（指示書5・6・7・8番）。各投稿へanalysis_priority_score等を
+    付与し、PENDING投稿はスコア降順→新しさ降順で並べ替える。pendingSummaryは表示件数
+    （limit）に関わらず、SKIPPEDを除く全PENDING件数を対象にする（指示書8番「解析待ち件数」・
+    3番「SKIPPED投稿は通常の解析待ち件数から除外」）。"""
+    if investment_db is None or not database_url:
+        return {"posts": [], "pendingSummary": {"pending": 0, "urgent": 0}}
+    posts = investment_db.list_recent_social_posts(
+        database_url, source_handle=NICOSOKU_X_USERNAME, min_importance=min_importance, limit=limit)
+    try:
+        watch_codes = {w.get("code") for w in investment_db.list_watchlist(database_url, user_id, market="JP")}
+        position_codes = {p.get("code") for p in investment_db.list_portfolio(database_url, user_id)}
+    except Exception:
+        watch_codes, position_codes = set(), set()
+    enriched = [_enrich_social_post_priority(p, watch_codes, position_codes) for p in posts]
+    ordered = sort_pending_posts_by_priority(enriched)
+    all_pending = investment_db.list_recent_social_posts(
+        database_url, source_handle=NICOSOKU_X_USERNAME, limit=500, image_analysis_status="PENDING")
+    pending_scores = [compute_social_post_priority_score(p, watch_codes, position_codes) for p in all_pending]
+    pending_summary = {"pending": len(all_pending), "urgent": sum(1 for s in pending_scores if s >= 80)}
+    return {"posts": ordered, "pendingSummary": pending_summary}
+
+
+def nicosoku_diagnostics(database_url, user_id):
+    """指示書11番：GET /api/social-sources/nicosoku/diagnostics の実体。Bearer Tokenそのもの
+    は絶対に返さない（token_configuredの真偽値のみ）。"""
+    source = investment_db.get_market_source(database_url, NICOSOKU_X_USERNAME) \
+        if (investment_db is not None and database_url) else None
+    latest = investment_db.list_recent_social_posts(database_url, source_handle=NICOSOKU_X_USERNAME, limit=1) \
+        if (investment_db is not None and database_url) else []
+    latest_post = latest[0] if latest else None
+    rate_limit_status = "RATE_LIMITED" if _nicosoku_diag.get("last_http_status") == "429" else "OK"
+    return {
+        "token_configured": bool(X_API_BEARER_TOKEN),
+        "username": NICOSOKU_X_USERNAME,
+        "user_id_resolved": bool(_nicosoku_x_user_id_cache),
+        "last_success_at": (source or {}).get("last_success_at"),
+        "last_error": (source or {}).get("last_error"),
+        "rate_limit_status": rate_limit_status,
+        "latest_post_id": (latest_post or {}).get("post_id"),
+        "latest_post_at": (latest_post or {}).get("posted_at"),
+        "latest_post_has_media": bool((latest_post or {}).get("media_json")),
+        "poller_running": _nicosoku_diag["poller_running"],
+        "stale": _nicosoku_source_is_stale(source),
+        "last_fetch_started_at": _nicosoku_diag["last_fetch_started_at"],
+        "last_fetch_finished_at": _nicosoku_diag["last_fetch_finished_at"],
+        "last_fetched_count": _nicosoku_diag["fetched_count"],
+        "last_inserted_count": _nicosoku_diag["inserted_count"],
+        "last_duplicate_count": _nicosoku_diag["duplicate_count"],
+    }
+
+
 def nicosoku_poll_once(database_url, user_id):
     """1サイクル分のポーリング（指示書1・2・3・8番）。ユーザーID解決→未取得分の投稿取得→
     分類・保存→イベント検出→market_sourcesの状態更新、までを1回実行する。戻り値：
-    {"status","newPosts","eventsDetected","error"}。"""
-    result = {"status": "ok", "newPosts": 0, "eventsDetected": 0, "error": None}
+    {"status","newPosts","fetched","duplicates","eventsDetected","error"}。
+    Phase2（指示書11・12・17番）：診断API・手動「今すぐ取得」の両方がこの関数をそのまま
+    再利用する（別実装を作らない）。_nicosoku_diag（プロセス内メモリ）への記録もここで行う。"""
+    result = {"status": "ok", "newPosts": 0, "fetched": 0, "duplicates": 0, "eventsDetected": 0, "error": None}
+    _nicosoku_diag["last_fetch_started_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     if investment_db is None or not database_url:
         result["status"] = "no_db"
         return result
@@ -3238,6 +3454,9 @@ def nicosoku_poll_once(database_url, user_id):
         uid, status, detail = _x_resolve_user_id(NICOSOKU_X_USERNAME)
         if status != "ok" or not uid:
             investment_db.update_market_source_status(database_url, NICOSOKU_X_USERNAME, last_error=f"ユーザーID解決失敗: {detail}")
+            _nicosoku_diag["last_error_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            _nicosoku_diag["last_error_message"] = detail
+            _nicosoku_diag["last_fetch_finished_at"] = _nicosoku_diag["last_error_at"]
             result["status"] = status
             result["error"] = detail
             return result
@@ -3246,13 +3465,21 @@ def nicosoku_poll_once(database_url, user_id):
 
     since_id = (source or {}).get("last_seen_post_id")
     data, status, detail = _x_fetch_recent_tweets(x_user_id, since_id=since_id)
+    _nicosoku_diag["last_http_status"] = "429" if status == "rate_limited" else ("200" if status == "ok" else status)
     if status != "ok":
         investment_db.update_market_source_status(database_url, NICOSOKU_X_USERNAME, last_error=f"投稿取得失敗: {detail}")
+        _nicosoku_diag["last_error_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        _nicosoku_diag["last_error_message"] = detail
+        _nicosoku_diag["last_fetch_finished_at"] = _nicosoku_diag["last_error_at"]
+        investment_db.update_market_source_fetch_stats(database_url, NICOSOKU_X_USERNAME,
+            last_fetch_started_at=_nicosoku_diag["last_fetch_started_at"], last_fetch_finished_at="NOW()",
+            last_error_at="NOW()", last_http_status=_nicosoku_diag["last_http_status"])
         result["status"] = status
         result["error"] = detail
         return result
 
     tweets = (data or {}).get("data") or []
+    result["fetched"] = len(tweets)
     media_list = ((data or {}).get("includes") or {}).get("media") or []
     media_by_key = {m.get("media_key"): {"url": m.get("url") or m.get("preview_image_url"),
                                            "type": m.get("type"), "width": m.get("width"),
@@ -3280,11 +3507,23 @@ def nicosoku_poll_once(database_url, user_id):
                         result["eventsDetected"] += imp_result.get("imported", 0)
                 except Exception as e:
                     print("  にこそく投稿からのイベント検出で例外", e)
+        else:
+            result["duplicates"] += 1
         if tweet.get("id") and (max_id is None or int(tweet["id"]) > int(max_id)):
             max_id = tweet["id"]
 
     investment_db.update_market_source_status(database_url, NICOSOKU_X_USERNAME,
                                                 last_seen_post_id=max_id, mark_success=True)
+    finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    _nicosoku_diag["last_fetch_finished_at"] = finished_at
+    _nicosoku_diag["fetched_count"] = result["fetched"]
+    _nicosoku_diag["inserted_count"] = result["newPosts"]
+    _nicosoku_diag["duplicate_count"] = result["duplicates"]
+    investment_db.update_market_source_fetch_stats(
+        database_url, NICOSOKU_X_USERNAME,
+        last_fetch_started_at=_nicosoku_diag["last_fetch_started_at"], last_fetch_finished_at=finished_at,
+        last_http_status=_nicosoku_diag["last_http_status"], last_fetched_count=result["fetched"],
+        last_inserted_count=result["newPosts"], last_duplicate_count=result["duplicates"])
     return result
 
 
@@ -3314,6 +3553,14 @@ def get_recent_social_market_signals(database_url, user_id, lookback_minutes=180
         watch_codes, position_codes = set(), set()
     relevant_codes = watch_codes | position_codes
     rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+    # 指示書15・16番：X APIソースがSTALE（更新停止）の場合、この関数が返す投稿は「参考情報
+    # として残す」が「NEW MARKET SIGNAL判定には使わない」ことを呼び出し側が判別できるよう、
+    # 各項目へdata_statusを追加専用フィールドとして付与する（既存キーには触れない）。
+    try:
+        source = investment_db.get_market_source(database_url, NICOSOKU_X_USERNAME)
+        data_status = "STALE" if _nicosoku_source_is_stale(source) else "OK"
+    except Exception:
+        data_status = "STALE"
     scored = []
     for p in posts:
         mentions = set(p.get("direct_mentions_json") or []) | set(p.get("theme_related_json") or [])
@@ -3340,7 +3587,7 @@ def get_recent_social_market_signals(database_url, user_id, lookback_minutes=180
             "source": "nicosoku", "posted_at": p.get("posted_at"), "importance": p.get("importance"),
             "categories": p.get("categories_json") or [], "summary": summary,
             "facts": facts, "author_opinion": p.get("author_opinion_json") or [],
-            "relevance": sorted(mentions), "url": p.get("url"),
+            "relevance": sorted(mentions), "url": p.get("url"), "data_status": data_status,
         })
     scored.sort(key=lambda s: (-rank.get(s["importance"], 0), s["posted_at"] or ""), reverse=False)
     scored.sort(key=lambda s: -rank.get(s["importance"], 0))
@@ -3366,10 +3613,17 @@ def _nicosoku_morning_commentary(database_url, user_id):
         if text:
             key_points.append(text)
         related |= set(p.get("direct_mentions_json") or []) | set(p.get("theme_related_json") or [])
+    # 指示書15番：source status != STALE の場合だけ latest_signal として扱う安全ガード。
+    # STALEでも内容自体は参考情報として残す（data_statusで明示するだけで、生成自体は行う）。
+    try:
+        source = investment_db.get_market_source(database_url, NICOSOKU_X_USERNAME)
+        data_status = "STALE" if _nicosoku_source_is_stale(source) else "OK"
+    except Exception:
+        data_status = "STALE"
     return {
         "latest_post_at": posts[0].get("posted_at"), "key_points": key_points,
         "market_implication": "、".join(key_points[:2]) if key_points else "",
-        "related_stocks": sorted(related),
+        "related_stocks": sorted(related), "data_status": data_status,
     }
 
 
@@ -3418,6 +3672,7 @@ def _nicosoku_poll_scheduler_loop():
     if not X_API_BEARER_TOKEN:
         print("  [にこそくX連携] X_API_BEARER_TOKEN未設定のためポーリングは無効（X_SOURCE_STATUS=DEGRADED）")
         return
+    _nicosoku_diag["poller_running"] = True
     consecutive_failures = 0
     while True:
         try:
@@ -3426,7 +3681,8 @@ def _nicosoku_poll_scheduler_loop():
             if result["status"] == "ok":
                 consecutive_failures = 0
                 if result["newPosts"] > 0:
-                    print(f"  [にこそくX連携] 新規投稿{result['newPosts']}件取得・イベント検出{result['eventsDetected']}件")
+                    print(f"  [にこそくX連携] fetched={result['fetched']}件・新規{result['newPosts']}件・"
+                          f"重複{result['duplicates']}件・イベント検出{result['eventsDetected']}件")
             elif result["status"] == "rate_limited":
                 consecutive_failures += 1
             else:
@@ -8138,8 +8394,14 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
                     social_image_analysis_results.append({"ok": False, "reason": "post_idが無いため保存できません"})
                 else:
                     post_id, analysis = normalized
+                    # Phase2（指示書10番）：confidenceは0.0〜1.0へ正規化する（値が無ければnullのまま）。
+                    if isinstance(analysis, dict) and "confidence" in analysis:
+                        analysis["confidence"] = _normalize_confidence(analysis.get("confidence"))
                     saved = investment_db.save_social_post_image_analysis(database_url, NICOSOKU_X_USERNAME, post_id, [analysis])
                     if saved is None:
+                        # Phase2（指示書2番）：保存失敗（対象投稿が見つからない）もFAILEDとして記録する。
+                        investment_db.mark_social_post_image_analysis_failed(
+                            database_url, NICOSOKU_X_USERNAME, post_id, "対象の投稿が見つかりません")
                         social_image_analysis_results.append({"ok": False, "reason": "対象の投稿が見つかりません", "post_id": post_id})
                     else:
                         events_imported = 0
@@ -8171,7 +8433,17 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
                                                                 "events_imported": events_imported, "mentions_added": mentions_added})
             except Exception as e:
                 print("  SmartImport: 画像解析保存失敗", e)
-                social_image_analysis_results.append({"ok": False, "reason": str(e)})
+                # Phase2（指示書2番）：解析JSON不正・保存失敗はFAILED＋理由として記録する
+                # （post_idが分かる場合のみ。DB側の状態更新自体が失敗しても握りつぶし、
+                # SmartImport全体の応答は落とさない）。
+                fallback_post_id = draft.get("post_id") if isinstance(draft, dict) else None
+                if fallback_post_id:
+                    try:
+                        investment_db.mark_social_post_image_analysis_failed(
+                            database_url, NICOSOKU_X_USERNAME, fallback_post_id, str(e))
+                    except Exception:
+                        pass
+                social_image_analysis_results.append({"ok": False, "reason": str(e), "post_id": fallback_post_id})
             continue
 
     results = {}
@@ -8637,15 +8909,19 @@ class Handler(SimpleHTTPRequestHandler):
                               "lastSeenPostId": (src or {}).get("last_seen_post_id")})
         elif self.path.startswith("/api/social-posts") and "/image-analysis" not in self.path:
             # 2026-09-10新規（にこそく@nicosokufx X投稿連携、指示書14番）：日本市場画面の
-            # 「X 市場情報」カード向け。?limit=&min_importance=。
+            # 「X 市場情報」カード向け。?limit=&min_importance=。Phase2（指示書5・6・7・8番）：
+            # analysis_priority_score・priority_label・並び替え・pendingSummaryを追加。
             qs = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(qs)
             limit = int(params.get("limit", ["10"])[0])
             min_importance = params.get("min_importance", [None])[0]
-            posts = investment_db.list_recent_social_posts(
-                DATABASE_URL, source_handle=NICOSOKU_X_USERNAME, min_importance=min_importance, limit=limit) \
-                if (investment_db is not None and DATABASE_URL) else []
-            self._send_json({"posts": posts})
+            resp = build_social_posts_response(DATABASE_URL, self.current_user, limit=limit, min_importance=min_importance)
+            self._send_json(resp)
+        elif self.path.startswith("/api/social-sources/nicosoku/diagnostics"):
+            # Phase2新規（指示書11番）：実X API疎通確認用の診断エンドポイント。
+            diag = nicosoku_diagnostics(DATABASE_URL, self.current_user) \
+                if (investment_db is not None and DATABASE_URL) else {"token_configured": bool(X_API_BEARER_TOKEN)}
+            self._send_json(diag)
         elif self.path.startswith("/api/social-signals"):
             # 2026-09-10新規：recent_social_market_signals（指示書9番、ChatGPT相談JSON補助情報）。
             qs = urllib.parse.urlparse(self.path).query
@@ -9390,6 +9666,46 @@ class Handler(SimpleHTTPRequestHandler):
                 self._send_json({"error": "対象の投稿が見つかりません"})
             else:
                 self._send_json({"post": saved})
+        elif self.path == "/api/social-posts/skip":
+            # Phase2新規（指示書3番）：PENDING投稿を「解析不要」としてSKIPPEDへ変更する。
+            # body: {postId}
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            post_id = body.get("postId")
+            if not post_id:
+                self._send_json({"error": "postIdは必須です"})
+                return
+            saved = investment_db.set_social_post_image_analysis_status(DATABASE_URL, NICOSOKU_X_USERNAME, post_id, "SKIPPED")
+            if saved is None:
+                self._send_json({"error": "対象の投稿が見つかりません"})
+            else:
+                self._send_json({"post": saved})
+        elif self.path == "/api/social-posts/reanalyze":
+            # Phase2新規（指示書4番）：ANALYZED/FAILED/SKIPPEDの投稿をPENDINGへ戻す
+            # （image_analysis_json自体は削除しない、再解析結果保存時に上書きされるだけ）。
+            # body: {postId}
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            post_id = body.get("postId")
+            if not post_id:
+                self._send_json({"error": "postIdは必須です"})
+                return
+            saved = investment_db.set_social_post_image_analysis_status(DATABASE_URL, NICOSOKU_X_USERNAME, post_id, "PENDING")
+            if saved is None:
+                self._send_json({"error": "対象の投稿が見つかりません"})
+            else:
+                self._send_json({"post": saved})
+        elif self.path == "/api/social-sources/nicosoku/fetch-now":
+            # Phase2新規（指示書12番）：診断用の手動「今すぐ取得」。既存pollerロジック
+            # （nicosoku_poll_once）をそのまま1回呼ぶだけで、別実装は作らない。
+            if not self._investment_db_ready():
+                return
+            result = nicosoku_poll_once(DATABASE_URL, self.current_user)
+            self._send_json({"ok": result.get("status") == "ok", "status": result.get("status"),
+                              "fetched": result.get("fetched", 0), "inserted": result.get("newPosts", 0),
+                              "duplicates": result.get("duplicates", 0), "error": result.get("error")})
         elif self.path == "/api/watchlist/migrate":
             # 既存ユーザーのlocalStorage watchlistを1回だけNeonへ取り込む（investmentLogMigratedと
             # 同じパターン）。冪等（同じcode+marketは上書きになるだけ）。

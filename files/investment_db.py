@@ -951,6 +951,33 @@ _MIGRATE_SOCIAL_POSTS_IMAGE_STATUS_SQL = """
 ALTER TABLE social_market_posts ADD COLUMN IF NOT EXISTS image_analysis_status TEXT;
 """
 
+# にこそくX連携 Phase2（2026-09-10）：image_analysis_statusをNONE/PENDING/ANALYZED/SKIPPED/
+# FAILEDの5値へ拡張する。既存DBは壊さず追加カラム＋バックフィルで対応（指示書1番）。
+# 旧仕様では画像なし投稿はNULLのままだったが、新仕様ではNONEを明示する（「そもそも対象外」を
+# 積極的に表す値へ変更、指示書1番の定義に合わせる）。既存のPENDING/ANALYZEDの値はそのまま
+# 意味が変わらないため触らない。
+_MIGRATE_SOCIAL_POSTS_IMAGE_STATUS_V2_SQL = """
+ALTER TABLE social_market_posts ADD COLUMN IF NOT EXISTS image_analysis_error TEXT;
+ALTER TABLE social_market_posts ADD COLUMN IF NOT EXISTS image_analysis_updated_at TIMESTAMPTZ;
+UPDATE social_market_posts SET image_analysis_status='NONE'
+    WHERE image_analysis_status IS NULL AND (media_json IS NULL OR media_json::text = '[]');
+UPDATE social_market_posts SET image_analysis_status='PENDING'
+    WHERE image_analysis_status IS NULL AND media_json IS NOT NULL AND media_json::text <> '[]';
+"""
+
+# にこそくX連携 Phase2・診断API（指示書11・17番）：1サイクル分のfetch統計をDBへも残す
+# （プロセス再起動をまたいでも直近の取得結果がdiagnosticsから見えるように）。Bearer Token
+# 等の秘密情報は一切保存しない列のみ。
+_MIGRATE_MARKET_SOURCES_DIAGNOSTICS_SQL = """
+ALTER TABLE market_sources ADD COLUMN IF NOT EXISTS last_fetch_started_at TIMESTAMPTZ;
+ALTER TABLE market_sources ADD COLUMN IF NOT EXISTS last_fetch_finished_at TIMESTAMPTZ;
+ALTER TABLE market_sources ADD COLUMN IF NOT EXISTS last_error_at TIMESTAMPTZ;
+ALTER TABLE market_sources ADD COLUMN IF NOT EXISTS last_http_status TEXT;
+ALTER TABLE market_sources ADD COLUMN IF NOT EXISTS last_fetched_count INTEGER;
+ALTER TABLE market_sources ADD COLUMN IF NOT EXISTS last_inserted_count INTEGER;
+ALTER TABLE market_sources ADD COLUMN IF NOT EXISTS last_duplicate_count INTEGER;
+"""
+
 
 def init_schema(database_url):
     """テーブルを（無ければ）作成し、マルチユーザー化・ChatGPT連携の移行SQLも実行する。
@@ -974,6 +1001,8 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_SOCIAL_MARKET_SQL)
         conn.execute(_MIGRATE_MARKET_INTEL_SOCIAL_SQL)
         conn.execute(_MIGRATE_SOCIAL_POSTS_IMAGE_STATUS_SQL)
+        conn.execute(_MIGRATE_SOCIAL_POSTS_IMAGE_STATUS_V2_SQL)
+        conn.execute(_MIGRATE_MARKET_SOURCES_DIAGNOSTICS_SQL)
         conn.commit()
 
 
@@ -4110,8 +4139,9 @@ def insert_social_post_if_new(database_url, post):
     values = []
     for c in cols:
         if c == "image_analysis_status":
-            # 画像付き投稿はPENDING（解析待ち）、画像なしはNULL（そもそも対象外）。
-            values.append("PENDING" if post.get("media") else None)
+            # Phase2（指示書1番）：画像付き投稿はPENDING（解析待ち）、画像なしはNONE
+            # （そもそも対象外を明示、旧NULLから変更）。
+            values.append("PENDING" if post.get("media") else "NONE")
             continue
         src_key = next((k for k, v in key_to_col.items() if v == c), c)
         v = post.get(src_key)
@@ -4131,7 +4161,9 @@ def insert_social_post_if_new(database_url, post):
 def save_social_post_image_analysis(database_url, source_handle, post_id, image_analysis):
     """指示書4番・画像解析待ちキュー指示書：画像の構造化解析結果（ユーザーがChatGPT等で解析
     した結果のJSON貼り付け）を既存投稿へ追記する。post自体は再取得しない（analysisだけの
-    更新）。保存に成功したらimage_analysis_status を PENDING→ANALYZED へ進める。"""
+    更新）。保存に成功したらimage_analysis_status を PENDING→ANALYZED へ進める。Phase2
+    （指示書2番）：正常保存なのでimage_analysis_errorはNULLへ戻す。戻り値がNoneなのは
+    対象投稿が見つからない場合（呼び出し側で「見つからない」エラーとして扱う）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
@@ -4139,9 +4171,88 @@ def save_social_post_image_analysis(database_url, source_handle, post_id, image_
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "UPDATE social_market_posts SET image_analysis_json=%s::jsonb, "
-                "image_analysis_status='ANALYZED', updated_at=now() "
+                "image_analysis_status='ANALYZED', image_analysis_error=NULL, "
+                "image_analysis_updated_at=now(), updated_at=now() "
                 "WHERE source_handle=%s AND post_id=%s RETURNING *",
                 [json.dumps(image_analysis or [], ensure_ascii=False), source_handle, post_id])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def mark_social_post_image_analysis_failed(database_url, source_handle, post_id, error_message):
+    """Phase2（指示書2番）：Smart Importでの画像解析保存に失敗した場合に呼ぶ。
+    image_analysis_status=FAILED・image_analysis_errorへ理由を記録する。対象投稿が無ければ
+    Noneを返す（呼び出し側でpost_id不明エラーとして扱う）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE social_market_posts SET image_analysis_status='FAILED', "
+                "image_analysis_error=%s, image_analysis_updated_at=now(), updated_at=now() "
+                "WHERE source_handle=%s AND post_id=%s RETURNING *",
+                [str(error_message or "")[:2000], source_handle, post_id])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+_SOCIAL_IMAGE_ANALYSIS_STATUSES = {"NONE", "PENDING", "ANALYZED", "SKIPPED", "FAILED"}
+
+
+def set_social_post_image_analysis_status(database_url, source_handle, post_id, status):
+    """Phase2（指示書3・4番）：SKIPPED化（「解析不要」ボタン）と、ANALYZED/FAILED/SKIPPEDから
+    PENDINGへ戻す再解析操作、の両方に使う汎用の状態遷移関数。image_analysis_json自体は
+    削除しない（指示書4番「即削除せず、再解析結果保存時に上書きする」）。不正なstatus値は
+    何もせずNoneを返す。"""
+    if status not in _SOCIAL_IMAGE_ANALYSIS_STATUSES:
+        return None
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE social_market_posts SET image_analysis_status=%s, "
+                "image_analysis_error=CASE WHEN %s='FAILED' THEN image_analysis_error ELSE NULL END, "
+                "image_analysis_updated_at=now(), updated_at=now() "
+                "WHERE source_handle=%s AND post_id=%s RETURNING *",
+                [status, status, source_handle, post_id])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def update_market_source_fetch_stats(database_url, handle, platform="X", **fields):
+    """Phase2（指示書11・17番）：1回のfetch-now/ポーリングサイクルの統計を記録する。
+    fieldsはlast_fetch_started_at/last_fetch_finished_at/last_error_at/last_http_status/
+    last_fetched_count/last_inserted_count/last_duplicate_countのいずれか（未指定のキーは
+    更新しない）。Bearer Token等の秘密情報はここでは一切扱わない。"""
+    allowed = {"last_fetch_started_at", "last_fetch_finished_at", "last_error_at", "last_http_status",
+               "last_fetched_count", "last_inserted_count", "last_duplicate_count"}
+    sets, params = [], []
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        if v == "NOW()":
+            sets.append(f"{k}=now()")
+        else:
+            sets.append(f"{k}=%s")
+            params.append(v)
+    if not sets:
+        return None
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    sets.append("updated_at=now()")
+    params += [platform, handle]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"UPDATE market_sources SET {', '.join(sets)} WHERE platform=%s AND handle=%s RETURNING *",
+                params)
             row = cur.fetchone()
         conn.commit()
     return _row_to_json(row) if row else None
@@ -4172,9 +4283,12 @@ def merge_social_post_mentions(database_url, source_handle, post_id, extra_direc
     return _row_to_json(updated) if updated else None
 
 
-def list_recent_social_posts(database_url, source_handle=None, since_iso=None, min_importance=None, limit=50):
+def list_recent_social_posts(database_url, source_handle=None, since_iso=None, min_importance=None, limit=50,
+                              image_analysis_status=None):
     """UI表示・にこそくカード向け。新しい順。min_importanceはLOW未満を除外する簡易フィルタ
-    ではなく、指定レベル以上のみ返す（LOW<MEDIUM<HIGH<CRITICAL）。"""
+    ではなく、指定レベル以上のみ返す（LOW<MEDIUM<HIGH<CRITICAL）。image_analysis_statusは
+    Phase2追加：NONE/PENDING/ANALYZED/SKIPPED/FAILEDのいずれかで完全一致絞り込み
+    （画像解析待ちキューのサマリー・並び替え計算に使う）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return []
@@ -4186,6 +4300,9 @@ def list_recent_social_posts(database_url, source_handle=None, since_iso=None, m
     if since_iso:
         where.append("posted_at >= %s")
         params.append(since_iso)
+    if image_analysis_status:
+        where.append("image_analysis_status=%s")
+        params.append(image_analysis_status)
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     params.append(limit if not min_importance else max(limit * 3, 100))  # min_importanceはPython側で絞るため多めに取る
     with pool.connection() as conn:

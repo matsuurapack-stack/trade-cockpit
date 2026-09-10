@@ -3558,23 +3558,56 @@ const X_POST_IMPORTANCE_META = {
   CRITICAL: {label: "CRITICAL", color: "var(--down)"}, HIGH: {label: "HIGH", color: "var(--accent)"},
   MEDIUM: {label: "MEDIUM", color: "var(--inkSoft)"}, LOW: {label: "LOW", color: "var(--inkFaint)"},
 };
+// Phase2新規（指示書6番）：優先度ラベルの簡潔表示。LOWはバッジ非表示（指示書「LOWはバッジ
+// 非表示でもよい」）。
+const X_POST_PRIORITY_META = {
+  URGENT: {emoji: "🔴", label: "最優先"}, HIGH: {emoji: "🟠", label: "優先"}, NORMAL: {emoji: "⚪", label: "通常"},
+};
 function XMarketSignalsCard(){
   const [posts,setPosts]=useState([]);
   const [status,setStatus]=useState(null);
+  const [pendingSummary,setPendingSummary]=useState(null);
+  const [diag,setDiag]=useState(null);
   const [expanded,setExpanded]=useState(false);
   const [loading,setLoading]=useState(false);
+  const [fetchingNow,setFetchingNow]=useState(false);
   const [copyMsgByPost,setCopyMsgByPost]=useState({});
   const load=async()=>{
     setLoading(true);
     try{
-      const [pr,sr]=await Promise.all([
+      const [pr,sr,dr]=await Promise.all([
         fetchJsonSafe(`/api/social-posts?limit=${expanded?10:3}`),
         fetchJsonSafe("/api/social-posts/status"),
+        fetchJsonSafe("/api/social-sources/nicosoku/diagnostics"),
       ]);
       if(pr&&Array.isArray(pr.posts))setPosts(pr.posts);
+      if(pr&&pr.pendingSummary)setPendingSummary(pr.pendingSummary);
       if(sr)setStatus(sr);
+      if(dr)setDiag(dr);
     }catch(e){}
     setLoading(false);
+  };
+  // Phase2新規（指示書12・13番）：診断用の手動「今すぐ取得」。既存pollerを1回だけ呼ぶ
+  // fetch-now APIを叩き、結果を反映するため一覧を再読込する。
+  const fetchNow=async()=>{
+    setFetchingNow(true);
+    try{
+      await fetchJsonSafe("/api/social-sources/nicosoku/fetch-now",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+      await load();
+    }catch(e){}
+    setFetchingNow(false);
+  };
+  // Phase2新規（指示書3・4番）：「解析不要」（SKIPPED）・「再解析」（→PENDINGへ戻す）。
+  // 誤操作対策として小さなconfirmを入れる（指示書「誤操作対策として小さな確認を入れてよい」）。
+  const skipPost=async(p)=>{
+    if(!window.confirm("この投稿を「解析不要」にしますか？"))return;
+    await fetchJsonSafe("/api/social-posts/skip",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({postId:p.post_id})});
+    await load();
+  };
+  const reanalyzePost=async(p)=>{
+    if(!window.confirm("この投稿を再解析待ちに戻しますか？"))return;
+    await fetchJsonSafe("/api/social-posts/reanalyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({postId:p.post_id})});
+    await load();
   };
   // 2026-09-10新規（にこそく画像解析待ちキュー）：画像付き投稿(image_analysis_status=
   // PENDING)向けに、ChatGPTへ渡す解析依頼JSONをそのままクリップボードへコピーするだけの
@@ -3583,16 +3616,25 @@ function XMarketSignalsCard(){
   // （ChatGPT側が「解析して指定スキーマで返す」というタスクを迷わず実行できるよう、
   // 相談的な前置き文ではなく依頼文＋厳密なJSONにする）。解析結果を貼り付ける先は既存の
   // 「ChatGPT連携」窓口（Smart Import、type:"social_market_image_analysis"を自動認識）。
+  // Phase2（指示書9番）：ChatGPTへ「何を優先して読むべき画像か」渡すため、
+  // importance/categories/related_positions/related_watchlist/analysis_priority_scoreを追加。
+  // これらはbuild_social_posts_response（サーバー側）が投稿へ付与済みの値をそのまま使う。
   const copyImageAnalysisRequest=async(p)=>{
     const payload={
       type:"social_market_image_analysis", source:"nicosoku", post_id:p.post_id,
       posted_at:p.posted_at, text:p.text, image_urls:(p.media_json||[]).map(m=>m&&m.url).filter(Boolean),
       request:{extract:["image_type","market_data","economic_events","stock_mentions",
         "sector_strength","technical_levels","author_annotations","market_implications"]},
+      importance:p.importance||null, categories:p.categories_json||[],
+      related_positions:p.related_positions||[], related_watchlist:p.related_watchlist||[],
+      analysis_priority_score:p.analysis_priority_score??null,
     };
     const text="この投稿に添付された画像を解析し、下記JSONのrequest.extractに挙げた項目を"+
       "できるだけ埋めて、同じ形の1つのJSONオブジェクト（トップレベルにtype/post_id/analysis）"+
-      "で返してください。読み取れない項目は無理に埋めずnull/空配列のままにしてください。\n\n"+
+      "で返してください。analysis内にはconfidence（0.0〜1.0、不明ならnull）も含めてください。"+
+      "importance/related_positions/related_watchlist/analysis_priority_scoreは、"+
+      "どの画像を優先して読むべきかの参考情報です。読み取れない項目は無理に埋めずnull/空配列の"+
+      "ままにしてください。\n\n"+
       "```json\n"+JSON.stringify(payload,null,2)+"\n```";
     const ok=await copyText(text);
     setCopyMsgByPost(m=>({...m,[p.post_id]:ok?"コピーしました":"コピー失敗"}));
@@ -3600,6 +3642,10 @@ function XMarketSignalsCard(){
   };
   useEffect(()=>{load();},[expanded]); // eslint-disable-line
   const isDegraded=status&&status.status==="DEGRADED";
+  // Phase2新規（指示書13番）：X API疎通の小さなステータス表示。
+  const diagLabel=!diag?null:!diag.token_configured?"未設定":diag.last_error?"エラー":"接続中";
+  const diagColor=diagLabel==="未設定"?"var(--inkFaint)":diagLabel==="エラー"?"var(--down)":"var(--up)";
+  const lastFetchAgo=diag&&diag.last_success_at?Math.max(0,Math.round((Date.now()-new Date(diag.last_success_at).getTime())/60000)):null;
   return <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:6,padding:"10px 12px",marginTop:12,marginBottom:12}}>
     <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,flexWrap:"wrap"}}>
       <div style={{fontWeight:800,fontSize:12.5}}>🐦 X 市場情報<span style={{fontWeight:400,fontSize:10.5,color:"var(--inkFaint)"}}>（にこそく @nicosokufx）</span></div>
@@ -3607,9 +3653,20 @@ function XMarketSignalsCard(){
         {isDegraded && <span style={{fontSize:10,color:"var(--down)"}} title={status.reason||""}>
           ⚠ DEGRADED{status.lastSuccessAt?`（最終成功: ${new Date(status.lastSuccessAt).toLocaleString("ja-JP")}）`:"（未取得）"}
         </span>}
+        {diag&&diag.stale&&!isDegraded && <span style={{fontSize:10,color:"var(--down)"}}>⚠ X情報更新停止</span>}
         <button className="iconbtn" style={{fontSize:11}} onClick={load} disabled={loading} title="更新">{loading?"…":"🔄"}</button>
       </div>
     </div>
+    {/* Phase2新規（指示書13番）：X API疎通の小さなステータス表示＋「今すぐ取得」。 */}
+    {diagLabel && <div style={{display:"flex",alignItems:"center",gap:6,marginTop:3,fontSize:10,color:"var(--inkFaint)"}}>
+      <span>X API: <span style={{color:diagColor,fontWeight:700}}>{diagLabel}</span></span>
+      {lastFetchAgo!=null && <span>最終取得: {lastFetchAgo<1?"1分未満前":`${lastFetchAgo}分前`}</span>}
+      {diag&&diag.token_configured && <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={fetchNow} disabled={fetchingNow}>{fetchingNow?"取得中…":"今すぐ取得"}</button>}
+    </div>}
+    {/* Phase2新規（指示書8番）：画像解析待ち件数のサマリー。 */}
+    {pendingSummary&&pendingSummary.pending>0 && <div style={{fontSize:10.5,marginTop:3,color:"var(--inkSoft)"}}>
+      画像解析待ち {pendingSummary.pending}件{pendingSummary.urgent>0?`（最優先 ${pendingSummary.urgent}件）`:""}
+    </div>}
     {posts.length===0
       ? <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:4}}>
           {isDegraded?"X APIが利用できないため投稿を取得できません（他機能には影響ありません）。":"投稿がまだありません。"}
@@ -3621,11 +3678,13 @@ function XMarketSignalsCard(){
             const relStocks=[...new Set([...(p.direct_mentions_json||[]),...(p.theme_related_json||[])])];
             const isNew=p.posted_at&&(Date.now()-new Date(p.posted_at).getTime())<30*60*1000&&(p.importance==="HIGH"||p.importance==="CRITICAL");
             const thumb=(p.media_json||[]).find(m=>m&&m.url);
+            const prioMeta=X_POST_PRIORITY_META[p.priority_label]; // LOWはundefined→非表示
             return <div key={p.id} style={{display:"flex",gap:8,padding:"5px 6px",borderRadius:4,background:"var(--bg)",border:"1px solid var(--rule)"}}>
               {thumb && <img src={thumb.url} alt={thumb.alt_text||""} style={{width:44,height:44,objectFit:"cover",borderRadius:3,flex:"0 0 auto"}}/>}
               <div style={{flex:1,minWidth:0}}>
                 <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap",fontSize:10.5}}>
                   {isNew && <span style={{color:"var(--down)",fontWeight:800}}>🔴 NEW</span>}
+                  {prioMeta && p.image_analysis_status==="PENDING" && <span title={`優先度スコア ${p.analysis_priority_score}`}>{prioMeta.emoji} {prioMeta.label}</span>}
                   <span style={{color:"var(--inkFaint)"}}>{p.posted_at?new Date(p.posted_at).toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"}):"—"}</span>
                   <span style={{fontWeight:700,color:impMeta.color,border:`1px solid ${impMeta.color}`,borderRadius:3,padding:"0 4px"}}>{impMeta.label}</span>
                   {cats.slice(0,3).map(c=><span key={c} className="chip" style={{fontSize:9.5,padding:"0 4px"}}>{c}</span>)}
@@ -3637,9 +3696,21 @@ function XMarketSignalsCard(){
                   {p.image_analysis_status==="PENDING" && <>
                     <span style={{color:"var(--accent)",fontWeight:700}}>🖼 画像解析待ち</span>
                     <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={()=>copyImageAnalysisRequest(p)}>ChatGPTで解析</button>
+                    <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={()=>skipPost(p)}>解析不要</button>
                     {copyMsgByPost[p.post_id] && <span style={{color:"var(--inkFaint)"}}>{copyMsgByPost[p.post_id]}</span>}
                   </>}
-                  {p.image_analysis_status==="ANALYZED" && <span style={{color:"var(--up)",fontWeight:700}}>✅ 画像解析済み</span>}
+                  {p.image_analysis_status==="ANALYZED" && <>
+                    <span style={{color:"var(--up)",fontWeight:700}}>✅ 画像解析済み</span>
+                    <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={()=>reanalyzePost(p)}>再解析</button>
+                  </>}
+                  {p.image_analysis_status==="SKIPPED" && <>
+                    <span style={{color:"var(--inkFaint)",fontWeight:700}}>— 解析不要</span>
+                    <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={()=>reanalyzePost(p)}>再解析</button>
+                  </>}
+                  {p.image_analysis_status==="FAILED" && <>
+                    <span style={{color:"var(--down)",fontWeight:700}} title={p.image_analysis_error||""}>⚠ 解析失敗</span>
+                    <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={()=>reanalyzePost(p)}>再解析</button>
+                  </>}
                 </div>
               </div>
             </div>;
