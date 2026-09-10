@@ -944,6 +944,13 @@ _MIGRATE_MARKET_INTEL_SOCIAL_SQL = """
 ALTER TABLE market_intelligence_reports ADD COLUMN IF NOT EXISTS social_signals_json JSONB;
 """
 
+# 2026-09-10追加（にこそく画像解析待ちキュー）：画像付き投稿を取得した時点でPENDINGにし、
+# ユーザーがChatGPT等で解析した結果を貼り付けて保存した時点でANALYZEDへ変わる2値の状態列。
+# 画像なし投稿はNULLのまま（「解析待ち」ではなく「そもそも対象外」）。
+_MIGRATE_SOCIAL_POSTS_IMAGE_STATUS_SQL = """
+ALTER TABLE social_market_posts ADD COLUMN IF NOT EXISTS image_analysis_status TEXT;
+"""
+
 
 def init_schema(database_url):
     """テーブルを（無ければ）作成し、マルチユーザー化・ChatGPT連携の移行SQLも実行する。
@@ -966,6 +973,7 @@ def init_schema(database_url):
         conn.execute(_MIGRATE_STOCK_THESES_MORNING_COLUMNS_SQL)
         conn.execute(_SCHEMA_SOCIAL_MARKET_SQL)
         conn.execute(_MIGRATE_MARKET_INTEL_SOCIAL_SQL)
+        conn.execute(_MIGRATE_SOCIAL_POSTS_IMAGE_STATUS_SQL)
         conn.commit()
 
 
@@ -4098,9 +4106,13 @@ def insert_social_post_if_new(database_url, post):
     cols = ["source_type", "source_name", "source_handle", "post_id", "posted_at", "text", "url",
             "media_json", "quoted_post_json", "public_metrics_json", "categories_json", "importance",
             "facts_json", "author_opinion_json", "system_inference_json", "direct_mentions_json",
-            "theme_related_json", "verification_status"]
+            "theme_related_json", "verification_status", "image_analysis_status"]
     values = []
     for c in cols:
+        if c == "image_analysis_status":
+            # 画像付き投稿はPENDING（解析待ち）、画像なしはNULL（そもそも対象外）。
+            values.append("PENDING" if post.get("media") else None)
+            continue
         src_key = next((k for k, v in key_to_col.items() if v == c), c)
         v = post.get(src_key)
         values.append(json.dumps(v, ensure_ascii=False) if c in _SOCIAL_POST_JSON_COLS else v)
@@ -4117,20 +4129,47 @@ def insert_social_post_if_new(database_url, post):
 
 
 def save_social_post_image_analysis(database_url, source_handle, post_id, image_analysis):
-    """指示書4番：画像の構造化解析結果（ユーザーがChatGPT等で解析した結果のJSON貼り付け）を
-    既存投稿へ追記する。post自体は再取得しない（analysisだけの更新）。"""
+    """指示書4番・画像解析待ちキュー指示書：画像の構造化解析結果（ユーザーがChatGPT等で解析
+    した結果のJSON貼り付け）を既存投稿へ追記する。post自体は再取得しない（analysisだけの
+    更新）。保存に成功したらimage_analysis_status を PENDING→ANALYZED へ進める。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "UPDATE social_market_posts SET image_analysis_json=%s::jsonb, updated_at=now() "
+                "UPDATE social_market_posts SET image_analysis_json=%s::jsonb, "
+                "image_analysis_status='ANALYZED', updated_at=now() "
                 "WHERE source_handle=%s AND post_id=%s RETURNING *",
                 [json.dumps(image_analysis or [], ensure_ascii=False), source_handle, post_id])
             row = cur.fetchone()
         conn.commit()
     return _row_to_json(row) if row else None
+
+
+def merge_social_post_mentions(database_url, source_handle, post_id, extra_direct_mentions):
+    """画像解析結果から新たに判明した銘柄関連付けを、既存direct_mentions_jsonへ重複無く
+    追記する（画像解析待ちキュー指示書：解析結果を関連銘柄へ反映）。"""
+    if not extra_direct_mentions:
+        return None
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT direct_mentions_json FROM social_market_posts WHERE source_handle=%s AND post_id=%s",
+                        [source_handle, post_id])
+            row = cur.fetchone()
+            if not row:
+                return None
+            merged = sorted(set(row["direct_mentions_json"] or []) | set(extra_direct_mentions))
+            cur.execute(
+                "UPDATE social_market_posts SET direct_mentions_json=%s::jsonb, updated_at=now() "
+                "WHERE source_handle=%s AND post_id=%s RETURNING *",
+                [json.dumps(merged, ensure_ascii=False), source_handle, post_id])
+            updated = cur.fetchone()
+        conn.commit()
+    return _row_to_json(updated) if updated else None
 
 
 def list_recent_social_posts(database_url, source_handle=None, since_iso=None, min_importance=None, limit=50):

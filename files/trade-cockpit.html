@@ -2658,6 +2658,7 @@ const SMART_IMPORT_CATEGORY_META={
   CHATGPT_LEGACY:{icon:"✅",label:"ChatGPT連携（従来形式）",color:"var(--up)"},
   WATCHLIST_UPDATE:{icon:"👀",label:"WATCHLIST UPDATE（監視銘柄）",color:"var(--up)"},
   POSITION_UPDATE:{icon:"💼",label:"POSITION UPDATE（保有ポジション）",color:"var(--down)"},
+  SOCIAL_IMAGE_ANALYSIS:{icon:"🖼",label:"SOCIAL IMAGE ANALYSIS（X投稿画像解析）",color:"var(--up)"},
   UNKNOWN:{icon:"❔",label:"判別不能",color:"var(--inkFaint)"},
 };
 const SMART_IMPORT_CONFIDENCE_META={
@@ -2666,7 +2667,8 @@ const SMART_IMPORT_CONFIDENCE_META={
 };
 // 2026-09-10更新（Phase SI-C）：WATCHLIST_UPDATE/POSITION_UPDATEを追加。
 const SMART_IMPORT_IMPLEMENTED=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
-  "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","CHATGPT_LEGACY","WATCHLIST_UPDATE","POSITION_UPDATE"];
+  "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","CHATGPT_LEGACY","WATCHLIST_UPDATE","POSITION_UPDATE",
+  "SOCIAL_IMAGE_ANALYSIS"];
 
 // 指示書25番（Phase SI-D）：UIテキストを統一表現に寄せる。sourceContextはCatalystタブ等
 // から開いた場合のヒント表示用（指示書12番：分類結果を強制しない、あくまで注記）。
@@ -2677,7 +2679,7 @@ const SMART_IMPORT_SOURCE_CONTEXT_LABEL={
 // TRADE_RULE・POSITION_UPDATE全般・WATCHLIST_UPDATEのREMOVEは除外）。判定はカテゴリ単位
 // （WATCHLIST_UPDATE自体はADD/UPDATEなら安全）＋isSmartImportCandidateSafe()で個別除外する。
 const SMART_IMPORT_SAFE_CATEGORIES=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
-  "MORNING_MARKET_CHECK","INTRADAY_REPORT","WATCHLIST_UPDATE"];
+  "MORNING_MARKET_CHECK","INTRADAY_REPORT","WATCHLIST_UPDATE","SOCIAL_IMAGE_ANALYSIS"];
 const isSmartImportCandidateSafe=c=>{
   if(!SMART_IMPORT_SAFE_CATEGORIES.includes(c.category))return false;
   if(c.category==="WATCHLIST_UPDATE"&&(c.draft?.action||"").toUpperCase()==="REMOVE")return false;
@@ -2893,6 +2895,12 @@ function SmartImportPanel({onReload,sourceContext=null,onSaved=null,compactMode=
                   {c.draft.stop_price!=null&&`　逆指値: ${c.draft.stop_price}円`}
                 </div>
               </>}
+              {c.category==="SOCIAL_IMAGE_ANALYSIS" && <>
+                {!c.draft.post_id && <div style={{fontSize:11,color:"var(--down)",fontWeight:700}}>⚠ post_idが無いため保存できません（対象の投稿を特定できません）</div>}
+                <div style={{fontSize:11,color:"var(--inkFaint)"}}>
+                  対象post_id: {c.draft.post_id||"（不明）"}　保存先: social_market_posts.image_analysis_json（既存投稿への追記のみ、売買スコアには加点しません）
+                </div>
+              </>}
               {!implemented && <div style={{fontSize:11.5,color:"var(--inkFaint)",whiteSpace:"pre-wrap"}}>{c.raw_text}</div>}
             </div>
           </div>;
@@ -2921,7 +2929,8 @@ function SmartImportPanel({onReload,sourceContext=null,onSaved=null,compactMode=
   </div>;
 }
 const SMART_IMPORT_CATEGORIES_UI=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
-  "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","WATCHLIST_UPDATE","POSITION_UPDATE","UNKNOWN"];
+  "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","WATCHLIST_UPDATE","POSITION_UPDATE",
+  "SOCIAL_IMAGE_ANALYSIS","UNKNOWN"];
 
 function ExpertViewsPanel({views,onReload,onOpenSmartImport}){
   const [pasteText,setPasteText]=useState("");
@@ -3554,6 +3563,7 @@ function XMarketSignalsCard(){
   const [status,setStatus]=useState(null);
   const [expanded,setExpanded]=useState(false);
   const [loading,setLoading]=useState(false);
+  const [copyMsgByPost,setCopyMsgByPost]=useState({});
   const load=async()=>{
     setLoading(true);
     try{
@@ -3565,6 +3575,28 @@ function XMarketSignalsCard(){
       if(sr)setStatus(sr);
     }catch(e){}
     setLoading(false);
+  };
+  // 2026-09-10新規（にこそく画像解析待ちキュー）：画像付き投稿(image_analysis_status=
+  // PENDING)向けに、ChatGPTへ渡す解析依頼JSONをそのままクリップボードへコピーするだけの
+  // ボタン。既存のcopyChatGPTPayload（buildChatGPTPayloadでcontext/date/generated_atを
+  // 追加してしまう「相談」用の汎用ラッパー）は使わず、指示されたJSON構造をそのまま出す
+  // （ChatGPT側が「解析して指定スキーマで返す」というタスクを迷わず実行できるよう、
+  // 相談的な前置き文ではなく依頼文＋厳密なJSONにする）。解析結果を貼り付ける先は既存の
+  // 「ChatGPT連携」窓口（Smart Import、type:"social_market_image_analysis"を自動認識）。
+  const copyImageAnalysisRequest=async(p)=>{
+    const payload={
+      type:"social_market_image_analysis", source:"nicosoku", post_id:p.post_id,
+      posted_at:p.posted_at, text:p.text, image_urls:(p.media_json||[]).map(m=>m&&m.url).filter(Boolean),
+      request:{extract:["image_type","market_data","economic_events","stock_mentions",
+        "sector_strength","technical_levels","author_annotations","market_implications"]},
+    };
+    const text="この投稿に添付された画像を解析し、下記JSONのrequest.extractに挙げた項目を"+
+      "できるだけ埋めて、同じ形の1つのJSONオブジェクト（トップレベルにtype/post_id/analysis）"+
+      "で返してください。読み取れない項目は無理に埋めずnull/空配列のままにしてください。\n\n"+
+      "```json\n"+JSON.stringify(payload,null,2)+"\n```";
+    const ok=await copyText(text);
+    setCopyMsgByPost(m=>({...m,[p.post_id]:ok?"コピーしました":"コピー失敗"}));
+    setTimeout(()=>setCopyMsgByPost(m=>({...m,[p.post_id]:""})),2500);
   };
   useEffect(()=>{load();},[expanded]); // eslint-disable-line
   const isDegraded=status&&status.status==="DEGRADED";
@@ -3602,6 +3634,12 @@ function XMarketSignalsCard(){
                 <div style={{display:"flex",alignItems:"center",gap:6,marginTop:2,fontSize:10,flexWrap:"wrap"}}>
                   {relStocks.length>0 && <span style={{color:"var(--inkSoft)"}}>関連：{relStocks.join("・")}</span>}
                   <a href={p.url} target="_blank" rel="noopener noreferrer" style={{color:"var(--accent)"}}>原文を見る↗</a>
+                  {p.image_analysis_status==="PENDING" && <>
+                    <span style={{color:"var(--accent)",fontWeight:700}}>🖼 画像解析待ち</span>
+                    <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={()=>copyImageAnalysisRequest(p)}>ChatGPTで解析</button>
+                    {copyMsgByPost[p.post_id] && <span style={{color:"var(--inkFaint)"}}>{copyMsgByPost[p.post_id]}</span>}
+                  </>}
+                  {p.image_analysis_status==="ANALYZED" && <span style={{color:"var(--up)",fontWeight:700}}>✅ 画像解析済み</span>}
                 </div>
               </div>
             </div>;

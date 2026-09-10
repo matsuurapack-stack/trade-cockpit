@@ -3031,6 +3031,100 @@ def _detect_events_from_social_text(text, posted_at_date):
     return drafts
 
 
+# ============================================================
+# にこそく画像解析待ちキュー。2026-09-10新規。
+# 画像付き投稿はimage_analysis_status=PENDINGで保存され、ユーザーがChatGPT等で解析した
+# 結果を既存の「ChatGPT連携」窓口（Smart Import）へ貼り付けるとSOCIAL_IMAGE_ANALYSISとして
+# 自動分類され、POST /api/social-posts/image-analysisと同じ保存経路へ振り分けられる
+# （smart_import_confirm()のSOCIAL_IMAGE_ANALYSIS分岐）。解析結果はrecent_social_market_
+# signals・朝一チェック・INTRADAY_REPORT・イベント検出・関連銘柄付けに使うが、売買スコアへは
+# 一切加点しない（既存方針の継続）。
+# ============================================================
+
+def normalize_social_image_analysis(draft, raw_text=None, import_source="unknown"):
+    """{"type":"social_market_image_analysis","post_id":...,"analysis":{...}}形式のJSONを
+    (post_id, analysis_dict)へ正規化する。post_idが無ければ保存できないためNoneを返す
+    （呼び出し側でconfidence=LOWとして自動保存対象外になる想定と一致させる）。analysisの
+    中身はユーザー/ChatGPT側の自由記述を許容し、厳密なスキーマ検証はしない（他のSmart
+    Import正規化関数と同じ「形を強制しすぎない」方針）。"""
+    if not isinstance(draft, dict):
+        return None
+    post_id = draft.get("post_id")
+    if not post_id:
+        return None
+    analysis = draft.get("analysis")
+    if not isinstance(analysis, dict):
+        # analysisキーが無い場合、post_id・type以外の残りのキー全体をanalysisとして扱う
+        # （ユーザーがrequestで例示した8項目をトップレベルに直接貼り付けるケースにも対応）。
+        analysis = {k: v for k, v in draft.items() if k not in ("type", "post_id", "posted_at", "text", "image_urls", "request")}
+    return post_id, analysis
+
+
+def _extract_stock_mentions_from_analysis(analysis):
+    """analysis中のstock_mentions（または旧仕様のstocks）から銘柄名/コード候補の文字列一覧を
+    取り出す（{"name":...}/{"stock":...}/{"code":...}/文字列、いずれの形も許容）。"""
+    raw = (analysis or {}).get("stock_mentions") or (analysis or {}).get("stocks") or []
+    if not isinstance(raw, list):
+        return []
+    names = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            names.append(item.strip())
+        elif isinstance(item, dict):
+            n = item.get("name") or item.get("stock") or item.get("code")
+            if n:
+                names.append(str(n).strip())
+    return names
+
+
+def _resolve_stock_mentions_to_codes(database_url, user_id, mention_names):
+    """画像解析が返した銘柄名候補を、既存監視銘柄の名前と突き合わせてコードへ解決する
+    （指示書15番と同じ「既存の登録データのみを根拠にする」方針、独自の固定マップは使わない）。"""
+    if investment_db is None or not database_url or not mention_names:
+        return []
+    try:
+        watchlist = investment_db.list_watchlist(database_url, user_id, market="JP")
+    except Exception:
+        return []
+    codes = set()
+    for name in mention_names:
+        for w in watchlist:
+            wname = (w.get("name") or "").strip()
+            if wname and (wname in name or name in wname):
+                codes.add(w.get("code"))
+    return sorted(codes)
+
+
+def _normalize_image_economic_events(analysis, posted_date):
+    """analysis中のeconomic_eventsを market_events importable な draft へ変換する
+    （文字列「9/10 PPI」形式は既存の_detect_events_from_social_textを再利用、
+    {"date":...,"title":...}形式は直接構築——別ロジックの重複実装を避ける）。"""
+    raw = (analysis or {}).get("economic_events") or []
+    if not isinstance(raw, list):
+        return []
+    drafts = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            drafts.extend(_detect_events_from_social_text(item, posted_date))
+        elif isinstance(item, dict) and item.get("title"):
+            event_date = posted_date
+            date_str = item.get("date")
+            if date_str:
+                m = re.match(r"(\d{1,2})/(\d{1,2})", str(date_str))
+                if m:
+                    try:
+                        event_date = datetime.date(posted_date.year, int(m.group(1)), int(m.group(2)))
+                    except ValueError:
+                        event_date = posted_date
+            drafts.append({
+                "event_date": event_date.isoformat(), "title": f"{item['title']}（にこそく画像解析より検出）",
+                "event_type": item.get("event_type") or "OTHER", "importance": item.get("importance") or "MEDIUM",
+                "source": "nicosoku_x_image", "source_type": "X_POST_IMAGE", "verification_status": "UNVERIFIED",
+                "raw_payload": {"confidence": "MEDIUM", "detected_from": "image_analysis"},
+            })
+    return drafts
+
+
 def _x_api_request(path, params=None):
     """X API v2への共通リクエスト。戻り値：(json_or_None, status, detail)。
     status："ok"|"no_key"|"rate_limited"|"timeout"|"failed"。指示書1番により実装方式は
@@ -3227,10 +3321,25 @@ def get_recent_social_market_signals(database_url, user_id, lookback_minutes=180
         if rank.get(p.get("importance"), 0) < rank.get("HIGH", 2) and not relevant:
             continue  # MEDIUM以下は関連銘柄が無ければ落とす（指示書「全投稿を送らない」）
         summary = (p.get("text") or "")[:80]
+        facts = list(p.get("facts_json") or [])
+        # 画像解析待ちキュー：ANALYZED済みの画像があれば、その構造化結果（market_implications/
+        # observations等）もfactsへ添える（指示書「解析結果をrecent_social_market_signals…
+        # へ利用する」）。売買スコアへは一切加点しない（この関数はChatGPT相談用の参考情報を
+        # 返すだけで、entry_score等の既存スコアには触れない）。
+        if p.get("image_analysis_status") == "ANALYZED":
+            for a in (p.get("image_analysis_json") or []):
+                if not isinstance(a, dict):
+                    continue
+                for key in ("market_implications", "observations"):
+                    v = a.get(key)
+                    if isinstance(v, str) and v:
+                        facts.append(f"[画像解析] {v}")
+                    elif isinstance(v, list):
+                        facts.extend(f"[画像解析] {x}" for x in v if isinstance(x, str))
         scored.append({
             "source": "nicosoku", "posted_at": p.get("posted_at"), "importance": p.get("importance"),
             "categories": p.get("categories_json") or [], "summary": summary,
-            "facts": p.get("facts_json") or [], "author_opinion": p.get("author_opinion_json") or [],
+            "facts": facts, "author_opinion": p.get("author_opinion_json") or [],
             "relevance": sorted(mentions), "url": p.get("url"),
         })
     scored.sort(key=lambda s: (-rank.get(s["importance"], 0), s["posted_at"] or ""), reverse=False)
@@ -7006,12 +7115,14 @@ SMART_IMPORT_CATEGORIES = [  # 指示書2番。将来カテゴリ追加時はこ
 SMART_IMPORT_IMPLEMENTED_CATEGORIES = {
     "CATALYST", "EVENT", "EXPERT_OPINION", "MARKET_ANALYSIS", "MORNING_MARKET_CHECK",
     "INTRADAY_REPORT", "TRADE_RULE", "CHATGPT_LEGACY", "WATCHLIST_UPDATE", "POSITION_UPDATE",
+    "SOCIAL_IMAGE_ANALYSIS",
 }
 # 指示書16番（Phase SI-C）：重要操作（TRADE_RULE・WATCHLIST_UPDATEのREMOVE・POSITION_UPDATE
 # 全般）は「安全な項目のみ選択」の対象外とする。POSITION_UPDATEはカテゴリ全体が対象外
-# （指示書6番：HIGH confidenceでも自動保存禁止、常に確認）。
+# （指示書6番：HIGH confidenceでも自動保存禁止、常に確認）。SOCIAL_IMAGE_ANALYSISは既存投稿
+# への追記のみ（売買・ルールに直接影響しない）のため安全側に含める。
 SMART_IMPORT_SAFE_CATEGORIES_BACKEND = {"CATALYST", "EVENT", "EXPERT_OPINION", "MARKET_ANALYSIS",
-                                          "MORNING_MARKET_CHECK", "INTRADAY_REPORT"}
+                                          "MORNING_MARKET_CHECK", "INTRADAY_REPORT", "SOCIAL_IMAGE_ANALYSIS"}
 
 _JSON_CODEBLOCK_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 
@@ -7086,6 +7197,10 @@ def _classify_json_item(item):
         return "WATCHLIST_UPDATE", ("MEDIUM" if str(item.get("action", "")).upper() == "REMOVE" else "HIGH"), item
     if t == "position_update":
         return "POSITION_UPDATE", "HIGH", item
+    if t == "social_market_image_analysis":
+        # 2026-09-10新規（にこそく画像解析待ちキュー）：post_idが無い場合は保存できないため
+        # confidenceを下げる（他のtype判定と同じ「必須項目が無ければ下げる」方針）。
+        return "SOCIAL_IMAGE_ANALYSIS", ("HIGH" if item.get("post_id") else "LOW"), item
     if _looks_like_legacy_chatgpt_payload(item):
         return "CHATGPT_LEGACY", "HIGH", item
 
@@ -7832,6 +7947,7 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
     chatgpt_legacy_results = []
     watchlist_update_results = []
     position_update_results = []
+    social_image_analysis_results = []
 
     for c in candidates or []:
         category = c.get("category")
@@ -8011,6 +8127,53 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
                 position_update_results.append({"ok": False, "reason": str(e)})
             continue
 
+        if category == "SOCIAL_IMAGE_ANALYSIS":
+            # にこそく画像解析待ちキュー：ChatGPT等で解析した画像の構造化結果を既存投稿へ
+            # 追記保存する（POST /api/social-posts/image-analysisと同じ保存経路）。保存後は
+            # PENDING→ANALYZEDになり、economic_events/stock_mentionsがあれば既存の
+            # イベント検出・監視銘柄照合ロジックへ流す（新しい判定ロジックは作らない）。
+            try:
+                normalized = normalize_social_image_analysis(draft, raw_text, import_source)
+                if normalized is None:
+                    social_image_analysis_results.append({"ok": False, "reason": "post_idが無いため保存できません"})
+                else:
+                    post_id, analysis = normalized
+                    saved = investment_db.save_social_post_image_analysis(database_url, NICOSOKU_X_USERNAME, post_id, [analysis])
+                    if saved is None:
+                        social_image_analysis_results.append({"ok": False, "reason": "対象の投稿が見つかりません", "post_id": post_id})
+                    else:
+                        events_imported = 0
+                        try:
+                            posted_at = saved.get("posted_at")
+                            posted_date = datetime.datetime.fromisoformat(posted_at).date() if posted_at else datetime.date.today()
+                            event_drafts = _normalize_image_economic_events(analysis, posted_date)
+                            if event_drafts:
+                                existing = investment_db.list_market_events(
+                                    database_url, user_id, from_date=posted_date.isoformat(),
+                                    to_date=(posted_date + datetime.timedelta(days=120)).isoformat())
+                                existing_keys = {(e.get("event_date"), _event_title_key(e.get("title"))) for e in existing}
+                                fresh = [d for d in event_drafts if (d["event_date"], _event_title_key(d["title"])) not in existing_keys]
+                                if fresh:
+                                    imp = investment_db.import_market_events(database_url, user_id, fresh)
+                                    events_imported = imp.get("imported", 0)
+                        except Exception as e:
+                            print("  SmartImport: 画像解析からのイベント検出失敗", e)
+                        mentions_added = 0
+                        try:
+                            mention_names = _extract_stock_mentions_from_analysis(analysis)
+                            extra_codes = _resolve_stock_mentions_to_codes(database_url, user_id, mention_names)
+                            if extra_codes:
+                                investment_db.merge_social_post_mentions(database_url, NICOSOKU_X_USERNAME, post_id, extra_codes)
+                                mentions_added = len(extra_codes)
+                        except Exception as e:
+                            print("  SmartImport: 画像解析からの銘柄関連付け失敗", e)
+                        social_image_analysis_results.append({"ok": True, "post_id": post_id,
+                                                                "events_imported": events_imported, "mentions_added": mentions_added})
+            except Exception as e:
+                print("  SmartImport: 画像解析保存失敗", e)
+                social_image_analysis_results.append({"ok": False, "reason": str(e)})
+            continue
+
     results = {}
     if buckets["CATALYST"]:
         results["CATALYST"] = investment_db.import_news_catalysts(database_url, user_id, buckets["CATALYST"])
@@ -8042,6 +8205,10 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
         results["POSITION_UPDATE"] = {"imported": sum(1 for r in position_update_results if r["ok"]),
                                        "skipped": sum(1 for r in position_update_results if not r["ok"]),
                                        "details": position_update_results}
+    if social_image_analysis_results:
+        results["SOCIAL_IMAGE_ANALYSIS"] = {"imported": sum(1 for r in social_image_analysis_results if r["ok"]),
+                                             "skipped": sum(1 for r in social_image_analysis_results if not r["ok"]),
+                                             "details": social_image_analysis_results}
     return {"results": results, "rejected_low_confidence": rejected, "skipped_unimplemented": skipped_unimplemented,
             "skipped_existing_report": skipped_existing_report}
 
