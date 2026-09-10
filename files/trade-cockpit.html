@@ -2583,23 +2583,33 @@ const SMART_IMPORT_CATEGORY_META={
   INTRADAY_REPORT:{icon:"✅",label:"INTRADAY REPORT（場中レポート）",color:"var(--up)"},
   TRADE_RULE:{icon:"🚨",label:"TRADE RULE（売買ルール変更候補）",color:"var(--down)"},
   CHATGPT_LEGACY:{icon:"✅",label:"ChatGPT連携（従来形式）",color:"var(--up)"},
+  WATCHLIST_UPDATE:{icon:"👀",label:"WATCHLIST UPDATE（監視銘柄）",color:"var(--up)"},
+  POSITION_UPDATE:{icon:"💼",label:"POSITION UPDATE（保有ポジション）",color:"var(--down)"},
   UNKNOWN:{icon:"❔",label:"判別不能",color:"var(--inkFaint)"},
 };
 const SMART_IMPORT_CONFIDENCE_META={
   HIGH:{label:"HIGH", color:"var(--up)"}, MEDIUM:{label:"MEDIUM", color:"var(--accent)"},
   LOW:{label:"LOW（要確認）", color:"var(--down)"},
 };
+// 2026-09-10更新（Phase SI-C）：WATCHLIST_UPDATE/POSITION_UPDATEを追加。
 const SMART_IMPORT_IMPLEMENTED=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
-  "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","CHATGPT_LEGACY"];
+  "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","CHATGPT_LEGACY","WATCHLIST_UPDATE","POSITION_UPDATE"];
 
 // 指示書25番（Phase SI-D）：UIテキストを統一表現に寄せる。sourceContextはCatalystタブ等
 // から開いた場合のヒント表示用（指示書12番：分類結果を強制しない、あくまで注記）。
 const SMART_IMPORT_SOURCE_CONTEXT_LABEL={
   CATALYST:"カタリスト", EVENT:"イベント", EXPERT_OPINION:"有識者", CHATGPT:"ChatGPT連携",
 };
-// 指示書20番：「安全な項目のみ選択」の対象（重要操作＝TRADE_RULE等は除外）
+// 指示書20番（Phase SI-D）・16番（Phase SI-C）：「安全な項目のみ選択」の対象（重要操作＝
+// TRADE_RULE・POSITION_UPDATE全般・WATCHLIST_UPDATEのREMOVEは除外）。判定はカテゴリ単位
+// （WATCHLIST_UPDATE自体はADD/UPDATEなら安全）＋isSmartImportCandidateSafe()で個別除外する。
 const SMART_IMPORT_SAFE_CATEGORIES=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
-  "MORNING_MARKET_CHECK","INTRADAY_REPORT"];
+  "MORNING_MARKET_CHECK","INTRADAY_REPORT","WATCHLIST_UPDATE"];
+const isSmartImportCandidateSafe=c=>{
+  if(!SMART_IMPORT_SAFE_CATEGORIES.includes(c.category))return false;
+  if(c.category==="WATCHLIST_UPDATE"&&(c.draft?.action||"").toUpperCase()==="REMOVE")return false;
+  return true;
+};
 const SMART_IMPORT_DATA_QUALITY_BY_CONFIDENCE={HIGH:"FULL",MEDIUM:"PARTIAL",LOW:"DEGRADED"};
 
 function SmartImportPanel({onReload,sourceContext=null,onSaved=null,compactMode=false,initialText=""}){
@@ -2622,8 +2632,9 @@ function SmartImportPanel({onReload,sourceContext=null,onSaved=null,compactMode=
     cands.forEach((c,i)=>{next[i]=ruleFn(c);});
     setSelected(next);
   };
-  // 指示書16・8番：LOW confidence・TRADE_RULEは既定で未選択（自動保存しない、能動的選択必須）
-  const defaultSelectionRule=c=>c.category!=="TRADE_RULE"&&c.confidence!=="LOW"&&SMART_IMPORT_IMPLEMENTED.includes(c.category);
+  // 指示書16・8番（SI-B）・6・16番（SI-C）：LOW confidence・TRADE_RULE・POSITION_UPDATE・
+  // WATCHLIST REMOVEは既定で未選択（自動保存しない、能動的選択必須）
+  const defaultSelectionRule=c=>c.confidence!=="LOW"&&SMART_IMPORT_IMPLEMENTED.includes(c.category)&&isSmartImportCandidateSafe(c);
 
   const analyze=async()=>{
     if(!text.trim())return;
@@ -2676,7 +2687,7 @@ function SmartImportPanel({onReload,sourceContext=null,onSaved=null,compactMode=
     if((e.ctrlKey||e.metaKey)&&e.key==="Enter"){
       e.preventDefault();
       if(e.shiftKey){
-        if(candidates)saveSelected(c=>SMART_IMPORT_SAFE_CATEGORIES.includes(c.category)&&c.confidence!=="LOW");
+        if(candidates)saveSelected(c=>isSmartImportCandidateSafe(c)&&c.confidence!=="LOW");
       }else if(!analyzing&&text.trim()){
         analyze();
       }
@@ -2711,7 +2722,7 @@ function SmartImportPanel({onReload,sourceContext=null,onSaved=null,compactMode=
         <div style={{fontSize:12.5,fontWeight:700}}>解析結果：{candidates.length}件</div>
         <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
           <button className="iconbtn" style={{fontSize:11}} onClick={()=>applySelectionRule(candidates,c=>SMART_IMPORT_IMPLEMENTED.includes(c.category))}>全て選択</button>
-          <button className="iconbtn" style={{fontSize:11}} onClick={()=>applySelectionRule(candidates,c=>SMART_IMPORT_SAFE_CATEGORIES.includes(c.category)&&c.confidence!=="LOW")}>安全な項目のみ選択</button>
+          <button className="iconbtn" style={{fontSize:11}} onClick={()=>applySelectionRule(candidates,c=>isSmartImportCandidateSafe(c)&&c.confidence!=="LOW")}>安全な項目のみ選択</button>
           <button className="iconbtn" style={{fontSize:11}} onClick={()=>applySelectionRule(candidates,()=>false)}>選択解除</button>
         </div>
       </div>
@@ -2787,6 +2798,28 @@ function SmartImportPanel({onReload,sourceContext=null,onSaved=null,compactMode=
               {c.category==="CHATGPT_LEGACY" && <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>
                 旧ChatGPT統合連携形式（date/watchlist/decisions/rule_updates等）として検出されました。既存のChatGPT統合連携パーサーへそのまま渡されます。
               </div>}
+              {c.category==="WATCHLIST_UPDATE" && <>
+                {(c.draft.action||"ADD").toUpperCase()==="REMOVE" && <div style={{fontSize:12,fontWeight:700,color:"var(--down)",marginBottom:4}}>
+                  ⚠ WATCHLIST REMOVE：{c.draft.ticker||"（銘柄未確定）"} を監視銘柄から削除します。よろしければ選択して保存してください。
+                </div>}
+                {!c.draft.ticker && <div style={{fontSize:11,color:"var(--down)",fontWeight:700}}>⚠ 銘柄コードを解決できませんでした（自動推定しません）</div>}
+                <div style={{fontSize:11,color:"var(--inkFaint)"}}>銘柄: {c.draft.ticker||"（不明）"}　action: {c.draft.action||"ADD"}{c.draft.themes?`　テーマ: ${c.draft.themes}`:""}</div>
+              </>}
+              {c.category==="POSITION_UPDATE" && <>
+                <div style={{fontSize:12,fontWeight:700,color:"var(--down)",marginBottom:4}}>
+                  🚨 POSITION UPDATE：この操作は保有ポジション情報を変更します。内容を確認してから保存してください。
+                </div>
+                {!c.draft.ticker && <div style={{fontSize:11,color:"var(--down)",fontWeight:700}}>⚠ 対象銘柄を解決できませんでした（自動推定しません）</div>}
+                {c.draft.quantity_unresolved && <div style={{fontSize:11,color:"var(--down)",fontWeight:700}}>⚠ 売却数量を特定できません（全株/数量を編集で指定してください）</div>}
+                <div style={{fontSize:11,color:"var(--inkFaint)"}}>
+                  銘柄: {c.draft.ticker||"（不明）"}　action: {c.draft.action||"（不明）"}
+                  {c.draft.entry_price!=null&&`　買値: ${c.draft.entry_price}円`}
+                  {c.draft.exit_price!=null&&`　売値: ${c.draft.exit_price}円`}
+                  {c.draft.quantity!=null&&`　数量: ${c.draft.quantity}株`}
+                  {c.draft.quantity_hint&&`　数量ヒント: ${c.draft.quantity_hint}`}
+                  {c.draft.stop_price!=null&&`　逆指値: ${c.draft.stop_price}円`}
+                </div>
+              </>}
               {!implemented && <div style={{fontSize:11.5,color:"var(--inkFaint)",whiteSpace:"pre-wrap"}}>{c.raw_text}</div>}
             </div>
           </div>;
@@ -2815,7 +2848,7 @@ function SmartImportPanel({onReload,sourceContext=null,onSaved=null,compactMode=
   </div>;
 }
 const SMART_IMPORT_CATEGORIES_UI=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
-  "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","UNKNOWN"];
+  "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","WATCHLIST_UPDATE","POSITION_UPDATE","UNKNOWN"];
 
 function ExpertViewsPanel({views,onReload,onOpenSmartImport}){
   const [pasteText,setPasteText]=useState("");

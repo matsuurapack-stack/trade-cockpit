@@ -6139,11 +6139,17 @@ SMART_IMPORT_CATEGORIES = [  # 指示書2番。将来カテゴリ追加時はこ
 # TRADE_RULEを追加。CHATGPT_LEGACYはSMART_IMPORT_CATEGORIESには含めない内部専用カテゴリ
 # （指示書1番：既存ChatGPT統合連携のtype=trading_log的な旧schemaを検出した場合に、既存の
 # save_chatgpt_unified_import()へそのまま委譲するための経路。UIのカテゴリ選択肢にも出さない）。
-# WATCHLIST_UPDATE・POSITION_UPDATE・NEWSはPhase SI-C予定、現時点ではUNKNOWNのまま。
+# Phase SI-C（2026-09-10）でWATCHLIST_UPDATE・POSITION_UPDATEを追加。NEWSは引き続き未実装
+# （既存ニュースタブのRSS取得と役割が重複するため、指示書のスコープではPhase SI-C対象外）。
 SMART_IMPORT_IMPLEMENTED_CATEGORIES = {
     "CATALYST", "EVENT", "EXPERT_OPINION", "MARKET_ANALYSIS", "MORNING_MARKET_CHECK",
-    "INTRADAY_REPORT", "TRADE_RULE", "CHATGPT_LEGACY",
+    "INTRADAY_REPORT", "TRADE_RULE", "CHATGPT_LEGACY", "WATCHLIST_UPDATE", "POSITION_UPDATE",
 }
+# 指示書16番（Phase SI-C）：重要操作（TRADE_RULE・WATCHLIST_UPDATEのREMOVE・POSITION_UPDATE
+# 全般）は「安全な項目のみ選択」の対象外とする。POSITION_UPDATEはカテゴリ全体が対象外
+# （指示書6番：HIGH confidenceでも自動保存禁止、常に確認）。
+SMART_IMPORT_SAFE_CATEGORIES_BACKEND = {"CATALYST", "EVENT", "EXPERT_OPINION", "MARKET_ANALYSIS",
+                                          "MORNING_MARKET_CHECK", "INTRADAY_REPORT"}
 
 _JSON_CODEBLOCK_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 
@@ -6212,6 +6218,12 @@ def _classify_json_item(item):
         return "MARKET_ANALYSIS", "HIGH", item
     if t == "trade_rule":
         return "TRADE_RULE", "HIGH", item
+    if t == "watchlist_update":
+        # 指示書2番（Phase SI-C）：REMOVEは重要操作のためconfidenceを上げすぎない（UIの既定
+        # 未選択はaction自体で別途判定するが、ここでも情報として下げておく）。
+        return "WATCHLIST_UPDATE", ("MEDIUM" if str(item.get("action", "")).upper() == "REMOVE" else "HIGH"), item
+    if t == "position_update":
+        return "POSITION_UPDATE", "HIGH", item
     if _looks_like_legacy_chatgpt_payload(item):
         return "CHATGPT_LEGACY", "HIGH", item
 
@@ -6248,8 +6260,12 @@ _SMART_IMPORT_CATALYST_KEYWORDS = [
     "新製品", "新サービス", "大型受注", "提携", "業務提携", "資本提携", "協業", "事業化",
     "量産開始", "量産化", "採用決定", "上方修正", "自社株買い", "増配", "下方修正", "減配",
     "不祥事", "事故", "訴訟", "公募増資", "希薄化", "売出し", "出荷", "受注", "サンプル出荷",
+    "材料",  # 「全固体電池材料で強い」等、日本の相場でよく使われる「好材料/悪材料」の略称
 ]
-_SMART_IMPORT_STOCK_CODE_RE = re.compile(r"\b(\d{4})\b")
+# 2026-09-10修正：\bは日本語文字を\w扱いする（Unicode既定）ため「7203を」のような直後に
+# 日本語が続く場合に境界と判定されず一致しない不具合があった。桁の前後に別の数字が
+# 続かないことだけを見るnegative lookaround（(?<!\d)/(?!\d)）に変更する。
+_SMART_IMPORT_STOCK_CODE_RE = re.compile(r"(?<!\d)(\d{4})(?!\d)")
 
 # 指示書7番（Phase SI-B）：売買ルール変更・追加の検出。単なる「〜しない」等の一般的な否定文
 # まで拾うと誤検出が多いため、明確なルール宣言語＋トレード行動語の組み合わせでのみ検出する
@@ -6264,8 +6280,191 @@ _SMART_IMPORT_RULE_PCT_RE = re.compile(r"([-+]?\d+(?:\.\d+)?)\s*%")
 # だけに留める（閾値の意味解釈や自動比較はしない、安全側）。
 _SMART_IMPORT_RISK_RULE_KEYWORDS = ["EXIT", "損切り", "-8%", "-8％"]
 
+# ============================================================
+# Phase SI-C（2026-09-10）：WATCHLIST_UPDATE・POSITION_UPDATEの検出。日常的な短文
+# （「JX3810で100株買い」「逆指値3820に上げた」「半分利確」等）を理解できるようにする
+# （指示書8番）。ただし対象銘柄・数量・価格に確信が持てない場合はnull/LOW confidenceに
+# 倒し、勝手に確定しない（指示書3・10・8・9番）。
+# ============================================================
+_SMART_IMPORT_WATCHLIST_ADD_KEYWORDS = ["監視銘柄に追加", "監視に追加", "ウォッチに追加", "監視銘柄へ追加", "監視リストに追加"]
+_SMART_IMPORT_WATCHLIST_REMOVE_KEYWORDS = ["監視銘柄から削除", "監視から外す", "監視解除", "監視銘柄から外す", "監視リストから削除"]
+_SMART_IMPORT_THEME_RE = re.compile(r"テーマは(.+?)(?:。|$)")
+_SMART_IMPORT_NAME_HINT_RE = re.compile(r"^([一-龠ぁ-んァ-ヶーA-Za-z0-9]{2,20}?)を?(?:監視銘柄|監視|ウォッチ)")
 
-def _classify_text_chunk(chunk):
+_SMART_IMPORT_BUY_RE = re.compile(r"(\d{2,6}(?:\.\d+)?)\s*円\s*で\s*(\d{1,6}(?:\.\d+)?)\s*株\s*(?:買|購入)")
+_SMART_IMPORT_SELL_WITH_QTY_RE = re.compile(r"(\d{2,6}(?:\.\d+)?)\s*円\s*で\s*(\d{1,6}(?:\.\d+)?)\s*株\s*(?:売却|売り|売った)")
+# 指示書8番の例文「JX3850で売れた」は「円」が省略されるため、円を任意とする。
+_SMART_IMPORT_SELL_PRICE_ONLY_RE = re.compile(r"(\d{2,6}(?:\.\d+)?)\s*円?\s*で\s*(?:売れた|売却|売り)")
+_SMART_IMPORT_ADD_SHARES_RE = re.compile(r"(\d{1,6}(?:\.\d+)?)\s*株\s*(?:追加|買い増し|買い足し)")
+# 「3900円で全部売却」のように「円で」と決済キーワードの間に「全部」等が挟まり上記の厳密な
+# パターンにマッチしない場合の汎用フォールバック（半分利確/全部売却と価格の組み合わせ用）。
+_SMART_IMPORT_ANY_PRICE_RE = re.compile(r"(\d{2,6}(?:\.\d+)?)\s*円")
+_SMART_IMPORT_STOP_RE = re.compile(r"逆指値\s*(\d{2,6}(?:\.\d+)?)")
+_SMART_IMPORT_HALF_KEYWORDS = ["半分利確", "半分売却", "半分だけ売却", "半分手仕舞い", "半分だけ利確"]
+_SMART_IMPORT_SAME_PRICE_EXIT_KEYWORDS = ["同値撤退", "同値で撤退", "同値決済", "同値で手仕舞い"]
+_SMART_IMPORT_FULL_EXIT_KEYWORDS = ["全部売却", "全株売却", "全部売った", "全株売った", "全て売却", "すべて売却"]
+_SMART_IMPORT_STOPLOSS_KEYWORDS = ["損切り"]
+_SMART_IMPORT_HOLD_KEYWORDS = ["持ち越し"]
+_SMART_IMPORT_SKIP_KEYWORDS = ["見送り"]
+_SMART_IMPORT_BUY_WORD = "買"
+_SMART_IMPORT_SELL_WORD_RE = re.compile(r"売")
+
+
+def _name_key(text):
+    """銘柄名の表記揺れを軽減するための正規化キー（指示書3番：完全なエイリアス辞書は
+    持たないため、あくまで簡易な語尾統一・空白除去のみのベストエフォート）。
+    「パナソニックホールディングス」「パナソニックHD」は一致させられるが、
+    「パナHD」のような大幅な略称までは解決できない既知の制約。"""
+    if not text:
+        return ""
+    key = text.strip()
+    for a, b in (("ホールディングス", "HD"), ("株式会社", ""), ("（株）", ""), (" ", ""), ("　", "")):
+        key = key.replace(a, b)
+    return key.upper()
+
+
+def _resolve_ticker_from_text(database_url, user_id, text, hint_code=None):
+    """テキストから銘柄コードを解決する（指示書3番の優先順位：①明示コード②現在Watchlist
+    ③Positions④銘柄マスター、news_catalysts・全文検索まではPhase SI-Cでは実装しない
+    既知の制約）。確信が持てなければ(None, "LOW")を返し、勝手に推定しない。
+    hint_code：同一raw_text内の直前チャンクで既に解決済みのコード（指示書9番：
+    「逆指値3820に上げた」等、名前が省略された文への継承に使う）。
+    2026-09-10修正：POSITION_UPDATE/WATCHLIST_UPDATEの短文では「3810円」「3850で」
+    「100株」「逆指値3820」等の価格・株数・逆指値の4桁数字が銘柄コードと誤認されやすい
+    （「円」「株」を伴わない裸の数字表現もあるため、記号での除外だけでは不十分）。そのため
+    優先順位を「①現在Watchlist②Positions③明示コード④銘柄マスター」に変更し、まず社名
+    ベースで解決を試みてから、社名が見つからない場合のみ裸の4桁数字をコードとして扱う。"""
+    if investment_db is not None and database_url:
+        text_key = _name_key(text)
+        try:
+            for w in investment_db.list_watchlist(database_url, user_id, market="JP") or []:
+                name = w.get("name")
+                if name and _name_key(name) and _name_key(name) in text_key:
+                    return w.get("code"), "HIGH"
+        except Exception:
+            pass
+        try:
+            for p in investment_db.list_portfolio(database_url, user_id) or []:
+                name = p.get("name")
+                if name and _name_key(name) and _name_key(name) in text_key:
+                    return p.get("code"), "HIGH"
+        except Exception:
+            pass
+    # 社名で解決できなかった場合のみ、裸の4桁数字をコードとして扱う（「3810円」「100株」
+    # 「逆指値3820」等の価格・株数・逆指値表現はスキップする）。
+    for m in _SMART_IMPORT_STOCK_CODE_RE.finditer(text):
+        if text[m.end():m.end() + 1] in ("円", "株"):
+            continue
+        if "逆指値" in text[max(0, m.start() - 4):m.start()]:
+            continue
+        return m.group(1), "HIGH"
+    if investment_db is not None and database_url:
+        try:
+            master = get_jp_issue_master() or {}
+            for code, info in master.items():
+                name = (info or {}).get("name")
+                if name and _name_key(name) and _name_key(name) in text_key:
+                    return code, "MEDIUM"
+        except Exception:
+            pass
+    if hint_code:
+        return hint_code, "MEDIUM"  # 直前チャンクからの継承（名前省略文への対応、指示書9番）
+    return None, "LOW"
+
+
+def _classify_watchlist_or_position_chunk(chunk, database_url, user_id, hint_code=None, next_chunk=""):
+    """自然文の1塊をWATCHLIST_UPDATE/POSITION_UPDATEへ分類する（指示書1・5番）。
+    該当しなければNoneを返す（他のカテゴリの判定に回す）。next_chunkは「テーマは○○。」が
+    別文として続く場合の補完に使う（指示書1番の例文どおり文が分かれるため、直後の1文だけ
+    先読みする）。"""
+    has_watch_add = any(kw in chunk for kw in _SMART_IMPORT_WATCHLIST_ADD_KEYWORDS)
+    has_watch_remove = any(kw in chunk for kw in _SMART_IMPORT_WATCHLIST_REMOVE_KEYWORDS)
+    if has_watch_add or has_watch_remove:
+        ticker, conf = _resolve_ticker_from_text(database_url, user_id, chunk)
+        name_match = _SMART_IMPORT_NAME_HINT_RE.match(chunk.strip())
+        theme_match = _SMART_IMPORT_THEME_RE.search(chunk) or (next_chunk and _SMART_IMPORT_THEME_RE.search(next_chunk))
+        action = "REMOVE" if has_watch_remove else "ADD"
+        # 指示書2番：REMOVEは重要操作のため、tickerが解決できてもconfidenceをMEDIUM止まりにする
+        confidence = "LOW" if ticker is None else ("MEDIUM" if action == "REMOVE" else conf)
+        return "WATCHLIST_UPDATE", confidence, {
+            "ticker": ticker, "name_hint": name_match.group(1) if name_match else None,
+            "action": action, "themes": theme_match.group(1) if theme_match else None, "notes": chunk}
+
+    buy_m = _SMART_IMPORT_BUY_RE.search(chunk)
+    sell_qty_m = _SMART_IMPORT_SELL_WITH_QTY_RE.search(chunk)
+    sell_price_only_m = _SMART_IMPORT_SELL_PRICE_ONLY_RE.search(chunk) if not sell_qty_m else None
+    add_shares_m = _SMART_IMPORT_ADD_SHARES_RE.search(chunk)
+    stop_m = _SMART_IMPORT_STOP_RE.search(chunk)
+    has_half = any(kw in chunk for kw in _SMART_IMPORT_HALF_KEYWORDS)
+    has_same_price_exit = any(kw in chunk for kw in _SMART_IMPORT_SAME_PRICE_EXIT_KEYWORDS)
+    has_full_exit = any(kw in chunk for kw in _SMART_IMPORT_FULL_EXIT_KEYWORDS)
+    has_stoploss = any(kw in chunk for kw in _SMART_IMPORT_STOPLOSS_KEYWORDS)
+    # 「持ち越し」「見送り」はTRADE_RULEの行動語（_SMART_IMPORT_RULE_ACTION_KEYWORDS）とも
+    # 重複するため、ルール宣言語（禁止/必ず等）が同じ文に含まれる場合はPOSITION_UPDATEの
+    # HOLD_NOTEとして奪わず、TRADE_RULE側の判定に委ねる（例：「FOMCまでは持ち越し禁止」）。
+    has_rule_decl_in_chunk = any(kw in chunk for kw in _SMART_IMPORT_RULE_DECLARATION_KEYWORDS)
+    has_hold = any(kw in chunk for kw in _SMART_IMPORT_HOLD_KEYWORDS) and not has_rule_decl_in_chunk
+    has_skip = any(kw in chunk for kw in _SMART_IMPORT_SKIP_KEYWORDS) and not has_rule_decl_in_chunk
+
+    # 数値を伴う強いシグナル（買い/売り/株数/逆指値）は単独でも判定してよいが、キーワードのみの
+    # 弱いシグナル（半分/同値撤退/全部売却/損切り/持ち越し/見送り）は、一般的な売買ルール文
+    # （TRADE_RULE）等と紛れやすいため、対象銘柄が解決できる場合に限って採用する
+    # （解決できなければNoneを返し、他の分類器に委ねる）。
+    strong_signal = any([buy_m, sell_qty_m, sell_price_only_m, add_shares_m, stop_m])
+    soft_signal = any([has_half, has_same_price_exit, has_full_exit, has_stoploss, has_hold, has_skip])
+    if not strong_signal and not soft_signal:
+        return None
+    ticker, tconf = _resolve_ticker_from_text(database_url, user_id, chunk, hint_code=hint_code)
+    if not strong_signal and soft_signal and ticker is None:
+        return None
+    draft = {"ticker": ticker, "notes": chunk}
+    if buy_m:
+        draft.update({"action": "OPEN", "entry_price": float(buy_m.group(1)), "quantity": float(buy_m.group(2))})
+    elif sell_qty_m:
+        draft.update({"action": "REDUCE", "exit_price": float(sell_qty_m.group(1)), "quantity": float(sell_qty_m.group(2))})
+    elif sell_price_only_m:
+        # 指示書10番：売却数量が特定できない場合はnullのまま（勝手にCLOSE確定しない）
+        draft.update({"action": "REDUCE", "exit_price": float(sell_price_only_m.group(1)), "quantity": None,
+                      "quantity_unresolved": True})
+    elif add_shares_m:
+        draft.update({"action": "ADD", "quantity": float(add_shares_m.group(1)), "entry_price": None})
+    elif has_full_exit:
+        price_m = _SMART_IMPORT_ANY_PRICE_RE.search(chunk)
+        draft.update({"action": "CLOSE", "quantity_hint": "ALL",
+                      "exit_price": float(price_m.group(1)) if price_m else None})
+    elif has_half:
+        price_m = _SMART_IMPORT_ANY_PRICE_RE.search(chunk)
+        draft.update({"action": "REDUCE", "quantity_hint": "HALF",
+                      "exit_price": float(price_m.group(1)) if price_m else None})
+    elif has_same_price_exit:
+        draft.update({"action": "CLOSE", "same_price_exit": True, "exit_price": None})
+    elif has_stoploss:
+        draft.update({"action": "CLOSE", "quantity_hint": "ALL", "exit_price": None, "is_stoploss": True})
+    elif has_hold:
+        draft.update({"action": "HOLD_NOTE"})
+    elif has_skip:
+        draft.update({"action": "HOLD_NOTE"})
+    # UPDATE_STOPは他アクションと併記され得る（例：買い＋逆指値）ため、別チャンクとして
+    # 追加検出はせずここではstop_priceを併記するだけに留める（複数銘柄操作の1文1候補の
+    # 原則に合わせ、同一文中の買い+逆指値は1つのOPEN候補としてstop_priceも持たせる）。
+    if stop_m and draft.get("action") not in ("OPEN", "ADD"):
+        draft["action"] = "UPDATE_STOP"
+    if stop_m:
+        draft["stop_price"] = float(stop_m.group(1))
+    if "action" not in draft:
+        return None
+    # confidence：ticker解決できないとLOW（指示書8番：対象特定不能ならLOW止まり）。
+    # 数量不明の売却もLOW寄りに倒す（指示書10番）。
+    if ticker is None:
+        confidence = "LOW"
+    elif draft.get("quantity_unresolved") or draft.get("quantity_hint") or draft.get("same_price_exit"):
+        confidence = "MEDIUM"
+    else:
+        confidence = tconf if tconf != "HIGH" else "HIGH"
+    return "POSITION_UPDATE", confidence, draft
+
+
+def _classify_text_chunk(chunk, database_url=None, user_id=None, hint_code=None, next_chunk=""):
     """自然文の1塊をEVENT/EXPERT_OPINION/CATALYST/TRADE_RULE/UNKNOWNへ分類する簡易
     ヒューリスティック（指示書4番STEP3・4、指示書22・23番：事実と意見の区別を試みるが、
     あくまで簡易判定であり確信が持てなければLOW・UNKNOWNに倒す）。AIモデルは使わず、
@@ -6273,6 +6472,11 @@ def _classify_text_chunk(chunk):
     chunk = chunk.strip()
     if not chunk:
         return "UNKNOWN", "LOW", {}
+    # 指示書1・5番（Phase SI-C）：WATCHLIST_UPDATE/POSITION_UPDATEは価格・株数・「監視銘柄に
+    # 追加」等の非常に具体的なパターンのため、他カテゴリより先に判定して取りこぼさない。
+    wp = _classify_watchlist_or_position_chunk(chunk, database_url, user_id, hint_code=hint_code, next_chunk=next_chunk)
+    if wp:
+        return wp
     has_date = any(p.search(chunk) for p in _SMART_IMPORT_DATE_PATTERNS)
     has_event_kw = any(kw in chunk for kw in _SMART_IMPORT_EVENT_KEYWORDS)
     expert_match = _SMART_IMPORT_EXPERT_NAME_RE.search(chunk)
@@ -6359,9 +6563,12 @@ def _classify_market_narrative(raw_text):
             "raw_text": text[:800], "draft": {"summary": text, "market_regime": market_regime}}
 
 
-def classify_content(raw_text):
+def classify_content(raw_text, database_url=None, user_id=None):
     """SmartImportEngineの入口（指示書4番の全STEP）。1回の貼り付けに複数種類の情報が
-    あっても対応し、1入力＝1レコードに固定しない（指示書5番）。
+    あっても対応し、1入力＝1レコードに固定しない（指示書5番）。database_url/user_idは
+    Phase SI-C（WATCHLIST_UPDATE/POSITION_UPDATE）の銘柄コード解決に使う（省略時は
+    コード直接記載以外の名前解決ができずticker=Noneになるだけで、他カテゴリの判定には
+    影響しない）。
     戻り値：[{category, confidence, source_kind, raw_text, draft}, ...]。
     draftはnormalize_*()にそのまま渡せる形（JSON由来ならそのdict、自然文由来なら
     抽出したフィールドのdict）。"""
@@ -6397,11 +6604,15 @@ def classify_content(raw_text):
     chunks = [c.strip() for c in re.split(r"[。\n]", raw_text) if c.strip()]
     if not chunks:
         chunks = [raw_text]
-    for chunk in chunks:
-        category, confidence, draft = _classify_text_chunk(chunk)
+    last_ticker = None  # 指示書9番：「逆指値3820に上げた」等、名前が省略された文への継承用
+    for idx, chunk in enumerate(chunks):
+        next_chunk = chunks[idx + 1] if idx + 1 < len(chunks) else ""
+        category, confidence, draft = _classify_text_chunk(chunk, database_url, user_id, hint_code=last_ticker, next_chunk=next_chunk)
         if category != "UNKNOWN":
             candidates.append({"category": category, "confidence": confidence, "source_kind": "natural_text",
                                 "raw_text": chunk, "draft": draft})
+            if category in ("WATCHLIST_UPDATE", "POSITION_UPDATE") and draft.get("ticker"):
+                last_ticker = draft["ticker"]
     if not candidates:
         # 完全に判別不能な場合のみ（指示書30番の「登録候補を特定できませんでした」に対応）
         candidates.append({"category": "UNKNOWN", "confidence": "LOW", "source_kind": "natural_text",
@@ -6591,6 +6802,90 @@ def normalize_trade_rule(draft, raw_text=None, import_source="unknown"):
     return rule_text, source_info, bool(draft.get("risk_rule_change_candidate"))
 
 
+def normalize_watchlist_update(draft, raw_text=None, import_source="unknown"):
+    """draftをinvestment_db.upsert_watchlist_item()/delete_watchlist_item()が受け付ける
+    形へ正規化する（指示書1・4番（Phase SI-C））。tickerが解決できていなければNoneを返す
+    （指示書3番：銘柄コードに自信が無い場合は保存不可、勝手に推定しない）。"""
+    draft = draft or {}
+    ticker = draft.get("ticker")
+    if not ticker:
+        return None
+    action = str(draft.get("action") or "ADD").upper()
+    if action not in ("ADD", "UPDATE", "REMOVE"):
+        action = "ADD"
+    return {"code": ticker, "name": draft.get("name") or draft.get("name_hint"), "action": action,
+            "themes": draft.get("themes"), "reason": draft.get("reason") or draft.get("notes"),
+            "raw_text": raw_text, "import_source": import_source}
+
+
+def normalize_position_update(database_url, user_id, draft, raw_text=None, import_source="unknown"):
+    """draftを既存のadd_position_entry/add_position_exit/upsert_portfolio_item（すべて
+    investment_db.py既存関数、平均単価・実現損益の計算ロジックはそこに委譲し重複実装しない、
+    指示書11・12番）が受け付ける形へ正規化する（指示書5〜10番）。ticker・価格・数量等が
+    確定できない場合はNoneを返す（指示書7・8・10番：勝手に確定しない）。
+    戻り値：正規化済みdict、またはNone。"""
+    draft = draft or {}
+    ticker = draft.get("ticker")
+    action = str(draft.get("action") or "").upper()
+    if not ticker or not action:
+        return None
+    existing = None
+    if investment_db is not None and database_url:
+        try:
+            existing = next((p for p in investment_db.list_portfolio(database_url, user_id) if p.get("code") == ticker), None)
+        except Exception:
+            existing = None
+
+    resolved = {"code": ticker, "action": action, "name": draft.get("name") or (existing or {}).get("name"),
+                "trade_style": draft.get("trade_style") or (existing or {}).get("trade_style"),
+                "raw_text": raw_text, "import_source": import_source}
+
+    if action in ("OPEN", "ADD"):
+        # 指示書11番：既存add_position_entry()が加重平均計算を担うため、ここでは正規化のみ。
+        if draft.get("entry_price") is None or draft.get("quantity") is None:
+            return None
+        resolved["entry_price"] = draft["entry_price"]
+        resolved["quantity"] = draft["quantity"]
+        resolved["stop_price"] = draft.get("stop_price")  # 同一文の逆指値併記（指示書14番）
+        return resolved
+
+    if action in ("REDUCE", "CLOSE"):
+        quantity = draft.get("quantity")
+        exit_price = draft.get("exit_price")
+        quantity_hint = draft.get("quantity_hint")
+        if quantity_hint == "HALF":
+            # 指示書8番：「半分利確」は既存保有数量の半分。保有が特定できなければ保存不可。
+            if not existing or not existing.get("quantity"):
+                return None
+            quantity = float(existing["quantity"]) / 2
+        elif quantity_hint == "ALL" or (action == "CLOSE" and quantity is None):
+            if not existing or not existing.get("quantity"):
+                return None
+            quantity = float(existing["quantity"])
+        if draft.get("same_price_exit"):
+            # 指示書8番：「同値撤退」は取得単価と同値での決済。
+            if not existing or existing.get("average_price") is None:
+                return None
+            exit_price = float(existing["average_price"])
+        if quantity is None or exit_price is None:
+            return None  # 指示書10番：売却数量・価格が未解決のまま勝手にCLOSE確定しない
+        resolved["quantity"] = quantity
+        resolved["exit_price"] = exit_price
+        return resolved
+
+    if action == "UPDATE_STOP":
+        if draft.get("stop_price") is None or not existing:
+            return None  # 対象ポジションが無ければ逆指値だけ更新できない
+        resolved["stop_price"] = draft["stop_price"]
+        return resolved
+
+    if action == "HOLD_NOTE":
+        resolved["note"] = draft.get("notes")
+        return resolved
+
+    return None
+
+
 def smart_import_check_duplicates(database_url, user_id, candidates):
     """CATALYST/MARKET_ANALYSIS/EVENTの候補について、既存データとタイトルが一致する可能性が
     あるものにpossible_duplicate=Trueを付与する（指示書19番（Phase SI-B）・Phase SI-Aの
@@ -6626,6 +6921,30 @@ def smart_import_check_duplicates(database_url, user_id, candidates):
                     existing_event_titles = set()
             if title in existing_event_titles:
                 c["possible_duplicate"] = True
+        elif category == "WATCHLIST_UPDATE":
+            # 指示書4番（Phase SI-C）：既にWatchlist登録済みのtickerへのADDは、新規ADDではなく
+            # 「テーマ追加として処理しますか？」の確認候補として扱う（自動で二重登録しない）。
+            ticker = (c.get("draft") or {}).get("ticker")
+            action = str((c.get("draft") or {}).get("action") or "ADD").upper()
+            if ticker and action == "ADD":
+                try:
+                    existing_codes = {w.get("code") for w in investment_db.list_watchlist(database_url, user_id, market="JP")}
+                except Exception:
+                    existing_codes = set()
+                if ticker in existing_codes:
+                    c["possible_duplicate"] = True
+        elif category == "POSITION_UPDATE":
+            # 指示書18番：同一ticker+action+price+quantityの候補が直近のtrade_history/
+            # portfolioと一致する場合に警告する簡易判定（時刻厳密照合はしない）。
+            draft = c.get("draft") or {}
+            ticker, action = draft.get("ticker"), str(draft.get("action") or "").upper()
+            if ticker and action in ("OPEN",):
+                try:
+                    existing_codes = {p.get("code") for p in investment_db.list_portfolio(database_url, user_id)}
+                except Exception:
+                    existing_codes = set()
+                if ticker in existing_codes:
+                    c["possible_duplicate"] = True  # 既に保有中→ADDの意図の可能性を警告
     return candidates
 
 
@@ -6649,6 +6968,8 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
     intraday_report_results = []
     trade_rule_results = []
     chatgpt_legacy_results = []
+    watchlist_update_results = []
+    position_update_results = []
 
     for c in candidates or []:
         category = c.get("category")
@@ -6751,6 +7072,83 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
                 chatgpt_legacy_results.append({"error": str(e)})
             continue
 
+        if category == "WATCHLIST_UPDATE":
+            # 指示書1〜4番（Phase SI-C）：既存upsert_watchlist_item/delete_watchlist_itemへ
+            # 振り分けるのみ。REMOVEは重要操作だが、ここに来る時点でユーザーが明示的に選択・
+            # 確定した候補のみ（UIで既定未選択、指示書2・16番）。
+            try:
+                normalized = normalize_watchlist_update(draft, raw_text, import_source)
+                if normalized is None:
+                    watchlist_update_results.append({"ok": False, "reason": "銘柄コードを解決できないため保存できません"})
+                elif normalized["action"] == "REMOVE":
+                    investment_db.delete_watchlist_item(database_url, user_id, normalized["code"], market="JP")
+                    watchlist_update_results.append({"ok": True, "code": normalized["code"], "action": "REMOVE"})
+                else:
+                    item = {"code": normalized["code"], "market": "JP", "source": "smart_import"}
+                    if normalized.get("name"):
+                        item["name"] = normalized["name"]
+                    if normalized.get("reason"):
+                        item["note"] = normalized["reason"]
+                    if normalized.get("themes"):
+                        # 指示書4番：既存themeは明示削除指示が無い限り残す（置換ではなく追記マージ）。
+                        existing_theme = None
+                        try:
+                            existing_w = next((w for w in investment_db.list_watchlist(database_url, user_id, market="JP")
+                                                if w.get("code") == normalized["code"]), None)
+                            existing_theme = (existing_w or {}).get("theme")
+                        except Exception:
+                            pass
+                        new_parts = [t.strip() for t in re.split(r"[、,]", normalized["themes"]) if t.strip()]
+                        old_parts = [t.strip() for t in re.split(r"[、,]", existing_theme or "") if t.strip()]
+                        merged = old_parts + [t for t in new_parts if t not in old_parts]
+                        item["theme"] = "、".join(merged) if merged else None
+                    ok = investment_db.upsert_watchlist_item(database_url, user_id, item)
+                    watchlist_update_results.append({"ok": ok, "code": normalized["code"], "action": normalized["action"]})
+            except Exception as e:
+                print("  SmartImport: WatchlistUpdate保存失敗", e)
+                watchlist_update_results.append({"ok": False, "reason": str(e)})
+            continue
+
+        if category == "POSITION_UPDATE":
+            # 指示書5〜13番（最重要）：POSITION_UPDATEはconfidenceに関わらず既に「ユーザーが
+            # 明示的に選択・確定した」候補のみここへ来る（UIで既定未選択、指示書6・16番）。
+            # 平均単価計算・実現損益計算は既存add_position_entry/add_position_exitへ完全に
+            # 委譲し、別ロジックを作らない（指示書11・12番）。position_risk_rules自体は
+            # 変更しない（次回評価時に既存関数が最新のportfolioを見るだけで自動的に
+            # 再評価される、指示書13番）。
+            try:
+                normalized = normalize_position_update(database_url, user_id, draft, raw_text, import_source)
+                if normalized is None:
+                    position_update_results.append({"ok": False, "reason": "対象銘柄・価格・数量のいずれかが未解決のため保存できません"})
+                else:
+                    code, action = normalized["code"], normalized["action"]
+                    if action in ("OPEN", "ADD"):
+                        updated = investment_db.add_position_entry(
+                            database_url, user_id, code, normalized.get("name"), "JP",
+                            normalized["entry_price"], normalized["quantity"], normalized.get("trade_style"))
+                        if updated is not None and normalized.get("stop_price") is not None:
+                            investment_db.upsert_portfolio_item(database_url, user_id,
+                                {"code": code, "market": "JP", "current_stop": normalized["stop_price"]})
+                        position_update_results.append({"ok": updated is not None, "code": code, "action": action})
+                    elif action in ("REDUCE", "CLOSE"):
+                        result = investment_db.add_position_exit(database_url, user_id, code, "JP",
+                                                                    normalized["exit_price"], normalized["quantity"])
+                        position_update_results.append({"ok": isinstance(result, dict) and "error" not in result,
+                                                          "code": code, "action": action, "detail": result})
+                    elif action == "UPDATE_STOP":
+                        ok = investment_db.upsert_portfolio_item(database_url, user_id,
+                            {"code": code, "market": "JP", "current_stop": normalized["stop_price"]})
+                        position_update_results.append({"ok": ok, "code": code, "action": action})
+                    elif action == "HOLD_NOTE":
+                        # DBを変更しない情報メモ（指示書14番の「持ち越し/見送り」）。履歴には残すが
+                        # ポジション自体には触れない。
+                        position_update_results.append({"ok": True, "code": code, "action": action,
+                                                          "note": normalized.get("note")})
+            except Exception as e:
+                print("  SmartImport: PositionUpdate保存失敗", e)
+                position_update_results.append({"ok": False, "reason": str(e)})
+            continue
+
     results = {}
     if buckets["CATALYST"]:
         results["CATALYST"] = investment_db.import_news_catalysts(database_url, user_id, buckets["CATALYST"])
@@ -6774,6 +7172,14 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
                                   "details": trade_rule_results}
     if chatgpt_legacy_results:
         results["CHATGPT_LEGACY"] = {"count": len(chatgpt_legacy_results), "details": chatgpt_legacy_results}
+    if watchlist_update_results:
+        results["WATCHLIST_UPDATE"] = {"imported": sum(1 for r in watchlist_update_results if r["ok"]),
+                                        "skipped": sum(1 for r in watchlist_update_results if not r["ok"]),
+                                        "details": watchlist_update_results}
+    if position_update_results:
+        results["POSITION_UPDATE"] = {"imported": sum(1 for r in position_update_results if r["ok"]),
+                                       "skipped": sum(1 for r in position_update_results if not r["ok"]),
+                                       "details": position_update_results}
     return {"results": results, "rejected_low_confidence": rejected, "skipped_unimplemented": skipped_unimplemented,
             "skipped_existing_report": skipped_existing_report}
 
@@ -7850,7 +8256,7 @@ class Handler(SimpleHTTPRequestHandler):
             body = self._read_json_body()
             raw_text = body.get("text") or ""
             try:
-                candidates = classify_content(raw_text)
+                candidates = classify_content(raw_text, DATABASE_URL, self.current_user)
                 if investment_db is not None and DATABASE_URL:
                     candidates = smart_import_check_duplicates(DATABASE_URL, self.current_user, candidates)
             except Exception as e:
