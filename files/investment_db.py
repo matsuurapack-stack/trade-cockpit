@@ -776,6 +776,49 @@ CREATE TABLE IF NOT EXISTS position_risk_rules (
 );
 """
 
+# 2026-09-10新規（Market Intelligence Timeline、Phase2-A）：MorningMarketCheckを起点に
+# 場中の定時レポート（寄り30分/前場終了/後場30分/大引け）を1本のタイムラインとして
+# 蓄積する。Phase2-Aでは09:30 OPENING_30Mのみ実装し、テーブル自体は他report_typeも
+# 受け入れられる汎用スキーマにしておく（Phase2-Bで11:30/13:00/15:30を追加する際に
+# テーブル変更が不要なようにするため）。
+_SCHEMA_MARKET_INTELLIGENCE_SQL = """
+CREATE TABLE IF NOT EXISTS market_intelligence_reports (
+    id                          SERIAL PRIMARY KEY,
+    user_id                     TEXT NOT NULL,
+    trade_date                  TEXT NOT NULL,
+    report_type                 TEXT NOT NULL,  -- OPENING_30M|MORNING_CLOSE|AFTERNOON_30M|MARKET_CLOSE
+    scheduled_time              TEXT,
+    generated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+    morning_check_id            INTEGER,
+    market_regime               TEXT,
+    volatility_regime           TEXT,
+    market_summary              TEXT,
+    nikkei_change_pct           NUMERIC,
+    topix_change_pct            NUMERIC,
+    growth250_change_pct        NUMERIC,
+    nikkei_vi                   NUMERIC,
+    usdjpy                      NUMERIC,
+    sector_snapshot_json        JSONB,
+    strong_sectors_json         JSONB,
+    weak_sectors_json           JSONB,
+    top_stocks_json             JSONB,
+    resilience_stocks_json      JSONB,
+    momentum_stocks_json        JSONB,
+    missed_opportunities_json   JSONB,
+    morning_thesis_evaluation_json JSONB,
+    risk_alerts_json            JSONB,
+    position_alerts_json        JSONB,
+    news_changes_json           JSONB,
+    event_risk_json             JSONB,
+    strategy_update_json        JSONB,
+    data_health_json            JSONB,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, trade_date, report_type)
+);
+CREATE INDEX IF NOT EXISTS idx_market_intel_user_date ON market_intelligence_reports(user_id, trade_date DESC, generated_at ASC);
+"""
+
 
 def init_schema(database_url):
     """テーブルを（無ければ）作成し、マルチユーザー化・ChatGPT連携の移行SQLも実行する。
@@ -793,6 +836,7 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_KNOWLEDGE_ENGINE_SQL)
         conn.execute(_SCHEMA_MORNING_CHECK_SQL)
         conn.execute(_SCHEMA_POSITION_RISK_RULES_SQL)
+        conn.execute(_SCHEMA_MARKET_INTELLIGENCE_SQL)
         conn.commit()
 
 
@@ -3611,6 +3655,83 @@ def mark_morning_check_read(database_url, user_id, check_id):
         conn.execute("UPDATE morning_market_checks SET is_read=true WHERE id=%s AND user_id=%s", [check_id, user_id])
         conn.commit()
     return True
+
+
+# ============================================================
+# ---- Market Intelligence Timeline（場中定時レポート）。2026-09-10新規、Phase2-A ----
+# 実際の市場データ取得・分析はserver.py側（intraday_analysis_engine/market_report_service）
+# が担う。ここではNeonへの保存・取得だけを持つ（MorningMarketCheckと同じ役割分担）。
+# ============================================================
+
+_MARKET_INTEL_JSON_COLS = [
+    "sector_snapshot_json", "strong_sectors_json", "weak_sectors_json", "top_stocks_json",
+    "resilience_stocks_json", "momentum_stocks_json", "missed_opportunities_json",
+    "morning_thesis_evaluation_json", "risk_alerts_json", "position_alerts_json",
+    "news_changes_json", "event_risk_json", "strategy_update_json", "data_health_json",
+]
+_MARKET_INTEL_SCALAR_COLS = [
+    "scheduled_time", "morning_check_id", "market_regime", "volatility_regime", "market_summary",
+    "nikkei_change_pct", "topix_change_pct", "growth250_change_pct", "nikkei_vi", "usdjpy",
+]
+
+
+def save_market_intelligence_report(database_url, user_id, trade_date, report_type, data):
+    """1回分のMarket Intelligence Timelineレポートを保存する（(user_id, trade_date,
+    report_type)でUNIQUE、手動再生成「今すぐ分析」はON CONFLICTで上書き＝重複レコードを
+    作らない、指示書4番）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    cols = _MARKET_INTEL_SCALAR_COLS + _MARKET_INTEL_JSON_COLS
+    values = []
+    for c in cols:
+        if c in _MARKET_INTEL_JSON_COLS:
+            values.append(json.dumps(data.get(c), ensure_ascii=False))
+        else:
+            values.append(data.get(c))
+    placeholders = ", ".join(["%s::jsonb" if c in _MARKET_INTEL_JSON_COLS else "%s" for c in cols])
+    update_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO market_intelligence_reports (user_id, trade_date, report_type, {', '.join(cols)}) "
+                f"VALUES (%s, %s, %s, {placeholders}) "
+                f"ON CONFLICT (user_id, trade_date, report_type) DO UPDATE SET "
+                f"{update_clause}, generated_at = now(), updated_at = now() "
+                f"RETURNING *",
+                [user_id, trade_date, report_type] + values,
+            )
+            saved = cur.fetchone()
+        conn.commit()
+    return _row_to_json(saved)
+
+
+def list_market_intelligence_reports(database_url, user_id, trade_date=None):
+    """当日（省略時は今日）分のMarket Intelligence Timelineを時系列（古い→新しい）で返す。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    trade_date = trade_date or datetime.date.today().isoformat()
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM market_intelligence_reports WHERE user_id=%s AND trade_date=%s "
+                "ORDER BY generated_at ASC", [user_id, trade_date])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def get_market_intelligence_report(database_url, user_id, trade_date, report_type):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM market_intelligence_reports WHERE user_id=%s AND trade_date=%s AND report_type=%s",
+                [user_id, trade_date, report_type])
+            row = cur.fetchone()
+    return _row_to_json(row) if row else None
 
 
 # ---- investment_profile（投資プロフィール。2026-09-02新規） ----

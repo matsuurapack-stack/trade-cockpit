@@ -7278,6 +7278,158 @@ function MorningCheckPanel({notifyPermission,requestNotifyPermission,notifyDeskt
   </div>;
 }
 
+// 2026-09-10新規（Market Intelligence Timeline、Phase2-A）：08:50 MorningMarketCheckを起点に
+// 09:30寄り30分レポートを積み上げていくタイムライン表示。Phase2-Aでは09:30のみ実装
+// （11:30/13:00/15:30はPhase2-Bで追加予定、指示書22番「独立タブでも朝一タブ拡張でもよい」の
+// うち後者＝既存「🌅 朝一」タブの拡張を採用し、タブを新設しない）。
+const THESIS_RESULT_META={
+  CONFIRMED:{icon:"✅",label:"CONFIRMED",color:"var(--up)"},
+  PARTIAL:{icon:"⚠",label:"PARTIAL",color:"var(--accent)"},
+  INVALIDATED:{icon:"❌",label:"INVALIDATED",color:"var(--down)"},
+  NOT_TRIGGERED:{icon:"⏳",label:"NOT TRIGGERED",color:"var(--inkFaint)"},
+  DATA_INSUFFICIENT:{icon:"❔",label:"DATA不足",color:"var(--inkFaint)"},
+};
+
+function IntradayTimelineSection(){
+  const [reports,setReports]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [generating,setGenerating]=useState(false);
+  const [detailOpen,setDetailOpen]=useState(false);
+
+  const load=async()=>{
+    const d=await fetchJsonSafe("/api/market-intelligence");
+    setReports((d&&d.reports)||[]);setLoading(false);
+  };
+  useEffect(()=>{load();
+    const id=setInterval(load,60*1000);
+    return ()=>clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
+
+  const generate=async()=>{
+    setGenerating(true);
+    const d=await fetchJsonSafe("/api/market-intelligence/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({reportType:"OPENING_30M"})});
+    setGenerating(false);
+    if(d&&d.report)load();
+  };
+
+  const opening=reports.find(r=>r.report_type==="OPENING_30M")||null;
+  const copyIntradayConsult=async()=>{
+    if(!opening)return;
+    await copyChatGPTPayload("寄り30分レポートを相談","market_intraday_report",{
+      schema_version:"1.0",type:"market_intraday_report",report_type:"OPENING_30M",
+      market_regime:opening.market_regime,volatility_regime:opening.volatility_regime,
+      market_summary:opening.market_summary,strong_sectors:opening.strong_sectors_json,
+      weak_sectors:opening.weak_sectors_json,thesis_evaluation:opening.morning_thesis_evaluation_json,
+      resilience:opening.resilience_stocks_json,risk_alerts:opening.risk_alerts_json,
+      position_alerts:opening.position_alerts_json,strategy_update:opening.strategy_update_json,
+    },()=>{});
+  };
+
+  if(loading)return null;
+
+  return <div style={{marginTop:18}}>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+      <div className="sec-head">📡 Market Intelligence Timeline</div>
+      <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+        {opening&&<button className="action-btn" onClick={copyIntradayConsult}>🤖 寄り30分を相談</button>}
+        <button className="action-btn" onClick={generate} disabled={generating}>{generating?"分析中…":"今すぐ分析（09:30）"}</button>
+      </div>
+    </div>
+
+    {/* タイムライン（指示書22番）：08:50→09:30→11:30→13:00→15:30。Phase2-Bまでは後半3つは「待機中」固定表示 */}
+    <div style={{display:"flex",gap:6,marginTop:10,flexWrap:"wrap",fontSize:11}}>
+      {[["08:50","MORNING",true],["09:30","OPENING 30M",!!opening],["11:30","MORNING CLOSE",false],
+        ["13:00","AFTERNOON",false],["15:30","CLOSE",false]].map(([time,label,done])=>
+        <div key={time} style={{padding:"4px 9px",borderRadius:4,border:"1px solid var(--rule)",
+          background:done?"var(--upBg)":"transparent",color:done?"var(--up)":"var(--inkFaint)"}}>
+          {time} {label} {done?"✅":"⏳"}
+        </div>)}
+    </div>
+
+    {!opening
+      ? <div style={{padding:20,textAlign:"center",color:"var(--inkSoft)",fontSize:12.5,border:"1px solid var(--rule)",borderRadius:4,marginTop:10}}>
+          本日の寄り30分レポートはまだありません。「今すぐ分析」を押すか、09:30の自動生成をお待ちください。
+        </div>
+    : <div style={{marginTop:10}}>
+        <div className="card" style={{padding:"14px 16px"}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+            <span style={{fontWeight:800,fontSize:15,color:(MORNING_REGIME_META[opening.market_regime]||{}).color}}>
+              {(MORNING_REGIME_META[opening.market_regime]||{}).label||opening.market_regime}
+            </span>
+            {opening.morning_thesis_evaluation_json?.regime_transition &&
+              opening.morning_thesis_evaluation_json.regime_transition.from!==opening.market_regime &&
+              <span style={{fontSize:11,color:"var(--inkFaint)"}}>
+                （朝：{opening.morning_thesis_evaluation_json.regime_transition.from} → 今：{opening.market_regime}）
+              </span>}
+            <span style={{fontSize:11,color:"var(--inkFaint)",marginLeft:"auto"}}>
+              最終更新：{new Date(opening.generated_at).toLocaleString("ja-JP")}
+            </span>
+          </div>
+          {opening.market_summary && <div style={{marginTop:8,fontSize:12.5,lineHeight:1.6}}>{opening.market_summary}</div>}
+        </div>
+
+        {(opening.risk_alerts_json||[]).length>0 && <div style={{display:"flex",flexDirection:"column",gap:4,marginTop:10}}>
+          {opening.risk_alerts_json.map((w,i)=><div key={i} style={{fontSize:12.5,fontWeight:700,
+            color:(MORNING_RISK_LEVEL_META[w.level]||{}).color,background:"var(--downBg)",
+            border:`1px solid ${(MORNING_RISK_LEVEL_META[w.level]||{}).color||"var(--rule)"}`,borderRadius:4,padding:"5px 9px"}}>
+            {(MORNING_RISK_LEVEL_META[w.level]||{}).icon} {w.message}
+          </div>)}
+        </div>}
+
+        {(opening.position_alerts_json||[]).length>0 && <div className="card" style={{padding:"10px 12px",marginTop:10,borderLeft:"3px solid var(--down)"}}>
+          <b style={{fontSize:12,color:"var(--down)"}}>保有ポジション警戒</b>
+          {opening.position_alerts_json.map((p,i)=><div key={i} style={{fontSize:12,marginTop:4,whiteSpace:"pre-wrap"}}>
+            <b>{p.name||p.code}</b> {p.pnlPct>0?"+":""}{p.pnlPct}%　<span style={{color:(MORNING_RISK_LEVEL_META[p.level]||{}).color}}>{p.message}</span>
+          </div>)}
+        </div>}
+
+        <div style={{marginTop:10}}>
+          <div className="card" style={{padding:"10px 12px"}}>
+            <b style={{fontSize:12}}>朝の仮説の答え合わせ（MORNING TOP5）</b>
+            {(opening.morning_thesis_evaluation_json?.stocks||[]).length===0
+              ? <div style={{fontSize:11.5,color:"var(--inkFaint)",marginTop:6}}>本日のMorning Check TOP5が0件のため対象なし</div>
+              : <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:6}}>
+                  {opening.morning_thesis_evaluation_json.stocks.map(s=>
+                    <div key={s.code} style={{fontSize:12,display:"flex",gap:8,alignItems:"center"}}>
+                      <span>{THESIS_RESULT_META[s.thesis_result]?.icon}</span>
+                      <b>{s.name}</b>
+                      <span style={{color:s.current_change_pct>0?"var(--up)":s.current_change_pct<0?"var(--down)":"var(--inkSoft)"}}>
+                        {s.current_change_pct!=null?`${s.current_change_pct>0?"+":""}${s.current_change_pct}%`:"—"}
+                      </span>
+                      <span style={{color:THESIS_RESULT_META[s.thesis_result]?.color,fontWeight:700}}>{THESIS_RESULT_META[s.thesis_result]?.label}</span>
+                    </div>)}
+                </div>}
+          </div>
+        </div>
+
+        <button className="iconbtn" style={{fontSize:11.5,marginTop:12}} onClick={()=>setDetailOpen(v=>!v)}>{detailOpen?"▾":"▸"} 詳細データを表示</button>
+        {detailOpen && <div style={{marginTop:8}}>
+          {(opening.resilience_stocks_json||[]).length>0 && <div className="card" style={{padding:"10px 12px"}}>
+            <b style={{fontSize:12}}>🛡 地合い耐性（09:30時点）</b>
+            <div style={{marginTop:6,fontSize:12}}>
+              {opening.resilience_stocks_json.map(r=><div key={r.code}>{r.name}　{r.changePct>0?"+":""}{r.changePct}%　対市場{r.marketRS>0?"+":""}{r.marketRS}pt</div>)}
+            </div>
+          </div>}
+          <div className="card" style={{padding:"10px 12px",marginTop:8}}>
+            <b style={{fontSize:12}}>SECTOR（マクロ推定）</b>
+            <div style={{marginTop:6,fontSize:12}}>
+              {(opening.strong_sectors_json||[]).map(s=><div key={s} style={{color:"var(--up)"}}>↑ {s}</div>)}
+              {(opening.weak_sectors_json||[]).map(s=><div key={s} style={{color:"var(--down)"}}>↓ {s}</div>)}
+              {!(opening.strong_sectors_json||[]).length&&!(opening.weak_sectors_json||[]).length&&<div style={{color:"var(--inkFaint)"}}>明確な偏りなし</div>}
+            </div>
+          </div>
+          <div className="card" style={{padding:"10px 12px",marginTop:8}}>
+            <b style={{fontSize:12}}>DATA HEALTH</b>
+            <div style={{display:"flex",flexWrap:"wrap",gap:8,marginTop:6,fontSize:11.5}}>
+              {Object.entries(opening.data_health_json||{}).map(([k,v])=><span key={k}>{MORNING_INDEX_LABELS[k]||k} {(MORNING_DATA_STATUS_META[v]||{}).icon}</span>)}
+            </div>
+          </div>
+        </div>}
+      </div>}
+  </div>;
+}
+
 // テーマ・セクター強弱の可視化：SectorWatchlist内のsectorGroups集計（平均騰落率・合計売買代金）と
 // 同じ考え方を、JP+US統合した銘柄リストに対して汎用的に適用する。keyFnがnull/""を返す銘柄は
 // 対象外にする（テーマ未設定銘柄をテーマ別ランキングから除外するため）。
@@ -9737,6 +9889,7 @@ function App(){
 
       {/* ===== 朝一チェック（MorningMarketCheck、2026-09-10新規） ===== */}
       {tab==="morningcheck" && <MorningCheckPanel notifyPermission={notifyPermission} requestNotifyPermission={requestNotifyPermission} notifyDesktop={notifyDesktop}/>}
+      {tab==="morningcheck" && <IntradayTimelineSection/>}
 
       {/* ===== NEWS（9章・9-1章・9-2章） ===== */}
       {tab==="news" && (()=>{
