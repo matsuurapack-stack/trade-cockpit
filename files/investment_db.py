@@ -1003,6 +1003,7 @@ def init_schema(database_url):
         conn.execute(_MIGRATE_SOCIAL_POSTS_IMAGE_STATUS_SQL)
         conn.execute(_MIGRATE_SOCIAL_POSTS_IMAGE_STATUS_V2_SQL)
         conn.execute(_MIGRATE_MARKET_SOURCES_DIAGNOSTICS_SQL)
+        conn.execute(_SCHEMA_SOCIAL_SIGNAL_EVALUATIONS_SQL)
         conn.commit()
 
 
@@ -4321,6 +4322,158 @@ def list_social_signals(database_url, since_iso, min_importance="MEDIUM", limit=
     """recent_social_market_signals生成用（指示書9番）。since_iso以降・min_importance以上の
     投稿を重要度→新しさの順で返す。"""
     return list_recent_social_posts(database_url, since_iso=since_iso, min_importance=min_importance, limit=limit)
+
+
+# ============================================================
+# にこそくX連携 Phase3（2026-09-10新規）：投稿の市場的中率・先行性・テーマ別信頼度を
+# 定量評価するsocial_signal_evaluationsテーブル。集計・スコア計算のロジック自体はserver.py側
+# （純粋関数、テスト容易性のため）に置き、ここではDB永続化とシンプルな取得・保存のみを担う
+# （指示書21番「売買ロジックには直接繋げない」——このテーブルはsource reliability contextの
+# 元データであり、entry_score等には一切関与しない）。
+# ============================================================
+_SCHEMA_SOCIAL_SIGNAL_EVALUATIONS_SQL = """
+CREATE TABLE IF NOT EXISTS social_signal_evaluations (
+    id                  SERIAL PRIMARY KEY,
+    source_handle       TEXT NOT NULL,
+    post_id             TEXT NOT NULL,
+    signal_type         TEXT NOT NULL,
+    signal_direction    TEXT NOT NULL,   -- BULLISH|BEARISH|MIXED|NEUTRAL
+    target_type         TEXT NOT NULL,   -- MARKET|SECTOR|STOCK|EVENT
+    target_key          TEXT NOT NULL,
+    evaluation_window    TEXT NOT NULL,   -- 30M|1H|MARKET_CLOSE|NEXT_OPEN|NEXT_CLOSE
+    baseline_at          TIMESTAMPTZ,
+    due_at               TIMESTAMPTZ,     -- schedulerが「評価してよい時刻」を判定する追加列
+    evaluated_at         TIMESTAMPTZ,
+    baseline_value        NUMERIC,
+    result_value          NUMERIC,
+    change_value           NUMERIC,        -- %（baseline比）
+    confirmed              BOOLEAN,          -- NEUTRAL/MIXEDや未評価の間はNULL
+    contradicted            BOOLEAN NOT NULL DEFAULT false,
+    confirmation_score       NUMERIC,        -- 0〜100
+    evaluation_status         TEXT NOT NULL DEFAULT 'PENDING',  -- PENDING|EVALUATED|NO_DATA
+    notes                     TEXT,
+    created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (source_handle, post_id, signal_type, target_type, target_key, evaluation_window)
+);
+CREATE INDEX IF NOT EXISTS idx_social_eval_due ON social_signal_evaluations(evaluation_status, due_at);
+CREATE INDEX IF NOT EXISTS idx_social_eval_handle ON social_signal_evaluations(source_handle, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_social_eval_post ON social_signal_evaluations(source_handle, post_id);
+"""
+
+
+def create_social_signal_evaluations(database_url, rows):
+    """指示書1・9番：評価対象の候補行を一括INSERTする（PENDING状態、まだ評価しない）。
+    UNIQUE制約によりON CONFLICT DO NOTHINGで重複を防ぐ（指示書16番「同一評価を再計算し
+    続けない」・テスト9番「重複評価防止」）。戻り値：実際に新規作成された行数。"""
+    if not rows:
+        return 0
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    cols = ["source_handle", "post_id", "signal_type", "signal_direction", "target_type", "target_key",
+            "evaluation_window", "baseline_at", "due_at", "baseline_value", "evaluation_status", "notes"]
+    inserted = 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            for r in rows:
+                values = [r.get(c) for c in cols]
+                cur.execute(
+                    f"INSERT INTO social_signal_evaluations ({', '.join(cols)}) "
+                    f"VALUES ({', '.join(['%s'] * len(cols))}) "
+                    f"ON CONFLICT (source_handle, post_id, signal_type, target_type, target_key, evaluation_window) "
+                    f"DO NOTHING",
+                    values)
+                inserted += cur.rowcount
+        conn.commit()
+    return inserted
+
+
+def list_due_social_signal_evaluations(database_url, now_iso, limit=50):
+    """指示書16番：scheduler向け。PENDING状態でdue_atが到来した評価だけを返す。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM social_signal_evaluations "
+                "WHERE evaluation_status='PENDING' AND due_at IS NOT NULL AND due_at <= %s "
+                "ORDER BY due_at ASC LIMIT %s",
+                [now_iso, limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def save_social_signal_evaluation_result(database_url, evaluation_id, result_value=None, change_value=None,
+                                          confirmed=None, contradicted=False, confirmation_score=None,
+                                          evaluation_status="EVALUATED", notes=None):
+    """1件分の評価結果を保存する（指示書7・8・18・19番）。evaluation_status="NO_DATA"の場合は
+    result_value等はNULLのまま記録し、的中率の分母から除外する（指示書18番、集計側
+    （server.py）がevaluation_status=='EVALUATED'のみを対象にすることで担保する）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE social_signal_evaluations SET result_value=%s, change_value=%s, confirmed=%s, "
+                "contradicted=%s, confirmation_score=%s, evaluation_status=%s, notes=%s, evaluated_at=now() "
+                "WHERE id=%s RETURNING *",
+                [result_value, change_value, confirmed, contradicted, confirmation_score, evaluation_status,
+                 notes, evaluation_id])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_social_signal_evaluations_for_post(database_url, source_handle, post_id):
+    """指示書15・22番：投稿単位の評価一覧（GET /api/social-posts/:post_id/evaluations）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM social_signal_evaluations WHERE source_handle=%s AND post_id=%s "
+                "ORDER BY evaluation_window",
+                [source_handle, post_id])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def list_social_signal_evaluations_since(database_url, source_handle, since_iso, limit=500):
+    """指示書9・10・20番：集計用の生データ取得。集計ロジック自体はPython側（server.py、
+    テスト容易性のため）が担う——ここは単純な期間絞り込みの取得のみ。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM social_signal_evaluations WHERE source_handle=%s AND created_at >= %s "
+                "ORDER BY created_at DESC LIMIT %s",
+                [source_handle, since_iso, limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def list_analyzed_social_posts_without_evaluations(database_url, source_handle, limit=50):
+    """指示書17番：バックフィル用。ANALYZED済みだが評価行が1件も無い投稿を返す（自動で
+    大量処理しないよう、呼び出し側でlimitを必須にする設計。ここは単なる候補取得）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT p.* FROM social_market_posts p "
+                "WHERE p.source_handle=%s AND p.image_analysis_status='ANALYZED' "
+                "AND NOT EXISTS (SELECT 1 FROM social_signal_evaluations e "
+                "WHERE e.source_handle=p.source_handle AND e.post_id=p.post_id) "
+                "ORDER BY p.posted_at DESC LIMIT %s",
+                [source_handle, limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
 
 
 # ---- investment_profile（投資プロフィール。2026-09-02新規） ----

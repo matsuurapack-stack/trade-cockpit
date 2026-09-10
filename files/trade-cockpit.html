@@ -3563,11 +3563,19 @@ const X_POST_IMPORTANCE_META = {
 const X_POST_PRIORITY_META = {
   URGENT: {emoji: "🔴", label: "最優先"}, HIGH: {emoji: "🟠", label: "優先"}, NORMAL: {emoji: "⚪", label: "通常"},
 };
+// Phase3新規（指示書14番）：過去実績表示のセクターキー→日本語ラベル（server.py側
+// SOCIAL_EVAL_SECTOR_KEY_MAPのtarget_keyに対応）。
+const SOCIAL_EVAL_SECTOR_LABELS = {
+  BANK: "銀行", SEMICONDUCTOR: "半導体", SHIPPING: "海運", INSURANCE: "保険",
+  AUTO: "自動車", SAAS: "SaaS", AI_INFRA: "AI関連",
+};
 function XMarketSignalsCard(){
   const [posts,setPosts]=useState([]);
   const [status,setStatus]=useState(null);
   const [pendingSummary,setPendingSummary]=useState(null);
   const [diag,setDiag]=useState(null);
+  const [performance,setPerformance]=useState(null);
+  const [showPerformance,setShowPerformance]=useState(false); // Phase3：過去実績は折りたたみ（指示書14番）
   const [expanded,setExpanded]=useState(false);
   const [loading,setLoading]=useState(false);
   const [fetchingNow,setFetchingNow]=useState(false);
@@ -3575,15 +3583,17 @@ function XMarketSignalsCard(){
   const load=async()=>{
     setLoading(true);
     try{
-      const [pr,sr,dr]=await Promise.all([
+      const [pr,sr,dr,perf]=await Promise.all([
         fetchJsonSafe(`/api/social-posts?limit=${expanded?10:3}`),
         fetchJsonSafe("/api/social-posts/status"),
         fetchJsonSafe("/api/social-sources/nicosoku/diagnostics"),
+        fetchJsonSafe("/api/social-sources/nicosoku/performance"),
       ]);
       if(pr&&Array.isArray(pr.posts))setPosts(pr.posts);
       if(pr&&pr.pendingSummary)setPendingSummary(pr.pendingSummary);
       if(sr)setStatus(sr);
       if(dr)setDiag(dr);
+      if(perf)setPerformance(perf);
     }catch(e){}
     setLoading(false);
   };
@@ -3667,6 +3677,23 @@ function XMarketSignalsCard(){
     {pendingSummary&&pendingSummary.pending>0 && <div style={{fontSize:10.5,marginTop:3,color:"var(--inkSoft)"}}>
       画像解析待ち {pendingSummary.pending}件{pendingSummary.urgent>0?`（最優先 ${pendingSummary.urgent}件）`:""}
     </div>}
+    {/* Phase3新規（指示書14番）：過去実績（的中率）。メイン画面を圧迫しないよう折りたたみ。 */}
+    {performance&&performance.total_evaluated>0 && <div style={{marginTop:4}}>
+      <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={()=>setShowPerformance(v=>!v)}>
+        {showPerformance?"▲ 過去実績を隠す":"▼ 過去実績を見る"}
+      </button>
+      {showPerformance && <div style={{fontSize:10.5,marginTop:4,color:"var(--inkSoft)",lineHeight:1.7}}>
+        <div>全体一致率 {performance.overall_confirmation_rate!=null?`${Math.round(performance.overall_confirmation_rate*100)}%`:"—"}
+          （評価済み{performance.total_evaluated}件）
+          {performance.source_quality_score&&performance.source_quality_score.provisional && <span style={{color:"var(--inkFaint)"}}>［サンプル不足・参考値］</span>}
+        </div>
+        {Object.entries(performance.theme_performance||{}).filter(([,v])=>!v.low_sample).map(([key,v])=>
+          <div key={key}>{SOCIAL_EVAL_SECTOR_LABELS[key]||key} {Math.round((v.confirmation_rate||0)*100)}%（{v.sample_count}件）</div>
+        )}
+        {Object.values(performance.theme_performance||{}).every(v=>v.low_sample) &&
+          <div style={{color:"var(--inkFaint)"}}>テーマ別実績はサンプル不足のため表示できません。</div>}
+      </div>}
+    </div>}
     {posts.length===0
       ? <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:4}}>
           {isDegraded?"X APIが利用できないため投稿を取得できません（他機能には影響ありません）。":"投稿がまだありません。"}
@@ -3711,6 +3738,10 @@ function XMarketSignalsCard(){
                     <span style={{color:"var(--down)",fontWeight:700}} title={p.image_analysis_error||""}>⚠ 解析失敗</span>
                     <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={()=>reanalyzePost(p)}>再解析</button>
                   </>}
+                  {/* Phase3新規（指示書15番）：評価済み時間軸だけの簡潔表示。未評価なら何も出さない。 */}
+                  {(p.evaluation_summary||[]).map(ev=>
+                    <span key={ev.window} style={{color:"var(--inkFaint)"}}>{ev.label} {ev.mark}</span>
+                  )}
                 </div>
               </div>
             </div>;
