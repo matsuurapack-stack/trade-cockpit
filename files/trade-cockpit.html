@@ -3692,6 +3692,18 @@ function XMarketSignalsCard(){
         )}
         {Object.values(performance.theme_performance||{}).every(v=>v.low_sample) &&
           <div style={{color:"var(--inkFaint)"}}>テーマ別実績はサンプル不足のため表示できません。</div>}
+        {/* Phase4新規（指示書16番）：評価品質の内訳。 */}
+        {performance.quality_breakdown && Object.keys(performance.quality_breakdown).length>0 && <div style={{marginTop:3}}>
+          評価品質　{["EXACT","NEAR_EXACT","ESTIMATED","NO_DATA"].filter(q=>performance.quality_breakdown[q]).map(q=>
+            `${q} ${Math.round(performance.quality_breakdown[q]*100)}%`).join("　")}
+        </div>}
+        {/* Phase4新規（指示書16番）：event評価があれば表示。 */}
+        {performance.event_performance && performance.event_performance.total_events>0 && <div style={{marginTop:3}}>
+          <div>イベント情報一致率 {performance.event_performance.exact_match_rate!=null?`${Math.round(performance.event_performance.exact_match_rate*100)}%`:"—"}
+            （{performance.event_performance.total_events}件）</div>
+          {performance.event_performance.avg_lead_time_minutes!=null &&
+            <div>平均先行時間 {(performance.event_performance.avg_lead_time_minutes/60).toFixed(1)}時間</div>}
+        </div>}
       </div>}
     </div>}
     {posts.length===0
@@ -3738,9 +3750,12 @@ function XMarketSignalsCard(){
                     <span style={{color:"var(--down)",fontWeight:700}} title={p.image_analysis_error||""}>⚠ 解析失敗</span>
                     <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={()=>reanalyzePost(p)}>再解析</button>
                   </>}
-                  {/* Phase3新規（指示書15番）：評価済み時間軸だけの簡潔表示。未評価なら何も出さない。 */}
+                  {/* Phase3・4新規（指示書15・12番）：評価済み時間軸だけの簡潔表示（例：
+                      「30分後 ✅ +0.74% [EXACT]」）。未評価なら何も出さない。 */}
                   {(p.evaluation_summary||[]).map(ev=>
-                    <span key={ev.window} style={{color:"var(--inkFaint)"}}>{ev.label} {ev.mark}</span>
+                    <span key={ev.window} style={{color:"var(--inkFaint)"}}>
+                      {ev.label} {ev.mark}{ev.change_label?` ${ev.change_label}`:""}{ev.quality?` [${ev.quality}]`:""}
+                    </span>
                   )}
                 </div>
               </div>

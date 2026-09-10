@@ -134,6 +134,8 @@ class SectorAggregationTests(unittest.TestCase):
     """11. sector aggregation（指示書5番：中央値、1銘柄だけでは判定しない）"""
 
     def test_sector_median_of_multiple_stocks(self):
+        # Phase4：_fetch_social_eval_value（前日終値比%の単一値）は_fetch_sector_snapshot
+        # （raw価格＋構成銘柄スナップショット）へ置き換わった。
         with mock.patch.object(server, "investment_db") as mock_db:
             mock_db.list_watchlist.return_value = [
                 {"code": "8306", "name": "三菱UFJ", "theme": "銀行"},
@@ -144,14 +146,26 @@ class SectorAggregationTests(unittest.TestCase):
                 mock_quotes.return_value = {
                     "8306": {"t": 110, "p": 100}, "8316": {"t": 102, "p": 100}, "8411": {"t": 106, "p": 100},
                 }
-                value = server._fetch_social_eval_value("dummy", "local", "SECTOR", "BANK")
-        self.assertEqual(value, 6.0)  # pct=[10,2,6] → median=6
+                snap = server._fetch_sector_snapshot("dummy", "local", "BANK")
+        self.assertEqual(snap["price"], 106.0)  # raw価格[110,102,106] → median=106
+        self.assertEqual(len(snap["members"]), 3)
 
     def test_single_stock_returns_none(self):
         with mock.patch.object(server, "investment_db") as mock_db:
             mock_db.list_watchlist.return_value = [{"code": "8306", "name": "三菱UFJ", "theme": "銀行"}]
-            value = server._fetch_social_eval_value("dummy", "local", "SECTOR", "BANK")
-        self.assertIsNone(value)
+            snap = server._fetch_sector_snapshot("dummy", "local", "BANK")
+        self.assertIsNone(snap)
+
+    def test_sector_result_change_pct_is_median_of_member_pct_changes(self):
+        # capture_signal_resultのSECTOR分岐：baseline_detail_jsonの各銘柄価格からのpct変化の
+        # 中央値をchange_pctとする（銘柄ごとの価格水準差に左右されないため）。
+        evaluation = {"target_type": "SECTOR", "target_key": "BANK", "baseline_value": 100.0,
+                      "baseline_detail_json": [{"code": "8306", "price": 100}, {"code": "8316", "price": 100},
+                                                {"code": "8411", "price": 100}]}
+        with mock.patch.object(server, "get_stock_quotes") as mock_quotes:
+            mock_quotes.return_value = {"8306": {"t": 110}, "8316": {"t": 102}, "8411": {"t": 106}}
+            captured = server.capture_signal_result("dummy", "local", evaluation, datetime.datetime.now(datetime.timezone.utc))
+        self.assertEqual(captured["change_pct"], 6.0)  # pct=[10,2,6] → median=6
 
 
 class SourcePerformanceTests(unittest.TestCase):
@@ -273,6 +287,7 @@ class RecentSocialSignalsSourceContextTests(unittest.TestCase):
                  "target_key": "BANK", "contradicted": False, "post_id": "1", "created_at": now_iso}
                 for _ in range(10)
             ]
+            mock_db.list_social_event_evaluations_since.return_value = []
             signals = server.get_recent_social_market_signals("dummy_url", "local")
         self.assertEqual(len(signals), 1)
         self.assertIn("source_context", signals[0])
@@ -303,7 +318,10 @@ class BackfillApiTests(unittest.TestCase):
             ]
             mock_db.list_watchlist.return_value = []
             mock_db.create_social_signal_evaluations.return_value = 3
-            with mock.patch.object(server, "_fetch_social_eval_value", return_value=1.0):
+            baseline = {"baseline_value": 100.0, "baseline_at": _iso(datetime.datetime.now(datetime.timezone.utc)),
+                        "baseline_source": "yfinance", "baseline_status": "OK", "baseline_detail_json": None,
+                        "evaluation_quality": "ESTIMATED"}
+            with mock.patch.object(server, "capture_signal_baseline", return_value=baseline):
                 result = server.backfill_social_signal_evaluations("dummy_url", "local", limit=10, dry_run=False)
         self.assertFalse(result["dry_run"])
         mock_db.create_social_signal_evaluations.assert_called_once()
@@ -318,7 +336,7 @@ class SchedulerTests(unittest.TestCase):
                 {"id": 1, "target_type": "MARKET", "target_key": "NIKKEI225", "signal_direction": "BULLISH",
                  "baseline_value": 0.5},
             ]
-            with mock.patch.object(server, "_fetch_social_eval_value", return_value=None):
+            with mock.patch.object(server, "capture_signal_result", return_value=None):
                 result = server.run_due_social_signal_evaluations("dummy_url", "local")
         self.assertEqual(result["no_data"], 1)
         self.assertEqual(result["evaluated"], 0)
@@ -329,15 +347,18 @@ class SchedulerTests(unittest.TestCase):
         with mock.patch.object(server, "investment_db") as mock_db:
             mock_db.list_due_social_signal_evaluations.return_value = [
                 {"id": 2, "target_type": "MARKET", "target_key": "NIKKEI225", "signal_direction": "BULLISH",
-                 "baseline_value": 0.0},
+                 "baseline_value": 100.0, "evaluation_quality": "EXACT"},
             ]
-            with mock.patch.object(server, "_fetch_social_eval_value", return_value=1.0):
+            captured = {"result_value": 101.0, "change_pct": 1.0,
+                        "result_at": _iso(datetime.datetime.now(datetime.timezone.utc)), "quality": "EXACT"}
+            with mock.patch.object(server, "capture_signal_result", return_value=captured):
                 result = server.run_due_social_signal_evaluations("dummy_url", "local")
         self.assertEqual(result["evaluated"], 1)
         kwargs = mock_db.save_social_signal_evaluation_result.call_args[1]
         self.assertEqual(kwargs["evaluation_status"], "EVALUATED")
         self.assertEqual(kwargs["change_value"], 1.0)
         self.assertTrue(kwargs["confirmed"])
+        self.assertEqual(kwargs["evaluation_quality"], "EXACT")
 
     def test_run_due_evaluations_only_processes_returned_due_items(self):
         # list_due_social_signal_evaluations自体がdue_at<=now・PENDINGのみ返す前提（DB側の

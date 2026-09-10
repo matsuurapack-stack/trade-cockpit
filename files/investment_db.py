@@ -1004,6 +1004,8 @@ def init_schema(database_url):
         conn.execute(_MIGRATE_SOCIAL_POSTS_IMAGE_STATUS_V2_SQL)
         conn.execute(_MIGRATE_MARKET_SOURCES_DIAGNOSTICS_SQL)
         conn.execute(_SCHEMA_SOCIAL_SIGNAL_EVALUATIONS_SQL)
+        conn.execute(_MIGRATE_SOCIAL_SIGNAL_EVALUATIONS_V2_SQL)
+        conn.execute(_SCHEMA_SOCIAL_EVENT_EVALUATIONS_SQL)
         conn.commit()
 
 
@@ -4360,26 +4362,67 @@ CREATE INDEX IF NOT EXISTS idx_social_eval_handle ON social_signal_evaluations(s
 CREATE INDEX IF NOT EXISTS idx_social_eval_post ON social_signal_evaluations(source_handle, post_id);
 """
 
+# にこそくX連携 Phase4（2026-09-10新規）：baseline/resultをsignal生成時点・評価時点それぞれの
+# 実スナップショットから取得するよう精度改善する（指示書1・2・3・4番）。既存Phase3列は
+# 無変更（変更後も後方互換、指示書19番「既存Phase3互換性」）。
+_MIGRATE_SOCIAL_SIGNAL_EVALUATIONS_V2_SQL = """
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS baseline_source TEXT;
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS baseline_status TEXT;
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS baseline_detail_json JSONB;
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS result_at TIMESTAMPTZ;
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS evaluation_quality TEXT;
+"""
+
+# にこそくX連携 Phase4（指示書9番）：economic_events系の投稿はBULLISH/BEARISH方向性評価
+# （social_signal_evaluations）とは分離し、専用テーブルで「イベント情報の一致率・先行時間」
+# だけを評価する（指示書7番「投稿単独では既存の売買スコアへ一切加点しない」方針を踏襲、
+# source reliability contextの一部）。
+_SCHEMA_SOCIAL_EVENT_EVALUATIONS_SQL = """
+CREATE TABLE IF NOT EXISTS social_event_evaluations (
+    id                  SERIAL PRIMARY KEY,
+    source_handle       TEXT NOT NULL,
+    post_id             TEXT NOT NULL,
+    event_name          TEXT NOT NULL,
+    event_type          TEXT,
+    event_start_at      TIMESTAMPTZ,
+    post_created_at     TIMESTAMPTZ,
+    lead_time_minutes   NUMERIC,
+    match_status        TEXT,   -- EXACT_MATCH|DATE_MATCH|PARTIAL_MATCH|NO_MATCH
+    timeliness          TEXT,   -- EARLY|GOOD|SHORT_NOTICE|LAST_MINUTE
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (source_handle, post_id, event_name, event_start_at)
+);
+CREATE INDEX IF NOT EXISTS idx_social_event_eval_handle ON social_event_evaluations(source_handle, created_at DESC);
+"""
+
 
 def create_social_signal_evaluations(database_url, rows):
     """指示書1・9番：評価対象の候補行を一括INSERTする（PENDING状態、まだ評価しない）。
     UNIQUE制約によりON CONFLICT DO NOTHINGで重複を防ぐ（指示書16番「同一評価を再計算し
-    続けない」・テスト9番「重複評価防止」）。戻り値：実際に新規作成された行数。"""
+    続けない」・テスト9番「重複評価防止」）。戻り値：実際に新規作成された行数。
+    Phase4（指示書1番）：baseline_source/baseline_status/baseline_detail_json/
+    evaluation_quality（baseline取得時点の品質、resultとcombineされる前の初期値）を追加。
+    baseline_detail_jsonはSECTOR評価用の構成銘柄スナップショット（[{"code","price"},...]）。"""
     if not rows:
         return 0
     pool = _get_pool(database_url)
     if pool is None:
         return 0
-    cols = ["source_handle", "post_id", "signal_type", "signal_direction", "target_type", "target_key",
-            "evaluation_window", "baseline_at", "due_at", "baseline_value", "evaluation_status", "notes"]
+    plain_cols = ["source_handle", "post_id", "signal_type", "signal_direction", "target_type", "target_key",
+                  "evaluation_window", "baseline_at", "due_at", "baseline_value", "baseline_source",
+                  "baseline_status", "evaluation_status", "evaluation_quality", "notes"]
+    json_cols = ["baseline_detail_json"]
+    cols = plain_cols + json_cols
     inserted = 0
     with pool.connection() as conn:
         with conn.cursor() as cur:
             for r in rows:
-                values = [r.get(c) for c in cols]
+                values = [r.get(c) for c in plain_cols]
+                values += [json.dumps(r.get(c), ensure_ascii=False) if r.get(c) is not None else None for c in json_cols]
+                placeholders = ", ".join(["%s"] * len(plain_cols) + ["%s::jsonb"] * len(json_cols))
                 cur.execute(
                     f"INSERT INTO social_signal_evaluations ({', '.join(cols)}) "
-                    f"VALUES ({', '.join(['%s'] * len(cols))}) "
+                    f"VALUES ({placeholders}) "
                     f"ON CONFLICT (source_handle, post_id, signal_type, target_type, target_key, evaluation_window) "
                     f"DO NOTHING",
                     values)
@@ -4406,10 +4449,13 @@ def list_due_social_signal_evaluations(database_url, now_iso, limit=50):
 
 def save_social_signal_evaluation_result(database_url, evaluation_id, result_value=None, change_value=None,
                                           confirmed=None, contradicted=False, confirmation_score=None,
-                                          evaluation_status="EVALUATED", notes=None):
-    """1件分の評価結果を保存する（指示書7・8・18・19番）。evaluation_status="NO_DATA"の場合は
-    result_value等はNULLのまま記録し、的中率の分母から除外する（指示書18番、集計側
-    （server.py）がevaluation_status=='EVALUATED'のみを対象にすることで担保する）。"""
+                                          evaluation_status="EVALUATED", notes=None, evaluation_quality=None,
+                                          result_at=None):
+    """1件分の評価結果を保存する（指示書3・4・7・8・18・19番）。evaluation_status="NO_DATA"の
+    場合はresult_value等はNULLのまま記録し、的中率の分母から除外する（指示書18番、集計側
+    （server.py）がevaluation_status=='EVALUATED'のみを対象にすることで担保する）。
+    evaluation_qualityはbaseline取得時点の品質とresult取得時点の品質を合わせた最終値
+    （呼び出し側で決定済みのものを渡す、指示書4番）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
@@ -4417,10 +4463,11 @@ def save_social_signal_evaluation_result(database_url, evaluation_id, result_val
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "UPDATE social_signal_evaluations SET result_value=%s, change_value=%s, confirmed=%s, "
-                "contradicted=%s, confirmation_score=%s, evaluation_status=%s, notes=%s, evaluated_at=now() "
+                "contradicted=%s, confirmation_score=%s, evaluation_status=%s, notes=%s, "
+                "evaluation_quality=COALESCE(%s, evaluation_quality), result_at=%s, evaluated_at=now() "
                 "WHERE id=%s RETURNING *",
                 [result_value, change_value, confirmed, contradicted, confirmation_score, evaluation_status,
-                 notes, evaluation_id])
+                 notes, evaluation_quality, result_at, evaluation_id])
             row = cur.fetchone()
         conn.commit()
     return _row_to_json(row) if row else None
@@ -4472,6 +4519,102 @@ def list_analyzed_social_posts_without_evaluations(database_url, source_handle, 
                 "WHERE e.source_handle=p.source_handle AND e.post_id=p.post_id) "
                 "ORDER BY p.posted_at DESC LIMIT %s",
                 [source_handle, limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def list_analyzed_social_posts(database_url, source_handle, limit=50):
+    """Phase4（指示書14番）：recompute=true専用。既存評価の有無を問わずANALYZED投稿を返す
+    （list_analyzed_social_posts_without_evaluationsとは異なり除外条件が無い）。勝手な
+    一括再計算を避けるため、呼び出し側（backfill、recompute=true時のみ）以外からは使わない
+    想定。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM social_market_posts WHERE source_handle=%s AND image_analysis_status='ANALYZED' "
+                "ORDER BY posted_at DESC LIMIT %s",
+                [source_handle, limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def delete_social_signal_evaluations_for_post(database_url, source_handle, post_id):
+    """Phase4（指示書14番）：recompute=true時のみ呼ぶ、既存評価行の削除。デフォルト経路
+    （recompute省略）からは一切呼ばれない——既存Phase3評価を勝手に上書きしないため
+    （指示書14番「勝手に既存評価を上書きしない」）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM social_signal_evaluations WHERE source_handle=%s AND post_id=%s",
+                        [source_handle, post_id])
+            n = cur.rowcount
+        conn.commit()
+    return n
+
+
+def count_social_signal_evaluations(database_url, source_handle, evaluation_status=None):
+    """Phase4（指示書15番）：diagnostics向けの件数カウント（pending_evaluations/
+    no_data_evaluations）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    where = ["source_handle=%s"]
+    params = [source_handle]
+    if evaluation_status:
+        where.append("evaluation_status=%s")
+        params.append(evaluation_status)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM social_signal_evaluations WHERE {' AND '.join(where)}", params)
+            n = cur.fetchone()[0]
+    return n
+
+
+# ---- social_event_evaluations（にこそくX連携 Phase4：event_accuracy/event_timeliness。
+# 2026-09-10新規） ----
+
+def create_social_event_evaluations(database_url, rows):
+    """指示書9番：economic_events系の候補を一括INSERTする。UNIQUE制約
+    （source_handle,post_id,event_name,event_start_at）によりON CONFLICT DO NOTHINGで
+    重複を防ぐ。戻り値：実際に新規作成された行数。"""
+    if not rows:
+        return 0
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    cols = ["source_handle", "post_id", "event_name", "event_type", "event_start_at", "post_created_at",
+            "lead_time_minutes", "match_status", "timeliness"]
+    inserted = 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            for r in rows:
+                values = [r.get(c) for c in cols]
+                cur.execute(
+                    f"INSERT INTO social_event_evaluations ({', '.join(cols)}) "
+                    f"VALUES ({', '.join(['%s'] * len(cols))}) "
+                    f"ON CONFLICT (source_handle, post_id, event_name, event_start_at) DO NOTHING",
+                    values)
+                inserted += cur.rowcount
+        conn.commit()
+    return inserted
+
+
+def list_social_event_evaluations_since(database_url, source_handle, since_iso, limit=500):
+    """指示書10番：performance集計（event_performance）用の生データ取得。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM social_event_evaluations WHERE source_handle=%s AND created_at >= %s "
+                "ORDER BY created_at DESC LIMIT %s",
+                [source_handle, since_iso, limit])
             rows = cur.fetchall()
     return [_row_to_json(r) for r in rows]
 
