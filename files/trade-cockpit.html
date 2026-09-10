@@ -3563,6 +3563,11 @@ const X_POST_IMPORTANCE_META = {
 const X_POST_PRIORITY_META = {
   URGENT: {emoji: "🔴", label: "最優先"}, HIGH: {emoji: "🟠", label: "優先"}, NORMAL: {emoji: "⚪", label: "通常"},
 };
+// Phase5新規（指示書22番）：投稿カードのsignal_kind小バッジ（情報過多にならないよう
+// 簡潔な日本語のみ。OBSERVATION/NEWS_REACTION/SENTIMENTは表示上のノイズになるため出さない）。
+const SIGNAL_KIND_BADGE_LABELS = {
+  FORECAST: "予想", TECHNICAL_VIEW: "テクニカル", EVENT_NOTICE: "実況", POSITIONING: "ポジション",
+};
 // Phase3新規（指示書14番）：過去実績表示のセクターキー→日本語ラベル（server.py側
 // SOCIAL_EVAL_SECTOR_KEY_MAPのtarget_keyに対応）。
 const SOCIAL_EVAL_SECTOR_LABELS = {
@@ -3683,15 +3688,31 @@ function XMarketSignalsCard(){
         {showPerformance?"▲ 過去実績を隠す":"▼ 過去実績を見る"}
       </button>
       {showPerformance && <div style={{fontSize:10.5,marginTop:4,color:"var(--inkSoft)",lineHeight:1.7}}>
+        {/* Phase5新規（指示書23番）：情報過多を避けるため最重要4項目を先頭に固定表示。 */}
+        <div style={{fontWeight:700}}>
+          予測的中率 {performance.overall_confirmation_rate_predictive!=null?`${Math.round(performance.overall_confirmation_rate_predictive*100)}%`:"—"}
+          　逆行率 {performance.false_signal_rate!=null?`${Math.round(performance.false_signal_rate*100)}%`:"—"}
+          　有効シグナル率 {performance.useful_signal_rate!=null?`${Math.round(performance.useful_signal_rate*100)}%`:"—"}
+          　統計信頼度 {performance.statistical_confidence||"—"}
+        </div>
         <div>全体一致率 {performance.overall_confirmation_rate!=null?`${Math.round(performance.overall_confirmation_rate*100)}%`:"—"}
           （評価済み{performance.total_evaluated}件）
+          {performance.ci95_low!=null && <span>　95%CI [{Math.round(performance.ci95_low*100)}%〜{Math.round(performance.ci95_high*100)}%]</span>}
           {performance.source_quality_score&&performance.source_quality_score.provisional && <span style={{color:"var(--inkFaint)"}}>［サンプル不足・参考値］</span>}
         </div>
+        {performance.by_window && (performance.by_window["30M"]!=null || performance.by_window["1H"]!=null) && <div>
+          30M精度 {performance.by_window["30M"]!=null?`${Math.round(performance.by_window["30M"]*100)}%`:"—"}
+          　1H精度 {performance.by_window["1H"]!=null?`${Math.round(performance.by_window["1H"]*100)}%`:"—"}
+        </div>}
         {Object.entries(performance.theme_performance||{}).filter(([,v])=>!v.low_sample).map(([key,v])=>
           <div key={key}>{SOCIAL_EVAL_SECTOR_LABELS[key]||key} {Math.round((v.confirmation_rate||0)*100)}%（{v.sample_count}件）</div>
         )}
         {Object.values(performance.theme_performance||{}).every(v=>v.low_sample) &&
           <div style={{color:"var(--inkFaint)"}}>テーマ別実績はサンプル不足のため表示できません。</div>}
+        {/* Phase5新規（指示書8番）：地合い別。 */}
+        {performance.by_market_regime && Object.keys(performance.by_market_regime).length>0 && <div>
+          地合い別　{Object.entries(performance.by_market_regime).map(([r,rate])=>`${r} ${rate!=null?Math.round(rate*100)+"%":"—"}`).join("　")}
+        </div>}
         {/* Phase4新規（指示書16番）：評価品質の内訳。 */}
         {performance.quality_breakdown && Object.keys(performance.quality_breakdown).length>0 && <div style={{marginTop:3}}>
           評価品質　{["EXACT","NEAR_EXACT","ESTIMATED","NO_DATA"].filter(q=>performance.quality_breakdown[q]).map(q=>
@@ -3724,6 +3745,10 @@ function XMarketSignalsCard(){
                 <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap",fontSize:10.5}}>
                   {isNew && <span style={{color:"var(--down)",fontWeight:800}}>🔴 NEW</span>}
                   {prioMeta && p.image_analysis_status==="PENDING" && <span title={`優先度スコア ${p.analysis_priority_score}`}>{prioMeta.emoji} {prioMeta.label}</span>}
+                  {/* Phase5新規（指示書1・22番）：signal_kindバッジ（予想/実況/テクニカル等）＋
+                      高信頼度マーカー。情報過多にならないよう簡潔な日本語1〜2文字＋絵文字に絞る。 */}
+                  {SIGNAL_KIND_BADGE_LABELS[p.signal_kind] && <span className="chip" style={{fontSize:9.5,padding:"0 4px"}}>{SIGNAL_KIND_BADGE_LABELS[p.signal_kind]}</span>}
+                  {(p.signal_confidence||0)>=0.9 && <span title={`信頼度 ${p.signal_confidence}`}>🎯 信頼度高</span>}
                   <span style={{color:"var(--inkFaint)"}}>{p.posted_at?new Date(p.posted_at).toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"}):"—"}</span>
                   <span style={{fontWeight:700,color:impMeta.color,border:`1px solid ${impMeta.color}`,borderRadius:3,padding:"0 4px"}}>{impMeta.label}</span>
                   {cats.slice(0,3).map(c=><span key={c} className="chip" style={{fontSize:9.5,padding:"0 4px"}}>{c}</span>)}

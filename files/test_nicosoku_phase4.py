@@ -46,7 +46,8 @@ class ResultCaptureTests(unittest.TestCase):
         with mock.patch.object(server, "_fetch_raw_price_snapshot") as mock_fetch:
             mock_fetch.return_value = {"price": 53530.0, "captured_at": _iso(datetime.datetime.now(datetime.timezone.utc)),
                                         "source": "yfinance", "quality_hint": "INTRADAY"}
-            captured = server.capture_signal_result("dummy", "local", evaluation, datetime.datetime.now(datetime.timezone.utc))
+            with mock.patch.object(server, "_concurrent_topix_change_pct", return_value=None):
+                captured = server.capture_signal_result("dummy", "local", evaluation, datetime.datetime.now(datetime.timezone.utc))
         self.assertIsNotNone(captured)
         self.assertEqual(captured["result_value"], 53530.0)
         self.assertIn("result_at", captured)
@@ -57,7 +58,8 @@ class ResultCaptureTests(unittest.TestCase):
         with mock.patch.object(server, "_fetch_raw_price_snapshot") as mock_fetch:
             mock_fetch.return_value = {"price": 2050.0, "captured_at": _iso(datetime.datetime.now(datetime.timezone.utc)),
                                         "source": "yfinance", "quality_hint": "INTRADAY"}
-            captured = server.capture_signal_result("dummy", "local", evaluation, datetime.datetime.now(datetime.timezone.utc))
+            with mock.patch.object(server, "_concurrent_topix_change_pct", return_value=None):
+                captured = server.capture_signal_result("dummy", "local", evaluation, datetime.datetime.now(datetime.timezone.utc))
         self.assertEqual(captured["change_pct"], 2.5)  # (2050-2000)/2000*100
 
 
@@ -209,9 +211,13 @@ class BackfillEstimatedTests(unittest.TestCase):
         old_posted_at = _iso(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=10))
         with mock.patch.object(server, "investment_db") as mock_db:
             mock_db.list_watchlist.return_value = []
+            mock_db.list_portfolio.return_value = []
+            mock_db.list_recent_signal_group_candidates.return_value = []
             mock_db.create_social_signal_evaluations.side_effect = lambda url, rows: (
                 [self.assertEqual(r["evaluation_quality"], "ESTIMATED") for r in rows] and len(rows))
-            with mock.patch.object(server, "_fetch_raw_price_snapshot") as mock_fetch:
+            with mock.patch.object(server, "_fetch_raw_price_snapshot") as mock_fetch, \
+                 mock.patch.object(server, "capture_market_state_snapshot", return_value={}), \
+                 mock.patch.object(server, "maybe_generate_social_signal_alert_safe", return_value=None):
                 # captured_atは「いま」なので、10日前のposted_atとは大きく乖離する→ESTIMATED
                 mock_fetch.return_value = {"price": 53000.0, "captured_at": _iso(datetime.datetime.now(datetime.timezone.utc)),
                                             "source": "yfinance", "quality_hint": "INTRADAY"}
@@ -275,11 +281,15 @@ class ApiUiTests(unittest.TestCase):
                  "categories_json": ["SECTOR_ROTATION"], "posted_at": _iso(datetime.datetime.now(datetime.timezone.utc))},
             ]
             mock_db.list_watchlist.return_value = []
+            mock_db.list_portfolio.return_value = []
+            mock_db.list_recent_signal_group_candidates.return_value = []
             mock_db.create_social_signal_evaluations.return_value = 1
             baseline = {"baseline_value": 100.0, "baseline_at": _iso(datetime.datetime.now(datetime.timezone.utc)),
                         "baseline_source": "yfinance", "baseline_status": "OK", "baseline_detail_json": None,
                         "evaluation_quality": "ESTIMATED"}
-            with mock.patch.object(server, "capture_signal_baseline", return_value=baseline):
+            with mock.patch.object(server, "capture_signal_baseline", return_value=baseline), \
+                 mock.patch.object(server, "capture_market_state_snapshot", return_value={}), \
+                 mock.patch.object(server, "maybe_generate_social_signal_alert_safe", return_value=None):
                 result = server.backfill_social_signal_evaluations("dummy_url", "local", limit=10, dry_run=False, recompute=True)
         mock_db.delete_social_signal_evaluations_for_post.assert_called_once_with("dummy_url", server.NICOSOKU_X_USERNAME, "1")
         mock_db.list_analyzed_social_posts.assert_called_once()  # recompute時は「除外なし」の一覧を使う

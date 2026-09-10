@@ -164,7 +164,8 @@ class SectorAggregationTests(unittest.TestCase):
                                                 {"code": "8411", "price": 100}]}
         with mock.patch.object(server, "get_stock_quotes") as mock_quotes:
             mock_quotes.return_value = {"8306": {"t": 110}, "8316": {"t": 102}, "8411": {"t": 106}}
-            captured = server.capture_signal_result("dummy", "local", evaluation, datetime.datetime.now(datetime.timezone.utc))
+            with mock.patch.object(server, "_concurrent_topix_change_pct", return_value=None):
+                captured = server.capture_signal_result("dummy", "local", evaluation, datetime.datetime.now(datetime.timezone.utc))
         self.assertEqual(captured["change_pct"], 6.0)  # pct=[10,2,6] → median=6
 
 
@@ -317,11 +318,15 @@ class BackfillApiTests(unittest.TestCase):
                  "categories_json": ["SECTOR_ROTATION"], "posted_at": _iso(datetime.datetime.now(datetime.timezone.utc))},
             ]
             mock_db.list_watchlist.return_value = []
+            mock_db.list_portfolio.return_value = []
+            mock_db.list_recent_signal_group_candidates.return_value = []
             mock_db.create_social_signal_evaluations.return_value = 3
             baseline = {"baseline_value": 100.0, "baseline_at": _iso(datetime.datetime.now(datetime.timezone.utc)),
                         "baseline_source": "yfinance", "baseline_status": "OK", "baseline_detail_json": None,
                         "evaluation_quality": "ESTIMATED"}
-            with mock.patch.object(server, "capture_signal_baseline", return_value=baseline):
+            with mock.patch.object(server, "capture_signal_baseline", return_value=baseline), \
+                 mock.patch.object(server, "capture_market_state_snapshot", return_value={}), \
+                 mock.patch.object(server, "maybe_generate_social_signal_alert_safe", return_value=None):
                 result = server.backfill_social_signal_evaluations("dummy_url", "local", limit=10, dry_run=False)
         self.assertFalse(result["dry_run"])
         mock_db.create_social_signal_evaluations.assert_called_once()

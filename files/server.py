@@ -9,7 +9,9 @@ import io
 import os
 import re
 import json
+import math
 import time
+import uuid
 import base64
 import secrets
 import calendar
@@ -3401,6 +3403,13 @@ def build_social_posts_response(database_url, user_id, limit=10, min_importance=
                 summary = _post_evaluation_summary(evals)
                 if summary:
                     p["evaluation_summary"] = summary
+                # Phase5新規（指示書22番）：投稿カードに小さくsignal_kindバッジ・高信頼度
+                # マーカーを出すための代表signal情報（OBSERVATIONより予測系を優先）。
+                rep = (next((e for e in evals if e.get("signal_kind") and e.get("signal_kind") != "OBSERVATION"), None)
+                       or (evals[0] if evals else None))
+                if rep:
+                    p["signal_kind"] = rep.get("signal_kind")
+                    p["signal_confidence"] = rep.get("signal_confidence")
             except Exception:
                 pass
     ordered = sort_pending_posts_by_priority(enriched)
@@ -3440,6 +3449,15 @@ def nicosoku_diagnostics(database_url, user_id):
         if (investment_db is not None and database_url) else 0
     no_data_evaluations = investment_db.count_social_signal_evaluations(database_url, NICOSOKU_X_USERNAME, "NO_DATA") \
         if (investment_db is not None and database_url) else 0
+    # Phase5（指示書24番）：JST当日0時からの集計。
+    today_start_iso = datetime.datetime.now(_JST).replace(hour=0, minute=0, second=0, microsecond=0) \
+        .astimezone(datetime.timezone.utc).isoformat()
+    duplicate_signal_groups = investment_db.count_duplicate_signal_groups_since(database_url, NICOSOKU_X_USERNAME, today_start_iso) \
+        if (investment_db is not None and database_url) else 0
+    alerts_generated_today = investment_db.count_social_signal_alerts_since(database_url, NICOSOKU_X_USERNAME, today_start_iso) \
+        if (investment_db is not None and database_url) else 0
+    high_confidence_signals_today = investment_db.count_high_confidence_signals_since(database_url, NICOSOKU_X_USERNAME, today_start_iso) \
+        if (investment_db is not None and database_url) else 0
     return {
         "token_configured": bool(X_API_BEARER_TOKEN),
         "username": NICOSOKU_X_USERNAME,
@@ -3461,6 +3479,10 @@ def nicosoku_diagnostics(database_url, user_id):
         "market_calendar_status": market_calendar_status,
         "pending_evaluations": pending_evaluations,
         "no_data_evaluations": no_data_evaluations,
+        "duplicate_signal_groups": duplicate_signal_groups,
+        "pending_signal_evaluations": pending_evaluations,  # 指示書24番の名称に合わせたエイリアス
+        "alerts_generated_today": alerts_generated_today,
+        "high_confidence_signals_today": high_confidence_signals_today,
     }
 
 
@@ -3544,15 +3566,96 @@ def _detect_signal_direction(text):
     return "NEUTRAL"
 
 
+# ============================================================
+# にこそくX連携 Phase5（2026-09-11新規）：signal_kind・signal_confidence・author_certainty。
+# 「観測（すでに起きたこと）」と「予測（これから起きること）」を分離するのが最重要
+# （指示書2番）——OBSERVATIONは未来予測の的中率評価に混ぜない。
+# ============================================================
+
+# 指示書1番：優先順位付きで判定する（先に一致した種別を採用）。EVENT_NOTICEは既存の
+# X_POST_EVENT_DATE_RE（M/D＋種別キーワード）で判定するため、ここでは残りの6種を扱う。
+SIGNAL_KIND_FORECAST_KEYWORDS = ["続きそう", "だろう", "と思う", "と見て", "見込み", "予想", "しそう",
+                                  "しやすい", "だろうか", "期待したい", "警戒したい", "しそうだ"]
+SIGNAL_KIND_TECHNICAL_KEYWORDS = ["移動平均", "5日線", "25日線", "75日線", "200日線", "ローソク足",
+                                    "MACD", "RSI", "ブレイク", "サポート", "レジスタンス", "出来高",
+                                    "陽線", "陰線", "上ヒゲ", "下ヒゲ"]
+SIGNAL_KIND_POSITIONING_KEYWORDS = ["ポジション", "買い増し", "利確", "ロング", "ショート", "持ち高",
+                                     "損切り", "手仕舞い", "打診買い"]
+SIGNAL_KIND_SENTIMENT_KEYWORDS = ["センチメント", "投資家心理", "強気派", "弱気派", "リスクオン",
+                                    "リスクオフ", "楽観", "悲観"]
+SIGNAL_KIND_NEWS_REACTION_KEYWORDS = ["を受けて", "発表を受け", "反応して", "好感", "嫌気"]
+
+# 指示書4番：author_certainty（投稿者自身の確信度、AI側confidenceとは別軸）。
+AUTHOR_CERTAINTY_HIGH_KEYWORDS = ["かなり", "非常に", "明確に", "はっきり", "確実", "間違いなく"]
+AUTHOR_CERTAINTY_LOW_KEYWORDS = ["もしかすると", "かもしれない", "可能性も", "微妙", "怪しい"]
+AUTHOR_CERTAINTY_MEDIUM_KEYWORDS = ["そう", "っぽい", "気配", "雰囲気", "模様"]
+
+# 指示書3番：曖昧な言い回しはsignal_confidenceを下げる。
+SIGNAL_CONFIDENCE_AMBIGUOUS_KEYWORDS = ["かもしれない", "かも", "微妙", "はっきりしない", "不透明", "模様眺め"]
+
+
+def classify_signal_kind(sentence):
+    """指示書1番：FORECAST/OBSERVATION/NEWS_REACTION/EVENT_NOTICE/TECHNICAL_VIEW/
+    POSITIONING/SENTIMENTを判定する。どれにも強く該当しなければOBSERVATION（「銀行強い」の
+    ような単純な現状描写のデフォルト、指示書1番の例に合わせる）。"""
+    if not sentence:
+        return "OBSERVATION"
+    if X_POST_EVENT_DATE_RE.search(sentence) and any(
+            kw in sentence for kws in X_POST_EVENT_TYPE_KEYWORDS.values() for kw in kws):
+        return "EVENT_NOTICE"
+    if any(kw in sentence for kw in SIGNAL_KIND_FORECAST_KEYWORDS):
+        return "FORECAST"
+    if any(kw in sentence for kw in SIGNAL_KIND_NEWS_REACTION_KEYWORDS):
+        return "NEWS_REACTION"
+    if any(kw in sentence for kw in SIGNAL_KIND_TECHNICAL_KEYWORDS):
+        return "TECHNICAL_VIEW"
+    if any(kw in sentence for kw in SIGNAL_KIND_POSITIONING_KEYWORDS):
+        return "POSITIONING"
+    if any(kw in sentence for kw in SIGNAL_KIND_SENTIMENT_KEYWORDS):
+        return "SENTIMENT"
+    return "OBSERVATION"
+
+
+def classify_author_certainty(sentence):
+    """指示書4番：投稿者自身の確信度（HIGH/MEDIUM/LOW/UNKNOWN）。"""
+    if not sentence:
+        return "UNKNOWN"
+    if any(kw in sentence for kw in AUTHOR_CERTAINTY_LOW_KEYWORDS):
+        return "LOW"
+    if any(kw in sentence for kw in AUTHOR_CERTAINTY_HIGH_KEYWORDS):
+        return "HIGH"
+    if any(kw in sentence for kw in AUTHOR_CERTAINTY_MEDIUM_KEYWORDS):
+        return "MEDIUM"
+    return "UNKNOWN"
+
+
+def compute_signal_confidence(sentence, from_image=False):
+    """指示書3番：0.0〜1.0。画像ヒートマップ等からの推測は0.75、曖昧な言い回しは0.50、
+    本文で明示的な方向キーワードが取れていれば0.95（このpure関数が呼ばれる時点で既に
+    _detect_signal_directionがBULLISH/BEARISHを検出済みという前提、つまり最低限の
+    明示性は保証されている）。"""
+    if from_image:
+        return 0.75
+    if sentence and any(kw in sentence for kw in SIGNAL_CONFIDENCE_AMBIGUOUS_KEYWORDS):
+        return 0.50
+    return 0.95
+
+
+# 指示書2番：未来予測の的中率評価の中心とするsignal_kind（OBSERVATIONは除外）。
+SIGNAL_KIND_PREDICTIVE = ("FORECAST", "TECHNICAL_VIEW", "POSITIONING")
+
+
 def _extract_signal_candidates_from_post(post, watchlist=None):
-    """指示書3・4・5番：ANALYZED投稿から評価対象候補を抽出する。評価対象にするのは
-    author_opinion・market_implications・observations・sector_strength（指示書4番、
+    """指示書1・2・3・4・5番：ANALYZED投稿から評価対象候補を抽出する。評価対象にするのは
+    author_opinion・market_implications・observations・sector_strength（指示書4番＝Phase4、
     「CPI 21:30」等の単純な日付列挙イベントは的中率の対象にしない——economic_eventsは
     ここでは扱わない）。watchlistは[{"code","name","theme"},...]（DB非依存、テスト容易性の
     ためpure functionとして実装）。戻り値：{"signal_type","signal_direction","target_type",
-    "target_key"}のリスト（(signal_type,target_type,target_key)単位で重複除去済み）。"""
+    "target_key","signal_kind","signal_confidence","author_certainty","observed_at_post"}の
+    リスト（(signal_type,target_type,target_key,signal_kind)単位で重複除去済み——指示書1番
+    「同じテーマでもsignal_kindが違えば別candidate」）。"""
     watchlist = watchlist or []
-    sentences = list(post.get("author_opinion_json") or [])
+    sentences = [{"text": s, "from_image": False} for s in (post.get("author_opinion_json") or [])]
     analyzed = post.get("image_analysis_json") or []
     for a in analyzed:
         if not isinstance(a, dict):
@@ -3560,47 +3663,65 @@ def _extract_signal_candidates_from_post(post, watchlist=None):
         for key in ("market_implications", "observations"):
             v = a.get(key)
             if isinstance(v, str) and v:
-                sentences.append(v)
+                sentences.append({"text": v, "from_image": True})
             elif isinstance(v, list):
-                sentences.extend(x for x in v if isinstance(x, str))
+                sentences.extend({"text": x, "from_image": True} for x in v if isinstance(x, str))
         sector_strength = a.get("sector_strength")
         if isinstance(sector_strength, list):
             for item in sector_strength:
                 if isinstance(item, str):
-                    sentences.append(item)
+                    sentences.append({"text": item, "from_image": True})
                 elif isinstance(item, dict) and item.get("sector"):
                     d = str(item.get("direction") or "").upper()
                     tag = ("強い" if d in ("UP", "BULLISH", "STRONG") else
                            "弱い" if d in ("DOWN", "BEARISH", "WEAK") else "")
                     if tag:
-                        sentences.append(f"{item['sector']}{tag}")
+                        sentences.append({"text": f"{item['sector']}{tag}", "from_image": True})
 
-    candidates, seen = [], set()
+    # signal_kindはDB側のUNIQUE制約（source_handle,post_id,signal_type,target_type,target_key,
+    # evaluation_window）に含まれないため、同一(signal_type,target_type,target_key)で複数の
+    # signal_kindが検出された場合は1つに絞る必要がある。予測性の高い種別（FORECAST/
+    # TECHNICAL_VIEW/POSITIONING）を優先し、同じ対象について「観測」と「予測」の両方が
+    # あれば予測を採用する（指示書2番の趣旨＝予測評価を優先する、に合わせる）。
+    _KIND_PRIORITY = {"FORECAST": 3, "TECHNICAL_VIEW": 3, "POSITIONING": 3,
+                       "NEWS_REACTION": 2, "SENTIMENT": 2, "EVENT_NOTICE": 2, "OBSERVATION": 1}
+    candidates_by_key = {}
 
-    def _add(signal_type, direction, target_type, target_key):
+    def _add(signal_type, direction, target_type, target_key, sentence, from_image):
+        signal_kind = classify_signal_kind(sentence)
         key = (signal_type, target_type, target_key)
-        if key in seen or direction == "NEUTRAL":
+        if direction == "NEUTRAL":
             return
-        seen.add(key)
-        candidates.append({"signal_type": signal_type, "signal_direction": direction,
-                            "target_type": target_type, "target_key": target_key})
+        existing = candidates_by_key.get(key)
+        if existing and _KIND_PRIORITY.get(existing["signal_kind"], 0) >= _KIND_PRIORITY.get(signal_kind, 0):
+            return
+        candidates_by_key[key] = {
+            "signal_type": signal_type, "signal_direction": direction, "target_type": target_type,
+            "target_key": target_key, "signal_kind": signal_kind,
+            "signal_confidence": compute_signal_confidence(sentence, from_image=from_image),
+            "author_certainty": classify_author_certainty(sentence),
+            # 指示書2番：OBSERVATIONは「投稿時点で既に観測されていた事実」として扱い、
+            # 未来予測の的中率評価から除外する（observed_at_post=Trueが目印）。
+            "observed_at_post": signal_kind == "OBSERVATION",
+        }
 
-    for s in sentences:
+    for entry in sentences:
+        s, from_image = entry["text"], entry["from_image"]
         direction = _detect_signal_direction(s)
         if direction == "NEUTRAL":
             continue
         for kw, target_key in SOCIAL_EVAL_SECTOR_KEY_MAP.items():
             if kw in s:
-                _add("SECTOR_ROTATION", direction, "SECTOR", target_key)
+                _add("SECTOR_ROTATION", direction, "SECTOR", target_key, s, from_image)
         for kw, target_key in SOCIAL_EVAL_MARKET_KEY_MAP.items():
             if kw in s:
-                _add("MARKET_SENTIMENT", direction, "MARKET", target_key)
+                _add("MARKET_SENTIMENT", direction, "MARKET", target_key, s, from_image)
         for w in watchlist:
             name = (w.get("name") or "").strip()
             code = w.get("code")
             if name and code and name in s:
-                _add("STOCK_TECHNICAL", direction, "STOCK", code)
-    return candidates
+                _add("STOCK_TECHNICAL", direction, "STOCK", code, s, from_image)
+    return list(candidates_by_key.values())
 
 
 # ============================================================
@@ -3851,15 +3972,32 @@ def capture_signal_baseline(database_url, user_id, target_type, target_key, as_o
             "baseline_detail_json": snap.get("members"), "evaluation_quality": quality}
 
 
+def _concurrent_topix_change_pct():
+    """Phase5（指示書10・11番）：relative_return_pct計算用の「同時点の市場全体の動き」。
+    自前のbaseline/result機構とは独立に、前日終値比で概算する軽量な参照値
+    （厳密な同時刻比較ではないが、地合いの強弱を大まかに補正するには十分、既知の制約）。"""
+    try:
+        r = _two_closes(INDEX["topix_etf"])
+        if r and r.get("p"):
+            return round((r["t"] - r["p"]) / r["p"] * 100, 3)
+    except Exception:
+        pass
+    return None
+
+
 def capture_signal_result(database_url, user_id, evaluation, as_of_dt):
-    """指示書3番：due_at到来時点でresultを実取得する。戻り値：{"result_value","change_pct",
-    "result_at","quality"}かNone（取得不能）。SECTORはbaseline_detail_jsonに保存済みの
-    構成銘柄それぞれの現在価格を再取得し、個々のpct変化の中央値をchange_pctとする
-    （銘柄ごとの価格水準差に左右されない指標にするため、Phase3から踏襲）。"""
+    """指示書3・9・10・11番：due_at到来時点でresultを実取得する。戻り値：{"result_value",
+    "change_pct","result_at","quality","breadth","relative_return_pct"}かNone（取得不能）。
+    SECTORはbaseline_detail_jsonに保存済みの構成銘柄それぞれの現在価格を再取得し、個々の
+    pct変化の中央値をchange_pctとする（銘柄ごとの価格水準差に左右されない指標にするため、
+    Phase3から踏襲）。breadth（構成銘柄中プラスだった比率）とTOPIX比の相対強度も併せて返す
+    （指示書9番「1〜2銘柄だけ急騰している場合の誤判定を減らす」・10番「TOPIX比で評価しすぎ
+    ない」）。"""
     target_type, target_key = evaluation.get("target_type"), evaluation.get("target_key")
     baseline_value = evaluation.get("baseline_value")
     if baseline_value is None:
         return None
+    topix_pct = _concurrent_topix_change_pct()
     if target_type == "SECTOR":
         detail = evaluation.get("baseline_detail_json") or []
         if len(detail) < 2:
@@ -3881,6 +4019,8 @@ def capture_signal_result(database_url, user_id, evaluation, as_of_dt):
         pcts.sort()
         n = len(pcts)
         median_pct = pcts[n // 2] if n % 2 else (pcts[n // 2 - 1] + pcts[n // 2]) / 2
+        equal_weight_pct = sum(pcts) / len(pcts)
+        breadth = round(sum(1 for p in pcts if p > 0) / len(pcts), 3)  # 指示書9番
         result_prices.sort()
         m = len(result_prices)
         median_price = result_prices[m // 2] if m % 2 else (result_prices[m // 2 - 1] + result_prices[m // 2]) / 2
@@ -3888,15 +4028,23 @@ def capture_signal_result(database_url, user_id, evaluation, as_of_dt):
         # セクターは構成銘柄を再取得する都合上、個々の観測時刻を厳密比較しない（実務上
         # schedulerが5分間隔で動く前提でNEAR_EXACT相当として扱う、指示書4番の簡略化）。
         quality = "NEAR_EXACT"
+        relative = round(median_pct - topix_pct, 3) if topix_pct is not None else None
         return {"result_value": round(median_price, 4), "change_pct": round(median_pct, 3),
-                "result_at": now_iso, "quality": quality}
+                "result_at": now_iso, "quality": quality, "breadth": breadth,
+                "relative_return_pct": relative, "equal_weight_return_pct": round(equal_weight_pct, 3)}
     snap = _fetch_raw_price_snapshot(target_type, target_key)
     if not snap:
         return None
     change_pct = round((snap["price"] - float(baseline_value)) / float(baseline_value) * 100, 3)
     quality = _classify_evaluation_quality(snap.get("captured_at"), as_of_dt, snap.get("quality_hint"))
+    # 指示書11番：個別銘柄はTOPIX比の相対リターンも計算する（地合いだけで動いたのか、
+    # 銘柄自体が強かったのかを区別する簡易版——セクター比の相対強度は将来拡張の余地として
+    # 残す、既知の制約）。MARKET（指数自体）はTOPIX比の意味が薄いため計算しない。
+    relative = None
+    if target_type == "STOCK" and topix_pct is not None:
+        relative = round(change_pct - topix_pct, 3)
     return {"result_value": snap["price"], "change_pct": change_pct, "result_at": snap.get("captured_at"),
-            "quality": quality}
+            "quality": quality, "breadth": None, "relative_return_pct": relative}
 
 
 def compute_signal_confirmation(direction, change_value, target_type):
@@ -3934,13 +4082,233 @@ def compute_signal_confirmation(direction, change_value, target_type):
     return None, False, score
 
 
+def compute_signal_confirmation_v2(direction, relative_return_pct, target_type, signal_kind,
+                                    breadth=None, signal_confidence=None):
+    """指示書2・9・10・11・12番：v1（絶対騰落%）は残したまま、v2は相対騰落
+    （sector_return-TOPIX_return等）・breadth・signal_kindを考慮する。OBSERVATIONは
+    未来予測ではないため評価しない（指示書2番、常に(None,False,None)）。戻り値：
+    (confirmed_v2, contradicted_v2, confirmation_score_v2)。"""
+    if signal_kind == "OBSERVATION":
+        return None, False, None
+    if relative_return_pct is None:
+        return None, False, None
+    confirmed, contradicted, score = compute_signal_confirmation(direction, relative_return_pct, target_type)
+    if score is None:
+        return confirmed, contradicted, score
+    # 指示書9番：セクターでbreadthが低い（一部銘柄だけの急騰）のに「確認」扱いになっている
+    # 場合は減点する。breadthが高ければ僅かに加点する。
+    if breadth is not None and target_type == "SECTOR":
+        if breadth < 0.5:
+            score = max(0, score - 20)
+            if confirmed and score < 60:
+                confirmed = False
+        elif breadth >= 0.7:
+            score = min(100, score + 5)
+    # 指示書3番：signal_confidenceが低い（曖昧な言い回し）場合はスコアを僅かに割り引く
+    # （合否自体は変えず、スコアのみ調整）。
+    if signal_confidence is not None and signal_confidence < 0.6:
+        score = round(score * 0.9)
+    return confirmed, contradicted, score
+
+
+# ============================================================
+# にこそくX連携 Phase5（指示書7・8番）：投稿時点の地合い（market_state）・市場環境分類
+# （market_regime）。「下落相場で強い情報源か、上昇相場で強い情報源か」を後から分析できる
+# ようにする追加専用データ（売買判断には使わない）。
+# ============================================================
+
+MARKET_STATE_CACHE_TTL_SEC = 120  # 既存キャッシュ機構をそのまま流用（新規キャッシュを作らない）
+
+
+def _market_state_component(sym, as_level=False):
+    try:
+        r = _two_closes(sym)
+        if not r:
+            return None
+        if as_level:
+            return r.get("t")
+        if not r.get("p"):
+            return None
+        return round((r["t"] - r["p"]) / r["p"] * 100, 3)
+    except Exception:
+        return None
+
+
+def capture_market_state_snapshot():
+    """指示書7番：取得できる範囲だけでよい（欠損はNoneのまま）。market_snapshot_cache
+    （既存_cache_get/_cache_set）で2分以内は再利用する。"""
+    def _fetch():
+        return {
+            "nikkei_change_pct": _market_state_component(INDEX["nikkei"]),
+            "topix_change_pct": _market_state_component(INDEX["topix_etf"]),
+            "usd_jpy": _market_state_component(INDEX["usdjpy"], as_level=True),
+            "vix": _market_state_component(INDEX["vix"], as_level=True),
+            "sox_change_pct": _market_state_component(INDEX["sox"]),
+        }
+    return _get_market_snapshot("marketstate", _fetch, max_age_sec=MARKET_STATE_CACHE_TTL_SEC) or {}
+
+
+def classify_market_regime(state):
+    """指示書8番：複数ラベル可。RISK_ON/RISK_OFF/RANGE/TREND_UP/TREND_DOWN/HIGH_VOLの
+    いずれか複数を返す（判定材料が無ければ空リスト）。"""
+    if not state:
+        return []
+    regimes = []
+    nk = state.get("nikkei_change_pct")
+    if nk is not None:
+        if nk >= 1.0:
+            regimes.append("TREND_UP")
+        elif nk <= -1.0:
+            regimes.append("TREND_DOWN")
+        else:
+            regimes.append("RANGE")
+    vix = state.get("vix")
+    if vix is not None and vix >= 25:
+        regimes.append("HIGH_VOL")
+    sox = state.get("sox_change_pct")
+    if nk is not None and sox is not None:
+        if nk > 0 and sox > 0:
+            regimes.append("RISK_ON")
+        elif nk < 0 and sox < 0:
+            regimes.append("RISK_OFF")
+    return regimes
+
+
+# ============================================================
+# にこそくX連携 Phase5（指示書5・6番）：signal deduplication・follow-up分類。
+# 「同じテーマを短時間に複数投稿するケース」を1つの独立予測として重複カウントしない。
+# ============================================================
+
+SIGNAL_GROUP_DEDUP_WINDOW_MIN = 30       # この時間内・同方向ならCONFIRMATION（重複扱い）
+SIGNAL_GROUP_LOOKBACK_HOURS = 6          # この時間内まではCONTINUATION/REVERSAL判定の対象
+
+
+def resolve_signal_group(prior_records, direction, now):
+    """指示書5・6番：prior_recordsは同一(source_handle,target_type,target_key,signal_kind)の
+    直近レコード（新しい順、[{"signal_group_id","signal_direction","created_at"},...]）。
+    戻り値：(signal_group_id, group_role)。
+    - 直近レコードが無い → 新規group、PRIMARY
+    - 同方向・30分以内 → 直近と同じgroup、CONFIRMATION（重複扱い、的中率には数えない）
+    - 同方向・30分超（lookback以内） → 直近と同じgroup、CONTINUATION（見解の再確認、
+      新しい機会として評価対象に含める）
+    - 逆方向 → 新規group、REVERSAL（新しい見解を優先、指示書6番）
+    """
+    if not prior_records:
+        return str(uuid.uuid4()), "PRIMARY"
+    latest = prior_records[0]
+    try:
+        latest_at = datetime.datetime.fromisoformat(str(latest.get("created_at")).replace("Z", "+00:00"))
+        if latest_at.tzinfo is None:
+            latest_at = latest_at.replace(tzinfo=datetime.timezone.utc)
+    except Exception:
+        return str(uuid.uuid4()), "PRIMARY"
+    gap_min = (now - latest_at).total_seconds() / 60
+    if gap_min > SIGNAL_GROUP_LOOKBACK_HOURS * 60:
+        return str(uuid.uuid4()), "PRIMARY"
+    latest_group_id = latest.get("signal_group_id") or str(uuid.uuid4())
+    if latest.get("signal_direction") == direction:
+        return latest_group_id, ("CONFIRMATION" if gap_min <= SIGNAL_GROUP_DEDUP_WINDOW_MIN else "CONTINUATION")
+    return str(uuid.uuid4()), "REVERSAL"
+
+
+def compute_decision_relevance_score(direct_position_hit=False, watch_related=False, day_trade_candidate=False,
+                                      macro_event=False):
+    """指示書18番：投稿者評価とは別の「自分の分析システムにとってどれだけ重要だったか」。
+    例の配点：保有銘柄直撃+30・デイトレ候補関連+20・監視セクター関連+15・FOMC等+20。"""
+    score = 0
+    if direct_position_hit:
+        score += 30
+    if day_trade_candidate:
+        score += 20
+    if watch_related:
+        score += 15
+    if macro_event:
+        score += 20
+    return min(score, 100)
+
+
+# ============================================================
+# にこそくX連携 Phase5（指示書19・20番）：SOCIAL_SIGNAL_ALERT。あくまで「注目に値する投稿が
+# あった」という記録であり、売買指示ではない（指示書19番「ただし売買指示にはしない」・
+# 30番「『この人が言ったから買う』というロジックにはしない」）。
+# ============================================================
+
+SOCIAL_SIGNAL_ALERT_MIN_CONFIDENCE = 0.75
+SOCIAL_SIGNAL_ALERT_MIN_RELEVANCE = 60
+SOCIAL_SIGNAL_ALERT_MIN_SAMPLE = 20
+SOCIAL_SIGNAL_ALERT_MIN_QUALITY_V3 = 55
+SOCIAL_SIGNAL_ALERT_COOLDOWN_MIN = 30
+
+
+def should_generate_social_signal_alert(candidate, group_role, decision_relevance_score, performance):
+    """指示書19・20番：アラート生成条件の判定（pure関数、DBアクセスなし）。CONFIRMATIONは
+    再アラートしない（指示書20番、cooldownとは別に種別自体で除外する）。"""
+    if group_role == "CONFIRMATION":
+        return False
+    if candidate.get("signal_kind") not in ("FORECAST", "TECHNICAL_VIEW"):
+        return False
+    if (candidate.get("signal_confidence") or 0) < SOCIAL_SIGNAL_ALERT_MIN_CONFIDENCE:
+        return False
+    if (decision_relevance_score or 0) < SOCIAL_SIGNAL_ALERT_MIN_RELEVANCE:
+        return False
+    if not performance or (performance.get("total_evaluated") or 0) < SOCIAL_SIGNAL_ALERT_MIN_SAMPLE:
+        return False
+    v3 = performance.get("source_quality_score_v3") or {}
+    if (v3.get("score") or 0) < SOCIAL_SIGNAL_ALERT_MIN_QUALITY_V3:
+        return False
+    return True
+
+
+def maybe_generate_social_signal_alert(database_url, user_id, post, candidate, group_id, group_role,
+                                        decision_relevance_score):
+    """指示書19・20番：条件を満たせばSOCIAL_SIGNAL_ALERTを1件記録する（同一signal_group_idへは
+    cooldown中は生成しない）。戻り値：生成したalert dictかNone。"""
+    if investment_db is None or not database_url:
+        return None
+    performance = get_social_source_performance(database_url, NICOSOKU_X_USERNAME, user_id=user_id)
+    if not should_generate_social_signal_alert(candidate, group_role, decision_relevance_score, performance):
+        return None
+    since_iso = (datetime.datetime.now(datetime.timezone.utc)
+                 - datetime.timedelta(minutes=SOCIAL_SIGNAL_ALERT_COOLDOWN_MIN)).isoformat()
+    if investment_db.list_recent_alerts_for_group(database_url, NICOSOKU_X_USERNAME, group_id, since_iso):
+        return None  # cooldown中（指示書20番）
+    theme_perf = (performance.get("theme_performance") or {}).get(candidate["target_key"]) or {}
+    payload = {
+        "text_summary": (post.get("text") or "")[:60], "target_type": candidate["target_type"],
+        "target_key": candidate["target_key"], "signal_kind": candidate["signal_kind"],
+        "signal_direction": candidate["signal_direction"],
+        "related_stocks": sorted(set(post.get("direct_mentions_json") or [])),
+        "source_confirmation_rate": performance.get("overall_confirmation_rate"),
+        "theme_confirmation_rate": theme_perf.get("confirmation_rate"),
+        "url": post.get("url"), "posted_at": post.get("posted_at"),
+    }
+    return investment_db.create_social_signal_alert(database_url, {
+        "source_handle": NICOSOKU_X_USERNAME, "post_id": post.get("post_id"), "signal_group_id": group_id,
+        "alert_type": "SOCIAL_SIGNAL_ALERT", "payload": payload,
+    })
+
+
+def maybe_generate_social_signal_alert_safe(database_url, user_id, post, candidate, group_id, group_role,
+                                             decision_relevance_score):
+    """指示書21番の精神と同じく、alert生成自体が本体の投稿保存フローを壊さないようにする。"""
+    try:
+        return maybe_generate_social_signal_alert(database_url, user_id, post, candidate, group_id, group_role,
+                                                   decision_relevance_score)
+    except Exception as e:
+        print("  にこそくalert生成で例外（無視して続行）", e)
+        return None
+
+
 def generate_social_signal_evaluations_for_post(database_url, user_id, post):
-    """指示書1・2・16番：ANALYZED投稿から評価対象候補を作りPENDINGで保存する。Phase4
-    （指示書1番）：baselineは「signal生成時点」で確定する（評価時点で過去値を推測しない）。
-    生成が投稿時刻から大きく遅れた場合（バックフィル等）は_classify_evaluation_qualityが
-    自動的にESTIMATEDへ分類する——過去データを特別扱いでEXACTにする処理は書かない
-    （指示書13番「過去データをEXACT扱いしない」は、この時刻ベースの品質判定だけで自然に
-    満たされる）。戻り値：新規作成した評価行数。"""
+    """指示書1・2・5・6・7・8・16・18・19番：ANALYZED投稿から評価対象候補を作りPENDINGで
+    保存する。Phase4（指示書1番）：baselineは「signal生成時点」で確定する（評価時点で過去値を
+    推測しない）。生成が投稿時刻から大きく遅れた場合（バックフィル等）は
+    _classify_evaluation_qualityが自動的にESTIMATEDへ分類する——過去データを特別扱いで
+    EXACTにする処理は書かない（指示書13番「過去データをEXACT扱いしない」は、この時刻ベースの
+    品質判定だけで自然に満たされる）。Phase5：signal_kind・signal_confidence・
+    author_certainty・signal_group_id/group_role・market_state/regime・
+    decision_relevance_scoreを追加し、条件を満たせばSOCIAL_SIGNAL_ALERTも生成する
+    （指示書19番、ただし売買指示にはしない）。戻り値：新規作成した評価行数。"""
     if investment_db is None or not database_url:
         return 0
     posted_at_str = post.get("posted_at")
@@ -3954,18 +4322,46 @@ def generate_social_signal_evaluations_for_post(database_url, user_id, post):
         watchlist = investment_db.list_watchlist(database_url, user_id, market="JP")
     except Exception:
         watchlist = []
+    try:
+        position_codes = {p.get("code") for p in investment_db.list_portfolio(database_url, user_id)}
+        watch_codes = {w.get("code") for w in watchlist}
+    except Exception:
+        position_codes, watch_codes = set(), set()
     candidates = _extract_signal_candidates_from_post(post, watchlist=watchlist)
     if not candidates:
         return 0
     categories = post.get("categories_json") or []
+    macro_event = bool({"ECONOMIC_EVENT", "CENTRAL_BANK"} & set(categories))
     windows = set()
     for c in categories:
         windows |= set(SOCIAL_EVAL_CATEGORY_WINDOWS.get(c, ()))
     if not windows:
         windows = set(SOCIAL_EVAL_DEFAULT_WINDOWS)
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    lookback_iso = (now_utc - datetime.timedelta(hours=SIGNAL_GROUP_LOOKBACK_HOURS)).isoformat()
+    market_state = capture_market_state_snapshot()
+    market_regime = classify_market_regime(market_state)
     rows = []
     for cand in candidates:
+        # 指示書3番：confidence<0.5は自動評価対象から除外してよい（現行ヒューリスティックは
+        # 0.50/0.75/0.95のいずれかしか返さないため実際には発動しないが、将来の精度改善に
+        # 備えたガード）。
+        if (cand.get("signal_confidence") or 0) < 0.5:
+            continue
         baseline = capture_signal_baseline(database_url, user_id, cand["target_type"], cand["target_key"], posted_at)
+        # 指示書5・6番：signal grouping/follow-up判定。同一(target_type,target_key,
+        # signal_kind)の直近レコードと比較する。
+        try:
+            prior = investment_db.list_recent_signal_group_candidates(
+                database_url, NICOSOKU_X_USERNAME, cand["target_type"], cand["target_key"],
+                cand["signal_kind"], lookback_iso)
+        except Exception:
+            prior = []
+        group_id, group_role = resolve_signal_group(prior, cand["signal_direction"], now_utc)
+        relevance = compute_decision_relevance_score(
+            direct_position_hit=cand["target_key"] in position_codes,
+            watch_related=cand["target_key"] in watch_codes,
+            macro_event=macro_event)
         for window in windows:
             rows.append({
                 "source_handle": NICOSOKU_X_USERNAME, "post_id": post.get("post_id"),
@@ -3977,7 +4373,13 @@ def generate_social_signal_evaluations_for_post(database_url, user_id, post):
                 "baseline_status": baseline["baseline_status"], "baseline_detail_json": baseline["baseline_detail_json"],
                 "evaluation_quality": baseline["evaluation_quality"],
                 "evaluation_status": "PENDING", "notes": None,
+                "signal_kind": cand["signal_kind"], "signal_confidence": cand["signal_confidence"],
+                "author_certainty": cand["author_certainty"], "observed_at_post": cand["observed_at_post"],
+                "signal_group_id": group_id, "group_role": group_role,
+                "market_state_json": market_state, "market_regime_json": market_regime,
+                "decision_relevance_score": relevance,
             })
+        maybe_generate_social_signal_alert_safe(database_url, user_id, post, cand, group_id, group_role, relevance)
     return investment_db.create_social_signal_evaluations(database_url, rows)
 
 
@@ -4016,10 +4418,16 @@ def run_due_social_signal_evaluations(database_url, user_id, limit=50):
         change_value = captured["change_pct"]
         confirmed, contradicted, score = compute_signal_confirmation(ev["signal_direction"], change_value, ev["target_type"])
         overall_quality = _combine_evaluation_quality(ev.get("evaluation_quality"), captured["quality"])
+        # Phase5（指示書12番）：v1は変えず、v2（相対騰落・breadth・signal_kind考慮）を追加算出。
+        confirmed_v2, contradicted_v2, score_v2 = compute_signal_confirmation_v2(
+            ev["signal_direction"], captured.get("relative_return_pct"), ev["target_type"],
+            ev.get("signal_kind"), breadth=captured.get("breadth"), signal_confidence=ev.get("signal_confidence"))
         investment_db.save_social_signal_evaluation_result(
             database_url, ev["id"], result_value=captured.get("result_value"), change_value=change_value,
             confirmed=confirmed, contradicted=contradicted, confirmation_score=score,
-            evaluation_status="EVALUATED", evaluation_quality=overall_quality, result_at=captured["result_at"])
+            evaluation_status="EVALUATED", evaluation_quality=overall_quality, result_at=captured["result_at"],
+            relative_return_pct=captured.get("relative_return_pct"), breadth=captured.get("breadth"),
+            confirmed_v2=confirmed_v2, confirmation_score_v2=score_v2)
         result["evaluated"] += 1
     return result
 
@@ -4066,6 +4474,40 @@ def aggregate_source_performance(evaluations, rolling_limit=100, rolling_days=90
         quality_counts[q] = quality_counts.get(q, 0) + 1
     total_q = len(evaluated)
     quality_breakdown = {q: round(n / total_q, 3) for q, n in quality_counts.items()} if total_q else {}
+    # Phase5（指示書2番）：OBSERVATION（すでに起きたことの描写）は未来予測の的中率へ混ぜない。
+    # signal_kind列が無い（Phase3/4時代の）行はkind不明のため予測系サンプルとして残す
+    # （指示書28番「Phase4互換性」——過去データを無効化しない）。
+    predictive = [e for e in evaluated if (e.get("signal_kind") or "") != "OBSERVATION"]
+    observation_only = [e for e in evaluated if e.get("signal_kind") == "OBSERVATION"]
+    # 指示書12番：confirmation_v2（相対騰落・breadth・signal_kind考慮）の的中率。v1
+    # （overall_confirmation_rate）は意味を変えず残す。
+    v2_directional = [e for e in evaluated if e.get("confirmed_v2") is not None]
+    overall_v2_rate = (round(sum(1 for e in v2_directional if e["confirmed_v2"]) / len(v2_directional), 3)
+                        if v2_directional else None)
+    # 指示書17番：false_signal_rate（明確に逆行した割合）。
+    directional_v1 = [e for e in evaluated if e.get("confirmed") is not None]
+    false_signal_rate = (round(sum(1 for e in directional_v1 if e.get("contradicted")) / len(directional_v1), 3)
+                          if directional_v1 else None)
+    # 指示書16番：useful_signal_rate（FORECAST/TECHNICAL_VIEW/POSITIONING・高confidence・
+    # 30M/1Hで明確なrelative moveだった割合）。
+    useful_candidates = [e for e in evaluated
+                          if (e.get("signal_kind") in SIGNAL_KIND_PREDICTIVE)
+                          and (e.get("signal_confidence") or 0) >= 0.75
+                          and e.get("evaluation_window") in ("30M", "1H")]
+    useful_signal_rate = (round(sum(1 for e in useful_candidates
+                                     if e.get("confirmed_v2") is True or e.get("confirmed") is True)
+                                 / len(useful_candidates), 3) if useful_candidates else None)
+    # 指示書8番：by_market_regime。
+    by_regime = {}
+    for e in evaluated:
+        regimes = e.get("market_regime_json") or []
+        if isinstance(regimes, str):
+            try:
+                regimes = json.loads(regimes)
+            except Exception:
+                regimes = []
+        for r in regimes:
+            by_regime.setdefault(r, []).append(e)
     return {
         "total_evaluated": len(evaluated),
         "contradicted_count": sum(1 for e in evaluated if e.get("contradicted")),
@@ -4076,6 +4518,14 @@ def aggregate_source_performance(evaluations, rolling_limit=100, rolling_days=90
         "quality_breakdown": quality_breakdown,
         "high_quality_sample_count": len(high_quality),
         "overall_confirmation_rate_high_quality": _social_eval_confirmation_rate(high_quality) if high_quality else None,
+        "overall_confirmation_rate_predictive": _social_eval_confirmation_rate(predictive),
+        "predictive_sample_count": len(predictive),
+        "observation_sample_count": len(observation_only),
+        "overall_confirmation_rate_v2": overall_v2_rate,
+        "false_signal_rate": false_signal_rate,
+        "useful_signal_rate": useful_signal_rate,
+        "by_market_regime": {r: _social_eval_confirmation_rate(items) for r, items in by_regime.items()},
+        "confirmation_scores": scores,  # statistical_confidence（variance）計算用の生スコア列
     }
 
 
@@ -4163,6 +4613,65 @@ def compute_source_quality_score_v2(performance, timeliness_rate=None, consisten
                 + (event_rate if event_rate is not None else 0.5) * 100 * 0.1)
     return {"score": round(v2_score, 1), "provisional": base["provisional"], "sample_count": base["sample_count"],
             "high_quality_ratio": round(high_quality_ratio, 3), "event_exact_match_rate": event_rate}
+
+
+# ============================================================
+# にこそくX連携 Phase5（指示書13・14・15番）：statistical_confidence・Wilson信頼区間・
+# source_quality_score_v3。外部統計ライブラリは使わず標準ライブラリのmathのみで実装する
+# （指示書14番「外部統計ライブラリは不要」）。
+# ============================================================
+
+def wilson_confidence_interval(hits, n, z=1.96):
+    """指示書14番：confirmation_rateの95%信頼区間（Wilson score interval、軽量な近似法）。
+    nが0ならNone,None。"""
+    if not n:
+        return None, None
+    phat = hits / n
+    denom = 1 + z * z / n
+    center = phat + z * z / (2 * n)
+    margin = z * math.sqrt((phat * (1 - phat) + z * z / (4 * n)) / n)
+    low = (center - margin) / denom
+    high = (center + margin) / denom
+    return round(max(0.0, low), 3), round(min(1.0, high), 3)
+
+
+def classify_statistical_confidence(sample_count, confirmation_scores=None, high_variance_threshold=900):
+    """指示書13番：sample_count<10→LOW、10〜30→MEDIUM、30以上はHIGH候補としつつ
+    confirmation_scoreのばらつき（分散）が大きい場合はMEDIUMへ据え置く。
+    high_variance_threshold=900は0〜100スケールのconfirmation_scoreで標準偏差30相当
+    （経験的なしきい値、既知の制約として完了報告に明記）。"""
+    if sample_count < 10:
+        return "LOW"
+    if sample_count < 30:
+        return "MEDIUM"
+    scores = confirmation_scores or []
+    if len(scores) >= 2:
+        mean = sum(scores) / len(scores)
+        variance = sum((s - mean) ** 2 for s in scores) / len(scores)
+        if variance > high_variance_threshold:
+            return "MEDIUM"
+    return "HIGH"
+
+
+def compute_source_quality_score_v3(performance, timeliness_rate=None, consistency=None, min_sample=20):
+    """指示書15番：v1/v2は残す。v3はprediction_accuracy30% + relative_strength_accuracy20% +
+    timeliness15% + consistency15% + event_accuracy10% + statistical_confidence10%を統合する。
+    provisional判定は維持（min_sample未満）。"""
+    prediction_accuracy = performance.get("overall_confirmation_rate_predictive")
+    relative_accuracy = performance.get("overall_confirmation_rate_v2")
+    event_rate = (performance.get("event_performance") or {}).get("exact_match_rate")
+    stat_conf = performance.get("statistical_confidence")
+    stat_component = {"LOW": 30, "MEDIUM": 60, "HIGH": 90}.get(stat_conf, 50)
+    score = (
+        (prediction_accuracy if prediction_accuracy is not None else 0.5) * 100 * 0.30
+        + (relative_accuracy if relative_accuracy is not None else 0.5) * 100 * 0.20
+        + (timeliness_rate if timeliness_rate is not None else 0.5) * 100 * 0.15
+        + (consistency if consistency is not None else 0.5) * 100 * 0.15
+        + (event_rate if event_rate is not None else 0.5) * 100 * 0.10
+        + stat_component * 0.10
+    )
+    total = performance.get("total_evaluated") or 0
+    return {"score": round(score, 1), "provisional": total < min_sample, "sample_count": total}
 
 
 # ============================================================
@@ -4305,8 +4814,11 @@ def aggregate_event_performance(event_evaluations):
 
 
 def get_social_source_performance(database_url, handle=None, user_id=None, rolling_days=90, rolling_limit=500):
-    """指示書9・10・11・12番の統合。GET /api/social-sources/nicosoku/performance の実体。
-    Phase4（指示書10・11番）：event_performance・source_quality_score_v2を追加。"""
+    """指示書9・10・11・12・13・14・15番の統合。GET /api/social-sources/nicosoku/performance
+    の実体。Phase4：event_performance・source_quality_score_v2。Phase5：
+    statistical_confidence・95%信頼区間・source_quality_score_v3・useful/false_signal_rate・
+    by_market_regimeを追加。handleは引数化してあり、将来別ソースを追加してもこの関数を
+    そのまま使い回せる（指示書26番、ハードコードしすぎない設計）。"""
     handle = handle or NICOSOKU_X_USERNAME
     if investment_db is None or not database_url:
         return {"handle": handle, "total_evaluated": 0, "overall_confirmation_rate": None,
@@ -4314,7 +4826,10 @@ def get_social_source_performance(database_url, handle=None, user_id=None, rolli
                 "theme_performance": {}, "timeliness_rate": None, "quality_breakdown": {},
                 "event_performance": {"total_events": 0, "exact_match_rate": None, "avg_lead_time_minutes": None},
                 "source_quality_score": {"score": None, "provisional": True, "sample_count": 0},
-                "source_quality_score_v2": {"score": None, "provisional": True, "sample_count": 0}}
+                "source_quality_score_v2": {"score": None, "provisional": True, "sample_count": 0},
+                "source_quality_score_v3": {"score": None, "provisional": True, "sample_count": 0},
+                "statistical_confidence": "LOW", "ci95_low": None, "ci95_high": None,
+                "false_signal_rate": None, "useful_signal_rate": None, "by_market_regime": {}}
     since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=rolling_days)).isoformat()
     evaluations = investment_db.list_social_signal_evaluations_since(database_url, handle, since_iso, limit=rolling_limit)
     perf = aggregate_source_performance(evaluations, rolling_limit=rolling_limit, rolling_days=rolling_days)
@@ -4327,10 +4842,22 @@ def get_social_source_performance(database_url, handle=None, user_id=None, rolli
     perf["timeliness_rate"] = compute_timeliness_rate(evaluations_by_post)
     event_evaluations = investment_db.list_social_event_evaluations_since(database_url, handle, since_iso, limit=rolling_limit)
     perf["event_performance"] = aggregate_event_performance(event_evaluations)
+    consistency = compute_consistency(perf["by_category"])
     perf["source_quality_score"] = compute_source_quality_score(
-        perf, timeliness_rate=perf["timeliness_rate"], consistency=compute_consistency(perf["by_category"]))
+        perf, timeliness_rate=perf["timeliness_rate"], consistency=consistency)
     perf["source_quality_score_v2"] = compute_source_quality_score_v2(
-        perf, timeliness_rate=perf["timeliness_rate"], consistency=compute_consistency(perf["by_category"]))
+        perf, timeliness_rate=perf["timeliness_rate"], consistency=consistency)
+    # 指示書13・14番：統計的信頼度・95%信頼区間（Wilson interval）。
+    directional_n = sum(1 for e in evaluations
+                         if e.get("evaluation_status") == "EVALUATED" and e.get("confirmed") is not None)
+    directional_hits = sum(1 for e in evaluations
+                            if e.get("evaluation_status") == "EVALUATED" and e.get("confirmed") is True)
+    perf["statistical_confidence"] = classify_statistical_confidence(
+        perf["total_evaluated"], confirmation_scores=perf.pop("confirmation_scores", []))
+    ci_low, ci_high = wilson_confidence_interval(directional_hits, directional_n)
+    perf["ci95_low"], perf["ci95_high"] = ci_low, ci_high
+    perf["source_quality_score_v3"] = compute_source_quality_score_v3(
+        perf, timeliness_rate=perf["timeliness_rate"], consistency=consistency)
     return perf
 
 
@@ -4552,6 +5079,21 @@ def _event_title_key(title):
     return re.sub(r"\s+", "", (title or "")).lower()
 
 
+def _representative_social_signal(database_url, source_handle, post_id):
+    """Phase5（指示書21番）：投稿の代表signal（複数candidateがあればOBSERVATION以外を優先）を
+    1件返す。recent_social_market_signalsへsignal_kind等を添えるための補助。"""
+    if investment_db is None or not database_url or not post_id:
+        return None
+    try:
+        evals = investment_db.list_social_signal_evaluations_for_post(database_url, source_handle, post_id)
+        if not evals:
+            return None
+        non_observation = [e for e in evals if e.get("signal_kind") and e.get("signal_kind") != "OBSERVATION"]
+        return (non_observation or evals)[0]
+    except Exception:
+        return None
+
+
 def get_recent_social_market_signals(database_url, user_id, lookback_minutes=180, min_importance="MEDIUM", limit=8):
     """指示書9番：recent_social_market_signals。ChatGPT相談JSONへ含める、絞り込み済みの
     投稿一覧を返す。全投稿ではなく、時間・重要度・現在の監視銘柄/ポジションとの関連性で
@@ -4589,6 +5131,16 @@ def get_recent_social_market_signals(database_url, user_id, lookback_minutes=180
         relevant = bool(mentions & relevant_codes)
         if rank.get(p.get("importance"), 0) < rank.get("HIGH", 2) and not relevant:
             continue  # MEDIUM以下は関連銘柄が無ければ落とす（指示書「全投稿を送らない」）
+        # Phase5（指示書21番）：投稿の代表signal（OBSERVATIONより予測系を優先）を添える。
+        rep = _representative_social_signal(database_url, NICOSOKU_X_USERNAME, p.get("post_id"))
+        historical_performance = None
+        if perf and rep and (perf.get("total_evaluated") or 0) >= 5:
+            historical_performance = {
+                "confirmation_rate": perf.get("overall_confirmation_rate"),
+                "false_signal_rate": perf.get("false_signal_rate"),
+                "sample_count": perf.get("total_evaluated"),
+                "statistical_confidence": perf.get("statistical_confidence"),
+            }
         summary = (p.get("text") or "")[:80]
         facts = list(p.get("facts_json") or [])
         # 画像解析待ちキュー：ANALYZED済みの画像があれば、その構造化結果（market_implications/
@@ -4611,6 +5163,10 @@ def get_recent_social_market_signals(database_url, user_id, lookback_minutes=180
             "facts": facts, "author_opinion": p.get("author_opinion_json") or [],
             "relevance": sorted(mentions), "url": p.get("url"), "data_status": data_status,
             "source_context": _social_source_context(perf, post_text=p.get("text")),
+            "signal_kind": (rep or {}).get("signal_kind"), "signal_confidence": (rep or {}).get("signal_confidence"),
+            "author_certainty": (rep or {}).get("author_certainty"), "signal_group_id": (rep or {}).get("signal_group_id"),
+            "market_regime": (rep or {}).get("market_regime_json") or [],
+            "historical_performance": historical_performance,
         })
     scored.sort(key=lambda s: (-rank.get(s["importance"], 0), s["posted_at"] or ""), reverse=False)
     scored.sort(key=lambda s: -rank.get(s["importance"], 0))
@@ -9963,6 +10519,16 @@ class Handler(SimpleHTTPRequestHandler):
             perf = get_social_source_performance(DATABASE_URL, NICOSOKU_X_USERNAME, user_id=self.current_user) \
                 if (investment_db is not None and DATABASE_URL) else None
             self._send_json(perf or {"handle": NICOSOKU_X_USERNAME, "total_evaluated": 0})
+        elif self.path.startswith("/api/social-sources/nicosoku/alerts"):
+            # Phase5新規（指示書19・22番）：UI表示用の直近SOCIAL_SIGNAL_ALERT一覧。売買指示では
+            # なく、あくまで「注目に値する投稿があった」という記録の閲覧API。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            lookback_hours = int(params.get("lookback_hours", ["24"])[0])
+            since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=lookback_hours)).isoformat()
+            alerts = investment_db.list_social_signal_alerts_since(DATABASE_URL, NICOSOKU_X_USERNAME, since_iso) \
+                if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"alerts": alerts})
         elif self.path.startswith("/api/social-signals"):
             # 2026-09-10新規：recent_social_market_signals（指示書9番、ChatGPT相談JSON補助情報）。
             qs = urllib.parse.urlparse(self.path).query

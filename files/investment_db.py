@@ -1006,6 +1006,8 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_SOCIAL_SIGNAL_EVALUATIONS_SQL)
         conn.execute(_MIGRATE_SOCIAL_SIGNAL_EVALUATIONS_V2_SQL)
         conn.execute(_SCHEMA_SOCIAL_EVENT_EVALUATIONS_SQL)
+        conn.execute(_MIGRATE_SOCIAL_SIGNAL_EVALUATIONS_V3_SQL)
+        conn.execute(_SCHEMA_SOCIAL_SIGNAL_ALERTS_SQL)
         conn.commit()
 
 
@@ -4410,8 +4412,11 @@ def create_social_signal_evaluations(database_url, rows):
         return 0
     plain_cols = ["source_handle", "post_id", "signal_type", "signal_direction", "target_type", "target_key",
                   "evaluation_window", "baseline_at", "due_at", "baseline_value", "baseline_source",
-                  "baseline_status", "evaluation_status", "evaluation_quality", "notes"]
-    json_cols = ["baseline_detail_json"]
+                  "baseline_status", "evaluation_status", "evaluation_quality", "notes",
+                  # Phase5（指示書1・3・4・5・6・7番）：追加専用列。
+                  "signal_kind", "signal_confidence", "author_certainty", "observed_at_post",
+                  "signal_group_id", "group_role", "relative_return_pct", "breadth", "decision_relevance_score"]
+    json_cols = ["baseline_detail_json", "market_state_json", "market_regime_json"]
     cols = plain_cols + json_cols
     inserted = 0
     with pool.connection() as conn:
@@ -4450,12 +4455,15 @@ def list_due_social_signal_evaluations(database_url, now_iso, limit=50):
 def save_social_signal_evaluation_result(database_url, evaluation_id, result_value=None, change_value=None,
                                           confirmed=None, contradicted=False, confirmation_score=None,
                                           evaluation_status="EVALUATED", notes=None, evaluation_quality=None,
-                                          result_at=None):
+                                          result_at=None, relative_return_pct=None, breadth=None,
+                                          confirmed_v2=None, confirmation_score_v2=None):
     """1件分の評価結果を保存する（指示書3・4・7・8・18・19番）。evaluation_status="NO_DATA"の
     場合はresult_value等はNULLのまま記録し、的中率の分母から除外する（指示書18番、集計側
     （server.py）がevaluation_status=='EVALUATED'のみを対象にすることで担保する）。
     evaluation_qualityはbaseline取得時点の品質とresult取得時点の品質を合わせた最終値
-    （呼び出し側で決定済みのものを渡す、指示書4番）。"""
+    （呼び出し側で決定済みのものを渡す、指示書4番）。Phase5（指示書10・11・12番）：
+    relative_return_pct/breadth/confirmed_v2/confirmation_score_v2を追加——v1列
+    （confirmed/confirmation_score等）はそのまま残す（指示書12番「既存v1は残す」）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
@@ -4464,10 +4472,13 @@ def save_social_signal_evaluation_result(database_url, evaluation_id, result_val
             cur.execute(
                 "UPDATE social_signal_evaluations SET result_value=%s, change_value=%s, confirmed=%s, "
                 "contradicted=%s, confirmation_score=%s, evaluation_status=%s, notes=%s, "
-                "evaluation_quality=COALESCE(%s, evaluation_quality), result_at=%s, evaluated_at=now() "
+                "evaluation_quality=COALESCE(%s, evaluation_quality), result_at=%s, "
+                "relative_return_pct=%s, breadth=%s, confirmed_v2=%s, confirmation_score_v2=%s, "
+                "evaluated_at=now() "
                 "WHERE id=%s RETURNING *",
                 [result_value, change_value, confirmed, contradicted, confirmation_score, evaluation_status,
-                 notes, evaluation_quality, result_at, evaluation_id])
+                 notes, evaluation_quality, result_at, relative_return_pct, breadth, confirmed_v2,
+                 confirmation_score_v2, evaluation_id])
             row = cur.fetchone()
         conn.commit()
     return _row_to_json(row) if row else None
@@ -4617,6 +4628,159 @@ def list_social_event_evaluations_since(database_url, source_handle, since_iso, 
                 [source_handle, since_iso, limit])
             rows = cur.fetchall()
     return [_row_to_json(r) for r in rows]
+
+
+# ============================================================
+# にこそくX連携 Phase5（2026-09-11新規）：実運用校正・シグナル品質改善。既存Phase3/4の列は
+# 一切変更しない（追加専用のALTER、指示書28番「Phase4互換性」）。集計・分類ロジック自体は
+# server.py側（純粋関数、テスト容易性のため）に置く方針を継続する。
+# ============================================================
+_MIGRATE_SOCIAL_SIGNAL_EVALUATIONS_V3_SQL = """
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS signal_kind TEXT;
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS signal_confidence NUMERIC;
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS author_certainty TEXT;
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS observed_at_post BOOLEAN;
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS signal_group_id TEXT;
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS group_role TEXT;
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS market_state_json JSONB;
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS market_regime_json JSONB;
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS relative_return_pct NUMERIC;
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS breadth NUMERIC;
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS confirmed_v2 BOOLEAN;
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS confirmation_score_v2 NUMERIC;
+ALTER TABLE social_signal_evaluations ADD COLUMN IF NOT EXISTS decision_relevance_score NUMERIC;
+CREATE INDEX IF NOT EXISTS idx_social_eval_group ON social_signal_evaluations(source_handle, signal_group_id);
+"""
+
+# 指示書19・20番：SOCIAL_SIGNAL_ALERT生成ログ（cooldown判定・diagnostics集計用）。売買指示では
+# なく、あくまで「注目に値する投稿があった」という記録。
+_SCHEMA_SOCIAL_SIGNAL_ALERTS_SQL = """
+CREATE TABLE IF NOT EXISTS social_signal_alerts (
+    id                  SERIAL PRIMARY KEY,
+    source_handle       TEXT NOT NULL,
+    post_id             TEXT NOT NULL,
+    signal_group_id     TEXT,
+    alert_type          TEXT NOT NULL DEFAULT 'SOCIAL_SIGNAL_ALERT',
+    payload_json        JSONB,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_social_alerts_group ON social_signal_alerts(source_handle, signal_group_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_social_alerts_handle ON social_signal_alerts(source_handle, created_at DESC);
+"""
+
+
+def list_recent_signal_group_candidates(database_url, source_handle, target_type, target_key, signal_kind, since_iso):
+    """指示書5・6番：signal deduplication/follow-up判定用。同一(target_type,target_key,
+    signal_kind)についてsince_iso以降に生成された評価行を新しい順で返す（signal_group_id・
+    group_role・signal_directionの解決に使う。1件のpostが複数windowを持つため
+    DISTINCT ON (post_id)で投稿単位にまとめる）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT DISTINCT ON (post_id) * FROM social_signal_evaluations "
+                "WHERE source_handle=%s AND target_type=%s AND target_key=%s AND signal_kind=%s "
+                "AND created_at >= %s ORDER BY post_id, created_at DESC",
+                [source_handle, target_type, target_key, signal_kind, since_iso])
+            rows = cur.fetchall()
+    rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    return [_row_to_json(r) for r in rows]
+
+
+def create_social_signal_alert(database_url, row):
+    """指示書19番：SOCIAL_SIGNAL_ALERTを1件記録する。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "INSERT INTO social_signal_alerts (source_handle, post_id, signal_group_id, alert_type, payload_json) "
+                "VALUES (%s,%s,%s,%s,%s::jsonb) RETURNING *",
+                [row.get("source_handle"), row.get("post_id"), row.get("signal_group_id"),
+                 row.get("alert_type") or "SOCIAL_SIGNAL_ALERT",
+                 json.dumps(row.get("payload") or {}, ensure_ascii=False)])
+            saved = cur.fetchone()
+        conn.commit()
+    return _row_to_json(saved)
+
+
+def list_recent_alerts_for_group(database_url, source_handle, signal_group_id, since_iso):
+    """指示書20番：alert spam防止（cooldown判定）。指定グループへ直近since_iso以降に
+    出したalertがあるかどうかを調べるために使う。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM social_signal_alerts WHERE source_handle=%s AND signal_group_id=%s "
+                "AND created_at >= %s ORDER BY created_at DESC",
+                [source_handle, signal_group_id, since_iso])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def list_social_signal_alerts_since(database_url, source_handle, since_iso, limit=50):
+    """指示書22番：UI表示・診断用の直近alert一覧。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM social_signal_alerts WHERE source_handle=%s AND created_at >= %s "
+                "ORDER BY created_at DESC LIMIT %s",
+                [source_handle, since_iso, limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def count_social_signal_alerts_since(database_url, source_handle, since_iso):
+    """指示書24番：diagnostics向け（alerts_generated_today）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM social_signal_alerts WHERE source_handle=%s AND created_at >= %s",
+                        [source_handle, since_iso])
+            return cur.fetchone()[0]
+
+
+def count_high_confidence_signals_since(database_url, source_handle, since_iso, min_confidence=0.75):
+    """指示書24番：diagnostics向け（high_confidence_signals_today）。post単位で数える
+    （同一postの複数window行を二重に数えない）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(DISTINCT post_id) FROM social_signal_evaluations "
+                "WHERE source_handle=%s AND created_at >= %s AND signal_confidence >= %s",
+                [source_handle, since_iso, min_confidence])
+            return cur.fetchone()[0]
+
+
+def count_duplicate_signal_groups_since(database_url, source_handle, since_iso):
+    """指示書24番：diagnostics向け（duplicate_signal_groups）。同一signal_group_idが複数
+    post_idにまたがっている（＝CONFIRMATION等でグルーピングされた）グループ数。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM ("
+                "  SELECT signal_group_id FROM social_signal_evaluations "
+                "  WHERE source_handle=%s AND created_at >= %s AND signal_group_id IS NOT NULL "
+                "  GROUP BY signal_group_id HAVING COUNT(DISTINCT post_id) > 1"
+                ") sub",
+                [source_handle, since_iso])
+            return cur.fetchone()[0]
 
 
 # ---- investment_profile（投資プロフィール。2026-09-02新規） ----
