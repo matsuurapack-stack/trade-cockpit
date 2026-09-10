@@ -167,6 +167,109 @@ ADR_TICKER_MAP = {
 }  # 動作確認済みティッカーのみ（NTT・三菱商事はYahoo Finance上でADR銘柄が見つからず対象外）
 
 
+# ============================================================
+# 外部データ取得レート制限耐性（2026-09-10新規、Market Intelligence Timeline専用）。
+# 既存の/api/quotes（メインダッシュボード、get_index_quotes）・登録銘柄の通常リアルタイム
+# 取得等には一切影響を与えない設計にする——ここで追加するキャッシュ/リトライは、
+# _fetch_index_snapshot・fetch_adr_snapshot・get_stock_quotes(cache_ttl指定時のみ)・
+# _intraday_regime(cache_ttl指定時のみ)経由でMorningMarketCheck・Market Intelligence
+# Timelineの呼び出しにのみ適用される（既存呼び出し元はcache_ttl省略＝0のままなので
+# 挙動が変わらない）。「レポートが出ない」より「一部データ不足と明示してレポートを出す」を
+# 優先する（ユーザー指示）。
+# ============================================================
+CACHE_TTL = {  # 用途別キャッシュTTL（秒）。指示書2番の目安レンジの中央値付近を採用。
+    "index": 45,        # 指数/為替/先物/KOSPI：30〜60秒
+    "stock5m": 90,       # 個別株5分足（VWAP・構造判定）：60〜120秒
+    "stock_quote": 90,   # 個別株現在値（get_stock_quotes）：60〜120秒
+    "news": 420,         # ニュース/カタリスト：5〜10分（中央値7分）
+    "sector": 90,        # セクター集計：60〜120秒（indices由来のため実質indexキャッシュに従属）
+}
+_CACHE_LOCK = threading.Lock()
+_CACHE_STORE = {}  # key -> {"value": ..., "ts": epoch秒}
+
+
+def _cache_get(key):
+    with _CACHE_LOCK:
+        return _CACHE_STORE.get(key)
+
+
+def _cache_set(key, value):
+    with _CACHE_LOCK:
+        _CACHE_STORE[key] = {"value": value, "ts": time.time()}
+
+
+def _cache_fresh(entry, ttl):
+    return entry is not None and (time.time() - entry["ts"]) <= ttl
+
+
+def _is_rate_limit_error(e):
+    """yfinance/curl_cffi等が投げる429系エラーをメッセージから判定する（構造化された
+    例外型が無いため文字列判定、指示書3・4番）。"""
+    msg = str(e)
+    return ("Too Many Requests" in msg or "429" in msg or "Rate limited" in msg
+            or "rate limit" in msg.lower())
+
+
+def _retry_on_rate_limit(fetch_fn, max_retries=2, backoff_base=1.0):
+    """429/レート制限系のエラーだけexponential backoffで最大max_retries回まで再試行する
+    （指示書4番：無限リトライ禁止、レート制限以外は即座に諦める）。Retry-Afterヘッダー相当の
+    情報はyfinance例外に構造化されて含まれないため、指数バックオフ（1秒→2秒→4秒、上限5秒）
+    で代用する。戻り値：(値, None)成功時 / (None, 例外)全滅時。"""
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return fetch_fn(), None
+        except Exception as e:
+            last_exc = e
+            if _is_rate_limit_error(e) and attempt < max_retries:
+                time.sleep(min(backoff_base * (2 ** attempt), 5))
+                continue
+            break
+    return None, last_exc
+
+
+def _cached_two_closes(cache_key, sym, ttl):
+    """_two_closes()をキャッシュ+リトライ+stale fallbackでラップする（指数/為替/先物/KOSPI/
+    ADR共通、指示書1・2・3・4番）。戻り値：(value_dict_or_None, cache_status)。
+    cache_status："ok"（新規取得 or TTL内キャッシュ）|"stale_cache"（期限切れキャッシュを代用）|
+    "rate_limited"（レート制限で取得不能・キャッシュも無し）|"failed"（レート制限以外の失敗）。"""
+    entry = _cache_get(cache_key)
+    if _cache_fresh(entry, ttl):
+        return entry["value"], "ok"
+    value, exc = _retry_on_rate_limit(lambda: _two_closes(sym))
+    if value is not None:
+        _cache_set(cache_key, value)
+        return value, "ok"
+    if exc is None:
+        # 取得自体は成功したが対象データが無い（上場廃止・薄商い等）＝レート制限とは無関係の
+        # 通常のデータ欠如。data_qualityのmissing/rate_limited扱いにはしない（"status"側の
+        # failed/staleで既に表現されるため、cache_statusとしては"ok"のまま返す）。
+        return None, "ok"
+    if entry is not None:
+        print(f"  [RateLimitGuard] {cache_key}：取得失敗のため期限切れキャッシュ（stale）を使用")
+        return entry["value"], "stale_cache"
+    if _is_rate_limit_error(exc):
+        return None, "rate_limited"
+    return None, "failed"
+
+
+def _quality_summary(source_statuses):
+    """data_health_json内に追加する指示書7番のdata_quality要約。source_statusesは
+    {source_name: cache_status}（cache_statusは"ok"|"stale_cache"|"rate_limited"|"failed"|
+    それ以外のstatus文字列）。stale_cacheのみならPARTIAL、rate_limited/failed（＝代替データも
+    無く完全欠損）が1つでもあればDEGRADED、全て健全ならFULL。"""
+    missing = [s for s, st in source_statuses.items() if st in ("failed", "missing", "no_data")]
+    rate_limited = [s for s, st in source_statuses.items() if st == "rate_limited"]
+    stale = [s for s, st in source_statuses.items() if st == "stale_cache"]
+    if missing or rate_limited:
+        quality = "DEGRADED"
+    elif stale:
+        quality = "PARTIAL"
+    else:
+        quality = "FULL"
+    return {"quality": quality, "missing_sources": missing, "stale_sources": stale, "rate_limited_sources": rate_limited}
+
+
 def _two_closes(sym):
     """最新終値(t)・1営業日前(p)・直近終値の推移(spark, 10-1章のミニスパークライン用)を返す"""
     h = yf.Ticker(sym).history(period="1mo")
@@ -233,59 +336,120 @@ def _download_chunk(symbols):
         return None
 
 
-def get_stock_quotes(watchlist):
+def _parse_stock_quote_frame(h):
+    """yf.downloadが返す1銘柄分のDataFrameから、get_stock_quotesの戻り値1件分を作る
+    （キャッシュ有無に関わらず共通で使うパース処理を切り出しただけ、ロジックは変更なし）。
+    データが無ければNoneを返す。"""
+    closes = h["Close"].dropna()
+    if len(closes) == 0:
+        return None
+    t = round(float(closes.iloc[-1]), 2)
+    p = round(float(closes.iloc[-2]), 2) if len(closes) >= 2 else None
+    highs = h["High"].dropna()
+    lows = h["Low"].dropna()
+    opens = h["Open"].dropna()  # 2026-09-07新規（ポジション・リアルタイム売却判断）：当日始値。
+    volumes = h["Volume"].dropna()
+    turnover = float(t) * float(volumes.iloc[-1]) if len(volumes) and t is not None else None
+    spark = [round(float(x), 2) for x in closes.tolist()[-20:]]  # 10-1章：カードUIのミニスパークライン用
+    return {
+        "t": t, "p": p,
+        "open": round(float(opens.iloc[-1]), 2) if len(opens) else None,
+        "high": round(float(highs.iloc[-1]), 2) if len(highs) else None,
+        "low": round(float(lows.iloc[-1]), 2) if len(lows) else None,
+        "volume": float(volumes.iloc[-1]) if len(volumes) else None,
+        "turnover": turnover,
+        "spark": spark,
+    }
+
+
+def get_stock_quotes(watchlist, cache_ttl=0, status_out=None):
     """登録銘柄それぞれの現在値(t)・前日終値(p)・当日高値(high)・当日安値(low)・売買代金(turnover)を返す。
     売買代金は 終値×出来高 で概算（セクターの並び替え用。4章の時価総額ソートから変更）。
-    価格履歴と同じ history() の出来高列から計算するため、追加のAPI呼び出しは不要。"""
+    価格履歴と同じ history() の出来高列から計算するため、追加のAPI呼び出しは不要。
+    2026-09-10新規（レート制限耐性）：cache_ttl>0を指定した呼び出し元（Market Intelligence
+    Timeline・Morning Check）だけ、銘柄単位のキャッシュ+バッチ全滅時のリトライ+stale
+    fallbackが有効になる。既存呼び出し元（メインダッシュボードの/api/stock-quotes等）は
+    cache_ttl省略＝0のままなので、常に無条件で最新値を取りに行く既存動作を完全維持する
+    （指示書「既存機能を壊さない」）。status_outを渡すとcode→cache_status（"ok"|
+    "stale_cache"|"rate_limited"|"failed"）を書き込む（呼び出し側のdata_quality集計用）。"""
     out = {}
     if yf is None:
         return out
     items = [(w.get("code", ""), _yf_symbol(w)) for w in watchlist if w.get("code")]
     if not items:
         return out
-    symbols = [sym for _, sym in items]
 
-    frames = {}
-    for i in range(0, len(symbols), STOCK_QUOTES_CHUNK):
-        chunk = symbols[i:i + STOCK_QUOTES_CHUNK]
-        data = _download_chunk(chunk)
-        if data is None:
-            continue
-        for sym in chunk:
+    to_fetch = items
+    if cache_ttl > 0:
+        to_fetch = []
+        for code, sym in items:
+            entry = _cache_get(f"stockquote:{sym}")
+            if _cache_fresh(entry, cache_ttl):
+                out[code] = entry["value"]
+                if status_out is not None:
+                    status_out[code] = "ok"
+            else:
+                to_fetch.append((code, sym))
+
+    if to_fetch:
+        symbols = [sym for _, sym in to_fetch]
+
+        def _download_all():
+            frames = {}
+            for i in range(0, len(symbols), STOCK_QUOTES_CHUNK):
+                chunk = symbols[i:i + STOCK_QUOTES_CHUNK]
+                data = _download_chunk(chunk)
+                if data is None:
+                    raise RuntimeError("stock quotes chunk download failed")
+                for sym in chunk:
+                    try:
+                        sub = data[sym]
+                        if sub is not None and not sub.empty:
+                            frames[sym] = sub
+                    except Exception:
+                        pass  # このシンボルだけ結果に含まれなかった（上場廃止・シンボル誤り等）
+            return frames
+
+        if cache_ttl > 0:
+            frames, exc = _retry_on_rate_limit(_download_all)
+            frames = frames or {}
+        else:
+            # 既存動作を完全維持：リトライせず1回だけ（失敗時は握りつぶして空扱い、従来通り）
             try:
-                sub = data[sym]
-                if sub is not None and not sub.empty:
-                    frames[sym] = sub
-            except Exception:
-                pass  # このシンボルだけ結果に含まれなかった（上場廃止・シンボル誤り等）
+                frames = _download_all()
+            except Exception as e:
+                print("  一括取得失敗（リトライ無効経路）", e)
+                frames = {}
+            exc = None
 
-    for code, sym in items:
-        h = frames.get(sym)
-        if h is None:
-            continue
-        try:
-            closes = h["Close"].dropna()
-            if len(closes) == 0:
-                continue
-            t = round(float(closes.iloc[-1]), 2)
-            p = round(float(closes.iloc[-2]), 2) if len(closes) >= 2 else None
-            highs = h["High"].dropna()
-            lows = h["Low"].dropna()
-            opens = h["Open"].dropna()  # 2026-09-07新規（ポジション・リアルタイム売却判断）：当日始値。
-            volumes = h["Volume"].dropna()
-            turnover = float(t) * float(volumes.iloc[-1]) if len(volumes) and t is not None else None
-            spark = [round(float(x), 2) for x in closes.tolist()[-20:]]  # 10-1章：カードUIのミニスパークライン用
-            out[code] = {
-                "t": t, "p": p,
-                "open": round(float(opens.iloc[-1]), 2) if len(opens) else None,
-                "high": round(float(highs.iloc[-1]), 2) if len(highs) else None,
-                "low": round(float(lows.iloc[-1]), 2) if len(lows) else None,
-                "volume": float(volumes.iloc[-1]) if len(volumes) else None,
-                "turnover": turnover,
-                "spark": spark,
-            }
-        except Exception as e:
-            print("  個別銘柄失敗", code, sym, e)
+        for code, sym in to_fetch:
+            h = frames.get(sym)
+            quote = None
+            if h is not None:
+                try:
+                    quote = _parse_stock_quote_frame(h)
+                except Exception as e:
+                    print("  個別銘柄失敗", code, sym, e)
+            if quote is not None:
+                out[code] = quote
+                if cache_ttl > 0:
+                    _cache_set(f"stockquote:{sym}", quote)
+                if status_out is not None:
+                    status_out[code] = "ok"
+            elif cache_ttl > 0 and exc is not None:
+                # バッチ取得自体が例外で全滅した場合のみキャッシュへフォールバックする。
+                # 個別銘柄がデータ無し（上場廃止等、バッチ自体は成功）の場合はレート制限とは
+                # 無関係の通常のデータ欠如のため、ここには来ない（statusは既存通りokのまま扱う）。
+                stale_entry = _cache_get(f"stockquote:{sym}")
+                if stale_entry is not None:
+                    out[code] = stale_entry["value"]
+                    print(f"  [RateLimitGuard] stockquote:{sym}：取得失敗のため期限切れキャッシュ（stale）を使用")
+                    if status_out is not None:
+                        status_out[code] = "stale_cache"
+                elif status_out is not None:
+                    status_out[code] = "rate_limited" if _is_rate_limit_error(exc) else "failed"
+            elif status_out is not None:
+                status_out[code] = "ok"  # バッチは成功したがこの銘柄だけデータ無し（従来通り欠損扱い、quality影響なし）
 
     _overlay_tachibana_prices(out, watchlist)
     return out
@@ -1513,9 +1677,12 @@ MORNING_CHECK_FINAL_SNAPSHOT = "T0850"
 
 # ---- market_data_service：取得のみ、分析ロジックを含まない ----
 
-def fetch_adr_snapshot(codes):
+def fetch_adr_snapshot(codes, status_out=None):
     """登録銘柄コードのうちADR_TICKER_MAPに存在するものだけADR変動率を取得する（指示書3G番）。
-    存在しない銘柄はスキップするだけで失敗として扱わない。"""
+    存在しない銘柄はスキップするだけで失敗として扱わない。2026-09-10更新（レート制限耐性）：
+    キャッシュ+リトライ+stale fallbackを適用（Morning Check・Market Intelligence Timeline
+    共通、指示書1・2・3・4番）。status_outを渡すとcode→cache_statusを書き込む（呼び出し側の
+    data_quality集計用、省略時は何もしない）。"""
     out = {}
     if yf is None:
         return out
@@ -1523,13 +1690,13 @@ def fetch_adr_snapshot(codes):
         adr_ticker = ADR_TICKER_MAP.get(code)
         if not adr_ticker:
             continue
-        try:
-            r = _two_closes(adr_ticker)
-            if r and r.get("t") is not None and r.get("p"):
-                pct = (r["t"] - r["p"]) / r["p"] * 100
-                out[code] = {"adrTicker": adr_ticker, "adrPct": round(pct, 2), "adrClose": r["t"], "status": "ok"}
-        except Exception as e:
-            print("  ADR取得失敗", code, adr_ticker, e)
+        r, cache_status = _cached_two_closes(f"adr:{code}", adr_ticker, CACHE_TTL["index"])
+        if status_out is not None:
+            status_out[code] = cache_status
+        if r and r.get("t") is not None and r.get("p"):
+            pct = (r["t"] - r["p"]) / r["p"] * 100
+            out[code] = {"adrTicker": adr_ticker, "adrPct": round(pct, 2), "adrClose": r["t"], "status": "ok",
+                         "cacheStatus": cache_status}
     return out
 
 
@@ -1547,28 +1714,26 @@ def fetch_fear_greed():
 def _fetch_index_snapshot(keys):
     """INDEX辞書のうち指定キーだけを取得し、timestamp・status付きで返す（指示書15番：
     データ品質の追跡）。既存get_index_quotes()を全キー分呼ぶと無駄なので、必要な分だけ
-    個別に_two_closes()する。"""
+    個別に_two_closes()する。2026-09-10更新（レート制限耐性）：キャッシュ+リトライ+
+    stale fallbackを適用（指示書1・2・3・4番）。既存の"status"（ok/stale/failed、値の中身に
+    基づく判定）は変えず、新たに"cache_status"（ok/stale_cache/rate_limited/failed、取得経路
+    自体の健全性）を追加する——両者は意味が異なるため混同しないこと。"""
     out = {}
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
     for key in keys:
         sym = INDEX.get(key)
         if not sym:
             continue
-        try:
-            r = _two_closes(sym)
-            if r and r.get("t") is not None:
-                pct = ((r["t"] - r["p"]) / r["p"] * 100) if r.get("p") else None
-                # nikkei_vi_etn等、前日値が取れない（薄商い）場合は値はあってもchange不明＝stale扱い
-                status = "ok" if r.get("p") is not None else "stale"
-                out[key] = {"value": r["t"], "prevClose": r.get("p"), "changePct": round(pct, 2) if pct is not None else None,
-                            "timestamp": now_iso, "status": status, "symbol": sym}
-            else:
-                out[key] = {"value": None, "prevClose": None, "changePct": None, "timestamp": now_iso,
-                            "status": "failed", "symbol": sym}
-        except Exception as e:
-            print("  指数取得失敗", key, sym, e)
+        r, cache_status = _cached_two_closes(f"index:{key}", sym, CACHE_TTL["index"])
+        if r and r.get("t") is not None:
+            pct = ((r["t"] - r["p"]) / r["p"] * 100) if r.get("p") else None
+            # nikkei_vi_etn等、前日値が取れない（薄商い）場合は値はあってもchange不明＝stale扱い
+            status = "ok" if r.get("p") is not None else "stale"
+            out[key] = {"value": r["t"], "prevClose": r.get("p"), "changePct": round(pct, 2) if pct is not None else None,
+                        "timestamp": now_iso, "status": status, "symbol": sym, "cache_status": cache_status}
+        else:
             out[key] = {"value": None, "prevClose": None, "changePct": None, "timestamp": now_iso,
-                        "status": "failed", "symbol": sym}
+                        "status": "failed", "symbol": sym, "cache_status": cache_status}
     return out
 
 
@@ -1739,19 +1904,32 @@ def evaluate_position_risk_warnings(database_url, user_id, stock_quotes):
     return warnings
 
 
-def generate_morning_watchlist_focus(database_url, user_id, market_data):
+def generate_morning_watchlist_focus(database_url, user_id, market_data, cache_ttl=0, status_out=None):
     """登録銘柄の朝の注目TOP5・追わない銘柄・地合い耐性銘柄を生成する（指示書4・8・10番）。
     重い日足履歴取得（analyze_stock等）は使わず、get_stock_quotes（既存の軽量な当日値取得）＋
     ADR＋既存のカタリスト/イベント関連度判定（investment_db.relevant_catalysts_for・
-    upcoming_event_signals、判断エンジンから再利用）だけでスコアリングする。"""
+    upcoming_event_signals、判断エンジンから再利用）だけでスコアリングする。
+    2026-09-10新規（レート制限耐性）：cache_ttl>0を指定した呼び出し元（Market Intelligence
+    Timeline）だけget_stock_quotes/fetch_adr_snapshotのキャッシュが有効になる。既存呼び出し元
+    （Morning Check）はcache_ttl省略＝0のままなので既存動作を完全維持する（指示書「既存機能を
+    壊さない」）。status_outを渡すと{"watchlist_quotes":cache_status,"adr":cache_status}を
+    書き込む（呼び出し側のdata_quality集計用）。"""
     if investment_db is None or not database_url:
         return {"top5": [], "avoid": [], "resilience": []}
     watchlist = investment_db.list_watchlist(database_url, user_id, market="JP")
     if not watchlist:
         return {"top5": [], "avoid": [], "resilience": []}
-    quotes = get_stock_quotes(watchlist)
+    quote_status = {}
+    quotes = get_stock_quotes(watchlist, cache_ttl=cache_ttl, status_out=quote_status if cache_ttl > 0 else None)
     nikkei_chg = market_data.get("indices", {}).get("nikkei", {}).get("changePct")
-    adr = fetch_adr_snapshot([w["code"] for w in watchlist])
+    adr_status = {}
+    adr = fetch_adr_snapshot([w["code"] for w in watchlist], status_out=adr_status if cache_ttl > 0 else None)
+    if status_out is not None and cache_ttl > 0:
+        # 個別銘柄単位のcache_statusのうち最も悪いもの（rate_limited>failed>stale_cache>ok）を代表値にする
+        _rank = {"rate_limited": 3, "failed": 2, "stale_cache": 1, "ok": 0}
+        worst = lambda d: max(d.values(), key=lambda v: _rank.get(v, 0)) if d else "ok"
+        status_out["watchlist_quotes"] = worst(quote_status)
+        status_out["adr"] = worst(adr_status)
 
     # セクター平均（対セクター計算用、既存run_momentum_stage1のsector_avgと同じ考え方の軽量版）
     sector_sum, sector_count = {}, {}
@@ -2055,37 +2233,74 @@ def _fetch_intraday(tk, interval):
 # 位置と、直近半分・前半分の高値/安値比較（切り上げ/切り下げ）だけで判定する単純なルールベース
 # （AI不使用、他のAUTO系エンジンと同じ方針）。データ不足・取得失敗時はNoneを返す（推測値は
 # 作らない）。
-def _intraday_regime(symbol, interval="5m"):
+def _intraday_regime_uncached(symbol, interval="5m"):
     if yf is None:
         return None
-    try:
-        tk = yf.Ticker(symbol)
-        bars = _fetch_intraday(tk, interval)
-        if not bars or len(bars["closes"]) < 6:
-            return None
-        closes, highs, lows, volumes = bars["closes"], bars["highs"], bars["lows"], bars["volumes"]
-        total_vol = sum(volumes)
-        vwap = (sum(c * v for c, v in zip(closes, volumes)) / total_vol) if total_vol > 0 else (sum(closes) / len(closes))
-        current = closes[-1]
-        above_vwap = current >= vwap
-        mid = len(highs) // 2
-        first_half_high = max(highs[:mid]) if mid > 0 else highs[0]
-        second_half_high = max(highs[mid:])
-        first_half_low = min(lows[:mid]) if mid > 0 else lows[0]
-        second_half_low = min(lows[mid:])
-        higher_highs = second_half_high > first_half_high
-        lower_lows = second_half_low < first_half_low
-        if above_vwap and higher_highs and not lower_lows:
-            regime, pattern = "RISK_ON", "higher_highs"
-        elif (not above_vwap) and lower_lows:
-            regime, pattern = "RISK_OFF", "lower_lows"
-        else:
-            regime, pattern = "MIXED", "mixed"
-        return {"current": round(current, 2), "vwap": round(vwap, 2), "aboveVwap": above_vwap,
-                "regime": regime, "pattern": pattern}
-    except Exception as e:
-        print("  セクターレジーム判定失敗", symbol, e)
+    tk = yf.Ticker(symbol)
+    bars = _fetch_intraday(tk, interval)
+    if not bars or len(bars["closes"]) < 6:
         return None
+    closes, highs, lows, volumes = bars["closes"], bars["highs"], bars["lows"], bars["volumes"]
+    total_vol = sum(volumes)
+    vwap = (sum(c * v for c, v in zip(closes, volumes)) / total_vol) if total_vol > 0 else (sum(closes) / len(closes))
+    current = closes[-1]
+    above_vwap = current >= vwap
+    mid = len(highs) // 2
+    first_half_high = max(highs[:mid]) if mid > 0 else highs[0]
+    second_half_high = max(highs[mid:])
+    first_half_low = min(lows[:mid]) if mid > 0 else lows[0]
+    second_half_low = min(lows[mid:])
+    higher_highs = second_half_high > first_half_high
+    lower_lows = second_half_low < first_half_low
+    if above_vwap and higher_highs and not lower_lows:
+        regime, pattern = "RISK_ON", "higher_highs"
+    elif (not above_vwap) and lower_lows:
+        regime, pattern = "RISK_OFF", "lower_lows"
+    else:
+        regime, pattern = "MIXED", "mixed"
+    return {"current": round(current, 2), "vwap": round(vwap, 2), "aboveVwap": above_vwap,
+            "regime": regime, "pattern": pattern}
+
+
+def _intraday_regime_cached(symbol, interval, ttl):
+    """_intraday_regime_uncached()をキャッシュ+リトライ+stale fallbackでラップする
+    （Market Intelligence Timelineの個別銘柄5分足判定専用、指示書1・2・3・4番）。
+    戻り値：(value_or_None, cache_status)。cache_status："ok"|"stale_cache"|
+    "rate_limited"|"failed"。"""
+    cache_key = f"intraday5m:{symbol}:{interval}"
+    entry = _cache_get(cache_key)
+    if _cache_fresh(entry, ttl):
+        return entry["value"], "ok"
+    value, exc = _retry_on_rate_limit(lambda: _intraday_regime_uncached(symbol, interval))
+    if value is not None:
+        _cache_set(cache_key, value)
+        return value, "ok"
+    if exc is None:
+        # 取得自体は成功したが分足データが無い（データ不足）＝レート制限とは無関係
+        return None, "ok"
+    if entry is not None:
+        print(f"  [RateLimitGuard] {cache_key}：取得失敗のため期限切れキャッシュ（stale）を使用")
+        return entry["value"], "stale_cache"
+    if exc is not None:
+        print("  5分足レジーム判定失敗（キャッシュ経路）", symbol, exc)
+        if _is_rate_limit_error(exc):
+            return None, "rate_limited"
+    return None, "failed"
+
+
+def _intraday_regime(symbol, interval="5m", cache_ttl=0):
+    """2026-09-10更新（レート制限耐性）：cache_ttl>0を指定した呼び出し元（Market Intelligence
+    Timelineの個別銘柄5分足判定）だけキャッシュ+リトライ+stale fallbackが有効になる。
+    既存呼び出し元（/api/sector-regime等）はcache_ttl省略＝0のままなので、常に無条件で
+    最新値を取りに行く既存動作を完全維持する。"""
+    if cache_ttl <= 0:
+        try:
+            return _intraday_regime_uncached(symbol, interval)
+        except Exception as e:
+            print("  セクターレジーム判定失敗", symbol, e)
+            return None
+    value, _status = _intraday_regime_cached(symbol, interval, cache_ttl)
+    return value
 
 
 # セクター代表ETF・関連するAUTO_RS拡張（テーマ相対強弱）で使う一覧。半導体のみ先行実装
@@ -2212,19 +2427,31 @@ def _previous_intraday_reference(database_url, user_id, trade_date, report_type,
 def _intraday_stock_snapshot(watchlist_item):
     """TOP5銘柄1件分の「今」の状態（現在値・当日騰落率・VWAP位置・5分足構造）を取得する。
     既存の_intraday_regime()（セクターETFの当日レジーム判定で既に使っている5分足取得＋VWAP計算）
-    をそのまま個別銘柄に転用するだけで、新しい分足取得経路は作らない（指示書30番）。"""
+    をそのまま個別銘柄に転用するだけで、新しい分足取得経路は作らない（指示書30番）。
+    2026-09-10更新（レート制限耐性）：現在値はget_stock_quotes(cache_ttl指定)、VWAP/5分足構造は
+    _intraday_regime_cached()経由でキャッシュ+リトライ+stale fallbackを適用する（指示書1・2・
+    3・4番）。cacheStatusも返す（呼び出し側のdata_quality集計用）。"""
     sym = _yf_symbol(watchlist_item)
-    quote = get_stock_quotes([watchlist_item]).get(watchlist_item.get("code"))
-    regime = _intraday_regime(sym)
+    quote_status = {}
+    quote = get_stock_quotes([watchlist_item], cache_ttl=CACHE_TTL["stock_quote"], status_out=quote_status).get(
+        watchlist_item.get("code"))
+    regime, regime_status = _intraday_regime_cached(sym, "5m", CACHE_TTL["stock5m"])
     current_change_pct = None
     if quote and quote.get("t") is not None and quote.get("p"):
         current_change_pct = round((quote["t"] - quote["p"]) / quote["p"] * 100, 2)
+    cache_status = quote_status.get(watchlist_item.get("code"), "failed") if quote else regime_status
+    # 両方stale/rate_limitedならその中でより深刻な方（missing相当）を優先して報告する
+    if regime_status in ("rate_limited", "failed") and cache_status == "ok":
+        cache_status = regime_status
+    elif regime_status == "stale_cache" and cache_status == "ok":
+        cache_status = "stale_cache"
     return {
         "current": quote.get("t") if quote else None,
         "currentChangePct": current_change_pct,
         "aboveVwap": regime["aboveVwap"] if regime else None,
         "fiveMinStructure": regime["pattern"] if regime else None,
         "dataStatus": "ok" if (quote and regime) else ("partial" if (quote or regime) else "failed"),
+        "cacheStatus": cache_status,
     }
 
 
@@ -2275,16 +2502,41 @@ def generate_intraday_report(database_url, user_id, report_type, trade_date=None
     previous_report, previous_kind = _previous_intraday_reference(database_url, user_id, trade_date, report_type, morning_check)
     data_health["previous_report"] = previous_kind or "missing"
 
-    index_keys = ["nikkei", "topix_etf", "growth250_etf", "nikkei_vi_etn", "usdjpy", "nasdaq", "sox", "us10y"]
+    # 2026-09-10更新（レート制限耐性）：kospiも共通キャッシュ対象に加える（指示書1番）。
+    # 実際の取得はすべて_fetch_index_snapshot→_cached_two_closes経由でキャッシュ+リトライ+
+    # stale fallbackが効くため、09:30/11:30/13:00/15:30が短時間に連続実行されても
+    # Yahoo Financeへの重複リクエストにならない。
+    index_keys = ["nikkei", "topix_etf", "growth250_etf", "nikkei_vi_etn", "usdjpy", "nasdaq", "sox", "us10y", "kospi"]
     try:
         indices = _fetch_index_snapshot(index_keys)
     except Exception as e:
         print("  IntradayReport: 指数取得で例外", e)
         indices = {}
+    source_statuses = {}  # data_quality集計用（指示書7番）。key=ソース名、value=cache_status
     for k in index_keys:
         data_health[k] = indices.get(k, {}).get("status", "failed")
+        source_statuses[k] = indices.get(k, {}).get("cache_status", "failed")
 
-    nikkei_chg = indices.get("nikkei", {}).get("changePct")
+    # 指示書6番：指数取得が完全に失敗した（値もキャッシュも無い）場合、前回レポート/MorningCheckに
+    # 保存済みの値へ最終フォールバックする（DBを「前回snapshot」として再利用）。あくまで最終手段
+    # であり、フォールバックした値はsource_statusesで"stale_cache"として明示する。
+    # 直前のintraday reportはpayload列（例：nikkei_change_pct）にスカラーで持つが、MorningCheckは
+    # 列を持たずindices_json内にネストされているため、両方の形を吸収する。
+    def _fallback_scalar(index_key, index_field, payload_field):
+        v = indices.get(index_key, {}).get(index_field)
+        if v is not None:
+            return v
+        if previous_report is not None and previous_kind != "morning_check" and previous_report.get(payload_field) is not None:
+            source_statuses[index_key] = "stale_cache"
+            return previous_report[payload_field]
+        if morning_check is not None:
+            mc_val = (morning_check.get("indices_json") or {}).get(index_key, {}).get(index_field)
+            if mc_val is not None:
+                source_statuses[index_key] = "stale_cache"
+                return mc_val
+        return None
+
+    nikkei_chg = _fallback_scalar("nikkei", "changePct", "nikkei_change_pct")
     n225_trend = _index_trend(INDEX["nikkei"])
     nasdaq_trend = _index_trend(INDEX["nasdaq"])
     sox_trend = _index_trend(INDEX["sox"])
@@ -2324,7 +2576,10 @@ def generate_intraday_report(database_url, user_id, report_type, trade_date=None
         except Exception as e:
             print("  IntradayReport: 朝TOP5答え合わせで例外", item.get("code"), e)
             snap = {"current": None, "currentChangePct": None, "aboveVwap": None,
-                    "fiveMinStructure": None, "dataStatus": "failed"}
+                    "fiveMinStructure": None, "dataStatus": "failed", "cacheStatus": "failed"}
+        _rank = {"rate_limited": 3, "failed": 2, "stale_cache": 1, "ok": 0}
+        if _rank.get(snap.get("cacheStatus", "ok"), 0) > _rank.get(source_statuses.get("watchlist_top5", "ok"), 0):
+            source_statuses["watchlist_top5"] = snap.get("cacheStatus", "ok")
         result = evaluate_morning_thesis(item, snap, nikkei_chg)
         entry = {
             "code": item.get("code"), "name": item.get("name"), "morning_rank": item.get("rank"),
@@ -2360,13 +2615,19 @@ def generate_intraday_report(database_url, user_id, report_type, trade_date=None
         data_health["thesis_evaluation"] = "no_morning_check"
 
     # ---- 地合い耐性ランキング（既存ロジック再利用、指示書7・30番） ----
+    # 2026-09-10更新（レート制限耐性）：cache_ttlを指定してget_stock_quotes/fetch_adr_snapshotの
+    # キャッシュを有効化する（Morning Checkはcache_ttl省略のまま呼ぶので影響を受けない）。
+    focus_status = {}
     try:
-        focus = generate_morning_watchlist_focus(database_url, user_id, {"indices": indices})
+        focus = generate_morning_watchlist_focus(database_url, user_id, {"indices": indices},
+                                                   cache_ttl=CACHE_TTL["stock_quote"], status_out=focus_status)
         data_health["resilience"] = "ok"
+        source_statuses.update(focus_status)
     except Exception as e:
         print("  IntradayReport: 地合い耐性ランキングで例外", e)
         focus = {"top5": [], "avoid": [], "resilience": []}
         data_health["resilience"] = "failed"
+        source_statuses["watchlist_quotes"] = "failed"
 
     # ---- 13:00後場30分のみ：資金移動の簡易分類（指示書2番）。根拠が弱い場合は推測せずUNKNOWN
     # （REVERSAL/SHORT_COVER/WEAKENINGは信用残高等のデータが無いと判定できないためPhase2-C以降）。
@@ -2392,6 +2653,8 @@ def generate_intraday_report(database_url, user_id, report_type, trade_date=None
             afternoon_flow.append({"code": code, "name": r.get("name"), "classification": classification, "reason": reason})
 
     # ---- 保有ポジションのリスク（既存position_risk_rulesをそのまま使用、指示書10番） ----
+    # 重要：EXIT RULE(-8%)の判定ロジック自体（evaluate_position_risk_warnings）は一切変更しない
+    # （損切りルール是正の意図を壊さないため）。変更するのは現在値の取得経路のキャッシュ利用のみ。
     positions_all = []  # try節で例外が起きても後段のルール違反検出（15:30のみ）がNameErrorにならないよう初期化
     try:
         watchlist_all = investment_db.list_watchlist(database_url, user_id, market="JP") if investment_db else []
@@ -2399,13 +2662,19 @@ def generate_intraday_report(database_url, user_id, report_type, trade_date=None
         quote_targets = {w["code"]: w for w in watchlist_all}
         for p in positions_all:
             quote_targets.setdefault(p.get("code"), {"code": p.get("code"), "market": "JP"})
-        stock_quotes = get_stock_quotes(list(quote_targets.values())) if quote_targets else {}
+        position_quote_status = {}
+        stock_quotes = get_stock_quotes(list(quote_targets.values()), cache_ttl=CACHE_TTL["stock_quote"],
+                                          status_out=position_quote_status) if quote_targets else {}
         position_alerts = evaluate_position_risk_warnings(database_url, user_id, stock_quotes)
         data_health["positions"] = "ok"
+        _rank = {"rate_limited": 3, "failed": 2, "stale_cache": 1, "ok": 0}
+        if position_quote_status:
+            source_statuses["position_quotes"] = max(position_quote_status.values(), key=lambda v: _rank.get(v, 0))
     except Exception as e:
         print("  IntradayReport: ポジションリスク判定で例外", e)
         position_alerts = []
         data_health["positions"] = "failed"
+        source_statuses["position_quotes"] = "failed"
 
     # ---- イベント・ニュース（既存判断エンジンをそのまま再利用、指示書5・17番） ----
     try:
@@ -2416,14 +2685,23 @@ def generate_intraday_report(database_url, user_id, report_type, trade_date=None
     try:
         # 指示書5番：厳密な「前回レポート生成時刻以降」の差分は現状のcatalyst_date（日付粒度）
         # では断定できないため、直近のLIVE/CURRENT鮮度のものだけに絞り、断定表現は避ける
-        # （possible_driver程度に留める、指示書5番）。
-        news_changes_raw = investment_db.relevant_catalysts_for(database_url, user_id, limit=8) if investment_db else []
+        # （possible_driver程度に留める、指示書5番）。ニュースはDB問い合わせ（Yahoo Financeの
+        # レート制限対象ではない）だが、指示書2番のTTL方針に合わせ短時間の重複問い合わせだけ
+        # キャッシュで避ける（5〜10分、DB負荷軽減目的）。
+        news_cache_key = f"news:{user_id}"
+        news_entry = _cache_get(news_cache_key)
+        if _cache_fresh(news_entry, CACHE_TTL["news"]):
+            news_changes_raw = news_entry["value"]
+        else:
+            news_changes_raw = investment_db.relevant_catalysts_for(database_url, user_id, limit=8) if investment_db else []
+            _cache_set(news_cache_key, news_changes_raw)
         news_changes = [{**c, "possible_driver": True} if c.get("freshness") in ("LIVE", "CURRENT") else c for c in news_changes_raw]
         data_health["news"] = "ok"
     except Exception as e:
         print("  IntradayReport: ニュース差分取得で例外", e)
         news_changes = []
         data_health["news"] = "failed"
+        source_statuses["news"] = "failed"
 
     # ---- 15:30大引けのみ：ルール違反検出（既存_check_known_risk_ignoredを再利用、指示書3番） ----
     rule_violations = []
@@ -2465,6 +2743,16 @@ def generate_intraday_report(database_url, user_id, report_type, trade_date=None
         if any(a["tier"] in ("WARNING", "EXIT") for a in position_alerts):
             overnight_notes.append("損切りライン接近/到達中の保有銘柄あり。持ち越し判断は個別に再確認")
 
+    # 指数の他のスカラーもnikkei_chgと同じフォールバック経路を通す（指示書6番）
+    topix_chg = _fallback_scalar("topix_etf", "changePct", "topix_change_pct")
+    growth250_chg = _fallback_scalar("growth250_etf", "changePct", "growth250_change_pct")
+    nikkei_vi_val = _fallback_scalar("nikkei_vi_etn", "value", "nikkei_vi")
+    usdjpy_val = _fallback_scalar("usdjpy", "value", "usdjpy")
+
+    # ---- data_quality要約（指示書7番）。UI表示・ChatGPT共有どちらにも使う ----
+    quality_summary = _quality_summary(source_statuses)
+    data_health["quality_summary"] = quality_summary
+
     strategy, _ = generate_morning_strategy(market_regime, volatility_regime, risk["score"], event_info.get("signals", []))
     _report_label = {"OPENING_30M": "寄り30分", "MORNING_CLOSE": "前場終了", "AFTERNOON_30M": "後場30分", "MARKET_CLOSE": "大引け"}[report_type]
     if morning_top5:
@@ -2478,16 +2766,18 @@ def generate_intraday_report(database_url, user_id, report_type, trade_date=None
     if report_type == "MARKET_CLOSE" and morning_top5:
         success_n = sum(1 for s in thesis_stocks if s.get("final_result") == "SUCCESS")
         summary_text += f"　本日の朝TOP5最終結果：SUCCESS {success_n}/{len(thesis_stocks)}件。"
+    if quality_summary["quality"] != "FULL":
+        summary_text += f"　⚠ データ品質：{quality_summary['quality']}（一部データはキャッシュ/取得制限の影響を受けています）"
 
     payload = {
         "scheduled_time": INTRADAY_REPORT_SNAPSHOT_TIMES[report_type],
         "morning_check_id": morning_check.get("id") if morning_check else None,
         "market_regime": market_regime, "volatility_regime": volatility_regime, "market_summary": summary_text,
         "nikkei_change_pct": nikkei_chg,
-        "topix_change_pct": indices.get("topix_etf", {}).get("changePct"),
-        "growth250_change_pct": indices.get("growth250_etf", {}).get("changePct"),
-        "nikkei_vi": indices.get("nikkei_vi_etn", {}).get("value"),
-        "usdjpy": indices.get("usdjpy", {}).get("value"),
+        "topix_change_pct": topix_chg,
+        "growth250_change_pct": growth250_chg,
+        "nikkei_vi": nikkei_vi_val,
+        "usdjpy": usdjpy_val,
         "sector_snapshot_json": {"strong": strong_sectors, "weak": weak_sectors,
                                   "newly_strong": newly_strong_sectors, "newly_weak": newly_weak_sectors},
         "strong_sectors_json": strong_sectors, "weak_sectors_json": weak_sectors,

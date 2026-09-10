@@ -7342,6 +7342,15 @@ function IntradayReportCard({report,reportType,isClose}){
         <button className="action-btn" style={{fontSize:11,marginLeft:"auto"}} onClick={copyConsult}>🤖 {meta.short}を相談</button>
         <span style={{fontSize:11,color:"var(--inkFaint)",width:"100%"}}>
           最終更新：{new Date(report.generated_at).toLocaleString("ja-JP")}
+          {/* 2026-09-10新規（レート制限耐性）：場中の視認性を邪魔しないよう、通常時（FULL）は
+              控えめな小表示のみ、劣化時だけ目立たせる（指示書8番） */}
+          {(()=>{const q=report.data_health_json?.quality_summary;if(!q)return null;
+            const degraded=q.quality!=="FULL";
+            return <span style={{marginLeft:8,color:degraded?"var(--accent)":"var(--inkFaint)",fontWeight:degraded?700:400}}>
+              　{degraded?"⚠ ":""}データ品質：{q.quality}
+              {degraded&&(q.stale_sources?.length>0)&&`（${q.stale_sources.length}件キャッシュ利用中）`}
+              {degraded&&(q.rate_limited_sources?.length>0)&&`（${q.rate_limited_sources.length}件レート制限中）`}
+            </span>;})()}
         </span>
       </div>
       {report.market_summary && <div style={{marginTop:8,fontSize:12.5,lineHeight:1.6}}>{report.market_summary}</div>}
