@@ -878,6 +878,72 @@ ALTER TABLE stock_theses ADD COLUMN IF NOT EXISTS avoid_condition TEXT;
 ALTER TABLE stock_theses ADD COLUMN IF NOT EXISTS morning_price NUMERIC;
 """
 
+# 2026-09-10新規（にこそく@nicosokufx X投稿 自動取得・市場分析連携、指示書3・20番）：
+# market_sourcesは将来の複数アカウント拡張用の設定テーブル（今回はnicosokufx 1件のみ
+# seedする）。social_market_postsは取得したX投稿本体＋分類＋事実/見解分離＋画像解析
+# （手動注釈、下記参照）の保存先。既存news_catalysts/news_feedback等とは完全に分離した
+# 専用テーブル（指示書3番「既存ニュースDBとは完全に混ぜない」）。
+# 画像の構造化解析（ヒートマップ読み取り等）はOCR/画像認識APIを新規導入せず（CLAUDE.md
+# 「有料AI APIは使わない」方針を踏襲）、image_analysis_jsonへユーザーがChatGPT等で解析した
+# 結果をJSON貼り付けで保存する設計とした（既存のSmart Import・ChatGPT連携と同じ
+# 「解析はユーザー側で行い、アプリは構造化データの保存/表示に徹する」パターン）。
+# postはユーザー非依存の公開市場情報として扱う（既存の大半のテーブルと異なりuser_id列を
+# 持たない——にこそく氏の投稿は全ユーザー共通の同一データのため、per-userに複製しない）。
+_SCHEMA_SOCIAL_MARKET_SQL = """
+CREATE TABLE IF NOT EXISTS market_sources (
+    id                 SERIAL PRIMARY KEY,
+    platform           TEXT NOT NULL DEFAULT 'X',
+    handle             TEXT NOT NULL,
+    display_name       TEXT,
+    enabled            BOOLEAN NOT NULL DEFAULT true,
+    priority           TEXT NOT NULL DEFAULT 'HIGH',
+    categories_json    JSONB,
+    last_seen_post_id  TEXT,
+    last_success_at    TIMESTAMPTZ,
+    last_error         TEXT,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (platform, handle)
+);
+
+CREATE TABLE IF NOT EXISTS social_market_posts (
+    id                     SERIAL PRIMARY KEY,
+    source_type            TEXT NOT NULL DEFAULT 'X_MARKET_SOURCE',
+    source_name            TEXT NOT NULL,
+    source_handle          TEXT NOT NULL,
+    post_id                TEXT NOT NULL,
+    posted_at              TIMESTAMPTZ,
+    text                   TEXT,
+    url                    TEXT,
+    media_json             JSONB,
+    quoted_post_json       JSONB,
+    public_metrics_json    JSONB,
+    categories_json        JSONB,   -- ["MARKET_HEATMAP","SECTOR_ROTATION",...]
+    importance             TEXT,    -- LOW|MEDIUM|HIGH|CRITICAL
+    facts_json             JSONB,
+    author_opinion_json    JSONB,
+    system_inference_json  JSONB,
+    direct_mentions_json   JSONB,   -- 本文に直接登場した登録銘柄コード
+    theme_related_json     JSONB,   -- テーマ経由の間接関連銘柄コード
+    image_analysis_json    JSONB,   -- ユーザーが後から貼り付ける構造化画像解析結果
+    verification_status    TEXT NOT NULL DEFAULT 'UNVERIFIED',  -- CONFIRMED|PARTIALLY_CONFIRMED|UNVERIFIED|CONTRADICTED
+    underlying_event_id    INTEGER, -- market_events.idへの紐付け（重複防止用）
+    fetched_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (source_handle, post_id)
+);
+CREATE INDEX IF NOT EXISTS idx_social_posts_posted_at ON social_market_posts(posted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_social_posts_importance ON social_market_posts(importance);
+"""
+
+# 場中レポート（market_intelligence_reports）から直近のにこそく投稿を参照できるように、
+# 追加専用の列を1つ増やすだけ（既存列・既存レポート生成ロジックには一切影響しない、
+# 指示書11・21番「既存機能を壊さない」）。
+_MIGRATE_MARKET_INTEL_SOCIAL_SQL = """
+ALTER TABLE market_intelligence_reports ADD COLUMN IF NOT EXISTS social_signals_json JSONB;
+"""
+
 
 def init_schema(database_url):
     """テーブルを（無ければ）作成し、マルチユーザー化・ChatGPT連携の移行SQLも実行する。
@@ -898,6 +964,8 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_MARKET_INTELLIGENCE_SQL)
         conn.execute(_SCHEMA_STOCK_THESES_SQL)
         conn.execute(_MIGRATE_STOCK_THESES_MORNING_COLUMNS_SQL)
+        conn.execute(_SCHEMA_SOCIAL_MARKET_SQL)
+        conn.execute(_MIGRATE_MARKET_INTEL_SOCIAL_SQL)
         conn.commit()
 
 
@@ -3729,6 +3797,7 @@ _MARKET_INTEL_JSON_COLS = [
     "resilience_stocks_json", "momentum_stocks_json", "missed_opportunities_json",
     "morning_thesis_evaluation_json", "risk_alerts_json", "position_alerts_json",
     "news_changes_json", "event_risk_json", "strategy_update_json", "data_health_json",
+    "social_signals_json",
 ]
 _MARKET_INTEL_SCALAR_COLS = [
     "scheduled_time", "morning_check_id", "market_regime", "volatility_regime", "market_summary",
@@ -3940,6 +4009,162 @@ def get_stock_thesis_stats(database_url, user_id, days=30):
     success_equivalent = success_n * 1.0 + partial_n * 0.5 + fail_n * 0.0
     win_rate = round(success_equivalent / decided * 100, 1) if decided else None
     return {"totalFinalized": total, "byResult": by_result, "winRate": win_rate, "sinceDate": since}
+
+
+# ---- market_sources / social_market_posts（にこそく@nicosokufx X投稿連携。2026-09-10新規） ----
+
+def ensure_market_source(database_url, platform, handle, display_name=None, priority="HIGH", categories=None):
+    """(platform, handle)の設定行を作る（無ければ）。既存があれば何もしない・既存の
+    enabled/priority設定は上書きしない（ユーザーが後で無効化した場合に自動復活させない
+    ため）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "INSERT INTO market_sources (platform, handle, display_name, priority, categories_json) "
+                "VALUES (%s,%s,%s,%s,%s::jsonb) "
+                "ON CONFLICT (platform, handle) DO NOTHING RETURNING *",
+                [platform, handle, display_name, priority, json.dumps(categories or [], ensure_ascii=False)])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else get_market_source(database_url, handle, platform)
+
+
+def get_market_source(database_url, handle, platform="X"):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM market_sources WHERE platform=%s AND handle=%s", [platform, handle])
+            row = cur.fetchone()
+    return _row_to_json(row) if row else None
+
+
+def update_market_source_status(database_url, handle, platform="X", last_seen_post_id=None,
+                                  mark_success=False, last_error=None, resolved_user_id_note=None):
+    """ポーリング1サイクル分の結果を反映する。last_seen_post_id指定時のみ更新（Noneのままなら
+    既存値を保持）。mark_success=Trueでlast_success_at=now()・last_error=NULLにする
+    （成功したのにエラーが残ったままにならないように）。last_error指定時はエラー内容を記録
+    （X_SOURCE_STATUS=DEGRADED表示に使う）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    sets, params = [], []
+    if last_seen_post_id is not None:
+        sets.append("last_seen_post_id=%s")
+        params.append(last_seen_post_id)
+    if mark_success:
+        sets.append("last_success_at=now()")
+        sets.append("last_error=NULL")
+    if last_error is not None:
+        sets.append("last_error=%s")
+        params.append(last_error)
+    if not sets:
+        return get_market_source(database_url, handle, platform)
+    sets.append("updated_at=now()")
+    params += [platform, handle]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"UPDATE market_sources SET {', '.join(sets)} WHERE platform=%s AND handle=%s RETURNING *",
+                params)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+_SOCIAL_POST_JSON_COLS = ["media_json", "quoted_post_json", "public_metrics_json", "categories_json",
+                           "facts_json", "author_opinion_json", "system_inference_json",
+                           "direct_mentions_json", "theme_related_json", "image_analysis_json"]
+
+
+def insert_social_post_if_new(database_url, post):
+    """postは{source_type,source_name,source_handle,post_id,posted_at,text,url,media,
+    quoted_post,public_metrics,categories,importance,facts,author_opinion,system_inference,
+    direct_mentions,theme_related,verification_status}を含むdict。(source_handle,post_id)の
+    UNIQUE制約により、既に取り込み済みの投稿は何もしない（指示書2・17番「同一投稿を何度も
+    処理しない」）。戻り値：新規なら作成行(dict)、既存ならNone。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    key_to_col = {"media": "media_json", "quoted_post": "quoted_post_json",
+                  "public_metrics": "public_metrics_json", "categories": "categories_json",
+                  "facts": "facts_json", "author_opinion": "author_opinion_json",
+                  "system_inference": "system_inference_json", "direct_mentions": "direct_mentions_json",
+                  "theme_related": "theme_related_json"}
+    cols = ["source_type", "source_name", "source_handle", "post_id", "posted_at", "text", "url",
+            "media_json", "quoted_post_json", "public_metrics_json", "categories_json", "importance",
+            "facts_json", "author_opinion_json", "system_inference_json", "direct_mentions_json",
+            "theme_related_json", "verification_status"]
+    values = []
+    for c in cols:
+        src_key = next((k for k, v in key_to_col.items() if v == c), c)
+        v = post.get(src_key)
+        values.append(json.dumps(v, ensure_ascii=False) if c in _SOCIAL_POST_JSON_COLS else v)
+    placeholders = ", ".join(["%s::jsonb" if c in _SOCIAL_POST_JSON_COLS else "%s" for c in cols])
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO social_market_posts ({', '.join(cols)}) VALUES ({placeholders}) "
+                f"ON CONFLICT (source_handle, post_id) DO NOTHING RETURNING *",
+                values)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def save_social_post_image_analysis(database_url, source_handle, post_id, image_analysis):
+    """指示書4番：画像の構造化解析結果（ユーザーがChatGPT等で解析した結果のJSON貼り付け）を
+    既存投稿へ追記する。post自体は再取得しない（analysisだけの更新）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE social_market_posts SET image_analysis_json=%s::jsonb, updated_at=now() "
+                "WHERE source_handle=%s AND post_id=%s RETURNING *",
+                [json.dumps(image_analysis or [], ensure_ascii=False), source_handle, post_id])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_recent_social_posts(database_url, source_handle=None, since_iso=None, min_importance=None, limit=50):
+    """UI表示・にこそくカード向け。新しい順。min_importanceはLOW未満を除外する簡易フィルタ
+    ではなく、指定レベル以上のみ返す（LOW<MEDIUM<HIGH<CRITICAL）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+    where, params = [], []
+    if source_handle:
+        where.append("source_handle=%s")
+        params.append(source_handle)
+    if since_iso:
+        where.append("posted_at >= %s")
+        params.append(since_iso)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    params.append(limit if not min_importance else max(limit * 3, 100))  # min_importanceはPython側で絞るため多めに取る
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT * FROM social_market_posts {clause} ORDER BY posted_at DESC NULLS LAST LIMIT %s",
+                params)
+            rows = [_row_to_json(r) for r in cur.fetchall()]
+    if min_importance:
+        min_rank = rank.get(min_importance, 0)
+        rows = [r for r in rows if rank.get(r.get("importance"), -1) >= min_rank]
+    return rows[:limit]
+
+
+def list_social_signals(database_url, since_iso, min_importance="MEDIUM", limit=20):
+    """recent_social_market_signals生成用（指示書9番）。since_iso以降・min_importance以上の
+    投稿を重要度→新しさの順で返す。"""
+    return list_recent_social_posts(database_url, since_iso=since_iso, min_importance=min_importance, limit=limit)
 
 
 # ---- investment_profile（投資プロフィール。2026-09-02新規） ----

@@ -103,6 +103,11 @@ EDINET_API_KEY = _SECRETS.get("edinet_api_key", "")
 # 同じDBに接続することでデータを一本化する。接続先はローカルはsecrets.jsonの"database_url"、
 # Renderは環境変数DATABASE_URL（Renderの規約に合わせた名前）のどちらでも読めるようにする。
 DATABASE_URL = os.environ.get("DATABASE_URL") or _SECRETS.get("database_url", "")
+# 2026-09-10新規（にこそく@nicosokufx X投稿 自動取得・市場分析連携）：X公式API v2のBearer
+# Token。未設定でもアプリ全体は正常動作し、この機能だけがX_SOURCE_STATUS=DEGRADEDになる
+# （指示書19番）。スクレイピング・ログイン回避等は実装しない（指示書1番、公式APIのみ使用）。
+X_API_BEARER_TOKEN = os.environ.get("X_API_BEARER_TOKEN") or _SECRETS.get("x_api_bearer_token", "")
+NICOSOKU_X_USERNAME = os.environ.get("NICOSOKU_X_USERNAME") or _SECRETS.get("nicosoku_x_username", "nicosokufx")
 # 2026-09-02 ユーザー要望「マルチユーザー化」：従来の単一共有パスワード(APP_PASSWORD)から、
 # ユーザー名ごとの個別パスワードに切り替える。{"ユーザー名": "パスワード"} の形。ローカルは
 # secrets.jsonの"users"、Renderは環境変数APP_USERS（JSON文字列）のどちらでも読める。
@@ -2179,7 +2184,8 @@ def generate_morning_market_check(database_url, user_id, snapshot_time):
         "resilience_json": focus["resilience"], "risk_warnings_json": risk_warnings[:3],
         "event_risk_json": event_info["events"][:5], "position_risk_json": position_risk,
         "strategy_json": strategy, "strategy_text": strategy_text,
-        "raw_payload_json": {"feargreed": fear_greed, "generatedAt": now.isoformat(), "missing": vol_missing + trend_missing},
+        "raw_payload_json": {"feargreed": fear_greed, "generatedAt": now.isoformat(), "missing": vol_missing + trend_missing,
+                              "external_market_commentary": _nicosoku_morning_commentary_safe(database_url, user_id)},
     }
     saved = investment_db.save_morning_check(database_url, user_id, check_date, snapshot_time, payload) if investment_db else None
     # 朝TOP5をstock_thesesへ永続化（source='MORNING'固定、以後書き換えない成績評価用スナップ
@@ -2854,6 +2860,476 @@ def _reevaluate_active_stock_theses(database_url, user_id, trade_date, report_ty
                 print("  Thesis最終確定失敗", thesis.get("code"), e)
 
 
+# ============================================================
+# にこそく（@nicosokufx）X投稿 自動取得・市場分析連携。2026-09-10新規。
+# 第一選択かつ唯一の取得方式はX公式API v2（指示書1番「スクレイピング・ログイン回避・
+# CAPTCHA回避は実装しない」）。X_API_BEARER_TOKEN未設定でもアプリ全体は正常動作し、この
+# 機能だけがX_SOURCE_STATUS=DEGRADEDになる（指示書19番）。投稿は全ユーザー共通の公開市場
+# 情報として扱い、他の大半のテーブルと異なりuser_id列を持たない（social_market_posts）
+# ——ただし関連銘柄（direct_mentions/theme_related）の判定は監視銘柄/ポジションに依存する
+# ため、ユーザー単位で計算する関数も用意する。画像そのものの構造化解析（ヒートマップの
+# 読み取り等）はOCR/画像認識APIを新規導入せず（CLAUDE.md「有料AI APIは使わない」方針を
+# 踏襲）、image_analysis_jsonへユーザーがChatGPT等で解析した結果をJSON貼り付けで保存する
+# 設計とした（既存のSmart Import・ChatGPT連携と同じ「解析はユーザー側、アプリは保存/表示に
+# 徹する」パターン）。既存の朝一チェック・INTRADAY_REPORT・イベント・カタリスト・AUTO_RS等の
+# 判定ロジックは一切変更しない（指示書12・21番）——追加専用フィールドとしてのみ統合する。
+# ============================================================
+
+X_API_BASE = "https://api.twitter.com/2"
+X_SOCIAL_SOURCE_PLATFORM = "X"
+
+# 指示書5番：投稿の自動分類（複数カテゴリ付与可）。AI不使用のキーワードベース分類
+# （他のSmart Import/AUTO系エンジンと同じ方針）。
+X_POST_CATEGORY_KEYWORDS = {
+    "MARKET_HEATMAP":    ["ヒートマップ"],
+    "INDEX_TECHNICAL":   ["日経平均", "日経先物", "TOPIX", "グロース250", "225先物"],
+    "STOCK_TECHNICAL":   ["日足", "移動平均", "出来高", "ローソク足", "チャート"],
+    "ECONOMIC_EVENT":    ["CPI", "PPI", "雇用統計", "小売売上高", "経済指標", "GDP"],
+    "CENTRAL_BANK":      ["FOMC", "FRB", "日銀", "ECB", "利上げ", "利下げ", "金融政策"],
+    "FX":                ["ドル円", "為替", "円安", "円高", "ユーロ円"],
+    "US_MARKET":         ["NYダウ", "ダウ平均", "ナスダック", "S&P", "米株", "米国株"],
+    "INTEREST_RATE":     ["金利", "国債利回り", "10年債"],
+    "SEMICONDUCTOR":     ["半導体", "SOX", "NVIDIA", "エヌビディア"],
+    "COMMODITY":         ["原油", "金相場", "商品市況", "WTI"],
+    "SHIPPING":          ["海運", "バルチック", "運賃指数"],
+    "SECTOR_ROTATION":   ["セクターローテーション", "資金循環", "物色"],
+    "MARKET_SENTIMENT":  ["センチメント", "投資家心理", "リスクオン", "リスクオフ"],
+    "MARKET_OVERVIEW":   ["相場全体", "本日の相場", "地合い", "全体観"],
+}
+X_POST_SQ_KEYWORDS = ["SQ", "メジャーSQ"]
+X_POST_HIGH_KEYWORDS = (["CPI", "PPI", "雇用統計", "FOMC", "FRB", "日銀", "ECB", "為替急変",
+                          "米金利急変", "SOX", "NVIDIA", "エヌビディア", "セクターローテーション"]
+                         + X_POST_SQ_KEYWORDS)
+X_POST_CRITICAL_KEYWORDS = ["急落", "急騰", "暴落", "暴騰", "サーキットブレーカー", "ストップ安", "ストップ高"]
+# 見解（author_opinion）を示す表現。事実（facts）との混同を防ぐための最重要ロジック（指示書7番）。
+X_POST_OPINION_MARKERS = ["だろう", "と思う", "と見ている", "べきではない", "べき", "山場",
+                           "かもしれない", "警戒したい", "期待したい", "注意したい", "懸念",
+                           "強気", "弱気", "個人的に", "想定", "様子見でいい", "お勧め", "推奨"]
+X_POST_FACT_TIME_RE = re.compile(r"\d{1,2}[:：]\d{2}|\d{1,2}/\d{1,2}|\d{4}年\d{1,2}月\d{1,2}日")
+# 指示書15番：直接銘柄名が無くてもテーマ経由で間接関連付けする対象キーワード。ここでは
+# キーワード検出だけ行い、実際の銘柄マッピングは監視銘柄の既存theme欄（2026-09-08
+# SECTOR_RELATIVE_STRENGTH機能で使われているもの）と突き合わせる——独自の銘柄マップを
+# ハードコードで作らない（不正確な固定マップの方が実害が大きいため、既存の登録データだけを
+# 根拠にする）。
+X_POST_THEME_KEYWORDS = ["AI", "半導体", "GPU", "データセンター", "電線", "銅", "SaaS",
+                          "海運", "銀行", "保険", "自動運転", "原油"]
+# 指示書8番：投稿からの将来イベント自動検出。日付（M/D）＋イベント種別キーワードの組み合わせ
+# だけを拾う軽量な正規表現ベース検出（既存Smart Import EVENTカテゴリの判定とは別の専用ロジック
+# ——にこそく投稿はイベントカレンダー画像＋短い日付列挙が多く、Smart Importの自然文パターンと
+# 形が異なるため）。
+X_POST_EVENT_DATE_RE = re.compile(r"(\d{1,2})/(\d{1,2})\s*([^\d/\n、。]{0,12})")
+X_POST_EVENT_TYPE_KEYWORDS = {
+    "ECONOMIC": ["CPI", "PPI", "雇用統計", "小売売上高", "GDP", "経済指標"],
+    "CENTRAL_BANK": ["FOMC", "日銀会合", "日銀", "ECB", "金融政策"],
+    "INDEX_REBALANCE": ["メジャーSQ", "SQ"],
+}
+
+
+def _classify_social_post_categories(text):
+    """指示書5番：キーワード一致で複数カテゴリを付与する（1つも一致しなければOTHER）。"""
+    if not text:
+        return ["OTHER"]
+    cats = [cat for cat, kws in X_POST_CATEGORY_KEYWORDS.items() if any(kw in text for kw in kws)]
+    return cats or ["OTHER"]
+
+
+def _classify_social_post_importance(text, categories, direct_mentions=None, position_codes=None):
+    """指示書6番：LOW/MEDIUM/HIGH/CRITICALを判定する。CRITICALは「市場を即時に動かしている・
+    現在保有銘柄へ直接影響・当日のトレード判断を変更する可能性が高い」場合だけに限定
+    （指示書の明示的な限定条件）——緊急性を示すキーワードがあり、かつ直接言及銘柄が実際の
+    保有銘柄と重なる場合のみCRITICALとする（無関係な急騰急落報告を無条件にCRITICAL化しない）。"""
+    if not text:
+        return "LOW"
+    direct_mentions = direct_mentions or []
+    position_codes = position_codes or set()
+    has_critical_kw = any(kw in text for kw in X_POST_CRITICAL_KEYWORDS)
+    affects_position = bool(set(direct_mentions) & set(position_codes))
+    if has_critical_kw and affects_position:
+        return "CRITICAL"
+    if any(kw in text for kw in X_POST_HIGH_KEYWORDS) or has_critical_kw:
+        return "HIGH"
+    if categories and categories != ["OTHER"]:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _split_facts_opinions(text):
+    """指示書7番：本文を「事実」と「投稿者の見解」に分離する（system_inferenceはPhase1では
+    生成しない——実際の売買判断ロジックと結び付けない段階のため、AIによる断定的な推論を
+    捏造しない。指示書12番「投稿だけで売買判断しない」の精神に合わせた保守的な実装）。
+    文分割は句点・改行の単純な区切り。見解マーカーが1つでも含まれる文はauthor_opinionへ、
+    それ以外はfactsへ（事実の断定はしすぎず、単純な列挙文もfactsとして保持する）。"""
+    if not text:
+        return [], []
+    sentences = re.split(r"[。\n]", text)
+    facts, opinions = [], []
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        if any(m in s for m in X_POST_OPINION_MARKERS):
+            opinions.append(s)
+        else:
+            facts.append(s)
+    return facts, opinions
+
+
+def _detect_social_post_mentions(database_url, user_id, text):
+    """指示書15番：登録銘柄の直接言及（銘柄名が本文に文字列として含まれるか）と、テーマ
+    キーワード経由の間接関連（監視銘柄の既存theme欄に同じキーワードが含まれる銘柄）を分離
+    して返す。独自の固定銘柄マップは使わない（既存の登録データのみを根拠にする）。
+    戻り値：{"direct_mentions": [code,...], "theme_related": [code,...]}"""
+    result = {"direct_mentions": [], "theme_related": []}
+    if investment_db is None or not database_url or not text:
+        return result
+    try:
+        watchlist = investment_db.list_watchlist(database_url, user_id, market="JP")
+    except Exception:
+        return result
+    direct, theme = set(), set()
+    matched_themes = [kw for kw in X_POST_THEME_KEYWORDS if kw in text]
+    for w in watchlist:
+        name = (w.get("name") or "").strip()
+        if name and name in text:
+            direct.add(w.get("code"))
+        if matched_themes:
+            item_theme = (w.get("theme") or "")
+            if any(kw in item_theme for kw in matched_themes):
+                theme.add(w.get("code"))
+    theme -= direct  # 直接言及と間接関連は排他（指示書15番「直接言及と間接関連は区別する」）
+    result["direct_mentions"] = sorted(direct)
+    result["theme_related"] = sorted(theme)
+    return result
+
+
+def _detect_events_from_social_text(text, posted_at_date):
+    """指示書8番：投稿本文から将来イベント候補を検出する（M/D＋イベント種別キーワード）。
+    確定登録はせずdraft（source='nicosoku_x', verification_status='UNVERIFIED'）として返す。
+    呼び出し側でinvestment_db.import_market_eventsへ渡す前に重複チェックを行う。"""
+    if not text:
+        return []
+    drafts = []
+    for m in X_POST_EVENT_DATE_RE.finditer(text):
+        month, day, tail = int(m.group(1)), int(m.group(2)), m.group(3)
+        event_type = next((et for et, kws in X_POST_EVENT_TYPE_KEYWORDS.items() if any(kw in tail for kw in kws)), None)
+        title = tail.strip()
+        if not event_type or not title:
+            continue
+        year = posted_at_date.year
+        try:
+            event_date = datetime.date(year, month, day)
+        except ValueError:
+            continue
+        if event_date < posted_at_date - datetime.timedelta(days=3):
+            event_date = datetime.date(year + 1, month, day)  # 年またぎ（12月の投稿で1月のイベント等）
+        drafts.append({
+            "event_date": event_date.isoformat(), "title": f"{title}（にこそく投稿より検出）",
+            "event_type": event_type, "importance": "MEDIUM",
+            "source": "nicosoku_x", "source_type": "X_POST", "verification_status": "UNVERIFIED",
+            "raw_payload": {"confidence": "LOW", "detected_text": tail.strip()},
+        })
+    return drafts
+
+
+def _x_api_request(path, params=None):
+    """X API v2への共通リクエスト。戻り値：(json_or_None, status, detail)。
+    status："ok"|"no_key"|"rate_limited"|"timeout"|"failed"。指示書1番により実装方式は
+    公式APIのみ（スクレイピング等は一切実装しない）。指示書2番「レート制限を検出したら
+    exponential backoff」は呼び出し側（_nicosoku_poll_scheduler_loop）が担当する
+    （このレイヤーは1回の試行結果を正しく分類して返すだけ）。"""
+    if not X_API_BEARER_TOKEN:
+        return None, "no_key", "X_API_BEARER_TOKEN未設定"
+    url = f"{X_API_BASE}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {X_API_BEARER_TOKEN}",
+                                                 "User-Agent": "trade-cockpit/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as res:
+            return json.loads(res.read().decode("utf-8")), "ok", None
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            return None, "rate_limited", "429 Too Many Requests"
+        try:
+            body = e.read().decode("utf-8")
+        except Exception:
+            body = str(e)
+        return None, "failed", f"HTTP {e.code}: {body[:200]}"
+    except TimeoutError:
+        return None, "timeout", "タイムアウト"
+    except Exception as e:
+        return None, "failed", str(e)
+
+
+def _x_resolve_user_id(username):
+    """GET /2/users/by/username/:username 相当（指示書1番）。"""
+    data, status, detail = _x_api_request(f"/users/by/username/{username}")
+    if status != "ok" or not data or not data.get("data"):
+        return None, status, detail
+    return data["data"].get("id"), "ok", None
+
+
+def _x_fetch_recent_tweets(user_id, since_id=None):
+    """GET /2/users/:id/tweets 相当（指示書1番）。リプライ・リポストは除外
+    （exclude=replies,retweets、引用投稿は本人のオリジナル投稿として残る）。"""
+    params = {
+        "max_results": "20",
+        "exclude": "replies,retweets",
+        "tweet.fields": "created_at,public_metrics,entities,attachments,referenced_tweets",
+        "expansions": "attachments.media_keys,referenced_tweets.id",
+        "media.fields": "url,preview_image_url,type,width,height,alt_text",
+    }
+    if since_id:
+        params["since_id"] = since_id
+    return _x_api_request(f"/users/{user_id}/tweets", params)
+
+
+def _build_social_post_record(database_url, user_id, tweet, media_by_key, source_handle, source_name):
+    """1件のtweet dict（X API v2形式）から、DB保存用のsocial_market_posts行を組み立てる
+    （指示書3・4・5・6・7・15番）。"""
+    text = tweet.get("text") or ""
+    post_id = tweet.get("id")
+    media_keys = (tweet.get("attachments") or {}).get("media_keys") or []
+    media = [media_by_key[k] for k in media_keys if k in media_by_key]
+    quoted = None
+    for ref in (tweet.get("referenced_tweets") or []):
+        if ref.get("type") == "quoted":
+            quoted = {"id": ref.get("id")}
+    posted_at_str = tweet.get("created_at")
+    try:
+        posted_at = datetime.datetime.fromisoformat((posted_at_str or "").replace("Z", "+00:00"))
+    except Exception:
+        posted_at = datetime.datetime.now(datetime.timezone.utc)
+    categories = _classify_social_post_categories(text)
+    mentions = _detect_social_post_mentions(database_url, user_id, text)
+    try:
+        positions = investment_db.list_portfolio(database_url, user_id) if investment_db else []
+        position_codes = {p.get("code") for p in positions}
+    except Exception:
+        position_codes = set()
+    importance = _classify_social_post_importance(text, categories, mentions["direct_mentions"], position_codes)
+    facts, opinions = _split_facts_opinions(text)
+    return {
+        "source_type": "X_MARKET_SOURCE", "source_name": source_name, "source_handle": source_handle,
+        "post_id": post_id, "posted_at": posted_at.isoformat(),
+        "text": text, "url": f"https://x.com/{source_handle}/status/{post_id}",
+        "media": media, "quoted_post": quoted, "public_metrics": tweet.get("public_metrics") or {},
+        "categories": categories, "importance": importance,
+        "facts": facts, "author_opinion": opinions, "system_inference": [],
+        "direct_mentions": mentions["direct_mentions"], "theme_related": mentions["theme_related"],
+        "verification_status": "UNVERIFIED",
+    }, posted_at.date()
+
+
+def nicosoku_poll_once(database_url, user_id):
+    """1サイクル分のポーリング（指示書1・2・3・8番）。ユーザーID解決→未取得分の投稿取得→
+    分類・保存→イベント検出→market_sourcesの状態更新、までを1回実行する。戻り値：
+    {"status","newPosts","eventsDetected","error"}。"""
+    result = {"status": "ok", "newPosts": 0, "eventsDetected": 0, "error": None}
+    if investment_db is None or not database_url:
+        result["status"] = "no_db"
+        return result
+    source = investment_db.ensure_market_source(database_url, X_SOCIAL_SOURCE_PLATFORM, NICOSOKU_X_USERNAME,
+                                                  display_name="にこそく", priority="HIGH",
+                                                  categories=["JP_MARKET", "MACRO"])
+    if not X_API_BEARER_TOKEN:
+        result["status"] = "no_key"
+        return result
+
+    # X APIのuser_id（数値ID）はmarket_sources.last_seen_post_idとは別物。DB列を1つ増やす
+    # ほどのものではないため、プロセス内メモリのキャッシュで十分（再起動時は再解決するだけで
+    # 実害はない）。
+    global _nicosoku_x_user_id_cache
+    if not _nicosoku_x_user_id_cache:
+        uid, status, detail = _x_resolve_user_id(NICOSOKU_X_USERNAME)
+        if status != "ok" or not uid:
+            investment_db.update_market_source_status(database_url, NICOSOKU_X_USERNAME, last_error=f"ユーザーID解決失敗: {detail}")
+            result["status"] = status
+            result["error"] = detail
+            return result
+        _nicosoku_x_user_id_cache = uid
+    x_user_id = _nicosoku_x_user_id_cache
+
+    since_id = (source or {}).get("last_seen_post_id")
+    data, status, detail = _x_fetch_recent_tweets(x_user_id, since_id=since_id)
+    if status != "ok":
+        investment_db.update_market_source_status(database_url, NICOSOKU_X_USERNAME, last_error=f"投稿取得失敗: {detail}")
+        result["status"] = status
+        result["error"] = detail
+        return result
+
+    tweets = (data or {}).get("data") or []
+    media_list = ((data or {}).get("includes") or {}).get("media") or []
+    media_by_key = {m.get("media_key"): {"url": m.get("url") or m.get("preview_image_url"),
+                                           "type": m.get("type"), "width": m.get("width"),
+                                           "height": m.get("height"), "alt_text": m.get("alt_text")}
+                    for m in media_list}
+    max_id = since_id
+    for tweet in tweets:
+        record, posted_date = _build_social_post_record(database_url, user_id, tweet, media_by_key,
+                                                           NICOSOKU_X_USERNAME, "にこそく")
+        saved = investment_db.insert_social_post_if_new(database_url, record)
+        if saved:
+            result["newPosts"] += 1
+            event_drafts = _detect_events_from_social_text(record["text"], posted_date)
+            if event_drafts:
+                try:
+                    existing = investment_db.list_market_events(
+                        database_url, user_id, from_date=posted_date.isoformat(),
+                        to_date=(posted_date + datetime.timedelta(days=120)).isoformat())
+                    existing_titles = {(e.get("event_date"), _event_title_key(e.get("title"))) for e in existing}
+                    fresh = [d for d in event_drafts
+                             if (d["event_date"], _event_title_key(d["title"])) not in existing_titles
+                             and not any(_event_title_key(d["title"])[:6] in _event_title_key(t) for _, t in existing_titles)]
+                    if fresh:
+                        imp_result = investment_db.import_market_events(database_url, user_id, fresh)
+                        result["eventsDetected"] += imp_result.get("imported", 0)
+                except Exception as e:
+                    print("  にこそく投稿からのイベント検出で例外", e)
+        if tweet.get("id") and (max_id is None or int(tweet["id"]) > int(max_id)):
+            max_id = tweet["id"]
+
+    investment_db.update_market_source_status(database_url, NICOSOKU_X_USERNAME,
+                                                last_seen_post_id=max_id, mark_success=True)
+    return result
+
+
+_nicosoku_x_user_id_cache = None
+
+
+def _event_title_key(title):
+    """タイトルの簡易正規化（空白除去・小文字化）。厳密な重複判定ではなく、投稿から検出した
+    イベントが既存の公式イベントとおおよそ同じかを見る軽量チェック用（指示書17番
+    「重複チェック必須」、完全一致でなくても明らかに同じイベントの二重登録を避ける）。"""
+    return re.sub(r"\s+", "", (title or "")).lower()
+
+
+def get_recent_social_market_signals(database_url, user_id, lookback_minutes=180, min_importance="MEDIUM", limit=8):
+    """指示書9番：recent_social_market_signals。ChatGPT相談JSONへ含める、絞り込み済みの
+    投稿一覧を返す。全投稿ではなく、時間・重要度・現在の監視銘柄/ポジションとの関連性で
+    絞り込む。"""
+    if investment_db is None or not database_url:
+        return []
+    since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=lookback_minutes)).isoformat()
+    posts = investment_db.list_social_signals(database_url, since_iso, min_importance=min_importance, limit=limit * 3)
+    try:
+        watch_codes = {w.get("code") for w in investment_db.list_watchlist(database_url, user_id, market="JP")}
+        positions = investment_db.list_portfolio(database_url, user_id)
+        position_codes = {p.get("code") for p in positions}
+    except Exception:
+        watch_codes, position_codes = set(), set()
+    relevant_codes = watch_codes | position_codes
+    rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+    scored = []
+    for p in posts:
+        mentions = set(p.get("direct_mentions_json") or []) | set(p.get("theme_related_json") or [])
+        relevant = bool(mentions & relevant_codes)
+        if rank.get(p.get("importance"), 0) < rank.get("HIGH", 2) and not relevant:
+            continue  # MEDIUM以下は関連銘柄が無ければ落とす（指示書「全投稿を送らない」）
+        summary = (p.get("text") or "")[:80]
+        scored.append({
+            "source": "nicosoku", "posted_at": p.get("posted_at"), "importance": p.get("importance"),
+            "categories": p.get("categories_json") or [], "summary": summary,
+            "facts": p.get("facts_json") or [], "author_opinion": p.get("author_opinion_json") or [],
+            "relevance": sorted(mentions), "url": p.get("url"),
+        })
+    scored.sort(key=lambda s: (-rank.get(s["importance"], 0), s["posted_at"] or ""), reverse=False)
+    scored.sort(key=lambda s: -rank.get(s["importance"], 0))
+    return scored[:limit]
+
+
+def _nicosoku_morning_commentary(database_url, user_id):
+    """指示書10番：朝一チェックの補助材料。前日15:30〜当日08:30(JST)程度の投稿から要点を
+    抽出する。既存のmorning_market_check本体ロジックには一切干渉しない、追加専用フィールド。"""
+    if investment_db is None or not database_url:
+        return None
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    now_jst = datetime.datetime.now(jst)
+    since_jst = (now_jst - datetime.timedelta(hours=17))  # 前日15:30頃〜のおおよそのカバー
+    since_iso = since_jst.astimezone(datetime.timezone.utc).isoformat()
+    posts = investment_db.list_recent_social_posts(database_url, source_handle=NICOSOKU_X_USERNAME,
+                                                      since_iso=since_iso, min_importance="MEDIUM", limit=10)
+    if not posts:
+        return None
+    key_points, related = [], set()
+    for p in posts[:5]:
+        text = (p.get("text") or "")[:60]
+        if text:
+            key_points.append(text)
+        related |= set(p.get("direct_mentions_json") or []) | set(p.get("theme_related_json") or [])
+    return {
+        "latest_post_at": posts[0].get("posted_at"), "key_points": key_points,
+        "market_implication": "、".join(key_points[:2]) if key_points else "",
+        "related_stocks": sorted(related),
+    }
+
+
+def _nicosoku_morning_commentary_safe(database_url, user_id):
+    """指示書10・21番：MorningMarketCheck本体を絶対に壊さないよう、例外は握りつぶしNoneを
+    返す（この機能単体の不具合で朝一チェック生成自体が失敗することを防ぐ）。"""
+    try:
+        return _nicosoku_morning_commentary(database_url, user_id)
+    except Exception as e:
+        print("  にこそく朝一コメンタリー生成で例外（無視して続行）", e)
+        return None
+
+
+def _nicosoku_intraday_signals(database_url, user_id, lookback_minutes=60):
+    """指示書11番：INTRADAY_REPORT生成時に直近60分以内・HIGH/CRITICALの投稿だけを参照する
+    （優先度の高い投稿に限定、指示書の明示的な条件）。既存のレポート生成・エントリー判定
+    ロジックには一切影響しない、追加専用フィールド。"""
+    return get_recent_social_market_signals(database_url, user_id, lookback_minutes=lookback_minutes,
+                                               min_importance="HIGH", limit=5)
+
+
+def _nicosoku_intraday_signals_safe(database_url, user_id, lookback_minutes=60):
+    """指示書11・21番：generate_intraday_report本体を絶対に壊さないよう例外を握りつぶす。"""
+    try:
+        return _nicosoku_intraday_signals(database_url, user_id, lookback_minutes)
+    except Exception as e:
+        print("  にこそく場中シグナル参照で例外（無視して続行）", e)
+        return []
+
+
+def _nicosoku_poll_interval_seconds():
+    """指示書2番：市場時間中(08:00-15:40 JST)は3-5分間隔、それ以外は10-15分間隔（固定値では
+    なくレンジの中間値を採用）。X APIのプラン・レート制限は環境変数側の契約に委ねる
+    （ハードコードしているのはあくまでポーリング頻度の目安であり、レート制限自体はAPI応答
+    （429）で検出しbackoffする、別のレイヤー）。"""
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    now_jst = datetime.datetime.now(jst)
+    hhmm = now_jst.strftime("%H:%M")
+    return 240 if "08:00" <= hhmm <= "15:40" else 750  # 4分 / 12.5分
+
+
+def _nicosoku_poll_scheduler_loop():
+    """バックグラウンドポーリングのデーモンスレッド。X_API_BEARER_TOKEN未設定なら何もせず
+    終了する（アプリ本体の動作には影響しない、指示書19番）。429検出時はexponential backoff
+    （指示書2番）。"""
+    if not X_API_BEARER_TOKEN:
+        print("  [にこそくX連携] X_API_BEARER_TOKEN未設定のためポーリングは無効（X_SOURCE_STATUS=DEGRADED）")
+        return
+    consecutive_failures = 0
+    while True:
+        try:
+            user_id = _morning_check_scheduler_users()[0]
+            result = nicosoku_poll_once(DATABASE_URL, user_id)
+            if result["status"] == "ok":
+                consecutive_failures = 0
+                if result["newPosts"] > 0:
+                    print(f"  [にこそくX連携] 新規投稿{result['newPosts']}件取得・イベント検出{result['eventsDetected']}件")
+            elif result["status"] == "rate_limited":
+                consecutive_failures += 1
+            else:
+                consecutive_failures += 1
+                print(f"  [にこそくX連携] 取得失敗（{result['status']}）：{result.get('error')}")
+        except Exception as e:
+            consecutive_failures += 1
+            print("  [にこそくX連携] ポーリングループで例外", e)
+        backoff_multiplier = min(2 ** consecutive_failures, 16) if consecutive_failures > 0 else 1
+        time.sleep(_nicosoku_poll_interval_seconds() * backoff_multiplier)
+
+
 def generate_opening_30m_report(database_url, user_id, trade_date=None):
     """後方互換の薄いラッパー（Phase2-A時点の呼び出し名をそのまま維持）。実体は
     generate_intraday_report()に一般化した（指示書「実装方針」：09:30専用ロジックを
@@ -3180,6 +3656,10 @@ def generate_intraday_report(database_url, user_id, report_type, trade_date=None
         "strategy_update_json": {"strategy": strategy, "text": summary_text, "major_changes": major_changes,
                                   "overnight_notes": overnight_notes, "previous_report_kind": previous_kind},
         "data_health_json": data_health,
+        # 2026-09-10新規（にこそく@nicosokufx X投稿連携、指示書11番）：直近60分以内・HIGH/
+        # CRITICALの投稿のみ参照する追加専用フィールド。既存のレポート生成・エントリー判定
+        # ロジックには一切影響しない（例外は握りつぶし、失敗しても空配列のまま）。
+        "social_signals_json": _nicosoku_intraday_signals_safe(database_url, user_id),
     }
     saved = investment_db.save_market_intelligence_report(database_url, user_id, trade_date, report_type, payload) if investment_db else None
     return saved
@@ -7972,6 +8452,43 @@ class Handler(SimpleHTTPRequestHandler):
             else:
                 theses, stats = [], {"totalFinalized": 0, "byResult": {}, "winRate": None}
             self._send_json({"theses": theses, "stats": stats})
+        elif self.path.startswith("/api/social-posts/status"):
+            # 2026-09-10新規（にこそく@nicosokufx X投稿連携、指示書19番）：X_SOURCE_STATUS表示用。
+            src = investment_db.get_market_source(DATABASE_URL, NICOSOKU_X_USERNAME) \
+                if (investment_db is not None and DATABASE_URL) else None
+            if not X_API_BEARER_TOKEN:
+                status_label = "DEGRADED"
+                reason = "X_API_BEARER_TOKEN未設定"
+            elif src and src.get("last_error"):
+                status_label = "DEGRADED"
+                reason = src.get("last_error")
+            else:
+                status_label = "OK"
+                reason = None
+            self._send_json({"status": status_label, "reason": reason,
+                              "lastSuccessAt": (src or {}).get("last_success_at"),
+                              "lastSeenPostId": (src or {}).get("last_seen_post_id")})
+        elif self.path.startswith("/api/social-posts") and "/image-analysis" not in self.path:
+            # 2026-09-10新規（にこそく@nicosokufx X投稿連携、指示書14番）：日本市場画面の
+            # 「X 市場情報」カード向け。?limit=&min_importance=。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            limit = int(params.get("limit", ["10"])[0])
+            min_importance = params.get("min_importance", [None])[0]
+            posts = investment_db.list_recent_social_posts(
+                DATABASE_URL, source_handle=NICOSOKU_X_USERNAME, min_importance=min_importance, limit=limit) \
+                if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"posts": posts})
+        elif self.path.startswith("/api/social-signals"):
+            # 2026-09-10新規：recent_social_market_signals（指示書9番、ChatGPT相談JSON補助情報）。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            lookback = int(params.get("lookback_minutes", ["180"])[0])
+            min_importance = params.get("min_importance", ["MEDIUM"])[0]
+            signals = get_recent_social_market_signals(DATABASE_URL, self.current_user,
+                                                         lookback_minutes=lookback, min_importance=min_importance) \
+                if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"recent_social_market_signals": signals})
         elif self.path.startswith("/api/auto-signal-events"):
             # v3-9続き（PHASE 1 AUTO SIGNAL LOG）：検証・確認用の閲覧API。?code=・?signal_type=で絞り込み可能。
             qs = urllib.parse.urlparse(self.path).query
@@ -8688,6 +9205,24 @@ class Handler(SimpleHTTPRequestHandler):
             import_source = body.get("importSource") or "manual"
             result = smart_import_confirm(DATABASE_URL, self.current_user, candidates, import_source)
             self._send_json(result)
+        elif self.path == "/api/social-posts/image-analysis":
+            # 2026-09-10新規（にこそく@nicosokufx X投稿連携、指示書4番）：画像の構造化解析は
+            # OCR/画像認識APIを新規導入せず、ユーザーがChatGPT等で解析した結果をJSON貼り付けで
+            # 保存する（既存のSmart Import/ChatGPT連携と同じパターン）。body: {postId, imageAnalysis}
+            # （imageAnalysisは[{image_type,market,observations,stocks},...]形式の配列）。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            post_id = body.get("postId")
+            image_analysis = body.get("imageAnalysis")
+            if not post_id or not isinstance(image_analysis, list):
+                self._send_json({"error": "postId・imageAnalysis（配列）は必須です"})
+                return
+            saved = investment_db.save_social_post_image_analysis(DATABASE_URL, NICOSOKU_X_USERNAME, post_id, image_analysis)
+            if saved is None:
+                self._send_json({"error": "対象の投稿が見つかりません"})
+            else:
+                self._send_json({"post": saved})
         elif self.path == "/api/watchlist/migrate":
             # 既存ユーザーのlocalStorage watchlistを1回だけNeonへ取り込む（investmentLogMigratedと
             # 同じパターン）。冪等（同じcode+marketは上書きになるだけ）。
@@ -8874,6 +9409,9 @@ def main():
         # 定時スケジューラ（Phase2-A範囲）。別スレッドに分離し、Morning Checkのスケジューラが
         # 万一詰まってもこちらは独立して動く（指示書31番のサービス分離方針）。
         threading.Thread(target=_intraday_report_scheduler_loop, daemon=True).start()
+        # 2026-09-10新規（にこそく@nicosokufx X投稿連携、指示書2番）：X_API_BEARER_TOKEN
+        # 未設定なら_nicosoku_poll_scheduler_loop内で即returnする（アプリ本体には影響しない）。
+        threading.Thread(target=_nicosoku_poll_scheduler_loop, daemon=True).start()
     try:
         httpd = ThreadingTCPServer((HOST, PORT), Handler)
     except OSError:

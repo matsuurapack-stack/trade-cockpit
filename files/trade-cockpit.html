@@ -3534,6 +3534,85 @@ function rankTop5(enriched,stockQuotes){
     .slice(0,5);
 }
 
+// 2026-09-10新規（にこそく@nicosokufx X投稿 自動取得・市場分析連携、指示書14番）：
+// 日本市場画面の小さな「X 市場情報」カード。初期状態は最新3件、展開すると最大10件まで表示する
+// （指示書「UIを大きくしすぎない」）。画像はサムネイル（あれば）、原文リンクを併記する。
+// 投稿だけで売買判断しないという指示書12番の方針に合わせ、あくまで参考情報の一覧表示のみ
+// （このカードから直接売買操作は行わない）。
+const X_POST_CATEGORY_LABELS = {
+  MARKET_OVERVIEW: "地合い", MARKET_HEATMAP: "ヒートマップ", INDEX_TECHNICAL: "指数",
+  STOCK_TECHNICAL: "個別銘柄", ECONOMIC_EVENT: "経済指標", CENTRAL_BANK: "中銀",
+  FX: "為替", US_MARKET: "米株", INTEREST_RATE: "金利", SEMICONDUCTOR: "半導体",
+  COMMODITY: "商品", SHIPPING: "海運", SECTOR_ROTATION: "セクター", MARKET_SENTIMENT: "心理", OTHER: "その他",
+};
+const X_POST_IMPORTANCE_META = {
+  CRITICAL: {label: "CRITICAL", color: "var(--down)"}, HIGH: {label: "HIGH", color: "var(--accent)"},
+  MEDIUM: {label: "MEDIUM", color: "var(--inkSoft)"}, LOW: {label: "LOW", color: "var(--inkFaint)"},
+};
+function XMarketSignalsCard(){
+  const [posts,setPosts]=useState([]);
+  const [status,setStatus]=useState(null);
+  const [expanded,setExpanded]=useState(false);
+  const [loading,setLoading]=useState(false);
+  const load=async()=>{
+    setLoading(true);
+    try{
+      const [pr,sr]=await Promise.all([
+        fetchJsonSafe(`/api/social-posts?limit=${expanded?10:3}`),
+        fetchJsonSafe("/api/social-posts/status"),
+      ]);
+      if(pr&&Array.isArray(pr.posts))setPosts(pr.posts);
+      if(sr)setStatus(sr);
+    }catch(e){}
+    setLoading(false);
+  };
+  useEffect(()=>{load();},[expanded]); // eslint-disable-line
+  const isDegraded=status&&status.status==="DEGRADED";
+  return <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:6,padding:"10px 12px",marginTop:12,marginBottom:12}}>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,flexWrap:"wrap"}}>
+      <div style={{fontWeight:800,fontSize:12.5}}>🐦 X 市場情報<span style={{fontWeight:400,fontSize:10.5,color:"var(--inkFaint)"}}>（にこそく @nicosokufx）</span></div>
+      <div style={{display:"flex",alignItems:"center",gap:8}}>
+        {isDegraded && <span style={{fontSize:10,color:"var(--down)"}} title={status.reason||""}>
+          ⚠ DEGRADED{status.lastSuccessAt?`（最終成功: ${new Date(status.lastSuccessAt).toLocaleString("ja-JP")}）`:"（未取得）"}
+        </span>}
+        <button className="iconbtn" style={{fontSize:11}} onClick={load} disabled={loading} title="更新">{loading?"…":"🔄"}</button>
+      </div>
+    </div>
+    {posts.length===0
+      ? <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:4}}>
+          {isDegraded?"X APIが利用できないため投稿を取得できません（他機能には影響ありません）。":"投稿がまだありません。"}
+        </div>
+      : <div style={{display:"flex",flexDirection:"column",gap:5,marginTop:6}}>
+          {posts.map(p=>{
+            const impMeta=X_POST_IMPORTANCE_META[p.importance]||X_POST_IMPORTANCE_META.LOW;
+            const cats=(p.categories_json||[]).map(c=>X_POST_CATEGORY_LABELS[c]||c);
+            const relStocks=[...new Set([...(p.direct_mentions_json||[]),...(p.theme_related_json||[])])];
+            const isNew=p.posted_at&&(Date.now()-new Date(p.posted_at).getTime())<30*60*1000&&(p.importance==="HIGH"||p.importance==="CRITICAL");
+            const thumb=(p.media_json||[]).find(m=>m&&m.url);
+            return <div key={p.id} style={{display:"flex",gap:8,padding:"5px 6px",borderRadius:4,background:"var(--bg)",border:"1px solid var(--rule)"}}>
+              {thumb && <img src={thumb.url} alt={thumb.alt_text||""} style={{width:44,height:44,objectFit:"cover",borderRadius:3,flex:"0 0 auto"}}/>}
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap",fontSize:10.5}}>
+                  {isNew && <span style={{color:"var(--down)",fontWeight:800}}>🔴 NEW</span>}
+                  <span style={{color:"var(--inkFaint)"}}>{p.posted_at?new Date(p.posted_at).toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"}):"—"}</span>
+                  <span style={{fontWeight:700,color:impMeta.color,border:`1px solid ${impMeta.color}`,borderRadius:3,padding:"0 4px"}}>{impMeta.label}</span>
+                  {cats.slice(0,3).map(c=><span key={c} className="chip" style={{fontSize:9.5,padding:"0 4px"}}>{c}</span>)}
+                </div>
+                <div style={{fontSize:11.5,marginTop:2,overflow:"hidden",textOverflow:"ellipsis",display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical"}}>{p.text}</div>
+                <div style={{display:"flex",alignItems:"center",gap:6,marginTop:2,fontSize:10,flexWrap:"wrap"}}>
+                  {relStocks.length>0 && <span style={{color:"var(--inkSoft)"}}>関連：{relStocks.join("・")}</span>}
+                  <a href={p.url} target="_blank" rel="noopener noreferrer" style={{color:"var(--accent)"}}>原文を見る↗</a>
+                </div>
+              </div>
+            </div>;
+          })}
+        </div>}
+    <button className="action-btn" style={{fontSize:10.5,marginTop:6,padding:"2px 8px"}} onClick={()=>setExpanded(v=>!v)}>
+      {expanded?"▲ 最新3件のみ表示":"▼ 過去の投稿も見る"}
+    </button>
+  </div>;
+}
+
 function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan,newsCatalysts,entryScanning,entryResult,onEntryScan,thesisStats,todayTheses}){
   const [expandedScoreCode,setExpandedScoreCode]=useState(null); // スコア内訳の折りたたみ展開（指示書21番）
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
@@ -9423,6 +9502,11 @@ function App(){
       body:JSON.stringify({code:w.code,sector:w.sector,market:w.market,analysisType:"stock",
         signals:buildSignalsFromAnalysis(a),baseSignal:analysisEnrichedMap.get(w.code)?.actionStatus})})
       .catch(()=>null);
+    // 2026-09-10新規（にこそく@nicosokufx X投稿連携、指示書9番）：時間・重要度・現在の監視銘柄/
+    // ポジションとの関連性で絞り込み済みのsocial signalsのみ添える（全投稿は送らない、
+    // サーバー側get_recent_social_market_signals()が絞り込みを担当）。取得失敗時は空配列
+    // （この連携が無くても既存の相談項目だけで成立する、ベストエフォート）。
+    const socialSignals=await fetchJsonSafe("/api/social-signals").then(d=>(d&&d.recent_social_market_signals)||[]).catch(()=>[]);
     await copyChatGPTPayload("詳細分析を相談","trade_analysis",{
       stock:{code:w.code,name:w.name,market:w.market,sector:w.sector||null},
       price:{current:a.current,note:"currentは現在値（実勢価格）。levels.entry_theoreticalはテクニカルから算出した押し目エントリー価格帯の理論値で、現在値と同じとは限らない。"},
@@ -9436,6 +9520,7 @@ function App(){
       margin:{ratio:a.tradeRules?.marginRatio??null,badge:a.tradeRules?.marginBadge??null},
       market_environment:a.marketEnv||null,
       recent_catalysts:recentCatalystsForConsult(w.code,w.sector),
+      recent_social_market_signals:socialSignals,
       active_rules:activeRulesForConsult.map(r=>({rule:r.rule_text,confidence:r.confidence,action:r.action_text||null})),
       integrated_judgment:knowledge&&!knowledge.error?{
         judgment:knowledge.judgment.judgment,confidence:knowledge.judgment.confidence,reasons:knowledge.judgment.reasons,
@@ -9875,6 +9960,7 @@ function App(){
             <span style={{fontSize:11,color:"var(--inkSoft)"}}>{jpFetching?"更新中…":jpMsg?jpMsg+"（30秒おき自動更新）":""}</span>
           </div>
         </div>
+        <XMarketSignalsCard/>
         <SectorWatchlist market="JP" watchlist={s.watchlist} setWatchlist={setWatchlistJP} candidates={masterJP} max={MAX}
           stockQuotes={s.stockQuotes} analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget}
           earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
