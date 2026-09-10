@@ -1688,6 +1688,10 @@ const TAB_GROUPS=[
   {key:"tradeAnalysis",label:"トレード分析",tabs:[{key:"analysis",label:"分析"},{key:"earnings",label:"決算"}]},
   {key:"position",label:"ポジション",tabs:[{key:"position",label:"ポジション"}]},
   {key:"news",label:"ニュース",tabs:[{key:"news",label:"ニュース"}]},
+  // 2026-09-10新規（Unified Smart Import、Phase SI-D、指示書2番）：補助機能ではなく
+  // Trade Cockpit全体の共通入力入口として、アクセスしやすいトップレベル位置に独立タブを
+  // 配置する（記録タブ配下ではない）。
+  {key:"smartimport",label:"📥 Smart Import",tabs:[{key:"smartimport",label:"Smart Import"}]},
   // 2026-09-08新規（UI全体の説明文整理・タブ順変更）：ユーザー指定により「記録」を必ず
   // 一番右端に配置する。tabキー・グループ構成自体は無変更、配列の並び順のみ変更。
   // 2026-09-09新規（ルール学習システム）：既存4サブタブに「ルール」を追加。tabキーは
@@ -2367,7 +2371,7 @@ function extractEventsArray(parsed){
   if(arrayKeys.length===1)return parsed[arrayKeys[0]];
   return null;
 }
-function EventsPanel({events,onReload}){
+function EventsPanel({events,onReload,onOpenSmartImport}){
   const [pasteText,setPasteText]=useState("");
   const [importing,setImporting]=useState(false);
   const [importMsg,setImportMsg]=useState("");
@@ -2422,16 +2426,22 @@ function EventsPanel({events,onReload}){
   const upcoming=sorted.filter(e=>e.event_date>=todayStr);
   const past=sorted.filter(e=>e.event_date<todayStr);
   return <div style={{marginTop:18}}>
-    <div className="sec-head">イベント登録</div>
-    <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 12px",marginBottom:14}}>
-      <textarea value={pasteText} onChange={e=>setPasteText(e.target.value)} rows={6}
-        placeholder={'例: [{"event_date":"2026-09-10","title":"米雇用統計","event_type":"ECONOMIC","importance":"HIGH","country":"US","source":"ChatGPT画像認識","verification_status":"IMAGE_DERIVED"}]'}
-        style={{width:"100%",fontSize:12,padding:8,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",fontFamily:"monospace",boxSizing:"border-box"}}/>
-      <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8}}>
-        <button className="btn primary" disabled={importing||!pasteText.trim()} onClick={doImport}>{importing?"取り込み中…":"JSONを取り込む"}</button>
-        {importMsg && <span style={{fontSize:12,whiteSpace:"pre-line",color:importOk?"var(--up)":"var(--down)",fontWeight:importOk?400:700}}>{importMsg}</span>}
-      </div>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+      <div className="sec-head">イベント登録</div>
+      <button className="btn primary" onClick={onOpenSmartImport}>📥 Smart Importで追加</button>
     </div>
+    <details style={{marginTop:10,marginBottom:14}}>
+      <summary style={{cursor:"pointer",fontSize:12,color:"var(--inkSoft)"}}>高度な入力（JSON直接入力）</summary>
+      <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 12px",marginTop:8}}>
+        <textarea value={pasteText} onChange={e=>setPasteText(e.target.value)} rows={6}
+          placeholder={'例: [{"event_date":"2026-09-10","title":"米雇用統計","event_type":"ECONOMIC","importance":"HIGH","country":"US","source":"ChatGPT画像認識","verification_status":"IMAGE_DERIVED"}]'}
+          style={{width:"100%",fontSize:12,padding:8,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",fontFamily:"monospace",boxSizing:"border-box"}}/>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8}}>
+          <button className="btn primary" disabled={importing||!pasteText.trim()} onClick={doImport}>{importing?"取り込み中…":"JSONを取り込む"}</button>
+          {importMsg && <span style={{fontSize:12,whiteSpace:"pre-line",color:importOk?"var(--up)":"var(--down)",fontWeight:importOk?400:700}}>{importMsg}</span>}
+        </div>
+      </div>
+    </details>
     <div className="sec-head" style={{fontSize:13}}>今後のイベント（{upcoming.length}件）</div>
     {upcoming.length===0
       ? <div style={{padding:16,color:"var(--inkFaint)",fontSize:13}}>登録されているイベントはありません。</div>
@@ -2462,7 +2472,7 @@ function EventsPanel({events,onReload}){
 // v3-9続き（PHASE 4 NEWS/CATALYST INTELLIGENCE）：カタリスト一覧タブ。EventsPanelと全く同じ
 // 「貼り付け→保存→リロード」パターン。ニュース本体（RSS/TDnet）は既存のニュースタブが担当し、
 // ここはChatGPT等で構造化したカタログ情報専用（重複しない）。
-function CatalystsPanel({catalysts,onReload}){
+function CatalystsPanel({catalysts,onReload,onOpenSmartImport}){
   const [pasteText,setPasteText]=useState("");
   const [importing,setImporting]=useState(false);
   const [importMsg,setImportMsg]=useState("");
@@ -2501,16 +2511,22 @@ function CatalystsPanel({catalysts,onReload}){
   const active=sorted.filter(isRelevant);
   const old=sorted.filter(c=>!isRelevant(c));
   return <div style={{marginTop:18}}>
-    <div className="sec-head">カタリスト</div>
-    <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 12px",marginBottom:14}}>
-      <textarea value={pasteText} onChange={e=>setPasteText(e.target.value)} rows={6}
-        placeholder={'例: [{"catalyst_date":"2026-09-05","title":"半導体関連セクターに資金流入","category":"SECTOR_CATALYST","importance":"HIGH","affected_sectors":["半導体"],"source":"ChatGPT画像認識","verification_status":"IMAGE_DERIVED"}]'}
-        style={{width:"100%",fontSize:12,padding:8,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",fontFamily:"monospace",boxSizing:"border-box"}}/>
-      <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8}}>
-        <button className="btn primary" disabled={importing||!pasteText.trim()} onClick={doImport}>{importing?"取り込み中…":"JSONを取り込む"}</button>
-        {importMsg && <span style={{fontSize:12,color:"var(--inkSoft)"}}>{importMsg}</span>}
-      </div>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+      <div className="sec-head">カタリスト</div>
+      <button className="btn primary" onClick={onOpenSmartImport}>📥 Smart Importで追加</button>
     </div>
+    <details style={{marginTop:10,marginBottom:14}}>
+      <summary style={{cursor:"pointer",fontSize:12,color:"var(--inkSoft)"}}>高度な入力（JSON直接入力）</summary>
+      <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 12px",marginTop:8}}>
+        <textarea value={pasteText} onChange={e=>setPasteText(e.target.value)} rows={6}
+          placeholder={'例: [{"catalyst_date":"2026-09-05","title":"半導体関連セクターに資金流入","category":"SECTOR_CATALYST","importance":"HIGH","affected_sectors":["半導体"],"source":"ChatGPT画像認識","verification_status":"IMAGE_DERIVED"}]'}
+          style={{width:"100%",fontSize:12,padding:8,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",fontFamily:"monospace",boxSizing:"border-box"}}/>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8}}>
+          <button className="btn primary" disabled={importing||!pasteText.trim()} onClick={doImport}>{importing?"取り込み中…":"JSONを取り込む"}</button>
+          {importMsg && <span style={{fontSize:12,color:"var(--inkSoft)"}}>{importMsg}</span>}
+        </div>
+      </div>
+    </details>
     <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,flexWrap:"wrap"}}>
       <span style={{fontSize:12,color:"var(--inkSoft)"}}>カテゴリ:</span>
       <select value={categoryFilter} onChange={e=>setCategoryFilter(e.target.value)}
@@ -2576,13 +2592,38 @@ const SMART_IMPORT_CONFIDENCE_META={
 const SMART_IMPORT_IMPLEMENTED=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
   "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","CHATGPT_LEGACY"];
 
-function SmartImportPanel({onReload}){
-  const [text,setText]=useState("");
+// 指示書25番（Phase SI-D）：UIテキストを統一表現に寄せる。sourceContextはCatalystタブ等
+// から開いた場合のヒント表示用（指示書12番：分類結果を強制しない、あくまで注記）。
+const SMART_IMPORT_SOURCE_CONTEXT_LABEL={
+  CATALYST:"カタリスト", EVENT:"イベント", EXPERT_OPINION:"有識者", CHATGPT:"ChatGPT連携",
+};
+// 指示書20番：「安全な項目のみ選択」の対象（重要操作＝TRADE_RULE等は除外）
+const SMART_IMPORT_SAFE_CATEGORIES=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
+  "MORNING_MARKET_CHECK","INTRADAY_REPORT"];
+const SMART_IMPORT_DATA_QUALITY_BY_CONFIDENCE={HIGH:"FULL",MEDIUM:"PARTIAL",LOW:"DEGRADED"};
+
+function SmartImportPanel({onReload,sourceContext=null,onSaved=null,compactMode=false,initialText=""}){
+  const [text,setText]=useState(initialText);
   const [analyzing,setAnalyzing]=useState(false);
   const [candidates,setCandidates]=useState(null);  // null=未解析
   const [selected,setSelected]=useState({});         // index -> bool
   const [saving,setSaving]=useState(false);
   const [resultMsg,setResultMsg]=useState("");
+  const [history,setHistory]=useState(null);
+  const textareaRef=useRef();
+
+  useEffect(()=>{
+    if(compactMode)return;  // モーダル内では履歴を出さない（画面を圧迫しないため）
+    fetchJsonSafe("/api/smart-import/history").then(d=>{if(d&&d.history)setHistory(d.history);});
+  },[compactMode]);
+
+  const applySelectionRule=(cands,ruleFn)=>{
+    const next={};
+    cands.forEach((c,i)=>{next[i]=ruleFn(c);});
+    setSelected(next);
+  };
+  // 指示書16・8番：LOW confidence・TRADE_RULEは既定で未選択（自動保存しない、能動的選択必須）
+  const defaultSelectionRule=c=>c.category!=="TRADE_RULE"&&c.confidence!=="LOW"&&SMART_IMPORT_IMPLEMENTED.includes(c.category);
 
   const analyze=async()=>{
     if(!text.trim())return;
@@ -2591,14 +2632,7 @@ function SmartImportPanel({onReload}){
     setAnalyzing(false);
     if(d&&d.candidates){
       setCandidates(d.candidates);
-      // 指示書16番：LOW confidenceは既定で未選択（自動保存しない、明示確認必須）。
-      // 指示書8番（最重要）：TRADE_RULEはHIGH confidenceでもconfidenceに関わらず既定で
-      // 未選択にする（🚨ルール変更候補として必ずユーザーに能動的な選択を求める）。
-      const init={};
-      d.candidates.forEach((c,i)=>{
-        init[i]=c.category!=="TRADE_RULE"&&c.confidence!=="LOW"&&SMART_IMPORT_IMPLEMENTED.includes(c.category);
-      });
-      setSelected(init);
+      applySelectionRule(d.candidates,defaultSelectionRule);
     }else{
       setResultMsg("解析に失敗しました");
     }
@@ -2611,45 +2645,83 @@ function SmartImportPanel({onReload}){
     setCandidates(prev=>prev.map((c,idx)=>idx===i?{...c,category}:c));
   };
 
-  const saveSelected=async()=>{
-    const toSave=candidates.filter((c,i)=>selected[i]).map(c=>({...c,force:c.confidence==="LOW"}));
+  const saveSelected=async(indexFilter)=>{
+    const idxOk=i=>indexFilter?indexFilter(candidates[i]):selected[i];
+    const toSave=candidates.filter((c,i)=>idxOk(i)).map(c=>({...c,force:c.confidence==="LOW"}));
     if(!toSave.length)return;
     setSaving(true);
     const d=await fetchJsonSafe("/api/smart-import/confirm",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({candidates:toSave,importSource:"manual"})});
+      body:JSON.stringify({candidates:toSave,importSource:sourceContext?sourceContext.toLowerCase():"manual"})});
     setSaving(false);
     if(d&&d.results){
-      const parts=Object.entries(d.results).map(([cat,r])=>`${cat} ${r.imported}件`);
-      setResultMsg(`登録完了：${parts.join("　")}`+(d.rejected_low_confidence?`　（LOW confidence除外 ${d.rejected_low_confidence}件）`:""));
+      // 指示書15番：保存結果サマリー（✅N件保存しました／⚠M件は未保存）
+      const savedCount=Object.values(d.results).reduce((sum,r)=>sum+(r.imported!=null?r.imported:1),0);
+      const parts=Object.entries(d.results).map(([cat,r])=>`${cat} ${r.imported!=null?r.imported:1}件`);
+      const unsaved=(d.rejected_low_confidence||0)+(d.skipped_unimplemented||0)+(d.skipped_existing_report||0);
+      let msg=`✅ ${savedCount}件保存しました（${parts.join("　")}）`;
+      if(unsaved)msg+=`　⚠ ${unsaved}件は未保存（LOW confidence等、要確認）`;
+      setResultMsg(msg);
       setText("");setCandidates(null);setSelected({});
       onReload?.();
+      onSaved?.();
+      if(!compactMode)fetchJsonSafe("/api/smart-import/history").then(d2=>{if(d2&&d2.history)setHistory(d2.history);});
     }else{
       setResultMsg("登録に失敗しました");
     }
   };
 
-  return <div style={{marginTop:18}}>
-    <div className="sec-head">📥 内容を解析して取り込む</div>
-    <div style={{fontSize:11.5,color:"var(--inkFaint)",marginBottom:8}}>
-      JSON・記事・箇条書き・ChatGPT出力・自然文に対応。カタリスト・イベント・有識者意見を自動判別します。
-    </div>
+  // 指示書21番：Ctrl+Enterで解析、Ctrl+Shift+Enterで「安全な項目のみ」保存
+  // （POSITION/RULE変更を伴う操作には誤操作防止のためショートカットを割り当てない）
+  const onTextareaKeyDown=(e)=>{
+    if((e.ctrlKey||e.metaKey)&&e.key==="Enter"){
+      e.preventDefault();
+      if(e.shiftKey){
+        if(candidates)saveSelected(c=>SMART_IMPORT_SAFE_CATEGORIES.includes(c.category)&&c.confidence!=="LOW");
+      }else if(!analyzing&&text.trim()){
+        analyze();
+      }
+    }
+  };
+
+  const selectedCount=Object.values(selected).filter(Boolean).length;
+
+  return <div style={{marginTop:compactMode?4:18}}>
+    {!compactMode && <>
+      <div className="sec-head">📥 Smart Import</div>
+      <div style={{fontSize:11.5,color:"var(--inkFaint)",marginBottom:8}}>
+        ここに何でも貼り付けてください。ニュース記事・ChatGPT/Claude分析・JSON・イベント・有識者意見・売買メモなどを自動判別します。
+      </div>
+    </>}
+    {sourceContext && SMART_IMPORT_SOURCE_CONTEXT_LABEL[sourceContext] && <div style={{fontSize:11,color:"var(--inkFaint)",marginBottom:6}}>
+      {SMART_IMPORT_SOURCE_CONTEXT_LABEL[sourceContext]}タブから開いています（判定結果はカテゴリに関わらずそのまま表示されます）
+    </div>}
     <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 12px"}}>
-      <textarea value={text} onChange={e=>setText(e.target.value)} rows={7}
-        placeholder="ここに何でも貼り付けてください（JSON・ニュース記事・ChatGPT分析・箇条書き・自然文 等）"
+      <textarea ref={textareaRef} value={text} onChange={e=>setText(e.target.value)} onKeyDown={onTextareaKeyDown}
+        rows={compactMode?5:7} autoFocus={compactMode}
+        placeholder="ここに何でも貼り付けてください。&#10;例：ニュース記事・ChatGPT/Claudeの分析・有識者コメント・FOMC等のイベント情報・売買メモ・JSON&#10;（Ctrl+Enterで解析）"
         style={{width:"100%",fontSize:12.5,padding:8,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",fontFamily:"inherit",boxSizing:"border-box"}}/>
-      <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8}}>
-        <button className="btn primary" disabled={analyzing||!text.trim()} onClick={analyze}>{analyzing?"解析中…":"解析"}</button>
-        {resultMsg && <span style={{fontSize:12,color:"var(--inkSoft)"}}>{resultMsg}</span>}
+      <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8,flexWrap:"wrap"}}>
+        <button className="btn primary" disabled={analyzing||!text.trim()} onClick={analyze}>{analyzing?"解析中…":"内容を解析"}</button>
+        {resultMsg && <span style={{fontSize:12,color:"var(--inkSoft)",whiteSpace:"pre-wrap"}}>{resultMsg}</span>}
       </div>
     </div>
 
     {candidates && <div style={{marginTop:14}}>
-      <div style={{fontSize:12.5,fontWeight:700,marginBottom:8}}>解析結果：{candidates.length}件</div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8,marginBottom:8}}>
+        <div style={{fontSize:12.5,fontWeight:700}}>解析結果：{candidates.length}件</div>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+          <button className="iconbtn" style={{fontSize:11}} onClick={()=>applySelectionRule(candidates,c=>SMART_IMPORT_IMPLEMENTED.includes(c.category))}>全て選択</button>
+          <button className="iconbtn" style={{fontSize:11}} onClick={()=>applySelectionRule(candidates,c=>SMART_IMPORT_SAFE_CATEGORIES.includes(c.category)&&c.confidence!=="LOW")}>安全な項目のみ選択</button>
+          <button className="iconbtn" style={{fontSize:11}} onClick={()=>applySelectionRule(candidates,()=>false)}>選択解除</button>
+        </div>
+      </div>
       <div style={{display:"flex",flexDirection:"column",gap:8}}>
         {candidates.map((c,i)=>{
           const meta=SMART_IMPORT_CATEGORY_META[c.category]||SMART_IMPORT_CATEGORY_META.UNKNOWN;
           const confMeta=SMART_IMPORT_CONFIDENCE_META[c.confidence]||{};
           const implemented=SMART_IMPORT_IMPLEMENTED.includes(c.category);
+          const dataQuality=SMART_IMPORT_DATA_QUALITY_BY_CONFIDENCE[c.confidence]||"—";
+          const sourceLabel=c.source_kind==="json"?"JSON":"自然文";
           return <div key={i} className="card" style={{padding:"10px 12px",opacity:implemented?1:0.6}}>
             <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
               {implemented && <input type="checkbox" checked={!!selected[i]} onChange={e=>setSelected(s=>({...s,[i]:e.target.checked}))}/>}
@@ -2658,7 +2730,8 @@ function SmartImportPanel({onReload}){
                 style={{fontSize:11.5,padding:"2px 4px",border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}>
                 {SMART_IMPORT_CATEGORIES_UI.map(cat=><option key={cat} value={cat}>{cat}</option>)}
               </select>
-              <span style={{fontSize:11,fontWeight:700,color:confMeta.color}}>confidence: {confMeta.label||c.confidence}</span>
+              <span style={{fontSize:11,fontWeight:700,color:confMeta.color}}>{c.confidence}/{dataQuality}</span>
+              <span style={{fontSize:10.5,color:"var(--inkFaint)",border:"1px solid var(--rule)",borderRadius:3,padding:"1px 5px"}}>source: {sourceLabel}</span>
               {c.possible_duplicate && <span style={{fontSize:11,color:"var(--down)",fontWeight:700}}>⚠ 登録済みの可能性</span>}
               {!implemented && <span style={{fontSize:11,color:"var(--inkFaint)"}}>（このカテゴリは今後のフェーズで対応予定）</span>}
             </div>
@@ -2719,16 +2792,32 @@ function SmartImportPanel({onReload}){
           </div>;
         })}
       </div>
-      <button className="btn primary" style={{marginTop:10}} disabled={saving||!Object.values(selected).some(Boolean)} onClick={saveSelected}>
-        {saving?"登録中…":"選択した項目を登録"}
+      <button className="btn primary" style={{marginTop:10}} disabled={saving||!selectedCount} onClick={()=>saveSelected()}>
+        {saving?"保存中…":`選択した項目を保存（${selectedCount}件）`}
       </button>
     </div>}
+
+    {/* 指示書14番：Smart Import経由の最近の取り込み履歴（専用ログDBは作らず既存DBから合成） */}
+    {!compactMode && history && history.length>0 && <details style={{marginTop:18}}>
+      <summary style={{cursor:"pointer",fontSize:12.5,color:"var(--inkSoft)"}}>取り込み履歴（{history.length}件）</summary>
+      <div style={{display:"flex",flexDirection:"column",gap:4,marginTop:8}}>
+        {history.map((h,i)=>{
+          const meta=SMART_IMPORT_CATEGORY_META[h.category]||SMART_IMPORT_CATEGORY_META.UNKNOWN;
+          return <div key={i} style={{fontSize:11.5,color:"var(--inkFaint)",display:"flex",gap:8,alignItems:"center"}}>
+            <span className="mono">{h.time?new Date(h.time).toLocaleString("ja-JP"):"—"}</span>
+            <span>{meta.icon} {h.category}</span>
+            <span style={{color:"var(--inkSoft)"}}>{h.title}</span>
+            {h.status==="CONFIRM_REQUIRED" && <span style={{color:"var(--down)",fontWeight:700}}>要確認</span>}
+          </div>;
+        })}
+      </div>
+    </details>}
   </div>;
 }
 const SMART_IMPORT_CATEGORIES_UI=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
   "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","UNKNOWN"];
 
-function ExpertViewsPanel({views,onReload}){
+function ExpertViewsPanel({views,onReload,onOpenSmartImport}){
   const [pasteText,setPasteText]=useState("");
   const [importing,setImporting]=useState(false);
   const [importMsg,setImportMsg]=useState("");
@@ -2764,16 +2853,22 @@ function ExpertViewsPanel({views,onReload}){
   const filtered=useMemo(()=>expertFilter==="ALL"?views:views.filter(v=>v.expert_name===expertFilter),[views,expertFilter]);
   const sorted=useMemo(()=>[...filtered].sort((a,b)=>(b.published_at||"").localeCompare(a.published_at||"")),[filtered]);
   return <div style={{marginTop:18}}>
-    <div className="sec-head">有識者</div>
-    <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 12px",marginBottom:14}}>
-      <textarea value={pasteText} onChange={e=>setPasteText(e.target.value)} rows={8}
-        placeholder={'例: [{"expert_name":"○○○○","source_title":"○○チャンネル 9/4配信","source_type":"YOUTUBE","published_at":"2026-09-04","time_horizon":"SHORT_TERM","market":"JP","outlook":"9月〜10月上旬は警戒","risk_window_start":"2026-09-01","risk_window_end":"2026-10-10","thesis":"テクニカル過熱・円高・金融政策が短期逆風","confirmations":["円高一服","日銀QT議論"],"invalidation_conditions":["原油急騰","円高加速"],"verification_status":"USER_PROVIDED_TRANSCRIPT"}]'}
-        style={{width:"100%",fontSize:12,padding:8,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",fontFamily:"monospace",boxSizing:"border-box"}}/>
-      <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8}}>
-        <button className="btn primary" disabled={importing||!pasteText.trim()} onClick={doImport}>{importing?"取り込み中…":"JSONを取り込む"}</button>
-        {importMsg && <span style={{fontSize:12,color:"var(--inkSoft)"}}>{importMsg}</span>}
-      </div>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+      <div className="sec-head">有識者</div>
+      <button className="btn primary" onClick={onOpenSmartImport}>📥 Smart Importで追加</button>
     </div>
+    <details style={{marginTop:10,marginBottom:14}}>
+      <summary style={{cursor:"pointer",fontSize:12,color:"var(--inkSoft)"}}>高度な入力（JSON直接入力）</summary>
+      <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"10px 12px",marginTop:8}}>
+        <textarea value={pasteText} onChange={e=>setPasteText(e.target.value)} rows={8}
+          placeholder={'例: [{"expert_name":"○○○○","source_title":"○○チャンネル 9/4配信","source_type":"YOUTUBE","published_at":"2026-09-04","time_horizon":"SHORT_TERM","market":"JP","outlook":"9月〜10月上旬は警戒","risk_window_start":"2026-09-01","risk_window_end":"2026-10-10","thesis":"テクニカル過熱・円高・金融政策が短期逆風","confirmations":["円高一服","日銀QT議論"],"invalidation_conditions":["原油急騰","円高加速"],"verification_status":"USER_PROVIDED_TRANSCRIPT"}]'}
+          style={{width:"100%",fontSize:12,padding:8,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",fontFamily:"monospace",boxSizing:"border-box"}}/>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8}}>
+          <button className="btn primary" disabled={importing||!pasteText.trim()} onClick={doImport}>{importing?"取り込み中…":"JSONを取り込む"}</button>
+          {importMsg && <span style={{fontSize:12,color:"var(--inkSoft)"}}>{importMsg}</span>}
+        </div>
+      </div>
+    </details>
     {experts.length>0 && <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,flexWrap:"wrap"}}>
       <span style={{fontSize:12,color:"var(--inkSoft)"}}>有識者:</span>
       <select value={expertFilter} onChange={e=>setExpertFilter(e.target.value)}
@@ -8085,6 +8180,11 @@ function App(){
   const NEWS_PAGE_SIZE=15; // 「もっと見る」：初期表示件数・1クリックあたりの追加表示件数
   const [newsShowCount,setNewsShowCount]=useState(NEWS_PAGE_SIZE); // サブタブごとにリセットする表示件数
   const [chartModal,setChartModal]=useState(null); // {symbol,name,code,market} 5章：登録銘柄行の「チャート」ボタン用モーダル
+  // 2026-09-10新規（Unified Smart Import、Phase SI-D、指示書11・29番）：各タブから同じ
+  // SmartImportPanelを共通モーダルとして開けるようにする（別コンポーネントを複製しない）。
+  // sourceContextは分類のヒントに過ぎず、内容判定結果を強制しない（指示書12番）。
+  const [smartImportModal,setSmartImportModal]=useState(null); // {sourceContext}
+  const openSmartImport=(sourceContext)=>setSmartImportModal({sourceContext});
   // 2026-09-08新規（日本市場/米国株一覧「⋮」メニューへのポジション追加）：監視銘柄
   // （watchTargets）登録の有無に関わらず、登録銘柄（watchlist）一覧の行から直接ポジション
   // 追加モーダルを開けるようにする。既存のPositionEntryModal・/api/portfolio/add-entryを
@@ -9562,7 +9662,8 @@ function App(){
       </div>}
 
       {/* ===== イベント（PHASE 3：EVENT/EARNINGS INTELLIGENCE） ===== */}
-      {tab==="events" && <EventsPanel events={marketEvents} onReload={loadMarketEvents}/>}
+      {tab==="events" && <EventsPanel events={marketEvents} onReload={loadMarketEvents} onOpenSmartImport={()=>openSmartImport("EVENT")}/>}
+      {tab==="smartimport" && <SmartImportPanel onReload={()=>{loadNewsCatalysts();loadExpertViews();loadMarketEvents();}}/>}
       {tab==="eventDashboard" && <EventDashboardPanel events={marketEvents} allWatch={allWatch} heldItems={heldItems} onOpenManage={()=>setTab("events")}/>}
 
 
@@ -10224,8 +10325,8 @@ function App(){
           <div className="subtabs">
             {NEWS_SUBTABS.map(t=><button key={t.key} className={"chip"+(newsSubTab===t.key?" on":"")} onClick={()=>{setNewsSubTab(t.key);setNewsShowCount(NEWS_PAGE_SIZE);}}>{t.label}</button>)}
           </div>
-          {isCatalyst && <CatalystsPanel catalysts={newsCatalysts} onReload={loadNewsCatalysts}/>}
-          {isExpert && <ExpertViewsPanel views={expertViews} onReload={loadExpertViews}/>}
+          {isCatalyst && <CatalystsPanel catalysts={newsCatalysts} onReload={loadNewsCatalysts} onOpenSmartImport={()=>openSmartImport("CATALYST")}/>}
+          {isExpert && <ExpertViewsPanel views={expertViews} onReload={loadExpertViews} onOpenSmartImport={()=>openSmartImport("EXPERT_OPINION")}/>}
           {isSmartImport && <SmartImportPanel onReload={()=>{loadNewsCatalysts();loadExpertViews();loadMarketEvents();}}/>}
           {!isStructured && <>
                 {hasImportant && <div style={{display:"flex",alignItems:"center",gap:10,background:"var(--upBg)",border:"1px solid var(--up)",borderRadius:4,padding:"10px 14px",marginBottom:12}}>
@@ -10285,6 +10386,23 @@ function App(){
       {sectorPositionEntryFor && <PositionEntryModal code={sectorPositionEntryFor.code} name={sectorPositionEntryFor.name} market={sectorPositionEntryFor.market}
         needsTradeStyle={true} onClose={()=>setSectorPositionEntryFor(null)}
         onSaved={()=>{loadHeldItems();}}/>}
+
+      {/* 2026-09-10新規（Unified Smart Import、Phase SI-D）：各タブの「📥 Smart Importで追加」
+          から開く共通モーダル。独立タブ（📥 Smart Import）と同じSmartImportPanelを使い回す
+          （指示書11・29番：別コンポーネントを複製しない）。 */}
+      {smartImportModal && <div onClick={()=>setSmartImportModal(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,.5)",zIndex:30,
+          display:"flex",alignItems:"center",justifyContent:"center",padding:18}}>
+        <div onClick={e=>e.stopPropagation()} style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:12,
+            width:"100%",maxWidth:640,maxHeight:"92vh",overflowY:"auto",padding:20,boxShadow:"var(--shadowLg)"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:4}}>
+            <div className="kicker">Smart Import</div>
+            <button className="iconbtn" style={{fontSize:20}} onClick={()=>setSmartImportModal(null)}>×</button>
+          </div>
+          <SmartImportPanel sourceContext={smartImportModal.sourceContext} compactMode={true}
+            onReload={()=>{loadNewsCatalysts();loadExpertViews();loadMarketEvents();}}
+            onSaved={()=>setSmartImportModal(null)}/>
+        </div>
+      </div>}
 
     </div>
   );

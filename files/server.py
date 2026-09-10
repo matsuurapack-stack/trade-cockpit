@@ -6778,6 +6778,61 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
             "skipped_existing_report": skipped_existing_report}
 
 
+def smart_import_recent_activity(database_url, user_id, limit=15):
+    """Smart Import経由で登録された最近の項目一覧を返す（指示書14番（Phase SI-D）：
+    「可能なら既存DB情報から構成し、SmartImport専用巨大ログDBは作らない」を厳守——
+    新しいテーブルは一切増やさず、既存の各一覧関数からraw_payload.smart_import==Trueの
+    行だけを抜き出して合成する。MorningCheck/IntradayReportは日付をまたぐ一覧関数を
+    持たないため、直近数日分だけ確認する簡易版（完全な履歴ではない、既知の制約）。"""
+    if investment_db is None or not database_url:
+        return []
+    items = []
+    try:
+        for c in investment_db.list_news_catalysts(database_url, user_id, limit=300):
+            if (c.get("raw_payload") or {}).get("smart_import"):
+                is_analysis = (c.get("raw_payload") or {}).get("information_kind") == "ANALYSIS"
+                items.append({"time": c.get("created_at"), "category": "MARKET_ANALYSIS" if is_analysis else "CATALYST",
+                              "title": c.get("title"), "status": "SUCCESS"})
+    except Exception as e:
+        print("  SmartImport履歴: catalyst取得失敗", e)
+    try:
+        for e in investment_db.list_market_events(database_url, user_id, limit=200):
+            if (e.get("raw_payload") or {}).get("smart_import"):
+                items.append({"time": e.get("created_at"), "category": "EVENT", "title": e.get("title"), "status": "SUCCESS"})
+    except Exception as e:
+        print("  SmartImport履歴: event取得失敗", e)
+    try:
+        for v in investment_db.list_expert_views(database_url, user_id, limit=200):
+            if (v.get("raw_payload") or {}).get("smart_import"):
+                items.append({"time": v.get("created_at"), "category": "EXPERT_OPINION", "title": v.get("expert_name"), "status": "SUCCESS"})
+    except Exception as e:
+        print("  SmartImport履歴: expert_view取得失敗", e)
+    try:
+        today = datetime.date.today()
+        for d in (today, today - datetime.timedelta(days=1)):
+            check = investment_db.get_latest_morning_check(database_url, user_id, check_date=d.isoformat())
+            if check and check.get("snapshot_time") == "SMART_IMPORT":
+                items.append({"time": check.get("generated_at"), "category": "MORNING_MARKET_CHECK",
+                              "title": check.get("strategy_text", "")[:40], "status": "SUCCESS"})
+            for rt in INTRADAY_REPORT_SNAPSHOT_TIMES:
+                rep = investment_db.get_market_intelligence_report(database_url, user_id, d.isoformat(), rt)
+                if rep and (rep.get("data_health_json") or {}).get("smart_import"):
+                    items.append({"time": rep.get("generated_at"), "category": "INTRADAY_REPORT",
+                                  "title": f"{rt}（{d.isoformat()}）", "status": "SUCCESS"})
+    except Exception as e:
+        print("  SmartImport履歴: morning/intraday取得失敗", e)
+    try:
+        for r in investment_db.list_trade_rules(database_url, user_id):
+            sources = r.get("source_json") or []
+            if any((s or {}).get("smart_import") for s in sources if isinstance(s, dict)):
+                items.append({"time": r.get("updated_at") or r.get("created_at"), "category": "TRADE_RULE",
+                              "title": r.get("rule_text") or r.get("description"), "status": "CONFIRM_REQUIRED" if r.get("status") == "TESTING" else "SUCCESS"})
+    except Exception as e:
+        print("  SmartImport履歴: trade_rule取得失敗", e)
+    items.sort(key=lambda x: str(x.get("time") or ""), reverse=True)
+    return items[:limit]
+
+
 class Handler(SimpleHTTPRequestHandler):
     def log_message(self, *a):
         pass  # アクセスログは静かに
@@ -7119,6 +7174,12 @@ class Handler(SimpleHTTPRequestHandler):
             to_date = params.get("to", [None])[0]
             events = investment_db.list_market_events(DATABASE_URL, self.current_user, from_date=from_date, to_date=to_date) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"events": events})
+        elif self.path.startswith("/api/smart-import/history"):
+            # 2026-09-10新規（Unified Smart Import、Phase SI-D、指示書14番）：Smart Import経由
+            # で登録された最近の項目一覧。専用テーブルは持たず既存一覧関数から合成するだけ。
+            history = smart_import_recent_activity(DATABASE_URL, self.current_user) \
+                if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"history": history})
         elif self.path.startswith("/api/news-catalysts"):
             # v3-9続き（PHASE 4 NEWS/CATALYST INTELLIGENCE）：?from=&to=（catalyst_dateのISO日付）・
             # ?category=で絞り込み可能。
