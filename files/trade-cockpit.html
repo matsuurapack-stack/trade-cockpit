@@ -311,6 +311,47 @@ async function fetchChartBarsCached(code,market,interval,period){
   _chartBarsCache.set(key,{at:Date.now(),data:d});
   return d;
 }
+// 2026-09-10新規（不具合修正：日本株5分足チャートのX軸時刻がUTCのまま表示される問題）。
+// 根本原因はサーバー側ではなくLightweightCharts側：バックエンドの_fetch_intraday_bars()は
+// yfinanceのtimezone-awareなDatetimeIndex（日本株は東証タイムゾーンへ自動ローカライズ済み）を
+// .timestamp()でUNIX秒（＝正しい絶対時刻）に変換しているだけで、値そのものは常に正しい
+// （実測：7203.Tの5分足で1788998700秒→JST09:05・UTC00:05を確認、backendは無変更で良いと判断）。
+// LightweightCharts（v4）はtime軸のラベルを既定でUTC基準の時刻として描画する仕様のため、
+// timezone未指定のままだとJST日本市場の09:00-11:30/12:30-15:30が00:00-02:30/03:30-06:30と
+// 表示されていた。「常時+9時間する」のではなく、Intl.DateTimeFormat（timeZone:"Asia/Tokyo"）
+// による正規のtimezone変換をtickMarkFormatter/localization.timeFormatterへ渡す方式にする
+// （データそのものは一切書き換えない＝データがどのtimezone由来でも二重変換にならない）。
+// 「時刻正規化の責任箇所」はフロント側チャート描画部分に統一する（バックエンドはUTC UNIX秒を
+// 保持するだけ、という既存設計を変更しない）。
+const JST_TIME_ZONE="Asia/Tokyo";
+const _jstHmFormatter=new Intl.DateTimeFormat("ja-JP",{timeZone:JST_TIME_ZONE,hour:"2-digit",minute:"2-digit",hour12:false});
+const _jstYearFormatter=new Intl.DateTimeFormat("ja-JP",{timeZone:JST_TIME_ZONE,year:"numeric"});
+const _jstMonthFormatter=new Intl.DateTimeFormat("ja-JP",{timeZone:JST_TIME_ZONE,month:"short"});
+const _jstDayFormatter=new Intl.DateTimeFormat("ja-JP",{timeZone:JST_TIME_ZONE,day:"numeric"});
+// crosshair・凡例に出す時刻（localization.timeFormatter）。
+function jstCrosshairTimeFormatter(unixSec){
+  return _jstHmFormatter.format(new Date(unixSec*1000));
+}
+// X軸の目盛りラベル（timeScale.tickMarkFormatter）。tickMarkTypeに応じて年/月/日/時刻を
+// 切り替える（複数日分のbarsが混在する時間足でも、日付跨ぎの目盛りがJST基準で正しく出る＝
+// 「日付跨ぎ対応」）。
+function jstTickMarkFormatter(unixSec,tickMarkType){
+  const TM=(typeof LightweightCharts!=="undefined")?LightweightCharts.TickMarkType:null;
+  const d=new Date(unixSec*1000);
+  if(TM&&tickMarkType===TM.Year)return _jstYearFormatter.format(d);
+  if(TM&&tickMarkType===TM.Month)return _jstMonthFormatter.format(d);
+  if(TM&&tickMarkType===TM.DayOfMonth)return _jstDayFormatter.format(d);
+  return _jstHmFormatter.format(d);
+}
+// 日本株チャートのcreateChartオプションへ、上記のtimezone変換オプションだけを差し込むヘルパー。
+// market!=="JP"の場合は何も変えず既存動作（LightweightChartsの既定描画）のまま返す＝
+// 米国株等の他市場チャートは無変更（不具合修正の対象外・壊さない）。
+function withJstChartTimeOptions(chartOptions,market){
+  if((market||"JP")!=="JP")return chartOptions;
+  return {...chartOptions,
+    localization:{...(chartOptions.localization||{}),timeFormatter:jstCrosshairTimeFormatter},
+    timeScale:{...(chartOptions.timeScale||{}),tickMarkFormatter:jstTickMarkFormatter}};
+}
 // 以下、短期足チャート専用のヘルパー（VWAP・前日高値安値・当日始値・初期表示範囲）。
 // いずれも取得済みのbars配列だけから計算する軽量処理で、新しいAPI呼び出しは発生しない。
 // 日付の区切りはJST基準（サーバーのタイムスタンプはUNIX秒＝UTC基準のため、JSTへ変換してから
@@ -4777,11 +4818,11 @@ function PositionIntradayChart({item,currentPrice}){
     if(!el)return;
     if(typeof LightweightCharts==="undefined"){setMsg("チャート描画ライブラリの読み込みに失敗しました。通信環境をご確認ください。");return;}
     el.innerHTML="";
-    const chart=LightweightCharts.createChart(el,{width:el.clientWidth||600,height:280,
+    const chart=LightweightCharts.createChart(el,withJstChartTimeOptions({width:el.clientWidth||600,height:280,
       layout:{background:{color:"transparent"},textColor:"#565A52"},
       grid:{vertLines:{color:"#D6D8CF"},horzLines:{color:"#D6D8CF"}},
       timeScale:{borderColor:"#C6C8BF",timeVisible:true,secondsVisible:false},
-      rightPriceScale:{borderColor:"#C6C8BF"}});
+      rightPriceScale:{borderColor:"#C6C8BF"}},item.market));
     const series=chart.addCandlestickSeries({upColor:"#AE3A34",downColor:"#2C6A48",borderVisible:false,
       wickUpColor:"#AE3A34",wickDownColor:"#2C6A48"}); // 日本の相場慣習に合わせ赤=上昇・緑=下落（既存JPチャートと同一配色）
     const volSeries=chart.addHistogramSeries({priceFormat:{type:"volume"},priceScaleId:"volPane",color:"#8a8f80"});
@@ -9501,11 +9542,15 @@ function App(){
       if(el._cleanup)el._cleanup();
       el.innerHTML="";
       const hasVolume=Array.isArray(volumes)&&volumes.length>0;
-      const chart=LightweightCharts.createChart(el,{width:el.clientWidth||680,height:440,
+      // 日足(isDaily)はtimeにUNIX秒ではなく日付文字列("YYYY-MM-DD")を渡す別系統のデータ
+      // （/api/stock-history）のため、jstTickMarkFormatter（UNIX秒前提）は分/時足の時だけ適用する
+      // （日足の日付表示は元々timezoneの影響を受けない、対象外）。
+      const jpChartBaseOptions={width:el.clientWidth||680,height:440,
         layout:{background:{color:"transparent"},textColor:"#565A52"},
         grid:{vertLines:{color:"#D6D8CF"},horzLines:{color:"#D6D8CF"}},
         timeScale:{borderColor:"#C6C8BF",timeVisible:!isDaily,secondsVisible:false},
-        rightPriceScale:{borderColor:"#C6C8BF"}});
+        rightPriceScale:{borderColor:"#C6C8BF"}};
+      const chart=LightweightCharts.createChart(el,isDaily?jpChartBaseOptions:withJstChartTimeOptions(jpChartBaseOptions,chartModal.market));
       const series=chart.addCandlestickSeries({upColor:"#AE3A34",downColor:"#2C6A48",borderVisible:false,
         wickUpColor:"#AE3A34",wickDownColor:"#2C6A48"}); // 日本の相場慣習に合わせ赤=上昇・緑=下落
       series.setData(candles);
