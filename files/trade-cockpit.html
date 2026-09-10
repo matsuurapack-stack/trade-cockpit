@@ -2556,17 +2556,25 @@ function CatalystsPanel({catalysts,onReload}){
 // 内の「JSONを取り込む」欄は引き続き残す（指示書1・25番：既存入力経路も残してよい）。
 // Phase SI-Aの実装範囲はCATALYST/EVENT/EXPERT_OPINIONの3カテゴリのみ（それ以外は
 // UNKNOWN扱いになり保存されない、Phase SI-B以降で拡張予定）。
+// 2026-09-10更新（Phase SI-B）：MARKET_ANALYSIS/MORNING_MARKET_CHECK/INTRADAY_REPORT/
+// TRADE_RULEを追加。TRADE_RULEだけ🚨表示（指示書8番：confidenceに関わらず自動選択しない）。
 const SMART_IMPORT_CATEGORY_META={
   CATALYST:{icon:"✅",label:"CATALYST（カタリスト）",color:"var(--up)"},
   EXPERT_OPINION:{icon:"✅",label:"EXPERT OPINION（有識者意見）",color:"var(--up)"},
   EVENT:{icon:"✅",label:"EVENT（イベント）",color:"var(--up)"},
+  MARKET_ANALYSIS:{icon:"✅",label:"MARKET ANALYSIS（市場分析）",color:"var(--up)"},
+  MORNING_MARKET_CHECK:{icon:"✅",label:"MORNING MARKET CHECK（朝一チェック）",color:"var(--up)"},
+  INTRADAY_REPORT:{icon:"✅",label:"INTRADAY REPORT（場中レポート）",color:"var(--up)"},
+  TRADE_RULE:{icon:"🚨",label:"TRADE RULE（売買ルール変更候補）",color:"var(--down)"},
+  CHATGPT_LEGACY:{icon:"✅",label:"ChatGPT連携（従来形式）",color:"var(--up)"},
   UNKNOWN:{icon:"❔",label:"判別不能",color:"var(--inkFaint)"},
 };
 const SMART_IMPORT_CONFIDENCE_META={
   HIGH:{label:"HIGH", color:"var(--up)"}, MEDIUM:{label:"MEDIUM", color:"var(--accent)"},
   LOW:{label:"LOW（要確認）", color:"var(--down)"},
 };
-const SMART_IMPORT_IMPLEMENTED=["CATALYST","EVENT","EXPERT_OPINION"];
+const SMART_IMPORT_IMPLEMENTED=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
+  "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","CHATGPT_LEGACY"];
 
 function SmartImportPanel({onReload}){
   const [text,setText]=useState("");
@@ -2583,9 +2591,13 @@ function SmartImportPanel({onReload}){
     setAnalyzing(false);
     if(d&&d.candidates){
       setCandidates(d.candidates);
-      // 指示書16番：LOW confidenceは既定で未選択にする（自動保存しない、ユーザーの明示確認必須）
+      // 指示書16番：LOW confidenceは既定で未選択（自動保存しない、明示確認必須）。
+      // 指示書8番（最重要）：TRADE_RULEはHIGH confidenceでもconfidenceに関わらず既定で
+      // 未選択にする（🚨ルール変更候補として必ずユーザーに能動的な選択を求める）。
       const init={};
-      d.candidates.forEach((c,i)=>{init[i]=c.confidence!=="LOW"&&SMART_IMPORT_IMPLEMENTED.includes(c.category);});
+      d.candidates.forEach((c,i)=>{
+        init[i]=c.category!=="TRADE_RULE"&&c.confidence!=="LOW"&&SMART_IMPORT_IMPLEMENTED.includes(c.category);
+      });
       setSelected(init);
     }else{
       setResultMsg("解析に失敗しました");
@@ -2668,6 +2680,40 @@ function SmartImportPanel({onReload}){
                   style={{width:"100%",fontSize:12,padding:4,marginBottom:4,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",boxSizing:"border-box"}}/>
                 <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>{c.draft.opinion_summary}</div>
               </>}
+              {c.category==="MARKET_ANALYSIS" && <>
+                <div style={{fontSize:11,color:"var(--inkFaint)"}}>地合い:{c.draft.market_regime||"（不明）"}</div>
+                <div style={{fontSize:11.5,color:"var(--inkSoft)",marginTop:4}}>{c.draft.summary||c.draft.market_summary}</div>
+              </>}
+              {c.category==="MORNING_MARKET_CHECK" && <>
+                <div style={{fontSize:11,color:"var(--inkFaint)"}}>地合い:{c.draft.market_regime||"（不明）"}　保存先: morning_market_checks（snapshot_time=SMART_IMPORT）</div>
+                <div style={{fontSize:11.5,color:"var(--inkSoft)",marginTop:4}}>{c.draft.summary}</div>
+              </>}
+              {c.category==="INTRADAY_REPORT" && <>
+                {!c.draft.report_type
+                  ? <span style={{fontSize:11,color:"var(--down)",fontWeight:700}}>⚠ 時間帯（report_type）未確定。下で指定してください（自動推定しません）</span>
+                  : <span style={{fontSize:11,color:"var(--inkFaint)"}}>時間帯:{c.draft.report_type}</span>}
+                <select value={c.draft.report_type||""} onChange={e=>updateDraft(i,"report_type",e.target.value||null)}
+                  style={{fontSize:11.5,padding:"2px 4px",marginLeft:6,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)"}}>
+                  <option value="">（未指定）</option>
+                  <option value="OPENING_30M">OPENING_30M（09:30）</option>
+                  <option value="MORNING_CLOSE">MORNING_CLOSE（11:30）</option>
+                  <option value="AFTERNOON_30M">AFTERNOON_30M（13:00）</option>
+                  <option value="MARKET_CLOSE">MARKET_CLOSE（15:30）</option>
+                </select>
+                <div style={{fontSize:11.5,color:"var(--inkSoft)",marginTop:4}}>{c.draft.market_summary}</div>
+              </>}
+              {c.category==="TRADE_RULE" && <>
+                {c.draft.risk_rule_change_candidate && <div style={{fontSize:12,fontWeight:700,color:"var(--down)",marginBottom:4}}>
+                  🚨 RISK RULE CHANGE：損切りルール（position_risk_rules）に関わる変更提案の可能性があります。
+                  このまま登録してもposition_risk_rulesは変更されません（trade_rulesへ「検証中」候補として記録されるのみ）。
+                </div>}
+                <textarea value={c.draft.description||""} onChange={e=>updateDraft(i,"description",e.target.value)} rows={2}
+                  style={{width:"100%",fontSize:12,padding:4,border:"1px solid var(--rule)",borderRadius:3,background:"var(--bg)",color:"var(--ink)",boxSizing:"border-box"}}/>
+                <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:4}}>登録先：ルール（trade_rules、TESTING/LOWから開始・既存の学習フローで昇格判定）</div>
+              </>}
+              {c.category==="CHATGPT_LEGACY" && <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>
+                旧ChatGPT統合連携形式（date/watchlist/decisions/rule_updates等）として検出されました。既存のChatGPT統合連携パーサーへそのまま渡されます。
+              </div>}
               {!implemented && <div style={{fontSize:11.5,color:"var(--inkFaint)",whiteSpace:"pre-wrap"}}>{c.raw_text}</div>}
             </div>
           </div>;
@@ -2679,7 +2725,8 @@ function SmartImportPanel({onReload}){
     </div>}
   </div>;
 }
-const SMART_IMPORT_CATEGORIES_UI=["CATALYST","EVENT","EXPERT_OPINION","UNKNOWN"];
+const SMART_IMPORT_CATEGORIES_UI=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
+  "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","UNKNOWN"];
 
 function ExpertViewsPanel({views,onReload}){
   const [pasteText,setPasteText]=useState("");
@@ -6094,21 +6141,32 @@ function ChatGptImportPanel({journal,activeRules}){
     {/* 2026-09-09更新（指示書1・2・29番）：「投資ログ取り込み」から「ChatGPT統合連携」へ
         役割を拡張。ChatGPTから受け取った市場情報・銘柄・ニュース・イベント・有識者見解・
         投資判断・ルールを自動分類して取り込む唯一の入口という位置づけを明示する。 */}
-    <div className="sec-head">ChatGPT統合連携</div>
-    <div className="sec-note" style={{marginTop:2}}>ChatGPTから受け取った市場情報、銘柄、ニュース、イベント、有識者見解、投資判断、ルールを自動分類して取り込みます。</div>
+    <div className="sec-head">ChatGPT / Claude / AI分析を貼り付け</div>
+    <div className="sec-note" style={{marginTop:2}}>JSON・自然文・箇条書き・分析文をそのまま貼り付け可能です。市場情報、銘柄、ニュース、イベント、有識者見解、投資判断、ルールを自動分類して取り込みます。</div>
 
     <div style={{marginTop:10,display:"flex",alignItems:"center",gap:8}}>
       <button className="action-btn" onClick={copyClosingReport}>📋 ChatGPT大引け振り返り用にコピー</button>
       {closingMsg && <span style={{fontSize:11,color:"var(--inkSoft)"}}>{closingMsg}</span>}
     </div>
 
-    <div style={{marginTop:16}}>
-      <label style={labelStyle}>ChatGPTが出力したJSON
-        <button className="action-btn" style={{marginLeft:8,fontSize:11}} onClick={()=>setRawText(CHATGPT_SAMPLE_JSON)}>サンプルを入力</button>
-      </label>
-      <textarea value={rawText} onChange={e=>setRawText(e.target.value)} rows={10} placeholder='{"date":"2026-09-02", ...}'
-        style={{...fieldStyle,fontFamily:"monospace",fontSize:12}}/>
-      <button className="action-btn" style={{marginTop:8}} onClick={parse} disabled={!rawText.trim()}>解析</button>
+    {/* 2026-09-10新規（Unified Smart Import、Phase SI-B、指示書1・12番）：ChatGPT統合連携を
+        Smart Importへ統合。「文章・自然文・箇条書き・分析文をそのまま貼る」場合はこちらを
+        使う（MARKET_ANALYSIS/MORNING_MARKET_CHECK/INTRADAY_REPORT/TRADE_RULE/CATALYST/
+        EVENT/EXPERT_OPINION/旧ChatGPT JSON形式まで自動判別）。既存の「詳細形式JSON」欄
+        （厳密なフラットschema向け、下記）はそのまま残す（指示書1・12番：既存JSONサンプル
+        入力欄も残してよい）。 */}
+    <SmartImportPanel onReload={loadImports}/>
+
+    <div style={{marginTop:24,paddingTop:16,borderTop:"1px solid var(--rule)"}}>
+      <div className="sec-head" style={{fontSize:13}}>詳細形式JSON（従来方式・厳密なschema向け）</div>
+      <div style={{marginTop:10}}>
+        <label style={labelStyle}>ChatGPTが出力したJSON
+          <button className="action-btn" style={{marginLeft:8,fontSize:11}} onClick={()=>setRawText(CHATGPT_SAMPLE_JSON)}>サンプルを入力</button>
+        </label>
+        <textarea value={rawText} onChange={e=>setRawText(e.target.value)} rows={10} placeholder='{"date":"2026-09-02", ...}'
+          style={{...fieldStyle,fontFamily:"monospace",fontSize:12}}/>
+        <button className="action-btn" style={{marginTop:8}} onClick={parse} disabled={!rawText.trim()}>解析</button>
+      </div>
     </div>
 
     {parseErrors.length>0 && <div className="card" style={{marginTop:12,padding:"10px 14px",border:"1px solid var(--down)"}}>

@@ -6135,7 +6135,15 @@ SMART_IMPORT_CATEGORIES = [  # 指示書2番。将来カテゴリ追加時はこ
     "CATALYST", "EXPERT_OPINION", "EVENT", "MARKET_ANALYSIS", "MORNING_MARKET_CHECK",
     "INTRADAY_REPORT", "TRADE_RULE", "NEWS", "WATCHLIST_UPDATE", "POSITION_UPDATE", "UNKNOWN",
 ]
-SMART_IMPORT_IMPLEMENTED_CATEGORIES = {"CATALYST", "EVENT", "EXPERT_OPINION"}  # Phase SI-Aの範囲
+# Phase SI-B（2026-09-10）で MARKET_ANALYSIS・MORNING_MARKET_CHECK・INTRADAY_REPORT・
+# TRADE_RULEを追加。CHATGPT_LEGACYはSMART_IMPORT_CATEGORIESには含めない内部専用カテゴリ
+# （指示書1番：既存ChatGPT統合連携のtype=trading_log的な旧schemaを検出した場合に、既存の
+# save_chatgpt_unified_import()へそのまま委譲するための経路。UIのカテゴリ選択肢にも出さない）。
+# WATCHLIST_UPDATE・POSITION_UPDATE・NEWSはPhase SI-C予定、現時点ではUNKNOWNのまま。
+SMART_IMPORT_IMPLEMENTED_CATEGORIES = {
+    "CATALYST", "EVENT", "EXPERT_OPINION", "MARKET_ANALYSIS", "MORNING_MARKET_CHECK",
+    "INTRADAY_REPORT", "TRADE_RULE", "CHATGPT_LEGACY",
+}
 
 _JSON_CODEBLOCK_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 
@@ -6166,12 +6174,47 @@ def _extract_json_candidates(raw_text):
     return None
 
 
+# INTRADAY_REPORT・EVENT等の時刻文字列（"09:30"等）からreport_typeを推定するための対応表
+# （指示書6番：INTRADAY_REPORT_SNAPSHOT_TIMESの逆引き。時刻の断定表記が無ければ推定しない）。
+_SMART_IMPORT_TIME_TO_REPORT_TYPE = {v: k for k, v in INTRADAY_REPORT_SNAPSHOT_TIMES.items()}
+
+
+def _looks_like_legacy_chatgpt_payload(item):
+    """既存ChatGPT統合連携（date/market/watchlist/decisions/rule_updates、
+    classify_chatgpt_unified_payload()が前提とするTRADING_LOG形式）のJSONかどうかを
+    フィールド形状で判定する（指示書1番：優先順位1＝既知JSON schema、2＝既存ChatGPT
+    parserを再利用する経路）。"""
+    if not isinstance(item, dict):
+        return False
+    list_keys = ("watchlist", "decisions", "rule_updates", "events", "news", "expert_opinions", "catalysts")
+    return "date" in item and any(isinstance(item.get(k), list) for k in list_keys)
+
+
 def _classify_json_item(item):
-    """dict1件をCATALYST/EVENT/EXPERT_OPINION/UNKNOWNへ分類する（フィールド形状ベース、
-    指示書4番STEP2）。既存の各schemaのキー名をそのまま使い、新しいschemaは増やさない。"""
+    """dict1件をカテゴリへ分類する（フィールド形状ベース、指示書4番STEP2・14番：既知typeを
+    最優先）。既存の各schemaのキー名をそのまま使い、新しいschemaは増やさない。"""
     if not isinstance(item, dict):
         return "UNKNOWN", "LOW", {}
     t = str(item.get("type") or "").strip().lower()
+
+    # 指示書14番：既知typeがあれば自然文解析より最優先。type=trading_log等の旧ChatGPT形式は
+    # 既存パーサーへ委譲する（指示書1番の優先順位1・2）。
+    if t == "morning_market_check" or ("watchlist_top5" in item and "market_regime" in item and t != "market_intraday_report"):
+        return "MORNING_MARKET_CHECK", "HIGH", item
+    if t in ("market_intraday_report", "daily_market_review"):
+        draft = dict(item)
+        if t == "daily_market_review" and not draft.get("report_type"):
+            draft["report_type"] = "MARKET_CLOSE"  # 指示書5番：daily_market_reviewは大引け相当
+        rt = draft.get("report_type")
+        confidence = "HIGH" if rt in INTRADAY_REPORT_SNAPSHOT_TIMES else "MEDIUM"
+        return "INTRADAY_REPORT", confidence, draft
+    if t == "market_analysis":
+        return "MARKET_ANALYSIS", "HIGH", item
+    if t == "trade_rule":
+        return "TRADE_RULE", "HIGH", item
+    if _looks_like_legacy_chatgpt_payload(item):
+        return "CHATGPT_LEGACY", "HIGH", item
+
     if t in ("catalyst", "news_catalyst"):
         return "CATALYST", "HIGH", item
     if t in ("event", "market_event"):
@@ -6208,12 +6251,25 @@ _SMART_IMPORT_CATALYST_KEYWORDS = [
 ]
 _SMART_IMPORT_STOCK_CODE_RE = re.compile(r"\b(\d{4})\b")
 
+# 指示書7番（Phase SI-B）：売買ルール変更・追加の検出。単なる「〜しない」等の一般的な否定文
+# まで拾うと誤検出が多いため、明確なルール宣言語＋トレード行動語の組み合わせでのみ検出する
+# （指示書8・9番：TRADE_RULEは自動保存禁止・position_risk_rulesは直接上書きしない前提）。
+_SMART_IMPORT_RULE_DECLARATION_KEYWORDS = ["禁止", "必ず", "例外なく", "例外なし", "一旦売却",
+    "厳守", "徹底する", "ルールとする", "ルール化", "変更する", "へ変更"]
+_SMART_IMPORT_RULE_ACTION_KEYWORDS = ["売却", "エントリー", "スイング", "建てる", "損切り",
+    "利確", "持ち越し", "デイトレ", "ポジション", "EXIT"]
+_SMART_IMPORT_RULE_PCT_RE = re.compile(r"([-+]?\d+(?:\.\d+)?)\s*%")
+# 指示書9番：position_risk_rules（-6 WATCH/-7 WARNING/-8 EXIT）に関わる変更提案かどうかの
+# 簡易判定。数値そのものの意味は判断せず「損切り/EXIT関連の語＋%」があれば警告フラグを立てる
+# だけに留める（閾値の意味解釈や自動比較はしない、安全側）。
+_SMART_IMPORT_RISK_RULE_KEYWORDS = ["EXIT", "損切り", "-8%", "-8％"]
+
 
 def _classify_text_chunk(chunk):
-    """自然文の1塊をEVENT/EXPERT_OPINION/CATALYST/UNKNOWNへ分類する簡易ヒューリスティック
-    （指示書4番STEP3・4、指示書22・23番：事実と意見の区別を試みるが、あくまで簡易判定であり
-    確信が持てなければLOW・UNKNOWNに倒す）。AIモデルは使わず、キーワード・正規表現のみで
-    判定する（他のAUTO系エンジンと同じ設計方針）。"""
+    """自然文の1塊をEVENT/EXPERT_OPINION/CATALYST/TRADE_RULE/UNKNOWNへ分類する簡易
+    ヒューリスティック（指示書4番STEP3・4、指示書22・23番：事実と意見の区別を試みるが、
+    あくまで簡易判定であり確信が持てなければLOW・UNKNOWNに倒す）。AIモデルは使わず、
+    キーワード・正規表現のみで判定する（他のAUTO系エンジンと同じ設計方針）。"""
     chunk = chunk.strip()
     if not chunk:
         return "UNKNOWN", "LOW", {}
@@ -6223,6 +6279,9 @@ def _classify_text_chunk(chunk):
     has_opinion_verb = any(v in chunk for v in _SMART_IMPORT_OPINION_VERBS)
     has_catalyst_kw = any(kw in chunk for kw in _SMART_IMPORT_CATALYST_KEYWORDS)
     stock_code = _SMART_IMPORT_STOCK_CODE_RE.search(chunk)
+    has_rule_decl = any(kw in chunk for kw in _SMART_IMPORT_RULE_DECLARATION_KEYWORDS)
+    has_rule_action = any(kw in chunk for kw in _SMART_IMPORT_RULE_ACTION_KEYWORDS)
+    pct_match = _SMART_IMPORT_RULE_PCT_RE.search(chunk)
 
     # 話者名＋意見動詞（より具体的なシグナル）を、単なるイベントキーワード一致より優先する。
     # 例：「木野内氏はFOMCまでは慎重との見方」はFOMCという語を含むが、これはイベント告知では
@@ -6230,6 +6289,13 @@ def _classify_text_chunk(chunk):
     if expert_match and has_opinion_verb:
         return "EXPERT_OPINION", "MEDIUM", {
             "expert_name": expert_match.group(1), "opinion_summary": chunk, "outlook": chunk}
+    # ルール宣言語＋トレード行動語の組み合わせも、単なるイベントキーワード一致より優先する
+    # （例：「FOMCまでスイング禁止」はFOMCを含むがイベント告知ではなくルール宣言）。
+    if has_rule_decl and has_rule_action:
+        is_risk_rule_change = bool(pct_match) and any(kw in chunk for kw in _SMART_IMPORT_RISK_RULE_KEYWORDS)
+        return "TRADE_RULE", ("MEDIUM" if pct_match else "HIGH"), {
+            "title": chunk[:60], "description": chunk, "threshold": pct_match.group(1) if pct_match else None,
+            "risk_rule_change_candidate": is_risk_rule_change}
     if has_event_kw:
         return "EVENT", ("MEDIUM" if has_date else "LOW"), {
             "title": chunk[:80], "event_date": None, "notes": chunk}
@@ -6237,6 +6303,60 @@ def _classify_text_chunk(chunk):
         return "CATALYST", ("MEDIUM" if stock_code else "LOW"), {
             "title": chunk[:80], "summary": chunk, "ticker": stock_code.group(1) if stock_code else None}
     return "UNKNOWN", "LOW", {}
+
+
+# 指示書2・3番（Phase SI-B）：文単位ではなく文章全体レベルで市場地合い・朝一・場中の
+# 「語り（narrative）」を検出する。MARKET_ANALYSIS/MORNING_MARKET_CHECK/INTRADAY_REPORTは
+# 1文に収まらない段落・複数文であることが多いため、_classify_text_chunk（1文単位）とは
+# 別枠で全体を1つの候補として扱う。
+_SMART_IMPORT_REGIME_KEYWORDS = ["RISK_OFF", "RISK_ON", "リスクオフ", "リスクオン", "様子見",
+    "地合い", "強気相場", "弱気相場"]
+_SMART_IMPORT_INDEX_MOVE_RE = re.compile(r"(日経|NASDAQ|ナスダック|VIX|米10年|TOPIX|ダウ|SOX)[^\d]{0,6}[-+]?\d+(\.\d+)?")
+_SMART_IMPORT_MORNING_MARKERS = ["今朝", "朝一", "寄り前", "本日の戦略", "本日の注目", "朝の想定"]
+_SMART_IMPORT_INTRADAY_MARKERS = ["時点", "VWAP", "地合い耐性", "朝仮説", "寄り30分", "前場終了", "後場"]
+_SMART_IMPORT_INTRADAY_TIME_RE = re.compile(r"(09:30|9:30|11:30|13:00|15:30)")
+
+
+def _guess_market_regime_from_text(text):
+    """テキスト中の地合い表現からmarket_regime文字列を推定する（数値の推測はしないが、
+    明示的に書かれている地合い語の言い換え正規化程度は許容する）。判別できなければNone。"""
+    if "RISK_OFF" in text or "リスクオフ" in text or "RISK OFF" in text:
+        return "RISK_OFF"
+    if "RISK_ON" in text or "リスクオン" in text or "RISK ON" in text:
+        return "RISK_ON"
+    if "様子見" in text:
+        return "NEUTRAL"
+    return None
+
+
+def _classify_market_narrative(raw_text):
+    """raw_text全体からMARKET_ANALYSIS/MORNING_MARKET_CHECK/INTRADAY_REPORTのいずれかを
+    検出する（指示書2・3・5番）。地合いキーワードまたは指数変動の言及が無ければNoneを返す
+    （誤検出防止、指示書30番の「判別不能」に倒れる）。"""
+    text = raw_text or ""
+    has_regime_kw = any(kw in text for kw in _SMART_IMPORT_REGIME_KEYWORDS)
+    has_index_move = bool(_SMART_IMPORT_INDEX_MOVE_RE.search(text))
+    if not (has_regime_kw or has_index_move):
+        return None
+    signal_count = sum([has_regime_kw, has_index_move])
+    is_morning = any(kw in text for kw in _SMART_IMPORT_MORNING_MARKERS)
+    is_intraday = any(kw in text for kw in _SMART_IMPORT_INTRADAY_MARKERS)
+    time_match = _SMART_IMPORT_INTRADAY_TIME_RE.search(text)
+    market_regime = _guess_market_regime_from_text(text)
+
+    if is_intraday:
+        report_type = _SMART_IMPORT_TIME_TO_REPORT_TYPE.get(time_match.group(1).replace("9:30", "09:30")) if time_match else None
+        confidence = "HIGH" if (report_type and signal_count >= 2) else ("MEDIUM" if report_type else "LOW")
+        return {"category": "INTRADAY_REPORT", "confidence": confidence, "source_kind": "natural_text",
+                "raw_text": text[:800], "draft": {"report_type": report_type, "market_summary": text,
+                                                    "market_regime": market_regime, "trade_date": None}}
+    if is_morning:
+        confidence = "HIGH" if signal_count >= 2 else "MEDIUM"
+        return {"category": "MORNING_MARKET_CHECK", "confidence": confidence, "source_kind": "natural_text",
+                "raw_text": text[:800], "draft": {"summary": text, "market_regime": market_regime}}
+    confidence = "MEDIUM" if signal_count >= 2 else "LOW"
+    return {"category": "MARKET_ANALYSIS", "confidence": confidence, "source_kind": "natural_text",
+            "raw_text": text[:800], "draft": {"summary": text, "market_regime": market_regime}}
 
 
 def classify_content(raw_text):
@@ -6266,10 +6386,17 @@ def classify_content(raw_text):
         if candidates:
             return candidates
     # JSONとして解釈できない、または要素0件→自然文解析（指示書3・30番：エラーにしない）
+    candidates = []
+    # 指示書2・3・5番（Phase SI-B）：文章全体レベルでMARKET_ANALYSIS/MORNING_MARKET_CHECK/
+    # INTRADAY_REPORTを先に検出する（1文単位では拾えない段落全体の「語り」のため）。
+    narrative = _classify_market_narrative(raw_text)
+    if narrative:
+        candidates.append(narrative)
+    # 続けて文単位でEVENT/EXPERT_OPINION/CATALYST/TRADE_RULEを検出する（指示書10番：
+    # 複数カテゴリ混在文を独立候補へ分割、narrativeとは重複しても構わない＝両方提示する）。
     chunks = [c.strip() for c in re.split(r"[。\n]", raw_text) if c.strip()]
     if not chunks:
         chunks = [raw_text]
-    candidates = []
     for chunk in chunks:
         category, confidence, draft = _classify_text_chunk(chunk)
         if category != "UNKNOWN":
@@ -6338,18 +6465,150 @@ def normalize_expert_opinion(draft, raw_text=None, import_source="unknown"):
     return out
 
 
+def normalize_market_analysis(draft, raw_text=None, import_source="unknown"):
+    """draftをinvestment_db.import_news_catalysts()が受け付ける形へ正規化する（指示書2番）。
+    MARKET_ANALYSIS専用のテーブルは新設せず、既存news_catalystsのcategory="MACRO"
+    （市場全体に関わるカタリスト、既存enumをそのまま再利用）として保存する——市場分析の
+    詳細構造（market_regime/strong_sectors/weak_sectors/watch_tickers/avoid_tickers/
+    risk_factors/strategy等）はraw_payloadへそのまま保持し、失われないようにする
+    （指示書19番）。指示書22番：あくまでANALYSIS（意見）であってFACTではないことを
+    raw_payload.information_kindで明示する。summaryが無ければNoneを返す。"""
+    draft = draft or {}
+    summary = draft.get("summary") or draft.get("market_summary")
+    if not summary:
+        return None
+    title = draft.get("title") or summary[:60]
+    out = {
+        "title": title, "summary": summary,
+        "catalyst_date": draft.get("analysis_date") or draft.get("published_at") or datetime.date.today().isoformat(),
+        "category": "MACRO",
+        "affected_stocks": (draft.get("watch_tickers") or []) + (draft.get("avoid_tickers") or []),
+        "affected_sectors": (draft.get("strong_sectors") or []) + (draft.get("weak_sectors") or []),
+        "source": draft.get("source") or import_source,
+    }
+    payload = dict(draft.get("raw_payload") or {})
+    payload.update({
+        "raw_text": raw_text, "import_source": import_source, "smart_import": True,
+        "information_kind": "ANALYSIS", "market_regime": draft.get("market_regime"),
+        "volatility_regime": draft.get("volatility_regime"), "strong_sectors": draft.get("strong_sectors"),
+        "weak_sectors": draft.get("weak_sectors"), "watch_tickers": draft.get("watch_tickers"),
+        "avoid_tickers": draft.get("avoid_tickers"), "risk_factors": draft.get("risk_factors"),
+        "strategy": draft.get("strategy"), "key_points": draft.get("key_points"),
+    })
+    out["raw_payload"] = payload
+    return out
+
+
+# Morning Checkの自然文解析結果をsave_morning_check()の必須列（_MORNING_CHECK_SCALAR_COLS/
+# _MORNING_CHECK_JSON_COLS）へ写像する。数値スコア系（market_risk_score・volatility_score等）
+# は自然文から確信を持って抽出できないためNoneのまま保持する（指示書3・20番：不足値を
+# 推測しない）。
+def normalize_morning_check(draft, raw_text=None, import_source="unknown"):
+    """draftをinvestment_db.save_morning_check()が受け付けるdata形へ正規化する
+    （指示書3・4番）。summaryもmarket_regimeも取れない場合はNoneを返す（保存不可）。
+    戻り値：(check_date, data) のタプル、またはNone。"""
+    draft = draft or {}
+    if not (draft.get("summary") or draft.get("market_regime") or draft.get("global_market")):
+        return None
+    check_date = draft.get("date") or datetime.date.today().isoformat()
+    data = {
+        "market_regime": draft.get("market_regime"), "volatility_regime": draft.get("volatility_regime"),
+        "trend_type": draft.get("trend_type"), "market_risk_score": draft.get("market_risk_score"),
+        "volatility_score": draft.get("volatility_score"), "trend_score": draft.get("trend_score"),
+        "macro_pressure_score": draft.get("macro_pressure_score"),
+        "strategy_text": draft.get("summary") or draft.get("morning_conclusion") or draft.get("strategy"),
+        "indices_json": {"global_market": draft.get("global_market"), "japan_market": draft.get("japan_market"),
+                          "rates_fx": draft.get("rates_fx"), "commodities": draft.get("commodities")},
+        "strong_sectors_json": draft.get("strong_sectors") or [],
+        "weak_sectors_json": draft.get("weak_sectors") or [],
+        # daytrade_watchlist/watch_tickers等、呼称のブレを吸収する（指示書13番：既存WARNINGの
+        # 改善＝別キーにある同等情報を自動マッピングし、ユーザーにschemaの違いを意識させない）。
+        "watchlist_top5_json": [{"code": t.get("code") if isinstance(t, dict) else None,
+                                   "name": t.get("name") if isinstance(t, dict) else t, "rank": i + 1}
+                                  for i, t in enumerate(draft.get("daytrade_watchlist") or draft.get("watch_tickers") or [])],
+        "avoid_stocks_json": [{"code": t.get("code") if isinstance(t, dict) else None,
+                                 "name": t.get("name") if isinstance(t, dict) else t}
+                                for t in (draft.get("avoid_watch") or draft.get("avoid_tickers") or [])],
+        "risk_warnings_json": draft.get("risk_alerts") or [],
+        "event_risk_json": [],
+        "position_risk_json": [],
+        "strategy_json": {"execution_rules": draft.get("execution_rules"), "scenario_plan": draft.get("scenario_plan")},
+        "data_quality_json": {"smart_import": True,
+                               "quality": "PARTIAL" if draft.get("market_risk_score") is None else "FULL"},
+        "raw_payload_json": {"raw_text": raw_text, "import_source": import_source, "smart_import": True,
+                              "source_mode": "smart_import"},
+    }
+    return check_date, data
+
+
+def normalize_intraday_report(draft, raw_text=None, import_source="unknown"):
+    """draftをinvestment_db.save_market_intelligence_report()が受け付けるdata形へ正規化する
+    （指示書5・6番）。report_typeが確定できない場合は勝手に推定せずNoneを返す（保存不可、
+    プレビューでユーザーに時間帯の指定を促す）。戻り値：(trade_date, report_type, data) の
+    タプル、またはNone。"""
+    draft = draft or {}
+    report_type = draft.get("report_type")
+    if report_type not in INTRADAY_REPORT_SNAPSHOT_TIMES:
+        return None
+    if not (draft.get("market_summary") or draft.get("market_regime")):
+        return None
+    trade_date = draft.get("trade_date") or datetime.date.today().isoformat()
+    data = {
+        "scheduled_time": INTRADAY_REPORT_SNAPSHOT_TIMES[report_type],
+        "morning_check_id": None,
+        "market_regime": draft.get("market_regime"), "volatility_regime": draft.get("volatility_regime"),
+        "market_summary": draft.get("market_summary"),
+        "nikkei_change_pct": draft.get("nikkei_change_pct"), "topix_change_pct": draft.get("topix_change_pct"),
+        "growth250_change_pct": draft.get("growth250_change_pct"), "nikkei_vi": draft.get("nikkei_vi"),
+        "usdjpy": draft.get("usdjpy"),
+        "sector_snapshot_json": {"strong": draft.get("strong_sectors") or [], "weak": draft.get("weak_sectors") or []},
+        "strong_sectors_json": draft.get("strong_sectors") or [], "weak_sectors_json": draft.get("weak_sectors") or [],
+        "top_stocks_json": draft.get("top_stocks") or [], "resilience_stocks_json": draft.get("resilience_stocks") or [],
+        "momentum_stocks_json": [], "missed_opportunities_json": [],
+        "morning_thesis_evaluation_json": draft.get("morning_thesis_evaluation") or {"stocks": []},
+        "risk_alerts_json": draft.get("risk_alerts") or [], "position_alerts_json": [],
+        "news_changes_json": [], "event_risk_json": [],
+        "strategy_update_json": {"text": draft.get("strategy_update") or draft.get("market_summary")},
+        "data_health_json": {"smart_import": True,
+                              "quality": "PARTIAL" if draft.get("nikkei_change_pct") is None else "FULL",
+                              "raw_text": raw_text, "import_source": import_source},
+    }
+    return trade_date, report_type, data
+
+
+def normalize_trade_rule(draft, raw_text=None, import_source="unknown"):
+    """draftをinvestment_db.upsert_trade_rule_from_text()が受け付ける引数へ正規化する
+    （指示書7・8・9番：TRADE_RULEは既存のルール学習システム（trade_rules、常にTESTING/LOW
+    始まり）へ候補として記録するだけで、position_risk_rules等の実運用ルールを直接
+    書き換えることは絶対にしない）。description/titleが無ければNoneを返す。
+    戻り値：(rule_text, source_info, risk_rule_change_candidate) のタプル、またはNone。"""
+    draft = draft or {}
+    rule_text = draft.get("description") or draft.get("title")
+    if not rule_text:
+        return None
+    source_info = {"raw_text": raw_text, "import_source": import_source, "smart_import": True,
+                    "threshold": draft.get("threshold")}
+    return rule_text, source_info, bool(draft.get("risk_rule_change_candidate"))
+
+
 def smart_import_check_duplicates(database_url, user_id, candidates):
-    """CATALYST/EVENTの候補について、既存データとタイトルが一致する可能性があるものに
-    possible_duplicate=Trueを付与する（指示書20番。厳密なcontent hash照合ではなく簡易な
-    タイトル一致判定——自動で二重登録はしない、あくまでプレビュー警告用）。"""
+    """CATALYST/MARKET_ANALYSIS/EVENTの候補について、既存データとタイトルが一致する可能性が
+    あるものにpossible_duplicate=Trueを付与する（指示書19番（Phase SI-B）・Phase SI-Aの
+    指示書20番。厳密なcontent hash照合ではなく簡易なタイトル一致判定——自動で二重登録は
+    しない、あくまでプレビュー警告用）。MORNING_MARKET_CHECK/INTRADAY_REPORTは
+    (user_id,date,snapshot_time)/(user_id,trade_date,report_type)の既存UNIQUE制約＋
+    UPSERTで重複防止されるため、ここでは対象外（指示書19番）。"""
     if investment_db is None or not database_url:
         return candidates
     existing_catalyst_titles, existing_event_titles = None, None
     for c in candidates:
         title = (c.get("draft") or {}).get("title")
-        if not title:
-            continue
-        if c.get("category") == "CATALYST":
+        category = c.get("category")
+        if category in ("CATALYST", "MARKET_ANALYSIS"):
+            if not title:
+                title = (c.get("draft") or {}).get("summary", "")[:60] or None
+            if not title:
+                continue
             if existing_catalyst_titles is None:
                 try:
                     existing_catalyst_titles = {x.get("title") for x in investment_db.list_news_catalysts(database_url, user_id, limit=300)}
@@ -6357,7 +6616,9 @@ def smart_import_check_duplicates(database_url, user_id, candidates):
                     existing_catalyst_titles = set()
             if title in existing_catalyst_titles:
                 c["possible_duplicate"] = True
-        elif c.get("category") == "EVENT":
+        elif category == "EVENT":
+            if not title:
+                continue
             if existing_event_titles is None:
                 try:
                     existing_event_titles = {x.get("title") for x in investment_db.list_market_events(database_url, user_id, limit=200)}
@@ -6369,17 +6630,26 @@ def smart_import_check_duplicates(database_url, user_id, candidates):
 
 
 def smart_import_confirm(database_url, user_id, candidates, import_source="unknown"):
-    """プレビュー画面でユーザーが確定した候補群を、カテゴリごとに既存のimport_*関数へ
-    振り分けて保存する（指示書18番：SmartImportは入口・変換・振り分けのみを担当し、
-    独自の巨大DBは作らない）。LOW confidenceの候補はforce指定が無い限り保存しない
-    （指示書16番：LOWは自動保存禁止）。
-    戻り値：{"results": {"CATALYST": {...}, "EVENT": {...}, "EXPERT_OPINION": {...}},
-    "rejected_low_confidence": N, "skipped_unimplemented": M}"""
+    """プレビュー画面でユーザーが確定した候補群を、カテゴリごとに既存のimport_*/save_*関数へ
+    振り分けて保存する（指示書18番（Phase SI-A）・24番（Phase SI-B）：SmartImportは入口・
+    変換・振り分けのみを担当し、独自の巨大DBは作らない・カテゴリごとに別エンジンを作らない）。
+    LOW confidenceの候補はforce指定が無い限り保存しない（指示書16番：LOWは自動保存禁止）。
+    1件の失敗が他候補の保存を巻き戻さない（指示書18番（Phase SI-B）：CATALYST/EVENT/
+    EXPERT_OPINION/MARKET_ANALYSISはバッチ処理のため個別例外はimport_*内部で吸収されるが、
+    MORNING_MARKET_CHECK/INTRADAY_REPORT/TRADE_RULE/CHATGPT_LEGACYは1件ずつtry/exceptする）。
+    戻り値：{"results": {category: {...}}, "rejected_low_confidence": N,
+    "skipped_unimplemented": M, "skipped_existing_report": K, "trade_rule_results": [...]}"""
     if investment_db is None or not database_url:
         return {"results": {}, "rejected_low_confidence": 0, "skipped_unimplemented": 0}
-    buckets = {"CATALYST": [], "EVENT": [], "EXPERT_OPINION": []}
+    buckets = {"CATALYST": [], "EVENT": [], "EXPERT_OPINION": [], "MARKET_ANALYSIS": []}
     rejected = 0
     skipped_unimplemented = 0
+    skipped_existing_report = 0
+    morning_check_results = []
+    intraday_report_results = []
+    trade_rule_results = []
+    chatgpt_legacy_results = []
+
     for c in candidates or []:
         category = c.get("category")
         if category not in SMART_IMPORT_IMPLEMENTED_CATEGORIES:
@@ -6390,19 +6660,97 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
             continue
         draft = c.get("draft") or {}
         raw_text = c.get("raw_text")
-        normalized = None
-        try:
-            if category == "CATALYST":
-                normalized = normalize_catalyst(draft, raw_text, import_source)
-            elif category == "EVENT":
-                normalized = normalize_event(draft, raw_text, import_source)
-            elif category == "EXPERT_OPINION":
-                normalized = normalize_expert_opinion(draft, raw_text, import_source)
-        except Exception as e:
-            print("  SmartImport: 正規化失敗", category, e)
+
+        if category in ("CATALYST", "EVENT", "EXPERT_OPINION", "MARKET_ANALYSIS"):
             normalized = None
-        if normalized is not None:
-            buckets[category].append(normalized)
+            try:
+                if category == "CATALYST":
+                    normalized = normalize_catalyst(draft, raw_text, import_source)
+                elif category == "EVENT":
+                    normalized = normalize_event(draft, raw_text, import_source)
+                elif category == "EXPERT_OPINION":
+                    normalized = normalize_expert_opinion(draft, raw_text, import_source)
+                elif category == "MARKET_ANALYSIS":
+                    normalized = normalize_market_analysis(draft, raw_text, import_source)
+            except Exception as e:
+                print("  SmartImport: 正規化失敗", category, e)
+                normalized = None
+            if normalized is not None:
+                buckets[category].append(normalized)
+            continue
+
+        if category == "MORNING_MARKET_CHECK":
+            try:
+                normalized = normalize_morning_check(draft, raw_text, import_source)
+                if normalized is not None:
+                    check_date, data = normalized
+                    # snapshot_time="SMART_IMPORT"専用枠を使う（指示書4番：既存の自動生成
+                    # 05:30/07:00/08:00/08:30/08:50/MANUALとは別枠のため、上書きの心配なし）。
+                    saved = investment_db.save_morning_check(database_url, user_id, check_date, "SMART_IMPORT", data)
+                    morning_check_results.append({"ok": saved is not None, "check_date": check_date})
+                else:
+                    morning_check_results.append({"ok": False, "reason": "必須項目（summary/market_regime）が不足"})
+            except Exception as e:
+                print("  SmartImport: MorningCheck保存失敗", e)
+                morning_check_results.append({"ok": False, "reason": str(e)})
+            continue
+
+        if category == "INTRADAY_REPORT":
+            try:
+                normalized = normalize_intraday_report(draft, raw_text, import_source)
+                if normalized is None:
+                    intraday_report_results.append({"ok": False, "reason": "report_type未確定またはmarket_summary不足のため保存できません"})
+                else:
+                    trade_date, report_type, data = normalized
+                    # 指示書「既存機能を壊さない」を最優先：自動生成された既存レポート
+                    # （data_health_json.smart_importが無いもの）を、貼り付けたテキストで
+                    # 無言のまま上書きしない。既存の自動レポートがある場合はforce指定が
+                    # 無い限りスキップする（Smart Import同士の再取り込みはUPSERTでよい）。
+                    existing = investment_db.get_market_intelligence_report(database_url, user_id, trade_date, report_type)
+                    if existing and not (existing.get("data_health_json") or {}).get("smart_import") and not c.get("force"):
+                        skipped_existing_report += 1
+                        intraday_report_results.append({"ok": False, "reason": f"{report_type}は既に自動生成レポートが存在するため上書きしません（forceで上書き可）"})
+                    else:
+                        saved = investment_db.save_market_intelligence_report(database_url, user_id, trade_date, report_type, data)
+                        intraday_report_results.append({"ok": saved is not None, "trade_date": trade_date, "report_type": report_type})
+            except Exception as e:
+                print("  SmartImport: IntradayReport保存失敗", e)
+                intraday_report_results.append({"ok": False, "reason": str(e)})
+            continue
+
+        if category == "TRADE_RULE":
+            # 指示書8・9番（最重要）：TRADE_RULEはconfidenceに関わらず既存のルール学習
+            # システム（trade_rules、常にTESTING/LOW始まり）へ候補記録するのみ。
+            # position_risk_rules等の実運用ルールを直接書き換える経路はここには一切無い。
+            try:
+                normalized = normalize_trade_rule(draft, raw_text, import_source)
+                if normalized is None:
+                    trade_rule_results.append({"ok": False, "reason": "ルール文が空のため保存できません"})
+                else:
+                    rule_text, source_info, is_risk_rule_change = normalized
+                    result = investment_db.upsert_trade_rule_from_text(
+                        database_url, user_id, rule_text, source_info=source_info, created_from="smart_import")
+                    trade_rule_results.append({"ok": result is not None, "rule_text": rule_text,
+                                                "risk_rule_change_candidate": is_risk_rule_change, "detail": result})
+            except Exception as e:
+                print("  SmartImport: TradeRule保存失敗", e)
+                trade_rule_results.append({"ok": False, "reason": str(e)})
+            continue
+
+        if category == "CHATGPT_LEGACY":
+            # 指示書1番：既知の旧ChatGPT統合連携schema（date/watchlist/decisions/rule_updates
+            # 等）は、既存のsave_chatgpt_unified_import()（内部でclassify_chatgpt_unified_
+            # payload()を使い、watchlist/decisions/rule_updates/events/news/catalysts/
+            # expert_opinions/user_feedback/trade_playbooksを一括で振り分ける）へそのまま委譲
+            # する。SmartImport側で個別に再実装しない（指示書33番）。
+            try:
+                result = investment_db.save_chatgpt_unified_import(database_url, user_id, draft)
+                chatgpt_legacy_results.append(result)
+            except Exception as e:
+                print("  SmartImport: ChatGPT legacy import失敗", e)
+                chatgpt_legacy_results.append({"error": str(e)})
+            continue
+
     results = {}
     if buckets["CATALYST"]:
         results["CATALYST"] = investment_db.import_news_catalysts(database_url, user_id, buckets["CATALYST"])
@@ -6410,7 +6758,24 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
         results["EVENT"] = investment_db.import_market_events(database_url, user_id, buckets["EVENT"])
     if buckets["EXPERT_OPINION"]:
         results["EXPERT_OPINION"] = investment_db.import_expert_views(database_url, user_id, buckets["EXPERT_OPINION"])
-    return {"results": results, "rejected_low_confidence": rejected, "skipped_unimplemented": skipped_unimplemented}
+    if buckets["MARKET_ANALYSIS"]:
+        results["MARKET_ANALYSIS"] = investment_db.import_news_catalysts(database_url, user_id, buckets["MARKET_ANALYSIS"])
+    if morning_check_results:
+        results["MORNING_MARKET_CHECK"] = {"imported": sum(1 for r in morning_check_results if r["ok"]),
+                                            "skipped": sum(1 for r in morning_check_results if not r["ok"]),
+                                            "details": morning_check_results}
+    if intraday_report_results:
+        results["INTRADAY_REPORT"] = {"imported": sum(1 for r in intraday_report_results if r["ok"]),
+                                       "skipped": sum(1 for r in intraday_report_results if not r["ok"]),
+                                       "details": intraday_report_results}
+    if trade_rule_results:
+        results["TRADE_RULE"] = {"imported": sum(1 for r in trade_rule_results if r["ok"]),
+                                  "skipped": sum(1 for r in trade_rule_results if not r["ok"]),
+                                  "details": trade_rule_results}
+    if chatgpt_legacy_results:
+        results["CHATGPT_LEGACY"] = {"count": len(chatgpt_legacy_results), "details": chatgpt_legacy_results}
+    return {"results": results, "rejected_low_confidence": rejected, "skipped_unimplemented": skipped_unimplemented,
+            "skipped_existing_report": skipped_existing_report}
 
 
 class Handler(SimpleHTTPRequestHandler):
