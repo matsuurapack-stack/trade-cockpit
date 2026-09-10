@@ -1725,6 +1725,21 @@ const ACTION_STATUS_META = {
   NONE:        {icon:"",label:"",color:"var(--inkFaint)"},
 };
 
+// Market Intelligence Timeline Phase2-C（今買い時TOP5、2026-09-10新規）：ENTRY_STATE（9種、
+// サーバー側entry_score算出とセットで返る）の表示ラベル・色。既存のACTION_STATUS_META
+// （RISK/WAIT/ENTRY_READY、enrichWatchRow()由来の別軸）とは別物、混同しないこと。
+const ENTRY_STATE_META = {
+  NOW_BUYABLE:   {label:"今すぐ買える",     color:"var(--up)"},
+  ENTRY_READY:   {label:"準備完了",         color:"var(--up)"},
+  WAIT_PULLBACK: {label:"押し目待ち",       color:"var(--accent)"},
+  WAIT_BREAKOUT: {label:"ブレイク待ち",     color:"var(--accent)"},
+  WATCH:         {label:"監視継続",         color:"var(--inkSoft)"},
+  CHASE_RISK:    {label:"高値掴みリスク",   color:"var(--down)"},
+  WEAK:          {label:"弱い",             color:"var(--inkFaint)"},
+  INVALID:       {label:"根拠崩れ",         color:"var(--down)"},
+  PROVISIONAL:   {label:"データ不足",       color:"var(--inkFaint)"},
+};
+
 // v3-9（監視銘柄自動登録エンジン）：🐒 MOMENTUM DAY専用バッジ。「買い推奨」ではないことを
 // 徹底するため、Primary/Action Status（enrichWatchRow、SSoT）の判定には一切影響しない完全に
 // 独立した表示のみ。
@@ -3461,7 +3476,7 @@ function rankTop5(enriched,stockQuotes){
     .slice(0,5);
 }
 
-function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan,newsCatalysts}){
+function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan,newsCatalysts,entryScanning,entryResult,onEntryScan,thesisStats}){
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
 
@@ -3773,6 +3788,60 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
               </div>;
             })}
           </div>}
+    </div>
+
+    {/* Market Intelligence Timeline Phase2-C（今買い時TOP5＋Thesis永続化、2026-09-10新規）：
+        上の「今日の注目TOP5」（クライアント側enrichWatchRow()だけの軽量ロジック、v3-4）とは
+        別物の、サーバー側ENTRY SCORE（0-100）に基づく独立パネル。既存の今日の注目TOP5は
+        無変更のまま残し、新しい仕組みは追加パネルとして併存させる（破壊しない）。 */}
+    <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:6,padding:"12px 14px",marginTop:12}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6,marginBottom:8}}>
+        <div style={{fontWeight:800,fontSize:13.5}}>🎯 ENTRY TOP5（entry_score版）</div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          {thesisStats && thesisStats.totalFinalized>0 && <span style={{fontSize:11,color:"var(--inkFaint)"}}>
+            直近30日 勝率{thesisStats.winRate}%（確定{thesisStats.totalFinalized}件）
+          </span>}
+          <button className="action-btn" style={{fontSize:12}} disabled={entryScanning} onClick={onEntryScan}>
+            {entryScanning?"🎯 スキャン中…":"🎯 ENTRY TOP5を更新"}
+          </button>
+        </div>
+      </div>
+      {!entryResult
+        ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>「ENTRY TOP5を更新」を押すと、監視銘柄の中から現在最もエントリー条件が整っている候補をENTRY SCOREで算出します。</div>
+        : <>
+          {entryResult.dataQuality==="DEGRADED" && <div style={{fontSize:11,color:"var(--down)",fontWeight:700,marginBottom:6}}>⚠ データ取得が不十分なため、一部の判定は暫定（PROVISIONAL）です。</div>}
+          {entryResult.entryReadyTop5.length===0
+            ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>現時点でENTRY READY以上の候補はありません。</div>
+            : <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:entryResult.watchCandidates.length>0?10:0}}>
+                {entryResult.entryReadyTop5.map(c=>{
+                  const stMeta=ENTRY_STATE_META[c.entryState]||{label:c.entryState,color:"var(--inkFaint)"};
+                  return <div key={c.code} style={{display:"flex",alignItems:"center",gap:10,padding:"7px 8px",borderRadius:4,
+                    background:"var(--bg)",border:"1px solid var(--rule)",flexWrap:"wrap"}}>
+                    <div style={{fontSize:13,fontWeight:800,color:"var(--inkFaint)",width:16,textAlign:"center"}}>{c.rank}</div>
+                    <div style={{width:56,fontSize:11.5,color:"var(--inkSoft)"}} className="mono">{c.code}</div>
+                    <div style={{flex:"0 0 auto",minWidth:90,fontSize:12.5,fontWeight:700}}>{c.name}</div>
+                    <div className="mono" style={{width:70,fontSize:12.5,textAlign:"right"}}>{c.current!=null?c.current.toLocaleString():"—"}</div>
+                    <span style={{fontSize:12,fontWeight:800,color:"var(--accent)",border:"1px solid var(--accent)",borderRadius:3,padding:"1px 6px"}}>SCORE {c.entryScore}</span>
+                    <span style={{fontSize:10.5,fontWeight:700,color:stMeta.color,border:`1px solid ${stMeta.color}`,borderRadius:3,padding:"1px 6px",whiteSpace:"nowrap"}}>{stMeta.label}</span>
+                    {c.analysisConfidence==="LOW" && <span style={{fontSize:10,color:"var(--down)"}}>確信度LOW</span>}
+                    <div style={{flex:"1 1 140px",minWidth:0,fontSize:11,color:"var(--inkSoft)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                      {(c.reasons||[]).join("・")}{c.risks&&c.risks.length>0?"　⚠"+c.risks.join("・"):""}
+                    </div>
+                  </div>;
+                })}
+              </div>}
+          {entryResult.watchCandidates.length>0 && <>
+            <div style={{fontSize:11,fontWeight:700,color:"var(--inkSoft)",marginBottom:4}}>Watch候補（まだENTRY READYではない）</div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+              {entryResult.watchCandidates.map(c=>{
+                const stMeta=ENTRY_STATE_META[c.entryState]||{label:c.entryState,color:"var(--inkFaint)"};
+                return <span key={c.code} style={{fontSize:11,padding:"2px 7px",borderRadius:3,border:"1px solid var(--rule)",whiteSpace:"nowrap"}}>
+                  {c.code} {c.name} <span className="mono">{c.entryScore}</span> <span style={{color:stMeta.color}}>{stMeta.label}</span>
+                </span>;
+              })}
+            </div>
+          </>}
+        </>}
     </div>
 
     {/* 2026-09-07更新（監視銘柄画面・情報整理/UI整理のみ、ロジック無変更）：②今日の状況／
@@ -9170,6 +9239,25 @@ function App(){
     setVolumeScanning(false);
   };
 
+  // Market Intelligence Timeline Phase2-C（今買い時TOP5＋Thesis永続化、2026-09-10新規）：
+  // 「今日の注目TOP5」（enrichWatchRow()だけを使うクライアント側の既存軽量ロジック、v3-4）とは
+  // 別物。サーバー側で算出したENTRY SCORE（0-100）に基づくentry_ready_top5・Watch候補を表示する
+  // 独立パネル。既存の今日の注目TOP5は無変更のまま残す（破壊しない、指示書の進め方に合わせて
+  // 追加のみ）。
+  const [entryScanning,setEntryScanning]=useState(false);
+  const [entryResult,setEntryResult]=useState(null);
+  const [thesisStats,setThesisStats]=useState(null);
+  const runEntryScan=async()=>{
+    setEntryScanning(true);
+    try{
+      const r=await fetch("/api/entry-candidates");
+      if(r.ok)setEntryResult(await r.json());
+      const sr=await fetch("/api/stock-theses?days=30");
+      if(sr.ok){const sd=await sr.json();setThesisStats(sd.stats);}
+    }catch(e){}
+    setEntryScanning(false);
+  };
+
   // 売買記録（トレードジャーナル）：銘柄分析カードの「記録に追加」ボタンから、そのカードの
   // entry/stop/target/marketEnv/entryReasonを初期値にしたドラフトを開き、「記録」タブへ遷移する。
   // 保存するまでs.journalには追加しない（下書き段階ではjournalDraft stateのみで保持）。
@@ -9658,7 +9746,8 @@ function App(){
         sectorLeaderScanning={sectorLeaderScanning} sectorLeaderResult={sectorLeaderResult} onSectorLeaderScan={runSectorLeaderScan}
         pullbackScanning={pullbackScanning} pullbackResult={pullbackResult} onPullbackScan={runPullbackScan}
         reversalScanning={reversalScanning} reversalResult={reversalResult} onReversalScan={runReversalScan}
-        volumeScanning={volumeScanning} volumeResult={volumeResult} onVolumeScan={runVolumeScan}/>}
+        volumeScanning={volumeScanning} volumeResult={volumeResult} onVolumeScan={runVolumeScan}
+        entryScanning={entryScanning} entryResult={entryResult} onEntryScan={runEntryScan} thesisStats={thesisStats}/>}
 
       {/* ===== BRIEFING（日本市場） ===== */}
       {tab==="briefing" && <div>

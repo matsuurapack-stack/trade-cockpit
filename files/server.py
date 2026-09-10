@@ -2481,6 +2481,280 @@ def evaluate_morning_thesis(morning_top5_item, snapshot, nikkei_chg):
     return "INVALIDATED"
 
 
+# ============================================================
+# Market Intelligence Timeline Phase2-C（今買い時TOP5＋Thesis永続化）。2026-09-10新規。
+# 「今日の注目TOP5」（trade-cockpit.htmlのenrichWatchRow()だけを使うフロント側の既存軽量
+# ロジック、v3-4）とは別物。こちらは「現在最も条件が整っているENTRY候補」（entry_ready_top5）を
+# ENTRY SCORE（0-100、重み付け）でサーバー側から算出し、Watch候補とは明確に分離する。既存の
+# 5エンジン（run_momentum_stage1・AUTO_RS・AUTO_SECTOR_LEADER・AUTO_VOLUME）・Market
+# Intelligence Timelineの個別銘柄5分足判定（_intraday_stock_snapshot・evaluate_morning_thesis・
+# _thesis_transition_status・_final_top5_result）をそのまま再利用し、新しい全市場スキャン・
+# 新しい判定ロジックの重複実装はしない。missed_opportunities本格分析・sector_rotation統計・
+# 5/20/60営業日統計・自動ルール生成・自動売買はPhase2-Cの範囲外（ユーザー指示）。
+# ============================================================
+
+ENTRY_STATE_META = {
+    "NOW_BUYABLE":   {"label": "今すぐ買える", "tier": 5},
+    "ENTRY_READY":   {"label": "エントリー準備完了", "tier": 4},
+    "WAIT_PULLBACK": {"label": "押し目待ち", "tier": 3},
+    "WAIT_BREAKOUT": {"label": "ブレイク待ち", "tier": 3},
+    "WATCH":         {"label": "監視継続", "tier": 2},
+    "CHASE_RISK":    {"label": "高値掴みリスク", "tier": 1},
+    "WEAK":          {"label": "弱い", "tier": 0},
+    "INVALID":       {"label": "根拠崩れ", "tier": 0},
+    "PROVISIONAL":   {"label": "データ不足（暫定）", "tier": 0},
+}
+
+
+def _entry_score_components(row, stage2, snapshot, auto_rs_current, auto_sector_current, catalysts, event_signals):
+    """entry_score（0-100、内訳の合計をclampしたもの）を配点ごとに算出する。既存の各エンジンが
+    既に計算済みの値だけを使い、新しい取得経路は増やさない。データが無い項目は0点（無理に
+    加点も減点もしない、「取得できない値は推測しない」の踏襲）。
+    配点：Momentum20/VWAP15/5分足構造15/MarketRelative15/Volume10/AUTO_RS10/AUTO_SECTOR5/
+    Catalyst5/RiskEvent-5〜0/Overheat-10〜0。"""
+    day_change = row.get("changePct")
+    market_rs = row.get("marketRS")
+    momentum = _scale_score(day_change, 0, 5, 20) if day_change is not None else 0.0
+
+    above_vwap = snapshot.get("aboveVwap") if snapshot else None
+    vwap_score = 15.0 if above_vwap else 0.0
+
+    structure = snapshot.get("fiveMinStructure") if snapshot else None
+    structure_score = 15.0 if structure == "higher_highs" else (7.0 if structure == "mixed" else 0.0)
+
+    market_rel_score = _scale_score(market_rs, 0, 5, 15) if market_rs is not None else 0.0
+
+    volume_type = _volume_type(stage2, row) if stage2 else "NEUTRAL_VOLUME"
+    tavr = stage2.get("timeAdjustedVolumeRatio") if stage2 else None
+    volume_score = 0.0 if volume_type in ("NEGATIVE_VOLUME", "CLIMAX_DOWN") else _scale_score(tavr, 1.0, 3.0, 10)
+
+    auto_rs_score = 10.0 if row.get("code") in auto_rs_current else 0.0
+    auto_sector_score = 5.0 if row.get("code") in auto_sector_current else 0.0
+
+    pos_cat = [c for c in (catalysts or []) if c.get("sentiment") == "positive" and c.get("freshness") in ("LIVE", "CURRENT")]
+    neg_cat = [c for c in (catalysts or []) if c.get("sentiment") == "negative" and c.get("freshness") in ("LIVE", "CURRENT")]
+    catalyst_score = 5.0 if pos_cat else 0.0
+
+    risk_event_penalty = 0.0
+    if "EVENT_RISK_HIGH" in (event_signals or []):
+        risk_event_penalty = -5.0
+    if neg_cat:
+        risk_event_penalty = -5.0
+
+    overheat_penalty = 0.0
+    if volume_type == "CLIMAX_UP":
+        overheat_penalty = -10.0
+    elif stage2 and stage2.get("aboveRecentHigh") and stage2.get("distanceFromHighPct") is not None:
+        d = stage2["distanceFromHighPct"]
+        if d >= 5:
+            overheat_penalty = -10.0
+        elif d >= 2:
+            overheat_penalty = -5.0
+
+    total = (momentum + vwap_score + structure_score + market_rel_score + volume_score
+             + auto_rs_score + auto_sector_score + catalyst_score + risk_event_penalty + overheat_penalty)
+    total = max(0.0, min(100.0, total))
+    return {
+        "total": round(total, 1),
+        "momentum": round(momentum, 1), "vwap": round(vwap_score, 1), "fiveMinStructure": round(structure_score, 1),
+        "marketRelative": round(market_rel_score, 1), "volume": round(volume_score, 1),
+        "autoRs": round(auto_rs_score, 1), "autoSector": round(auto_sector_score, 1),
+        "catalyst": round(catalyst_score, 1), "riskEvent": round(risk_event_penalty, 1),
+        "overheat": round(overheat_penalty, 1),
+        "volumeType": volume_type, "positiveCatalysts": pos_cat[:1], "negativeCatalysts": neg_cat[:1],
+    }
+
+
+def _classify_entry_state(entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present):
+    """ENTRY_STATE（9種）をルールベースで決定する（AI不使用、既存AUTO系エンジンと同じ方針）。
+    data_quality=DEGRADED（Stage2・5分足スナップショットの両方が欠落）の場合はPROVISIONAL固定
+    ＝confidence=LOWの銘柄をNOW_BUYABLEにしない（指示書要件）。"""
+    if data_quality == "DEGRADED":
+        return "PROVISIONAL"
+    above_vwap = snapshot.get("aboveVwap") if snapshot else None
+    structure = snapshot.get("fiveMinStructure") if snapshot else None
+    market_rs = row.get("marketRS")
+    volume_type = _volume_type(stage2, row) if stage2 else "NEUTRAL_VOLUME"
+    making_new_low = bool(stage2 and stage2.get("makingNewLowToday"))
+    overheated = volume_type == "CLIMAX_UP" or bool(
+        stage2 and stage2.get("aboveRecentHigh") and (stage2.get("distanceFromHighPct") or 0) >= 5)
+
+    if neg_cat_present and (making_new_low or (market_rs is not None and market_rs < 0)):
+        return "INVALID"
+    if overheated:
+        return "CHASE_RISK"
+    if entry_score < 30:
+        return "WEAK"
+    if "EVENT_RISK_HIGH" in (event_signals or []) and entry_score < 60:
+        return "WATCH"
+    if above_vwap and structure == "higher_highs" and (market_rs is not None and market_rs > 0) and entry_score >= 70:
+        return "NOW_BUYABLE"
+    if above_vwap and structure in ("higher_highs", "mixed") and entry_score >= 55:
+        return "ENTRY_READY"
+    if entry_score >= 40 and above_vwap is False:
+        return "WAIT_BREAKOUT"
+    if entry_score >= 40 and above_vwap:
+        return "WAIT_PULLBACK"
+    if entry_score >= 30:
+        return "WATCH"
+    return "WEAK"
+
+
+def compute_entry_ready_candidates(database_url, user_id):
+    """今買い時TOP5（entry_ready_top5）とWatch候補を算出する。既存の共有Stage1
+    （run_momentum_stage1、複数AUTOエンジンとキャッシュ共有）・AUTO_RS/AUTO_SECTOR_LEADERの
+    CURRENT登録・AUTO_VOLUMEのStage2（_volume_stage2_detail）・Market Intelligence
+    Timelineの個別銘柄5分足判定（_intraday_stock_snapshot）をそのまま再利用する（新規の
+    全市場スキャン・新規の分足取得経路は追加しない）。対象は監視銘柄（watchlist）のみ
+    （全市場4000銘柄には広げない。「Watch候補との分離」は監視銘柄内での話）。"""
+    if investment_db is None or not database_url:
+        return {"entryReadyTop5": [], "watchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None}
+    watchlist = investment_db.list_watchlist(database_url, user_id, market="JP")
+    if not watchlist:
+        return {"entryReadyTop5": [], "watchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None}
+    stage1 = run_momentum_stage1()
+    stage1_rows = stage1.get("rows", {})
+    auto_rs_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_RS_CURRENT", market="JP")
+    auto_sector_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_SECTOR_LEADER_CURRENT", market="JP")
+
+    candidates = []
+    quality_counts = {"FULL": 0, "PARTIAL": 0, "DEGRADED": 0}
+    for w in watchlist:
+        code = w.get("code")
+        row = stage1_rows.get(code)
+        if not row or row.get("current") is None:
+            continue
+        stage2 = None
+        try:
+            stage2 = _volume_stage2_detail(code, row)
+        except Exception as e:
+            print("  entry-candidates: Stage2取得失敗", code, e)
+        snapshot = None
+        try:
+            snap = _intraday_stock_snapshot(w)
+            if snap.get("dataStatus") != "failed":
+                snapshot = snap
+        except Exception as e:
+            print("  entry-candidates: 5分足スナップショット失敗", code, e)
+
+        if stage2 is not None and snapshot is not None:
+            data_quality = "FULL"
+        elif stage2 is not None or snapshot is not None:
+            data_quality = "PARTIAL"
+        else:
+            data_quality = "DEGRADED"
+        quality_counts[data_quality] += 1
+        analysis_confidence = {"FULL": "HIGH", "PARTIAL": "MEDIUM", "DEGRADED": "LOW"}[data_quality]
+
+        catalysts = investment_db.relevant_catalysts_for(database_url, user_id, code=code, sector=row.get("sector"), limit=3)
+        events = investment_db.upcoming_event_signals(database_url, user_id, code=code, sector=row.get("sector"))
+        event_signals = events["signals"]
+
+        comp = _entry_score_components(row, stage2, snapshot or {}, auto_rs_current, auto_sector_current, catalysts, event_signals)
+        neg_cat_present = bool(comp["negativeCatalysts"])
+        entry_score = comp["total"]
+        entry_state = _classify_entry_state(entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present)
+
+        reasons = []
+        if comp["momentum"] > 0:
+            reasons.append(f"当日+{row.get('changePct'):.1f}%の勢い")
+        if comp["vwap"] > 0:
+            reasons.append("VWAP上を維持")
+        if comp["fiveMinStructure"] >= 15:
+            reasons.append("5分足で高値切り上げ")
+        if comp["marketRelative"] > 0:
+            reasons.append(f"対市場+{row.get('marketRS'):.1f}pt")
+        if comp["autoRs"] > 0:
+            reasons.append("AUTO_RS選出中")
+        if comp["autoSector"] > 0:
+            reasons.append("セクター内優位（AUTO_SECTOR_LEADER）")
+        if comp["positiveCatalysts"]:
+            reasons.append(f"好材料：{comp['positiveCatalysts'][0].get('title','')[:20]}")
+        risks = []
+        if comp["negativeCatalysts"]:
+            risks.append(f"悪材料：{comp['negativeCatalysts'][0].get('title','')[:20]}")
+        if comp["riskEvent"] < 0 and not comp["negativeCatalysts"]:
+            risks.append("重要イベント接近")
+        if comp["overheat"] < 0:
+            risks.append("直近高値からの乖離が大きい（高値掴み注意）")
+
+        candidates.append({
+            "code": code, "name": w.get("name"), "sector": w.get("sector"),
+            "current": row.get("current"),
+            "changePct": round(row.get("changePct"), 2) if row.get("changePct") is not None else None,
+            "marketRS": round(row.get("marketRS"), 2) if row.get("marketRS") is not None else None,
+            "entryScore": round(entry_score), "entryState": entry_state,
+            "analysisConfidence": analysis_confidence, "dataQuality": data_quality,
+            "scoreBreakdown": comp, "reasons": reasons or ["総合スコア上位"], "risks": risks,
+        })
+
+    candidates.sort(key=lambda c: -c["entryScore"])
+    entry_ready_top5 = [c for c in candidates if c["entryState"] in ("NOW_BUYABLE", "ENTRY_READY")][:5]
+    top5_codes = {c["code"] for c in entry_ready_top5}
+    watch_candidates = [c for c in candidates
+                         if c["entryState"] in ("WAIT_PULLBACK", "WAIT_BREAKOUT", "WATCH")
+                         and c["code"] not in top5_codes][:15]
+    overall_quality = "FULL" if quality_counts["DEGRADED"] == 0 and quality_counts["PARTIAL"] == 0 else (
+        "DEGRADED" if quality_counts["FULL"] == 0 else "PARTIAL")
+
+    # 選出時点の仮説をstock_thesesへ新規登録（既に今日のACTIVEな仮説がある銘柄は上書きしない、
+    # ensure_stock_thesis側のUNIQUE制約に任せる＝「選出時点の仮説」を保持し続ける）。
+    trade_date = datetime.date.today().isoformat()
+    for i, c in enumerate(entry_ready_top5):
+        try:
+            investment_db.ensure_stock_thesis(
+                database_url, user_id, c["code"], "JP", trade_date, c["name"],
+                c["entryScore"], c["entryState"], c["reasons"], c["analysisConfidence"])
+        except Exception as e:
+            print("  entry-candidates: thesis新規作成失敗", c["code"], e)
+
+    return {
+        "entryReadyTop5": [{**c, "rank": i + 1} for i, c in enumerate(entry_ready_top5)],
+        "watchCandidates": watch_candidates,
+        "dataQuality": overall_quality,
+        "generatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+
+def _reevaluate_active_stock_theses(database_url, user_id, trade_date, report_type, nikkei_chg):
+    """entry_ready_top5から作られたstock_thesesを答え合わせする。朝TOP5の答え合わせと全く
+    同じevaluate_morning_thesis/_thesis_transition_status/_final_top5_resultを再利用する
+    （別ロジックは作らない）。report_type=MARKET_CLOSEの回だけ、当日の履歴から最終結果
+    （SUCCESS/PARTIAL_SUCCESS/FAIL/NO_ENTRY/DATA_INSUFFICIENT）を確定する。"""
+    if investment_db is None or not database_url:
+        return
+    active = investment_db.list_active_stock_theses(database_url, user_id, trade_date)
+    for thesis in active:
+        code, market = thesis.get("code"), thesis.get("market", "JP")
+        w = {"code": code, "market": market, "name": thesis.get("name")}
+        try:
+            snap = _intraday_stock_snapshot(w)
+        except Exception as e:
+            print("  Thesis答え合わせ: スナップショット失敗", code, e)
+            continue
+        result = evaluate_morning_thesis({"code": code}, snap, nikkei_chg)
+        prev_result = thesis.get("latest_thesis_result")
+        transition = _thesis_transition_status(prev_result, result) if prev_result else None
+        try:
+            investment_db.update_stock_thesis_evaluation(
+                database_url, user_id, code, market, trade_date, result, transition,
+                thesis.get("latest_entry_score"), report_type)
+        except Exception as e:
+            print("  Thesis答え合わせ: 更新失敗", code, e)
+
+    if report_type == "MARKET_CLOSE":
+        for thesis in investment_db.list_active_stock_theses(database_url, user_id, trade_date):
+            history = [h.get("thesis_result") for h in (thesis.get("status_history_json") or []) if h.get("thesis_result")]
+            if not history:
+                continue
+            final = _final_top5_result(history)
+            try:
+                investment_db.finalize_stock_thesis(
+                    database_url, user_id, thesis["code"], thesis.get("market", "JP"), trade_date, final)
+            except Exception as e:
+                print("  Thesis最終確定失敗", thesis.get("code"), e)
+
+
 def generate_opening_30m_report(database_url, user_id, trade_date=None):
     """後方互換の薄いラッパー（Phase2-A時点の呼び出し名をそのまま維持）。実体は
     generate_intraday_report()に一般化した（指示書「実装方針」：09:30専用ロジックを
@@ -2613,6 +2887,15 @@ def generate_intraday_report(database_url, user_id, report_type, trade_date=None
         data_health["thesis_evaluation"] = "ok" if any(s["thesis_result"] != "DATA_INSUFFICIENT" for s in thesis_stocks) else "failed"
     else:
         data_health["thesis_evaluation"] = "no_morning_check"
+
+    # ---- Phase2-C：entry_ready_top5から作ったstock_thesesの答え合わせ（朝TOP5とは別の仮説群、
+    # 同じevaluate_morning_thesis/_thesis_transition_status/_final_top5_resultを再利用） ----
+    try:
+        _reevaluate_active_stock_theses(database_url, user_id, trade_date, report_type, nikkei_chg)
+        data_health["entry_theses"] = "ok"
+    except Exception as e:
+        print("  IntradayReport: entry_ready_top5仮説の答え合わせで例外", e)
+        data_health["entry_theses"] = "failed"
 
     # ---- 地合い耐性ランキング（既存ロジック再利用、指示書7・30番） ----
     # 2026-09-10更新（レート制限耐性）：cache_ttlを指定してget_stock_quotes/fetch_adr_snapshotの
@@ -7564,6 +7847,32 @@ class Handler(SimpleHTTPRequestHandler):
                   f"出来高候補{result['stage2ValidCount']}件→自動登録{result['registeredCount']}件"
                   f"（降格{result['demotedToSeenCount']}件・時間進行度{result['marketTimeProgressRatio']}）")
             self._send_json(result)
+        elif self.path.startswith("/api/entry-candidates"):
+            # 2026-09-10新規（Market Intelligence Timeline Phase2-C「今買い時TOP5＋Thesis永続化」）：
+            # entry_ready_top5（ENTRY_SCOREで選ばれた「今エントリー条件が整っている」候補）と
+            # Watch候補を返す。既存の共有Stage1・AUTO_RS/AUTO_SECTOR_LEADER・AUTO_VOLUME Stage2・
+            # 個別銘柄5分足判定を再利用（新規の全市場スキャンではない、監視銘柄のみ対象）。
+            print("[取得] ENTRY TOP5候補スキャン開始…")
+            result = compute_entry_ready_candidates(DATABASE_URL, self.current_user) \
+                if (investment_db is not None and DATABASE_URL) else \
+                {"entryReadyTop5": [], "watchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None}
+            print(f"  ENTRY TOP5：{len(result['entryReadyTop5'])}件、Watch候補：{len(result['watchCandidates'])}件"
+                  f"（dataQuality={result['dataQuality']}）")
+            self._send_json(result)
+        elif self.path.startswith("/api/stock-theses"):
+            # 2026-09-10新規（Phase2-C）：成績評価画面向け。?days=（既定30）で集計期間指定、
+            # 一覧は?from=&to=で絞り込み可能。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            from_date = params.get("from", [None])[0]
+            to_date = params.get("to", [None])[0]
+            days = int(params.get("days", ["30"])[0])
+            if investment_db is not None and DATABASE_URL:
+                theses = investment_db.list_stock_theses(DATABASE_URL, self.current_user, from_date=from_date, to_date=to_date)
+                stats = investment_db.get_stock_thesis_stats(DATABASE_URL, self.current_user, days=days)
+            else:
+                theses, stats = [], {"totalFinalized": 0, "byResult": {}, "winRate": None}
+            self._send_json({"theses": theses, "stats": stats})
         elif self.path.startswith("/api/auto-signal-events"):
             # v3-9続き（PHASE 1 AUTO SIGNAL LOG）：検証・確認用の閲覧API。?code=・?signal_type=で絞り込み可能。
             qs = urllib.parse.urlparse(self.path).query

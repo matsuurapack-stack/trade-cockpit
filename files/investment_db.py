@@ -819,6 +819,46 @@ CREATE TABLE IF NOT EXISTS market_intelligence_reports (
 CREATE INDEX IF NOT EXISTS idx_market_intel_user_date ON market_intelligence_reports(user_id, trade_date DESC, generated_at ASC);
 """
 
+# 2026-09-10新規（Market Intelligence Timeline Phase2-C「今買い時TOP5＋Thesis永続化」）：
+# entry_ready_top5（ENTRY_SCOREで選ばれた「今エントリー条件が整っている」候補）1件ごとに、
+# 選出時点の仮説（thesis）と、その後の答え合わせ（Phase2-A/Bの朝TOP5答え合わせと同じ
+# evaluate_morning_thesis/_thesis_transition_status/_final_top5_resultをそのまま再利用、
+# 別ロジックは作らない）を永続化する専用テーブル。market_intelligence_reportsは日付単位の
+# レポートJSONブロブで銘柄横断の履歴クエリに向かないため、新規テーブルとした。
+# thesis_status は ACTIVE（選出直後）→CONFIRMED/PARTIAL/INVALIDATED/NOT_TRIGGERED/
+# DATA_INSUFFICIENT（初回の答え合わせ）→STRENGTHENED/MAINTAINED/WEAKENED/FAILED（2回目以降の
+# 答え合わせ、前回からの変化）→SUCCESS/PARTIAL_SUCCESS/FAIL/NO_ENTRY/DATA_INSUFFICIENT
+# （大引け時点の最終結果）という1本のライフサイクルを順番に上書きしていく（全履歴は
+# status_history_jsonに保持、成績評価集計はfinal_resultで行う）。
+# 重複キーは(user_id, code, market, entry_date)＝同じ銘柄が同じ日に何度TOP5入りしても
+# 1つの仮説として扱う（既に今日のACTIVEな仮説がある銘柄を再度TOP5に選んでも新規作成しない）。
+_SCHEMA_STOCK_THESES_SQL = """
+CREATE TABLE IF NOT EXISTS stock_theses (
+    id                       SERIAL PRIMARY KEY,
+    user_id                  TEXT NOT NULL,
+    code                     TEXT NOT NULL,
+    market                   TEXT NOT NULL DEFAULT 'JP',
+    entry_date               TEXT NOT NULL,
+    name                     TEXT,
+    initial_entry_score      INTEGER,
+    initial_entry_state      TEXT,
+    initial_reasons_json     JSONB,
+    latest_entry_score       INTEGER,
+    latest_thesis_result     TEXT,     -- 直近のevaluate_morning_thesis()生の結果（次回transition計算の入力）
+    analysis_confidence      TEXT,     -- HIGH|MEDIUM|LOW（data_qualityから決定、独自に推測しない）
+    thesis_status            TEXT NOT NULL DEFAULT 'ACTIVE',
+    final_result             TEXT,     -- 大引け確定後のみ設定：SUCCESS|PARTIAL_SUCCESS|FAIL|NO_ENTRY|DATA_INSUFFICIENT
+    entered_position         BOOLEAN NOT NULL DEFAULT false,
+    status_history_json      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    raw_payload_json         JSONB,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, code, market, entry_date)
+);
+CREATE INDEX IF NOT EXISTS idx_stock_theses_user_date ON stock_theses(user_id, entry_date DESC);
+CREATE INDEX IF NOT EXISTS idx_stock_theses_user_status ON stock_theses(user_id, thesis_status);
+"""
+
 
 def init_schema(database_url):
     """テーブルを（無ければ）作成し、マルチユーザー化・ChatGPT連携の移行SQLも実行する。
@@ -837,6 +877,7 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_MORNING_CHECK_SQL)
         conn.execute(_SCHEMA_POSITION_RISK_RULES_SQL)
         conn.execute(_SCHEMA_MARKET_INTELLIGENCE_SQL)
+        conn.execute(_SCHEMA_STOCK_THESES_SQL)
         conn.commit()
 
 
@@ -3732,6 +3773,138 @@ def get_market_intelligence_report(database_url, user_id, trade_date, report_typ
                 [user_id, trade_date, report_type])
             row = cur.fetchone()
     return _row_to_json(row) if row else None
+
+
+# ---- stock_theses（Market Intelligence Timeline Phase2-C「今買い時TOP5＋Thesis永続化」） ----
+
+def ensure_stock_thesis(database_url, user_id, code, market, entry_date, name, entry_score, entry_state, reasons, analysis_confidence):
+    """entry_ready_top5に選ばれた銘柄の仮説を新規作成する。同じ(user_id, code, market,
+    entry_date)が既にあれば何もしない（同日に何度TOP5へ選ばれても仮説は1つのまま、既存の
+    仮説を上書きしない＝「選出時点の仮説」を保持し続けるのが目的）。戻り値：作成したら
+    新規行(dict)、既存行があればNone。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    history = [{"at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "status": "ACTIVE", "entry_score": entry_score, "note": "entry_ready_top5選出"}]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "INSERT INTO stock_theses (user_id, code, market, entry_date, name, initial_entry_score, "
+                "initial_entry_state, initial_reasons_json, latest_entry_score, analysis_confidence, "
+                "thesis_status, status_history_json) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,'ACTIVE',%s::jsonb) "
+                "ON CONFLICT (user_id, code, market, entry_date) DO NOTHING "
+                "RETURNING *",
+                [user_id, code, market, entry_date, name, entry_score, entry_state,
+                 json.dumps(reasons or [], ensure_ascii=False), entry_score, analysis_confidence,
+                 json.dumps(history, ensure_ascii=False)])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_active_stock_theses(database_url, user_id, entry_date):
+    """当日分の、まだ最終確定（final_result未設定）していない仮説を返す（答え合わせ対象）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM stock_theses WHERE user_id=%s AND entry_date=%s AND final_result IS NULL",
+                [user_id, entry_date])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def update_stock_thesis_evaluation(database_url, user_id, code, market, entry_date, thesis_result, transition_status, entry_score, note):
+    """答え合わせ1回分を反映する。thesis_result＝evaluate_morning_thesis()の生の結果
+    （次回のtransition計算の入力として保存）、transition_status＝前回からの変化
+    （STRENGTHENED/MAINTAINED/WEAKENED/FAILED、初回はNone）。表示用thesis_statusは
+    transition_statusがあればそれ、無ければthesis_resultをそのまま使う（指示書の
+    ACTIVE→結果→変化、というライフサイクルを1列に反映）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    visible_status = transition_status or thesis_result
+    entry = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "status": visible_status, "thesis_result": thesis_result,
+              "entry_score": entry_score, "note": note}
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE stock_theses SET latest_thesis_result=%s, thesis_status=%s, latest_entry_score=%s, "
+                "status_history_json = status_history_json || %s::jsonb, updated_at=now() "
+                "WHERE user_id=%s AND code=%s AND market=%s AND entry_date=%s AND final_result IS NULL "
+                "RETURNING *",
+                [thesis_result, visible_status, entry_score, json.dumps([entry], ensure_ascii=False),
+                 user_id, code, market, entry_date])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def finalize_stock_thesis(database_url, user_id, code, market, entry_date, final_result):
+    """大引け時点の最終結果を確定する（以後、答え合わせ対象から外れる）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    entry = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "status": final_result, "note": "大引け確定"}
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE stock_theses SET final_result=%s, thesis_status=%s, "
+                "status_history_json = status_history_json || %s::jsonb, updated_at=now() "
+                "WHERE user_id=%s AND code=%s AND market=%s AND entry_date=%s AND final_result IS NULL "
+                "RETURNING *",
+                [final_result, final_result, json.dumps([entry], ensure_ascii=False),
+                 user_id, code, market, entry_date])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_stock_theses(database_url, user_id, from_date=None, to_date=None, limit=200):
+    """成績評価画面向け：期間内の仮説を新しい順で返す。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where = ["user_id=%s"]
+    params = [user_id]
+    if from_date:
+        where.append("entry_date >= %s")
+        params.append(from_date)
+    if to_date:
+        where.append("entry_date <= %s")
+        params.append(to_date)
+    params.append(limit)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT * FROM stock_theses WHERE {' AND '.join(where)} "
+                f"ORDER BY entry_date DESC, id DESC LIMIT %s", params)
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def get_stock_thesis_stats(database_url, user_id, days=30):
+    """直近days日分のfinal_result内訳（成績評価）を集計する。final_result未確定（当日進行中）
+    の仮説は集計に含めない。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return {"totalFinalized": 0, "byResult": {}, "winRate": None}
+    since = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT final_result, COUNT(*) AS n FROM stock_theses "
+                "WHERE user_id=%s AND entry_date >= %s AND final_result IS NOT NULL "
+                "GROUP BY final_result", [user_id, since])
+            rows = cur.fetchall()
+    by_result = {r["final_result"]: r["n"] for r in rows}
+    total = sum(by_result.values())
+    decided = by_result.get("SUCCESS", 0) + by_result.get("PARTIAL_SUCCESS", 0) + by_result.get("FAIL", 0)
+    win_rate = round((by_result.get("SUCCESS", 0) + by_result.get("PARTIAL_SUCCESS", 0)) / decided * 100, 1) if decided else None
+    return {"totalFinalized": total, "byResult": by_result, "winRate": win_rate, "sinceDate": since}
 
 
 # ---- investment_profile（投資プロフィール。2026-09-02新規） ----
