@@ -341,6 +341,13 @@ ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS manual_registered BOOLEAN NOT NUL
 -- （merge_auto_tag）でキー単位の追加・上書きのみを行い、他の理由キーには触れない。
 ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS auto_tags JSONB;
 
+-- Smart Import「監視銘柄更新」（type: watchlist_master_update）対応：SBI証券等の監視銘柄
+-- マスターを一括反映する際、update_mode="sync"でマスター側に存在しなくなった既存銘柄を
+-- 即削除せず区別して残すための列。active（表示/非表示の絶対フラグ）とは別軸——
+-- inactive_candidateはあくまで「次回同期でも見当たらなかった」という注記であり、
+-- ユーザーが手動で判断するまで監視銘柄一覧からは消さない。
+ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS inactive_candidate BOOLEAN NOT NULL DEFAULT false;
+
 -- v3-9続き（2026-09-05・PHASE 1 AUTO SIGNAL LOG）：5つの自動登録エンジン（MOMENTUM DAY/
 -- AUTO_BREAK/AUTO_RS/AUTO_SECTOR_LEADER/AUTO_PULLBACK、将来のAUTO_REVERSAL/AUTO_VOLUME/
 -- AUTO_EARNINGSも含む）共通の恒久履歴テーブル。watchlist.auto_tags（CURRENT/SEEN・期限切れで
@@ -7286,6 +7293,64 @@ def upsert_watchlist_item(database_url, user_id, item):
         ok = _upsert_watchlist_item_conn(conn, user_id, item)
         conn.commit()
     return ok
+
+
+def upsert_watchlist_master_stocks(database_url, user_id, stocks, update_mode="add", source="smart_import_master"):
+    """Smart Import『監視銘柄更新』（type: watchlist_master_update）専用の一括upsert。
+    stocksは[{"code":str,"name":str|None}, ...]。codeは"417A"/"593A"のような英字入りの
+    銘柄コードも文字列としてそのまま保持し、数値変換は一切行わない。
+    update_mode:
+      "add"  … stocksに含まれる銘柄をadd/updateするのみ（他の既存銘柄には触れない）
+      "sync" … 上記に加え、マスターに存在しなくなった既存銘柄（同一user_id・market='JP'）を
+               即削除せずinactive_candidate=trueにする（指示書：即削除しない）
+    戻り値：{"added":N,"updated":N,"invalid":N,"inactive_candidates":N}。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return {"added": 0, "updated": 0, "invalid": 0, "inactive_candidates": 0}
+    valid, seen_codes, invalid = [], set(), 0
+    for s in stocks or []:
+        code = str((s or {}).get("code") or "").strip()
+        if not code:
+            invalid += 1
+            continue
+        if code in seen_codes:
+            continue  # 同一バッチ内の重複は先勝ち・invalidにはしない
+        seen_codes.add(code)
+        valid.append({"code": code, "name": (s or {}).get("name")})
+    added = updated = inactive_marked = 0
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT code FROM watchlist WHERE user_id=%s AND market='JP'", [user_id])
+            existing_codes = {r["code"] for r in cur.fetchall()}
+        for item in valid:
+            is_new = item["code"] not in existing_codes
+            cols, values = ["source"], [source]
+            if item.get("name"):
+                cols.append("name")
+                values.append(item["name"])
+            placeholders = ", ".join(["%s"] * len(cols))
+            conn.execute(
+                f"INSERT INTO watchlist (user_id, code, market, {', '.join(cols)}, inactive_candidate) "
+                f"VALUES (%s, %s, 'JP', {placeholders}, false) "
+                f"ON CONFLICT (user_id, code, market) DO UPDATE SET "
+                f"{', '.join(c + '=EXCLUDED.' + c for c in cols)}, active=true, inactive_candidate=false, "
+                f"updated_at=now()",
+                [user_id, item["code"]] + values)
+            if is_new:
+                added += 1
+            else:
+                updated += 1
+        if update_mode == "sync":
+            stale_codes = list(existing_codes - {item["code"] for item in valid})
+            if stale_codes:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE watchlist SET inactive_candidate=true, updated_at=now() "
+                        "WHERE user_id=%s AND market='JP' AND code = ANY(%s)",
+                        [user_id, stale_codes])
+                    inactive_marked = cur.rowcount
+        conn.commit()
+    return {"added": added, "updated": updated, "invalid": invalid, "inactive_candidates": inactive_marked}
 
 
 # v3-9（監視銘柄自動登録エンジン）：手動登録との事故防止のため、auto_tags/manual_registeredは

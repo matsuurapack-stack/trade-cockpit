@@ -2686,6 +2686,7 @@ const SMART_IMPORT_CATEGORY_META={
   TRADE_RULE:{icon:"🚨",label:"TRADE RULE（売買ルール変更候補）",color:"var(--down)"},
   CHATGPT_LEGACY:{icon:"✅",label:"ChatGPT連携（従来形式）",color:"var(--up)"},
   WATCHLIST_UPDATE:{icon:"👀",label:"WATCHLIST UPDATE（監視銘柄）",color:"var(--up)"},
+  WATCHLIST_MASTER_UPDATE:{icon:"📋",label:"WATCHLIST_UPDATE（監視銘柄更新）",color:"var(--up)"},
   POSITION_UPDATE:{icon:"💼",label:"POSITION UPDATE（保有ポジション）",color:"var(--down)"},
   SOCIAL_IMAGE_ANALYSIS:{icon:"🖼",label:"SOCIAL IMAGE ANALYSIS（X投稿画像解析）",color:"var(--up)"},
   UNKNOWN:{icon:"❔",label:"判別不能",color:"var(--inkFaint)"},
@@ -2696,8 +2697,8 @@ const SMART_IMPORT_CONFIDENCE_META={
 };
 // 2026-09-10更新（Phase SI-C）：WATCHLIST_UPDATE/POSITION_UPDATEを追加。
 const SMART_IMPORT_IMPLEMENTED=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
-  "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","CHATGPT_LEGACY","WATCHLIST_UPDATE","POSITION_UPDATE",
-  "SOCIAL_IMAGE_ANALYSIS"];
+  "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","CHATGPT_LEGACY","WATCHLIST_UPDATE",
+  "WATCHLIST_MASTER_UPDATE","POSITION_UPDATE","SOCIAL_IMAGE_ANALYSIS"];
 
 // 指示書25番（Phase SI-D）：UIテキストを統一表現に寄せる。sourceContextはCatalystタブ等
 // から開いた場合のヒント表示用（指示書12番：分類結果を強制しない、あくまで注記）。
@@ -2909,6 +2910,23 @@ function SmartImportPanel({onReload,sourceContext=null,onSaved=null,compactMode=
                 {!c.draft.ticker && <div style={{fontSize:11,color:"var(--down)",fontWeight:700}}>⚠ 銘柄コードを解決できませんでした（自動推定しません）</div>}
                 <div style={{fontSize:11,color:"var(--inkFaint)"}}>銘柄: {c.draft.ticker||"（不明）"}　action: {c.draft.action||"ADD"}{c.draft.themes?`　テーマ: ${c.draft.themes}`:""}</div>
               </>}
+              {c.category==="WATCHLIST_MASTER_UPDATE" && (()=>{
+                const stats=c.draft.preview_stats||{add_count:0,existing_count:0,invalid_count:0,total:(c.draft.stocks||[]).length};
+                const mode=(c.draft.update_mode||"add").toLowerCase();
+                return <>
+                  {mode==="sync" && <div style={{fontSize:12,fontWeight:700,color:"var(--accent)",marginBottom:4}}>
+                    ⚠ SYNC：このマスターに含まれない既存の監視銘柄は削除せず「非アクティブ候補」として残します。
+                  </div>}
+                  {stats.total===0 && <div style={{fontSize:11,color:"var(--down)",fontWeight:700}}>⚠ stocks配列が空、または無いため保存できません</div>}
+                  <div style={{fontSize:12,fontWeight:700}}>
+                    追加予定{stats.add_count}件 / 既存{stats.existing_count}件 / 無効{stats.invalid_count}件
+                  </div>
+                  <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:2}}>
+                    update_mode: {mode}　対象: {stats.total}件
+                    {(c.draft.stocks||[]).slice(0,5).map(s=>s.code).join("・")}{(c.draft.stocks||[]).length>5?" ...":""}
+                  </div>
+                </>;
+              })()}
               {c.category==="POSITION_UPDATE" && <>
                 <div style={{fontSize:12,fontWeight:700,color:"var(--down)",marginBottom:4}}>
                   🚨 POSITION UPDATE：この操作は保有ポジション情報を変更します。内容を確認してから保存してください。
@@ -2958,8 +2976,8 @@ function SmartImportPanel({onReload,sourceContext=null,onSaved=null,compactMode=
   </div>;
 }
 const SMART_IMPORT_CATEGORIES_UI=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
-  "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","WATCHLIST_UPDATE","POSITION_UPDATE",
-  "SOCIAL_IMAGE_ANALYSIS","UNKNOWN"];
+  "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","WATCHLIST_UPDATE","WATCHLIST_MASTER_UPDATE",
+  "POSITION_UPDATE","SOCIAL_IMAGE_ANALYSIS","UNKNOWN"];
 
 function ExpertViewsPanel({views,onReload,onOpenSmartImport}){
   const [pasteText,setPasteText]=useState("");

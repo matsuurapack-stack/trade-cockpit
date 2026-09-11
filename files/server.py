@@ -13149,7 +13149,8 @@ def _macro_text(items):
 
 SMART_IMPORT_CATEGORIES = [  # 指示書2番。将来カテゴリ追加時はここへ追加するだけでよい構造
     "CATALYST", "EXPERT_OPINION", "EVENT", "MARKET_ANALYSIS", "MORNING_MARKET_CHECK",
-    "INTRADAY_REPORT", "TRADE_RULE", "NEWS", "WATCHLIST_UPDATE", "POSITION_UPDATE", "UNKNOWN",
+    "INTRADAY_REPORT", "TRADE_RULE", "NEWS", "WATCHLIST_UPDATE", "WATCHLIST_MASTER_UPDATE",
+    "POSITION_UPDATE", "UNKNOWN",
 ]
 # Phase SI-B（2026-09-10）で MARKET_ANALYSIS・MORNING_MARKET_CHECK・INTRADAY_REPORT・
 # TRADE_RULEを追加。CHATGPT_LEGACYはSMART_IMPORT_CATEGORIESには含めない内部専用カテゴリ
@@ -13159,8 +13160,8 @@ SMART_IMPORT_CATEGORIES = [  # 指示書2番。将来カテゴリ追加時はこ
 # （既存ニュースタブのRSS取得と役割が重複するため、指示書のスコープではPhase SI-C対象外）。
 SMART_IMPORT_IMPLEMENTED_CATEGORIES = {
     "CATALYST", "EVENT", "EXPERT_OPINION", "MARKET_ANALYSIS", "MORNING_MARKET_CHECK",
-    "INTRADAY_REPORT", "TRADE_RULE", "CHATGPT_LEGACY", "WATCHLIST_UPDATE", "POSITION_UPDATE",
-    "SOCIAL_IMAGE_ANALYSIS",
+    "INTRADAY_REPORT", "TRADE_RULE", "CHATGPT_LEGACY", "WATCHLIST_UPDATE", "WATCHLIST_MASTER_UPDATE",
+    "POSITION_UPDATE", "SOCIAL_IMAGE_ANALYSIS",
 }
 # 指示書16番（Phase SI-C）：重要操作（TRADE_RULE・WATCHLIST_UPDATEのREMOVE・POSITION_UPDATE
 # 全般）は「安全な項目のみ選択」の対象外とする。POSITION_UPDATEはカテゴリ全体が対象外
@@ -13240,6 +13241,14 @@ def _classify_json_item(item):
         # 指示書2番（Phase SI-C）：REMOVEは重要操作のためconfidenceを上げすぎない（UIの既定
         # 未選択はaction自体で別途判定するが、ここでも情報として下げておく）。
         return "WATCHLIST_UPDATE", ("MEDIUM" if str(item.get("action", "")).upper() == "REMOVE" else "HIGH"), item
+    if t == "watchlist_master_update":
+        # 監視銘柄マスター一括更新（SBI証券の監視銘柄エクスポート等を想定）。単発の
+        # WATCHLIST_UPDATE（1件ずつADD/UPDATE/REMOVE）とは形が異なるため別カテゴリとする——
+        # stocks配列が無い/空ならUNKNOWN扱いにせずLOW confidenceの候補として残す（型は
+        # 正しく認識しつつ、中身が使えないことを明示する）。
+        stocks = item.get("stocks")
+        confidence = "HIGH" if isinstance(stocks, list) and stocks else "LOW"
+        return "WATCHLIST_MASTER_UPDATE", confidence, item
     if t == "position_update":
         return "POSITION_UPDATE", "HIGH", item
     if t == "social_market_image_analysis":
@@ -13840,6 +13849,61 @@ def normalize_watchlist_update(draft, raw_text=None, import_source="unknown"):
             "raw_text": raw_text, "import_source": import_source}
 
 
+def _watchlist_master_stock_code(stock):
+    """417A/593A等の英字入りコードも文字列としてそのまま保持する（数値変換しない）。"""
+    return str((stock or {}).get("code") or "").strip()
+
+
+def compute_watchlist_master_update_preview_stats(draft, existing_codes):
+    """type: watchlist_master_updateのプレビュー用に「追加予定○件 / 既存○件 / 無効○件」を
+    集計する。無効＝codeが空、または同一バッチ内の重複（2件目以降）。"""
+    stocks = (draft or {}).get("stocks")
+    if not isinstance(stocks, list):
+        return {"add_count": 0, "existing_count": 0, "invalid_count": 0, "total": 0}
+    seen, add_count, existing_count, invalid_count = set(), 0, 0, 0
+    for s in stocks:
+        code = _watchlist_master_stock_code(s)
+        if not code or code in seen:
+            invalid_count += 1
+            continue
+        seen.add(code)
+        if code in (existing_codes or set()):
+            existing_count += 1
+        else:
+            add_count += 1
+    return {"add_count": add_count, "existing_count": existing_count, "invalid_count": invalid_count,
+            "total": len(stocks)}
+
+
+WATCHLIST_MASTER_UPDATE_MODES = ("add", "sync")
+
+
+def normalize_watchlist_master_update(draft, raw_text=None, import_source="unknown"):
+    """draftをinvestment_db.upsert_watchlist_master_stocks()が受け付ける形へ正規化する。
+    stocksが配列でない、または有効な銘柄が1件も無ければNoneを返す。update_modeは
+    "add"（既定）または"sync"のみを許可し、それ以外は"add"へフォールバックする（未知の
+    値でsync＝隔離扱いを誤爆させないための安全側デフォルト）。"""
+    draft = draft or {}
+    stocks = draft.get("stocks")
+    if not isinstance(stocks, list) or not stocks:
+        return None
+    normalized_stocks = []
+    seen = set()
+    for s in stocks:
+        code = _watchlist_master_stock_code(s)
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        normalized_stocks.append({"code": code, "name": (s or {}).get("name")})
+    if not normalized_stocks:
+        return None
+    update_mode = str(draft.get("update_mode") or "add").strip().lower()
+    if update_mode not in WATCHLIST_MASTER_UPDATE_MODES:
+        update_mode = "add"
+    return {"stocks": normalized_stocks, "update_mode": update_mode, "raw_text": raw_text,
+            "import_source": import_source}
+
+
 def normalize_position_update(database_url, user_id, draft, raw_text=None, import_source="unknown"):
     """draftを既存のadd_position_entry/add_position_exit/upsert_portfolio_item（すべて
     investment_db.py既存関数、平均単価・実現損益の計算ロジックはそこに委譲し重複実装しない、
@@ -13955,6 +14019,15 @@ def smart_import_check_duplicates(database_url, user_id, candidates):
                     existing_codes = set()
                 if ticker in existing_codes:
                     c["possible_duplicate"] = True
+        elif category == "WATCHLIST_MASTER_UPDATE":
+            # 指示書：解析後プレビューで「追加予定○件 / 既存○件 / 無効○件」を表示できるよう、
+            # ここで集計してdraft.preview_statsへ付与する（保存処理自体はまだ行わない）。
+            draft = c.get("draft") or {}
+            try:
+                existing_codes = {w.get("code") for w in investment_db.list_watchlist(database_url, user_id, market="JP")}
+            except Exception:
+                existing_codes = set()
+            c["draft"]["preview_stats"] = compute_watchlist_master_update_preview_stats(draft, existing_codes)
         elif category == "POSITION_UPDATE":
             # 指示書18番：同一ticker+action+price+quantityの候補が直近のtrade_history/
             # portfolioと一致する場合に警告する簡易判定（時刻厳密照合はしない）。
@@ -13991,6 +14064,7 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
     trade_rule_results = []
     chatgpt_legacy_results = []
     watchlist_update_results = []
+    watchlist_master_update_results = []
     position_update_results = []
     social_image_analysis_results = []
 
@@ -14132,6 +14206,24 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
                 watchlist_update_results.append({"ok": False, "reason": str(e)})
             continue
 
+        if category == "WATCHLIST_MASTER_UPDATE":
+            # 監視銘柄マスター一括更新：既存upsert_watchlist_master_stocks()へ振り分けるのみ。
+            # update_mode="sync"でも即削除はせずinactive_candidate扱いにする（investment_db側で
+            # 担保）。
+            try:
+                normalized = normalize_watchlist_master_update(draft, raw_text, import_source)
+                if normalized is None:
+                    watchlist_master_update_results.append(
+                        {"ok": False, "reason": "有効な銘柄（code）が1件も無いため保存できません"})
+                else:
+                    stats = investment_db.upsert_watchlist_master_stocks(
+                        database_url, user_id, normalized["stocks"], update_mode=normalized["update_mode"])
+                    watchlist_master_update_results.append({"ok": True, "update_mode": normalized["update_mode"], **stats})
+            except Exception as e:
+                print("  SmartImport: WatchlistMasterUpdate保存失敗", e)
+                watchlist_master_update_results.append({"ok": False, "reason": str(e)})
+            continue
+
         if category == "POSITION_UPDATE":
             # 指示書5〜13番（最重要）：POSITION_UPDATEはconfidenceに関わらず既に「ユーザーが
             # 明示的に選択・確定した」候補のみここへ来る（UIで既定未選択、指示書6・16番）。
@@ -14267,6 +14359,11 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
         results["WATCHLIST_UPDATE"] = {"imported": sum(1 for r in watchlist_update_results if r["ok"]),
                                         "skipped": sum(1 for r in watchlist_update_results if not r["ok"]),
                                         "details": watchlist_update_results}
+    if watchlist_master_update_results:
+        results["WATCHLIST_MASTER_UPDATE"] = {
+            "imported": sum(1 for r in watchlist_master_update_results if r["ok"]),
+            "skipped": sum(1 for r in watchlist_master_update_results if not r["ok"]),
+            "details": watchlist_master_update_results}
     if position_update_results:
         results["POSITION_UPDATE"] = {"imported": sum(1 for r in position_update_results if r["ok"]),
                                        "skipped": sum(1 for r in position_update_results if not r["ok"]),
