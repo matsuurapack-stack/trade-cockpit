@@ -5880,7 +5880,7 @@ function PositionJudgmentPanel({item,detail,cur,posFlags,posIndicators,enrStatus
 // 更新頻度には一切影響しない）。ここでは新しい売買ロジックは作らず、売却は既存のPositionExitModal
 // （onOpenExit経由で親から渡される）をそのまま呼ぶだけ。
 const POSITION_LIVE_POLL_MS=12000; // 展開中のみ12秒間隔（yfinance/立花証券APIとも常時ポーリング前提のAPIではないため控えめにする）
-function PositionLiveDetail({item,onOpenExit,posFlags,posIndicators,enrStatus}){
+function PositionLiveDetail({item,onOpenExit,posFlags,posIndicators,enrStatus,onQuote}){
   const [detail,setDetail]=useState(null);
   const [err,setErr]=useState("");
   const [loading,setLoading]=useState(true);
@@ -5889,12 +5889,20 @@ function PositionLiveDetail({item,onOpenExit,posFlags,posIndicators,enrStatus}){
     const load=async()=>{
       const d=await fetchJsonSafe(`/api/position-live?code=${encodeURIComponent(item.code)}&market=${encodeURIComponent(item.market||"JP")}`);
       if(cancelled)return;
-      if(d.error){setErr(d.error);}else{setDetail(d);setErr("");}
+      if(d.error){setErr(d.error);}else{
+        setDetail(d);setErr("");
+        // 不具合修正（2026-09-11）：この一番新しい実測値を親（ポジションカード）へ即時共有し、
+        // 上部カードの現在値・評価損益等が「初回ロード時だけ」ではなくポーリングの度に追従する
+        // ようにする（single source of truth、指示書6番）。
+        const freshCur=num(d.t);
+        if(freshCur!=null&&!cancelled)onQuote?.(freshCur);
+      }
       if(!cancelled)setLoading(false);
     };
     load();
     const timer=setInterval(load,POSITION_LIVE_POLL_MS);
     return ()=>{cancelled=true;clearInterval(timer);};
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   },[item.code,item.market]);
 
   const rowStyle={display:"flex",justifyContent:"space-between",fontSize:12,padding:"2px 0"};
@@ -6118,6 +6126,19 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
   // v3-9続き（2026-09-07・リアルタイム売却判断画面 Phase1）：詳細展開は同時に1銘柄のみ
   // （item17のAPI負荷対策として推奨されている方式を採用。展開を閉じれば即ポーリング停止）。
   const [expandedLiveCode,setExpandedLiveCode]=useState(null);
+  // 不具合修正（2026-09-11）：上部ポジションカードの「現在値」が30秒間隔の一括stockQuotes
+  // （watchlist経由の/api/stock-quotesバッチ）を見ていた一方、リアルタイム売却判断／チャートは
+  // 12秒間隔で独自に/api/position-liveをポーリングしており、2つの別々の取得経路で数値がズレる
+  // 不具合があった（上部2,584円・下部2,634円のように表示が食い違う）。PositionLiveDetailが
+  // 取得した最新値をonQuoteで親（この一箇所）へ集約し、single source of truthとして
+  // カード全体（現在値・評価損益・trailing・RR・EXIT/CAUTION等）へ流す。展開中のポジション
+  // だけがこのmapに値を持ち、優先順位は「liveQuotes（実測） > stockQuotes（30秒バッチ） >
+  // なし」とする（指示書の優先順位：live > market quote > DB/cache）。
+  const [liveQuotes,setLiveQuotes]=useState({}); // key: code+market -> {price, fetchedAt}
+  const reportLiveQuote=useCallback((key,price)=>{
+    if(price==null)return;
+    setLiveQuotes(p=>(p[key]?.price===price?p:{...p,[key]:{price,fetchedAt:new Date().toISOString()}}));
+  },[]);
 
   // v3-4：入力中のコードがトレード分析タブで既に「分析」済みなら、その時点のstop/target/
   // fullExitTargetを初期SL・利確①②の下書きに流し込むショートカット（既存analysisDataの
@@ -6405,7 +6426,12 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
         ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>まだ保有株の登録がありません。</div>
         : <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(260px,1fr))",gap:8}}>
             {items.map(it=>{
-              const current=num(stockQuotes?.[it.code]?.t);
+              // 不具合修正（2026-09-11）：live（/api/position-live実測、liveQuotes）を最優先、
+              // 無ければ従来通りstockQuotes（30秒バッチ）を使う。current以下（損益・trailing・
+              // RR・EXIT/CAUTION等）は全てこのcurrent 1つから導出されるため、ここを直すだけで
+              // カード全体が同じ現在値に揃う。
+              const liveKey=it.code+it.market;
+              const current=liveQuotes[liveKey]?.price??num(stockQuotes?.[it.code]?.t);
               const {amount:pnlAmount,pct:pnlPct}=calcUnrealizedPnl(it.average_price,it.quantity,current);
               const basisPrice=it.average_price??current;
               const rr=calcPositionRR(it.target_1,basisPrice,it.current_stop);
@@ -6553,7 +6579,8 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
                     {expandedLiveCode===(it.code+it.market)?"📊 リアルタイム売却判断 ▲ 閉じる":"📊 リアルタイム売却判断を開く ▼"}
                   </button>
                   {expandedLiveCode===(it.code+it.market) && <PositionLiveDetail item={it} onOpenExit={openExit}
-                    posFlags={posFlags} posIndicators={posIndicators} enrStatus={enr?.status}/>}
+                    posFlags={posFlags} posIndicators={posIndicators} enrStatus={enr?.status}
+                    onQuote={price=>reportLiveQuote(liveKey,price)}/>}
                 </div>
 
                 {/* ⑧ 操作・参考情報・メモ */}
