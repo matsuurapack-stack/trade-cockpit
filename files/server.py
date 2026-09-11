@@ -2880,6 +2880,197 @@ def _reevaluate_active_stock_theses(database_url, user_id, trade_date, report_ty
 X_API_BASE = "https://api.twitter.com/2"
 X_SOCIAL_SOURCE_PLATFORM = "X"
 
+# ============================================================
+# Market Intelligence Phase6（2026-09-12新規）：@nicosokufx専用だったX連携を複数情報源へ拡張。
+# market_sourcesを設定駆動型にする（指示書1番）。4者は情報の性質が異なるため同一評価ロジックを
+# 一律適用しない——source_type別に専用の抽出・分類関数を用意し、既存Phase1〜5の
+# にこそく（MARKET_COMMENTARY）向けロジックはそのまま維持する（指示書2・4番「後方互換」）。
+# ============================================================
+
+SOURCE_TYPES = ("MARKET_COMMENTARY", "PREDICTION_MARKET", "STOCK_BREAKING", "CORPORATE_BREAKING")
+
+# 指示書1・13番：初期登録する4source。DBのmarket_sources行が既にあれば上書きしない
+# （ensure_market_sourceの既存方針を継続）——ここはあくまで「初回の種」。intervalは
+# rate limit優先で設定可能にする（指示書1番「intervalは設定可能にする」）。
+MARKET_SOURCE_CONFIGS = [
+    {"handle": "nicosokufx", "display_name": "にこそく", "priority": "HIGH", "source_type": "MARKET_COMMENTARY",
+     "poll_interval_market_sec": 240, "poll_interval_off_sec": 750,
+     "categories": ["JP_MARKET", "MACRO"],
+     "strengths": ["macro", "sectors", "technical", "events"],
+     "evaluation_modes": ["prediction_accuracy"]},
+    {"handle": "polymarketjapan", "display_name": "Polymarket Japan", "priority": "HIGH",
+     "source_type": "PREDICTION_MARKET", "poll_interval_market_sec": 300, "poll_interval_off_sec": 600,
+     "categories": ["PREDICTION_MARKET", "MACRO"],
+     "strengths": ["prediction_probability", "politics", "macro_events"],
+     "evaluation_modes": ["calibration", "probability_movement"]},
+    {"handle": "kgbukabu", "display_name": "急騰", "priority": "HIGH", "source_type": "STOCK_BREAKING",
+     "poll_interval_market_sec": 180, "poll_interval_off_sec": 600,
+     "categories": ["JP_STOCK", "BREAKING"],
+     "strengths": ["stock_breaking", "momentum", "catalysts"],
+     "evaluation_modes": ["timeliness", "subsequent_price_movement"]},
+    {"handle": "aryarya", "display_name": "ありゃりゃ", "priority": "HIGH", "source_type": "CORPORATE_BREAKING",
+     "poll_interval_market_sec": 180, "poll_interval_off_sec": 600,
+     "categories": ["JP_STOCK", "DISCLOSURE"],
+     "strengths": ["corporate_breaking", "disclosure_discovery", "policy"],
+     "evaluation_modes": ["discovery_speed", "primary_source_accuracy"]},
+]
+MARKET_SOURCE_BY_HANDLE = {c["handle"]: c for c in MARKET_SOURCE_CONFIGS}
+
+
+# ---- source_type別の一次情報リンク判定・投稿分類（指示書11・12番） ----
+
+PRIMARY_SOURCE_DOMAIN_HINTS = (
+    ("release.tdnet.info", "TDNET"), ("tdnet", "TDNET"),
+    ("kantei.go.jp", "GOV"), ("fsa.go.jp", "GOV"), (".go.jp", "GOV"),
+    ("bloomberg", "NEWS"), ("reuters", "NEWS"), ("nikkei.com", "NEWS"), ("nikkei.co.jp", "NEWS"),
+)
+
+
+def classify_primary_source_type(url):
+    """指示書11番：一次情報リンク先をTDNET|GOV|NEWS|IRのいずれかに分類する（判定不能ならNone、
+    無理に断定しない）。"""
+    if not url:
+        return None
+    host = (urllib.parse.urlparse(url).netloc or "").lower()
+    for hint, kind in PRIMARY_SOURCE_DOMAIN_HINTS:
+        if hint in host:
+            return kind
+    if host.endswith(".co.jp") or "ir" in host:
+        return "IR"
+    return None
+
+
+# 指示書12番：投稿を「独自見解」「事実の紹介」「速報の紹介」「単純な感想」に分類する。
+POST_RELAY_BREAKING_KEYWORDS = ["速報", "上方修正", "下方修正", "TOB", "M&A", "自社株買い", "増資", "業績修正", "不祥事"]
+
+
+def classify_post_relay_type(text, has_link):
+    """指示書12番：ORIGINAL_ANALYSIS/FACT_RELAY/BREAKING_RELAY/OPINIONを判定する。企業開示を
+    早く紹介しただけの投稿（リンクのみ＋速報系キーワード）は投稿者の「予測的中率」評価対象に
+    せず、discovery_speed等の別軸で評価する設計にする土台（指示書12番）。"""
+    if not text:
+        return "OPINION"
+    if has_link and any(kw in text for kw in POST_RELAY_BREAKING_KEYWORDS):
+        return "BREAKING_RELAY"
+    if has_link:
+        return "FACT_RELAY"
+    if any(kw in text for kw in SOCIAL_EVAL_BULLISH_KEYWORDS + SOCIAL_EVAL_BEARISH_KEYWORDS
+           + SIGNAL_KIND_TECHNICAL_KEYWORDS):
+        return "ORIGINAL_ANALYSIS"
+    return "OPINION"
+
+
+# ---- @polymarketjapan専用解析（指示書5・6番） ----
+
+POLYMARKET_PROBABILITY_SHIFT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%\s*(?:→|->|から)\s*(\d{1,3}(?:\.\d+)?)\s*%")
+POLYMARKET_SINGLE_PROBABILITY_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
+POLYMARKET_CATEGORY_KEYWORDS = {
+    "POLITICS": ["大統領選", "選挙", "政権", "議会"],
+    "MACRO": ["FRB", "FOMC", "利下げ", "利上げ", "日銀", "CPI", "GDP", "政府閉鎖"],
+    "CRYPTO": ["ビットコイン", "BTC", "仮想通貨", "クリプト"],
+    "TECH": ["AI", "テック"],
+}
+
+
+def extract_prediction_market_data(text):
+    """指示書5・6番：prediction probability・probability_change等を抽出する。単純な
+    「70%」だけの投稿ではprevious_probabilityは取れないためNoneのまま（無理に推測しない）。
+    resolution_date抽出は本文の書式が定まらないため今回は未実装（既知の制約）。"""
+    if not text:
+        return None
+    prev_p = cur_p = None
+    m = POLYMARKET_PROBABILITY_SHIFT_RE.search(text)
+    if m:
+        prev_p, cur_p = float(m.group(1)), float(m.group(2))
+    else:
+        m2 = POLYMARKET_SINGLE_PROBABILITY_RE.search(text)
+        if m2:
+            cur_p = float(m2.group(1))
+    probability_change = round(cur_p - prev_p, 1) if (prev_p is not None and cur_p is not None) else None
+    category = next((cat for cat, kws in POLYMARKET_CATEGORY_KEYWORDS.items() if any(kw in text for kw in kws)), "OTHER")
+    urls = re.findall(r"https?://\S+", text)
+    return {
+        "prediction_topic": text[:40], "event_name": text[:60],
+        "probability": cur_p, "previous_probability": prev_p, "probability_change": probability_change,
+        "resolution_date": None, "market_url": urls[0] if urls else None, "category": category,
+    }
+
+
+def classify_prediction_market_shift(probability_change, threshold=10):
+    """指示書6番：52%→70%のような急変（閾値10ptを既定）をPREDICTION_MARKET_SHIFTとして
+    重要視する。"""
+    if probability_change is None:
+        return False
+    return abs(probability_change) >= threshold
+
+
+# ---- @kgbukabu専用解析（指示書8・9番） ----
+
+STOCK_TICKER_RE = re.compile(r"(?<!\d)(\d{4})(?!\d)")
+STOCK_CHANGE_PCT_RE = re.compile(r"[+＋▲△]\s*(\d+(?:\.\d+)?)\s*%|[-−▼▽]\s*(\d+(?:\.\d+)?)\s*%")
+STOCK_CATALYST_KEYWORDS = ["上方修正", "下方修正", "新製品", "提携", "業務提携", "受注", "テーマ"]
+STOCK_DISCLOSURE_KEYWORDS = ["開示", "適時開示", "TDnet", "TDNET"]
+STOCK_LIMIT_KEYWORDS = {"ストップ高": "LIMIT_UP", "ストップ安": "LIMIT_DOWN"}
+# 指示書9番：kgbukabu専用のsignal_kind追加（既存enumはそのまま、追加のみ）。
+KGBUKABU_MOMENTUM_KEYWORDS = ["出来高急増", "急伸", "急変", "急増"]
+KGBUKABU_BREAKING_KEYWORDS = ["ストップ高", "ストップ安", "急騰", "急落"]
+
+
+def extract_stock_breaking_data(text, watchlist=None):
+    """指示書8番：ticker/company_name/change_pct/catalyst/disclosure/limit_statusを抽出する
+    （画像内のチャート・出来高等は今回のテキスト解析範囲外、既知の制約）。"""
+    if not text:
+        return None
+    watchlist = watchlist or []
+    tickers = STOCK_TICKER_RE.findall(text)
+    company_name, ticker = None, (tickers[0] if tickers else None)
+    for w in watchlist:
+        name = (w.get("name") or "").strip()
+        if name and name in text:
+            company_name = name
+            if not ticker:
+                ticker = w.get("code")
+            break
+    change_pct = None
+    m = STOCK_CHANGE_PCT_RE.search(text)
+    if m:
+        val = m.group(1) or m.group(2)
+        sign = 1 if m.group(1) else -1
+        change_pct = sign * float(val)
+    catalyst = next((kw for kw in STOCK_CATALYST_KEYWORDS if kw in text), None)
+    disclosure = any(kw in text for kw in STOCK_DISCLOSURE_KEYWORDS)
+    limit_status = next((v for kw, v in STOCK_LIMIT_KEYWORDS.items() if kw in text), None)
+    return {"ticker": ticker, "company_name": company_name, "change_pct": change_pct,
+            "catalyst": catalyst, "disclosure": disclosure, "limit_status": limit_status}
+
+
+def classify_signal_kind_for_source(sentence, source_type=None):
+    """指示書9番：STOCK_BREAKING（kgbukabu）ソースだけBREAKING_STOCK/MOMENTUM_ALERT/
+    CATALYST_ALERTを優先判定する。それ以外のsource_typeでは既存classify_signal_kind
+    （Phase5）と完全に同じ結果を返す（指示書「既存enumとの互換性を壊さない」）。"""
+    if source_type == "STOCK_BREAKING" and sentence:
+        if any(kw in sentence for kw in KGBUKABU_BREAKING_KEYWORDS):
+            return "BREAKING_STOCK"
+        if any(kw in sentence for kw in KGBUKABU_MOMENTUM_KEYWORDS):
+            return "MOMENTUM_ALERT"
+        if any(kw in sentence for kw in STOCK_CATALYST_KEYWORDS):
+            return "CATALYST_ALERT"
+    return classify_signal_kind(sentence)
+
+
+# ---- @aryarya専用解析（指示書10・11番） ----
+
+def extract_corporate_breaking_data(text, url=None):
+    """指示書10・11番：投稿本文にリンクがある場合のlinked_domain/linked_url/headlineを保持
+    する。一次情報かどうかの分類自体はclassify_primary_source_typeが担う（役割を分離）。"""
+    if not text and not url:
+        return None
+    return {
+        "linked_url": url, "linked_domain": (urllib.parse.urlparse(url).netloc if url else None),
+        "headline": (text or "")[:60],
+    }
+
+
 # 指示書5番：投稿の自動分類（複数カテゴリ付与可）。AI不使用のキーワードベース分類
 # （他のSmart Import/AUTO系エンジンと同じ方針）。
 X_POST_CATEGORY_KEYWORDS = {
@@ -3180,9 +3371,14 @@ def _x_fetch_recent_tweets(user_id, since_id=None):
     return _x_api_request(f"/users/{user_id}/tweets", params)
 
 
-def _build_social_post_record(database_url, user_id, tweet, media_by_key, source_handle, source_name):
+def _build_social_post_record(database_url, user_id, tweet, media_by_key, source_handle, source_name,
+                               source_config=None):
     """1件のtweet dict（X API v2形式）から、DB保存用のsocial_market_posts行を組み立てる
-    （指示書3・4・5・6・7・15番）。"""
+    （指示書3・4・5・6・7・15番）。Market Intelligence Phase6（指示書4・5・8・10・11・12番）：
+    source_configのsource_type別に専用解析（Polymarket確率抽出・kgbukabu銘柄速報抽出・
+    aryarya一次情報リンク抽出）を追加専用フィールドとして付与する。source_config省略時は
+    従来通りnicosoku（MARKET_COMMENTARY）相当の扱い（後方互換）。"""
+    account_type = (source_config or {}).get("source_type") or "MARKET_COMMENTARY"
     text = tweet.get("text") or ""
     post_id = tweet.get("id")
     media_keys = (tweet.get("attachments") or {}).get("media_keys") or []
@@ -3201,10 +3397,28 @@ def _build_social_post_record(database_url, user_id, tweet, media_by_key, source
     try:
         positions = investment_db.list_portfolio(database_url, user_id) if investment_db else []
         position_codes = {p.get("code") for p in positions}
+        watchlist = investment_db.list_watchlist(database_url, user_id, market="JP") if investment_db else []
     except Exception:
-        position_codes = set()
+        position_codes, watchlist = set(), []
     importance = _classify_social_post_importance(text, categories, mentions["direct_mentions"], position_codes)
     facts, opinions = _split_facts_opinions(text)
+
+    urls = re.findall(r"https?://\S+", text)
+    has_link = bool(urls)
+    primary_source_url = urls[0] if urls else None
+    primary_source_type = classify_primary_source_type(primary_source_url) if primary_source_url else None
+    post_classification = classify_post_relay_type(text, has_link)
+
+    prediction_market = extract_prediction_market_data(text) if account_type == "PREDICTION_MARKET" else None
+    stock_breaking = extract_stock_breaking_data(text, watchlist=watchlist) if account_type == "STOCK_BREAKING" else None
+    corporate_breaking = extract_corporate_breaking_data(text, url=primary_source_url) \
+        if account_type == "CORPORATE_BREAKING" else None
+
+    # 指示書6番：Polymarketのprobability急変はimportanceをHIGH以上へ引き上げる（既存の
+    # キーワードベース判定とは別の追加条件、他sourceには影響しない）。
+    if prediction_market and classify_prediction_market_shift(prediction_market.get("probability_change")):
+        importance = "HIGH" if importance in ("LOW", "MEDIUM") else importance
+
     return {
         "source_type": "X_MARKET_SOURCE", "source_name": source_name, "source_handle": source_handle,
         "post_id": post_id, "posted_at": posted_at.isoformat(),
@@ -3214,6 +3428,10 @@ def _build_social_post_record(database_url, user_id, tweet, media_by_key, source
         "facts": facts, "author_opinion": opinions, "system_inference": [],
         "direct_mentions": mentions["direct_mentions"], "theme_related": mentions["theme_related"],
         "verification_status": "UNVERIFIED",
+        "post_classification": post_classification, "prediction_market": prediction_market,
+        "stock_breaking": stock_breaking, "corporate_breaking": corporate_breaking,
+        "primary_source_url": primary_source_url, "primary_source_type": primary_source_type,
+        "discovered_via_social": bool(has_link),
     }, posted_at.date()
 
 
@@ -3231,6 +3449,22 @@ _nicosoku_diag = {
     "fetched_count": 0, "inserted_count": 0, "duplicate_count": 0,
     "last_http_status": None, "poller_running": False,
 }
+
+# Market Intelligence Phase6（指示書2・30番）：他3source用の同形の診断dict。nicosokuは
+# 既存の_nicosoku_diagをそのまま使う（後方互換、nicosoku_diagnostics()の戻り値を変えない）。
+_market_source_diag = {}
+
+
+def _get_source_diag(handle):
+    if handle == NICOSOKU_X_USERNAME:
+        return _nicosoku_diag
+    return _market_source_diag.setdefault(handle, {
+        "last_fetch_started_at": None, "last_fetch_finished_at": None,
+        "last_error_at": None, "last_error_message": None,
+        "fetched_count": 0, "inserted_count": 0, "duplicate_count": 0,
+        "last_http_status": None, "poller_running": False,
+    })
+
 
 SOCIAL_IMAGE_ANALYSIS_STATUSES = ("NONE", "PENDING", "ANALYZED", "SKIPPED", "FAILED")
 
@@ -3378,15 +3612,18 @@ def _nicosoku_source_is_stale(source, now=None):
     return age_min > threshold
 
 
-def build_social_posts_response(database_url, user_id, limit=10, min_importance=None):
+def build_social_posts_response(database_url, user_id, limit=10, min_importance=None, source_handle=None):
     """GET /api/social-posts の実体（指示書5・6・7・8番）。各投稿へanalysis_priority_score等を
     付与し、PENDING投稿はスコア降順→新しさ降順で並べ替える。pendingSummaryは表示件数
     （limit）に関わらず、SKIPPEDを除く全PENDING件数を対象にする（指示書8番「解析待ち件数」・
-    3番「SKIPPED投稿は通常の解析待ち件数から除外」）。"""
+    3番「SKIPPED投稿は通常の解析待ち件数から除外」）。Market Intelligence Phase6
+    （指示書26番）：source_handleを指定すると他source（polymarketjapan/kgbukabu/aryarya）の
+    投稿一覧も同じ関数で取得できる（省略時は従来通りにこそく、後方互換）。"""
+    source_handle = source_handle or NICOSOKU_X_USERNAME
     if investment_db is None or not database_url:
         return {"posts": [], "pendingSummary": {"pending": 0, "urgent": 0}}
     posts = investment_db.list_recent_social_posts(
-        database_url, source_handle=NICOSOKU_X_USERNAME, min_importance=min_importance, limit=limit)
+        database_url, source_handle=source_handle, min_importance=min_importance, limit=limit)
     try:
         watch_codes = {w.get("code") for w in investment_db.list_watchlist(database_url, user_id, market="JP")}
         position_codes = {p.get("code") for p in investment_db.list_portfolio(database_url, user_id)}
@@ -3399,7 +3636,7 @@ def build_social_posts_response(database_url, user_id, limit=10, min_importance=
     for p in enriched:
         if p.get("image_analysis_status") == "ANALYZED":
             try:
-                evals = investment_db.list_social_signal_evaluations_for_post(database_url, NICOSOKU_X_USERNAME, p.get("post_id"))
+                evals = investment_db.list_social_signal_evaluations_for_post(database_url, source_handle, p.get("post_id"))
                 summary = _post_evaluation_summary(evals)
                 if summary:
                     p["evaluation_summary"] = summary
@@ -3414,22 +3651,24 @@ def build_social_posts_response(database_url, user_id, limit=10, min_importance=
                 pass
     ordered = sort_pending_posts_by_priority(enriched)
     all_pending = investment_db.list_recent_social_posts(
-        database_url, source_handle=NICOSOKU_X_USERNAME, limit=500, image_analysis_status="PENDING")
+        database_url, source_handle=source_handle, limit=500, image_analysis_status="PENDING")
     pending_scores = [compute_social_post_priority_score(p, watch_codes, position_codes) for p in all_pending]
     pending_summary = {"pending": len(all_pending), "urgent": sum(1 for s in pending_scores if s >= 80)}
     return {"posts": ordered, "pendingSummary": pending_summary}
 
 
-def nicosoku_diagnostics(database_url, user_id):
-    """指示書11番：GET /api/social-sources/nicosoku/diagnostics の実体。Bearer Tokenそのもの
-    は絶対に返さない（token_configuredの真偽値のみ）。Phase4（指示書15番）：
-    snapshot_status・market_calendar_status・pending_evaluations・no_data_evaluationsを追加。"""
-    source = investment_db.get_market_source(database_url, NICOSOKU_X_USERNAME) \
+def get_market_source_diagnostics(database_url, handle, user_id=None):
+    """Market Intelligence Phase6新規（指示書2・30番）：nicosoku_diagnostics()を一般化した
+    もの。GET /api/market-sources/:handle/diagnostics の実体。Bearer Tokenそのものは絶対に
+    返さない（token_configuredの真偽値のみ）。1source分のみを見るため、他sourceの障害の
+    影響を受けない（指示書30番「1sourceの障害で全体をDEGRADEDにしない」）。"""
+    diag = _get_source_diag(handle)
+    source = investment_db.get_market_source(database_url, handle) \
         if (investment_db is not None and database_url) else None
-    latest = investment_db.list_recent_social_posts(database_url, source_handle=NICOSOKU_X_USERNAME, limit=1) \
+    latest = investment_db.list_recent_social_posts(database_url, source_handle=handle, limit=1) \
         if (investment_db is not None and database_url) else []
     latest_post = latest[0] if latest else None
-    rate_limit_status = "RATE_LIMITED" if _nicosoku_diag.get("last_http_status") == "429" else "OK"
+    rate_limit_status = "RATE_LIMITED" if diag.get("last_http_status") == "429" else "OK"
     # snapshot_status：market_snapshot_cache（既存_cache_get流用）に日経平均の鮮度の高い
     # エントリがあればOK、無ければUNKNOWN（診断呼び出し自体では新規取得しない——重い・
     # レート制限の対象になり得るライブ取得を診断のたびに走らせない設計）。
@@ -3445,36 +3684,37 @@ def nicosoku_diagnostics(database_url, user_id):
         market_calendar_status = "OK" if isinstance(is_jp_trading_day(datetime.datetime.now(_JST).date()), bool) else "ERROR"
     except Exception:
         market_calendar_status = "ERROR"
-    pending_evaluations = investment_db.count_social_signal_evaluations(database_url, NICOSOKU_X_USERNAME, "PENDING") \
+    pending_evaluations = investment_db.count_social_signal_evaluations(database_url, handle, "PENDING") \
         if (investment_db is not None and database_url) else 0
-    no_data_evaluations = investment_db.count_social_signal_evaluations(database_url, NICOSOKU_X_USERNAME, "NO_DATA") \
+    no_data_evaluations = investment_db.count_social_signal_evaluations(database_url, handle, "NO_DATA") \
         if (investment_db is not None and database_url) else 0
     # Phase5（指示書24番）：JST当日0時からの集計。
     today_start_iso = datetime.datetime.now(_JST).replace(hour=0, minute=0, second=0, microsecond=0) \
         .astimezone(datetime.timezone.utc).isoformat()
-    duplicate_signal_groups = investment_db.count_duplicate_signal_groups_since(database_url, NICOSOKU_X_USERNAME, today_start_iso) \
+    duplicate_signal_groups = investment_db.count_duplicate_signal_groups_since(database_url, handle, today_start_iso) \
         if (investment_db is not None and database_url) else 0
-    alerts_generated_today = investment_db.count_social_signal_alerts_since(database_url, NICOSOKU_X_USERNAME, today_start_iso) \
+    alerts_generated_today = investment_db.count_social_signal_alerts_since(database_url, handle, today_start_iso) \
         if (investment_db is not None and database_url) else 0
-    high_confidence_signals_today = investment_db.count_high_confidence_signals_since(database_url, NICOSOKU_X_USERNAME, today_start_iso) \
+    high_confidence_signals_today = investment_db.count_high_confidence_signals_since(database_url, handle, today_start_iso) \
         if (investment_db is not None and database_url) else 0
     return {
         "token_configured": bool(X_API_BEARER_TOKEN),
-        "username": NICOSOKU_X_USERNAME,
-        "user_id_resolved": bool(_nicosoku_x_user_id_cache),
+        "username": handle,
+        "source_type": (source or {}).get("source_type") or (MARKET_SOURCE_BY_HANDLE.get(handle) or {}).get("source_type"),
+        "user_id_resolved": bool(_x_user_id_cache.get(handle)),
         "last_success_at": (source or {}).get("last_success_at"),
         "last_error": (source or {}).get("last_error"),
         "rate_limit_status": rate_limit_status,
         "latest_post_id": (latest_post or {}).get("post_id"),
         "latest_post_at": (latest_post or {}).get("posted_at"),
         "latest_post_has_media": bool((latest_post or {}).get("media_json")),
-        "poller_running": _nicosoku_diag["poller_running"],
+        "poller_running": diag["poller_running"],
         "stale": _nicosoku_source_is_stale(source),
-        "last_fetch_started_at": _nicosoku_diag["last_fetch_started_at"],
-        "last_fetch_finished_at": _nicosoku_diag["last_fetch_finished_at"],
-        "last_fetched_count": _nicosoku_diag["fetched_count"],
-        "last_inserted_count": _nicosoku_diag["inserted_count"],
-        "last_duplicate_count": _nicosoku_diag["duplicate_count"],
+        "last_fetch_started_at": diag["last_fetch_started_at"],
+        "last_fetch_finished_at": diag["last_fetch_finished_at"],
+        "last_fetched_count": diag["fetched_count"],
+        "last_inserted_count": diag["inserted_count"],
+        "last_duplicate_count": diag["duplicate_count"],
         "snapshot_status": snapshot_status,
         "market_calendar_status": market_calendar_status,
         "pending_evaluations": pending_evaluations,
@@ -3484,6 +3724,24 @@ def nicosoku_diagnostics(database_url, user_id):
         "alerts_generated_today": alerts_generated_today,
         "high_confidence_signals_today": high_confidence_signals_today,
     }
+
+
+def nicosoku_diagnostics(database_url, user_id):
+    """指示書11番・Phase6指示書2番：GET /api/social-sources/nicosoku/diagnostics の実体
+    （既存API後方互換のための薄いラッパー）。"""
+    return get_market_source_diagnostics(database_url, NICOSOKU_X_USERNAME, user_id=user_id)
+
+
+def get_all_market_source_diagnostics(database_url, user_id=None):
+    """Market Intelligence Phase6新規（指示書30番）：sourceごとに診断を返す。1sourceの障害が
+    他sourceの結果に影響しない（各handleを独立に処理、例外はそのsourceだけERROR扱い）。"""
+    out = {}
+    for cfg in MARKET_SOURCE_CONFIGS:
+        try:
+            out[cfg["handle"]] = get_market_source_diagnostics(database_url, cfg["handle"], user_id=user_id)
+        except Exception as e:
+            out[cfg["handle"]] = {"status": "ERROR", "error": str(e)}
+    return out
 
 
 # ============================================================
@@ -4966,52 +5224,66 @@ def _social_signal_evaluation_scheduler_loop():
         time.sleep(300)
 
 
-def nicosoku_poll_once(database_url, user_id):
-    """1サイクル分のポーリング（指示書1・2・3・8番）。ユーザーID解決→未取得分の投稿取得→
-    分類・保存→イベント検出→market_sourcesの状態更新、までを1回実行する。戻り値：
-    {"status","newPosts","fetched","duplicates","eventsDetected","error"}。
-    Phase2（指示書11・12・17番）：診断API・手動「今すぐ取得」の両方がこの関数をそのまま
-    再利用する（別実装を作らない）。_nicosoku_diag（プロセス内メモリ）への記録もここで行う。"""
+_x_user_id_cache = {}  # handle -> X APIのuser_id（数値ID）。Phase6（指示書2番）：source毎に必要。
+
+
+def poll_market_source(database_url, user_id, source_config):
+    """Market Intelligence Phase6新規（指示書1・2・29番）：nicosoku_poll_once()を一般化した
+    もの。ユーザーID解決→未取得分の投稿取得→分類・保存→イベント検出→クラスタ割当→
+    market_sourcesの状態更新、までを1source分1回実行する。戻り値：{"status","newPosts",
+    "fetched","duplicates","eventsDetected","error"}。source_configはMARKET_SOURCE_CONFIGSの
+    1要素（handle/display_name/source_type/categories等）。"""
+    handle = source_config["handle"]
+    diag = _get_source_diag(handle)
     result = {"status": "ok", "newPosts": 0, "fetched": 0, "duplicates": 0, "eventsDetected": 0, "error": None}
-    _nicosoku_diag["last_fetch_started_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    diag["last_fetch_started_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     if investment_db is None or not database_url:
         result["status"] = "no_db"
         return result
-    source = investment_db.ensure_market_source(database_url, X_SOCIAL_SOURCE_PLATFORM, NICOSOKU_X_USERNAME,
-                                                  display_name="にこそく", priority="HIGH",
-                                                  categories=["JP_MARKET", "MACRO"])
+    source = investment_db.ensure_market_source(
+        database_url, X_SOCIAL_SOURCE_PLATFORM, handle, display_name=source_config.get("display_name"),
+        priority=source_config.get("priority", "HIGH"), categories=source_config.get("categories"),
+        source_type=source_config.get("source_type"),
+        poll_interval_market_sec=source_config.get("poll_interval_market_sec"),
+        poll_interval_off_sec=source_config.get("poll_interval_off_sec"),
+        strengths=source_config.get("strengths"), evaluation_modes=source_config.get("evaluation_modes"))
     if not X_API_BEARER_TOKEN:
         result["status"] = "no_key"
+        return result
+    if source and source.get("enabled") is False:
+        result["status"] = "disabled"
         return result
 
     # X APIのuser_id（数値ID）はmarket_sources.last_seen_post_idとは別物。DB列を1つ増やす
     # ほどのものではないため、プロセス内メモリのキャッシュで十分（再起動時は再解決するだけで
-    # 実害はない）。
-    global _nicosoku_x_user_id_cache
-    if not _nicosoku_x_user_id_cache:
-        uid, status, detail = _x_resolve_user_id(NICOSOKU_X_USERNAME)
+    # 実害はない）。指示書2番：source毎にキャッシュする。
+    if not _x_user_id_cache.get(handle):
+        uid, status, detail = _x_resolve_user_id(handle)
         if status != "ok" or not uid:
-            investment_db.update_market_source_status(database_url, NICOSOKU_X_USERNAME, last_error=f"ユーザーID解決失敗: {detail}")
-            _nicosoku_diag["last_error_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            _nicosoku_diag["last_error_message"] = detail
-            _nicosoku_diag["last_fetch_finished_at"] = _nicosoku_diag["last_error_at"]
+            investment_db.update_market_source_status(database_url, handle, last_error=f"ユーザーID解決失敗: {detail}")
+            diag["last_error_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            diag["last_error_message"] = detail
+            diag["last_fetch_finished_at"] = diag["last_error_at"]
             result["status"] = status
             result["error"] = detail
             return result
-        _nicosoku_x_user_id_cache = uid
-    x_user_id = _nicosoku_x_user_id_cache
+        _x_user_id_cache[handle] = uid
+    x_user_id = _x_user_id_cache[handle]
 
     since_id = (source or {}).get("last_seen_post_id")
     data, status, detail = _x_fetch_recent_tweets(x_user_id, since_id=since_id)
-    _nicosoku_diag["last_http_status"] = "429" if status == "rate_limited" else ("200" if status == "ok" else status)
+    diag["last_http_status"] = "429" if status == "rate_limited" else ("200" if status == "ok" else status)
     if status != "ok":
-        investment_db.update_market_source_status(database_url, NICOSOKU_X_USERNAME, last_error=f"投稿取得失敗: {detail}")
-        _nicosoku_diag["last_error_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        _nicosoku_diag["last_error_message"] = detail
-        _nicosoku_diag["last_fetch_finished_at"] = _nicosoku_diag["last_error_at"]
-        investment_db.update_market_source_fetch_stats(database_url, NICOSOKU_X_USERNAME,
-            last_fetch_started_at=_nicosoku_diag["last_fetch_started_at"], last_fetch_finished_at="NOW()",
-            last_error_at="NOW()", last_http_status=_nicosoku_diag["last_http_status"])
+        # 指示書6・30番：1source障害で全体をDEGRADEDにしない——ここではこのsourceの
+        # market_sources行にだけエラーを記録し、他sourceのポーリングには一切影響しない
+        # （呼び出し側=市場情報ポーリングループがsourceごとに独立してこの関数を呼ぶ設計）。
+        investment_db.update_market_source_status(database_url, handle, last_error=f"投稿取得失敗: {detail}")
+        diag["last_error_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        diag["last_error_message"] = detail
+        diag["last_fetch_finished_at"] = diag["last_error_at"]
+        investment_db.update_market_source_fetch_stats(database_url, handle,
+            last_fetch_started_at=diag["last_fetch_started_at"], last_fetch_finished_at="NOW()",
+            last_error_at="NOW()", last_http_status=diag["last_http_status"])
         result["status"] = status
         result["error"] = detail
         return result
@@ -5026,7 +5298,8 @@ def nicosoku_poll_once(database_url, user_id):
     max_id = since_id
     for tweet in tweets:
         record, posted_date = _build_social_post_record(database_url, user_id, tweet, media_by_key,
-                                                           NICOSOKU_X_USERNAME, "にこそく")
+                                                           handle, source_config.get("display_name") or handle,
+                                                           source_config=source_config)
         saved = investment_db.insert_social_post_if_new(database_url, record)
         if saved:
             result["newPosts"] += 1
@@ -5044,32 +5317,92 @@ def nicosoku_poll_once(database_url, user_id):
                         imp_result = investment_db.import_market_events(database_url, user_id, fresh)
                         result["eventsDetected"] += imp_result.get("imported", 0)
                 except Exception as e:
-                    print("  にこそく投稿からのイベント検出で例外", e)
+                    print(f"  [{handle}] 投稿からのイベント検出で例外", e)
             # Phase4新規（指示書7・8・9番）：投稿本文のeconomic_events候補について
             # event_accuracy/event_timeliness評価も生成する（既存のmarket_events自動登録
-            # ロジックとは別の専用テーブル、失敗してもポーリング自体は壊さない）。
+            # ロジックとは別の専用テーブル、失敗してもポーリング自体は壊さない）。全source共通
+            # （経済指標系の言及はどのsourceにも起こり得るため、handleで絞らない）。
             generate_social_event_evaluations_for_post_safe(database_url, user_id, saved)
+            # Market Intelligence Phase6新規（指示書16・19番）：cross-source entity matching。
+            assign_intelligence_cluster_safe(database_url, saved)
         else:
             result["duplicates"] += 1
         if tweet.get("id") and (max_id is None or int(tweet["id"]) > int(max_id)):
             max_id = tweet["id"]
 
-    investment_db.update_market_source_status(database_url, NICOSOKU_X_USERNAME,
-                                                last_seen_post_id=max_id, mark_success=True)
+    investment_db.update_market_source_status(database_url, handle, last_seen_post_id=max_id, mark_success=True)
     finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    _nicosoku_diag["last_fetch_finished_at"] = finished_at
-    _nicosoku_diag["fetched_count"] = result["fetched"]
-    _nicosoku_diag["inserted_count"] = result["newPosts"]
-    _nicosoku_diag["duplicate_count"] = result["duplicates"]
+    diag["last_fetch_finished_at"] = finished_at
+    diag["fetched_count"] = result["fetched"]
+    diag["inserted_count"] = result["newPosts"]
+    diag["duplicate_count"] = result["duplicates"]
     investment_db.update_market_source_fetch_stats(
-        database_url, NICOSOKU_X_USERNAME,
-        last_fetch_started_at=_nicosoku_diag["last_fetch_started_at"], last_fetch_finished_at=finished_at,
-        last_http_status=_nicosoku_diag["last_http_status"], last_fetched_count=result["fetched"],
+        database_url, handle,
+        last_fetch_started_at=diag["last_fetch_started_at"], last_fetch_finished_at=finished_at,
+        last_http_status=diag["last_http_status"], last_fetched_count=result["fetched"],
         last_inserted_count=result["newPosts"], last_duplicate_count=result["duplicates"])
     return result
 
 
-_nicosoku_x_user_id_cache = None
+def nicosoku_poll_once(database_url, user_id):
+    """指示書2番：既存API名との後方互換のための薄いラッパー。実体はpoll_market_source()に
+    一般化した（にこそく専用のhandle固定処理は撤去）。"""
+    return poll_market_source(database_url, user_id, MARKET_SOURCE_BY_HANDLE[NICOSOKU_X_USERNAME]
+                               if NICOSOKU_X_USERNAME in MARKET_SOURCE_BY_HANDLE
+                               else {"handle": NICOSOKU_X_USERNAME, "display_name": "にこそく", "priority": "HIGH",
+                                     "source_type": "MARKET_COMMENTARY", "categories": ["JP_MARKET", "MACRO"]})
+
+
+def _market_source_poll_interval_seconds(source_config):
+    """指示書1番：市場時間中(08:00-15:40 JST)はpoll_interval_market_sec、それ以外は
+    poll_interval_off_secを使う（にこそくの_nicosoku_poll_interval_secondsと同じ考え方を
+    source_config駆動へ一般化）。"""
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    hhmm = datetime.datetime.now(jst).strftime("%H:%M")
+    key = "poll_interval_market_sec" if "08:00" <= hhmm <= "15:40" else "poll_interval_off_sec"
+    return source_config.get(key) or (240 if key == "poll_interval_market_sec" else 750)
+
+
+def _source_due_for_poll(handle, interval_sec):
+    """指示書1・29番：rate limitをsource数分だけ無駄に消費しないよう、source毎の設定間隔に
+    達していなければスキップする。"""
+    diag = _get_source_diag(handle)
+    last_started = diag.get("last_fetch_started_at")
+    if not last_started:
+        return True
+    try:
+        last_dt = datetime.datetime.fromisoformat(last_started)
+    except Exception:
+        return True
+    return (datetime.datetime.now(datetime.timezone.utc) - last_dt).total_seconds() >= interval_sec
+
+
+def poll_all_market_sources_once(database_url, user_id, force=False):
+    """Market Intelligence Phase6新規（指示書1・2・29番）：enabled=trueのmarket_sourcesを
+    走査して、source毎の設定間隔（poll_interval_market_sec/poll_interval_off_sec）に達した
+    ものだけをポーリングする。1sourceの例外が他sourceのポーリングを止めないよう、source単位で
+    try/exceptする（指示書6・30番）。force=Trueは間隔を無視して全source即座にポーリングする
+    （手動「今すぐ取得」用）。戻り値：{handle: result_or_None, ...}（Noneはこのtickでは
+    間隔未達のためスキップしたことを示す）。"""
+    results = {}
+    configs = MARKET_SOURCE_CONFIGS
+    if investment_db is not None and database_url:
+        try:
+            db_sources = {s["handle"]: s for s in investment_db.list_market_sources(database_url)}
+        except Exception:
+            db_sources = {}
+        # DB側でenabled=falseにされたsourceは走査から除外する（指示書1番「設定駆動型」）。
+        configs = [c for c in MARKET_SOURCE_CONFIGS if db_sources.get(c["handle"], {}).get("enabled", True) is not False]
+    for cfg in configs:
+        if not force and not _source_due_for_poll(cfg["handle"], _market_source_poll_interval_seconds(cfg)):
+            results[cfg["handle"]] = None
+            continue
+        try:
+            results[cfg["handle"]] = poll_market_source(database_url, user_id, cfg)
+        except Exception as e:
+            print(f"  [{cfg['handle']}] ポーリングで例外（他sourceは継続）", e)
+            results[cfg["handle"]] = {"status": "failed", "error": str(e)}
+    return results
 
 
 def _event_title_key(title):
@@ -5173,6 +5506,189 @@ def get_recent_social_market_signals(database_url, user_id, lookback_minutes=180
     return scored[:limit]
 
 
+# ============================================================
+# Market Intelligence Phase6（指示書16・17・18・19・20・21・24番）：cross-source entity
+# matching・Market Intelligence Consensus。複数source横断で「同じ材料」を束ね、一致・不一致を
+# 判定する。source performance/confirmation_v2等（Phase3〜5）とは独立した、あくまで
+# 「テーマの一致度」を見るための軽量エンジン（重い集計や外部API呼び出しは行わない）。
+# ============================================================
+
+INTELLIGENCE_CLUSTER_LOOKBACK_MINUTES = 120  # 指示書16番のclustering対象時間窓
+CONSENSUS_LOOKBACK_MINUTES = 180
+
+
+def _extract_topic_signals_for_post(post):
+    """指示書17・19番：consensus計算用の軽量トピック抽出。投稿本文全体から方向性のある
+    SECTOR/MARKETの話題だけを拾う——Phase3〜5のbaseline/result評価パイプライン
+    （ANALYZED画像・author_opinion限定）とは別目的の、テキスト直読みの簡易版。"""
+    text = post.get("text") or ""
+    direction = _detect_signal_direction(text)
+    topics = []
+    if direction in ("BULLISH", "BEARISH"):
+        for kw, target_key in SOCIAL_EVAL_SECTOR_KEY_MAP.items():
+            if kw in text:
+                topics.append(("SECTOR", target_key, direction))
+        for kw, target_key in SOCIAL_EVAL_MARKET_KEY_MAP.items():
+            if kw in text:
+                topics.append(("MARKET", target_key, direction))
+    return topics
+
+
+def _posts_are_similar(post_a, post_b):
+    """指示書16番：ticker/company/event種別/headline類似度/posted_at近接でクラスタ判定する
+    （軽量ヒューリスティック、厳密なNLP類似度は使わない——既知の制約）。"""
+    a_mentions = set(post_a.get("direct_mentions_json") or [])
+    b_mentions = set(post_b.get("direct_mentions_json") or [])
+    a_ticker = ((post_a.get("stock_breaking_json") or {}) or {}).get("ticker")
+    b_ticker = ((post_b.get("stock_breaking_json") or {}) or {}).get("ticker")
+    if a_ticker and a_ticker == b_ticker:
+        return True
+    if a_mentions & b_mentions:
+        return True
+    a_cats, b_cats = set(post_a.get("categories_json") or []), set(post_b.get("categories_json") or [])
+    if not (a_cats & b_cats):
+        return False
+    # headline類似度：本文冒頭語の簡易オーバーラップ（形態素解析は使わない、既知の制約）。
+    a_words = set((post_a.get("text") or "")[:40])
+    b_words = set((post_b.get("text") or "")[:40])
+    if not a_words or not b_words:
+        return False
+    overlap = len(a_words & b_words) / max(1, min(len(a_words), len(b_words)))
+    return overlap >= 0.5
+
+
+def find_intelligence_cluster_match(candidate_posts, new_post):
+    """指示書16番：candidate_posts（新しい順を想定）の中からnew_postと同一クラスタとみなせる
+    投稿を1件返す（見つからなければNone）。既にintelligence_cluster_idを持つものを優先する。"""
+    matches = [p for p in candidate_posts
+               if p.get("post_id") != new_post.get("post_id") and _posts_are_similar(p, new_post)]
+    with_cluster = [p for p in matches if p.get("intelligence_cluster_id")]
+    return with_cluster[0] if with_cluster else (matches[0] if matches else None)
+
+
+def assign_intelligence_cluster(database_url, new_post, lookback_minutes=INTELLIGENCE_CLUSTER_LOOKBACK_MINUTES):
+    """指示書16・19番：new_postを既存クラスタへ割り当てるか、一致する投稿が無ければ何もしない
+    （単独の投稿にまでクラスタIDを振らない——「1 source」の話をわざわざクラスタ化する必要は
+    無いため、指示書18番のNONE扱いと自然に整合する）。戻り値：割り当てたcluster_idかNone。"""
+    if investment_db is None or not database_url:
+        return None
+    since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=lookback_minutes)).isoformat()
+    candidates = investment_db.list_recent_social_posts_all_sources(database_url, since_iso, limit=200)
+    match = find_intelligence_cluster_match(candidates, new_post)
+    if not match:
+        return None
+    cluster_id = match.get("intelligence_cluster_id") or f"cluster-{match.get('source_handle')}-{match.get('post_id')}"
+    investment_db.set_post_intelligence_cluster(database_url, new_post.get("source_handle"), new_post.get("post_id"), cluster_id)
+    if not match.get("intelligence_cluster_id"):
+        investment_db.set_post_intelligence_cluster(database_url, match.get("source_handle"), match.get("post_id"), cluster_id)
+    return cluster_id
+
+
+def assign_intelligence_cluster_safe(database_url, new_post):
+    """指示書16番：クラスタ割当の失敗が投稿保存自体を壊さないようにする。"""
+    try:
+        return assign_intelligence_cluster(database_url, new_post)
+    except Exception as e:
+        print("  Market Intelligence: クラスタ割当で例外（無視して続行）", e)
+        return None
+
+
+CONSENSUS_STRENGTH_BY_COUNT = {0: "NONE", 1: "NONE", 2: "MODERATE"}  # 3以上は"STRONG"
+
+
+def build_market_intelligence_consensus(database_url, lookback_minutes=CONSENSUS_LOOKBACK_MINUTES):
+    """指示書17・18・19・20・21番：直近投稿を横断してconsensus/disagreementを構築する。
+    同一primary_source_url（＝同じ記事の転載）の投稿は1つの独立ソースとして扱う（指示書19番
+    「転載を3ソース一致と誤判定しない」）。1 source（独立換算）はconsensusを生成しない
+    （指示書18番）。戻り値：{"consensus":[...],"disagreements":[...]}。"""
+    if investment_db is None or not database_url:
+        return {"consensus": [], "disagreements": []}
+    since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=lookback_minutes)).isoformat()
+    posts = investment_db.list_recent_social_posts_all_sources(database_url, since_iso, limit=200)
+    by_topic = {}
+    for p in posts:
+        for target_type, target_key, direction in _extract_topic_signals_for_post(p):
+            by_topic.setdefault((target_type, target_key), []).append({"post": p, "direction": direction})
+    consensus, disagreements = [], []
+    for (target_type, target_key), entries in by_topic.items():
+        # 指示書19番：同一primary_source_urlの投稿は1つの独立ソースにまとめる（重複除去）。
+        seen_keys, independent = set(), []
+        for e in entries:
+            url = e["post"].get("primary_source_url")
+            handle = e["post"].get("source_handle")
+            key = url or f"handle:{handle}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            independent.append(e)
+        directions = {e["direction"] for e in independent}
+        sources = sorted({e["post"].get("source_handle") for e in independent})
+        related_stocks = sorted({code for e in independent for code in (e["post"].get("direct_mentions_json") or [])})
+        if len(directions) > 1:
+            # 指示書21番：無理にconsensusを作らず、重要な情報として不一致自体を残す。
+            disagreements.append({
+                "topic": target_key, "target_type": target_type, "sources": sources,
+                "directions": {e["post"].get("source_handle"): e["direction"] for e in independent},
+                "disagreement": True, "consensus_strength": "NONE",
+            })
+            continue
+        n = len(independent)
+        if n <= 1:
+            continue  # 指示書18番：1 source → consensusを生成しない
+        strength = CONSENSUS_STRENGTH_BY_COUNT.get(n, "STRONG")
+        confidence = {2: 0.6, 3: 0.75}.get(n, 0.85)
+        consensus.append({
+            "topic": target_key, "target_type": target_type, "direction": next(iter(directions)),
+            "sources": sources, "independent_source_count": n, "consensus_strength": strength,
+            "confidence": confidence, "related_stocks": related_stocks,
+        })
+    return {"consensus": consensus, "disagreements": disagreements}
+
+
+def get_recent_market_intelligence(database_url, user_id, lookback_minutes=CONSENSUS_LOOKBACK_MINUTES):
+    """指示書22番：ChatGPT相談payload向けrecent_market_intelligence。既存
+    recent_social_market_signals（にこそく専用）は後方互換のため別途維持し、この関数は
+    4source横断の要約を追加専用で提供する。"""
+    if investment_db is None or not database_url:
+        return {"social_signals": [], "prediction_market_shifts": [], "breaking_stock_signals": [],
+                "corporate_breaking": [], "consensus": [], "disagreements": []}
+    since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=lookback_minutes)).isoformat()
+    posts = investment_db.list_recent_social_posts_all_sources(database_url, since_iso, limit=200)
+    social_signals = get_recent_social_market_signals(database_url, user_id, lookback_minutes=lookback_minutes)
+    prediction_shifts, breaking_stock, corporate_breaking = [], [], []
+    for p in posts:
+        pm = p.get("prediction_market_json")
+        if pm and classify_prediction_market_shift(pm.get("probability_change")):
+            prediction_shifts.append({
+                "source": p.get("source_handle"), "posted_at": p.get("posted_at"),
+                "prediction_topic": pm.get("prediction_topic"), "probability": pm.get("probability"),
+                "previous_probability": pm.get("previous_probability"),
+                "probability_change": pm.get("probability_change"), "category": pm.get("category"),
+                "url": p.get("url"),
+            })
+        sb = p.get("stock_breaking_json")
+        if sb and (sb.get("ticker") or sb.get("company_name")):
+            breaking_stock.append({
+                "source": p.get("source_handle"), "posted_at": p.get("posted_at"),
+                "ticker": sb.get("ticker"), "company_name": sb.get("company_name"),
+                "change_pct": sb.get("change_pct"), "catalyst": sb.get("catalyst"),
+                "limit_status": sb.get("limit_status"), "url": p.get("url"),
+            })
+        cb = p.get("corporate_breaking_json")
+        if cb and cb.get("linked_url"):
+            corporate_breaking.append({
+                "source": p.get("source_handle"), "posted_at": p.get("posted_at"),
+                "headline": cb.get("headline"), "linked_domain": cb.get("linked_domain"),
+                "primary_source_type": p.get("primary_source_type"), "url": p.get("url"),
+            })
+    consensus_result = build_market_intelligence_consensus(database_url, lookback_minutes=lookback_minutes)
+    return {
+        "social_signals": social_signals, "prediction_market_shifts": prediction_shifts,
+        "breaking_stock_signals": breaking_stock, "corporate_breaking": corporate_breaking,
+        "consensus": consensus_result["consensus"], "disagreements": consensus_result["disagreements"],
+    }
+
+
 def _nicosoku_morning_commentary(database_url, user_id):
     """指示書10番：朝一チェックの補助材料。前日15:30〜当日08:30(JST)程度の投稿から要点を
     抽出する。既存のmorning_market_check本体ロジックには一切干渉しない、追加専用フィールド。"""
@@ -5245,33 +5761,36 @@ def _nicosoku_poll_interval_seconds():
 
 
 def _nicosoku_poll_scheduler_loop():
-    """バックグラウンドポーリングのデーモンスレッド。X_API_BEARER_TOKEN未設定なら何もせず
-    終了する（アプリ本体の動作には影響しない、指示書19番）。429検出時はexponential backoff
-    （指示書2番）。"""
+    """Market Intelligence Phase6（指示書2・29番）：にこそく専用だったこのスケジューラを
+    poll_all_market_sources_once()経由の全source対応へ一般化した（関数名・スレッド起動元は
+    互換性のため維持）。X_API_BEARER_TOKEN未設定なら何もせず終了する（アプリ本体の動作には
+    影響しない、指示書19番）。429検出時はexponential backoff（指示書2番）。tickは60秒間隔
+    （最短source間隔180秒より十分細かい）、各sourceは自身のpoll_interval_*_secに達した時だけ
+    実際にポーリングされる（poll_all_market_sources_once・_source_due_for_poll）。"""
     if not X_API_BEARER_TOKEN:
-        print("  [にこそくX連携] X_API_BEARER_TOKEN未設定のためポーリングは無効（X_SOURCE_STATUS=DEGRADED）")
+        print("  [Market Intelligence] X_API_BEARER_TOKEN未設定のためポーリングは無効（DEGRADED）")
         return
-    _nicosoku_diag["poller_running"] = True
+    for cfg in MARKET_SOURCE_CONFIGS:
+        _get_source_diag(cfg["handle"])["poller_running"] = True
     consecutive_failures = 0
     while True:
         try:
             user_id = _morning_check_scheduler_users()[0]
-            result = nicosoku_poll_once(DATABASE_URL, user_id)
-            if result["status"] == "ok":
-                consecutive_failures = 0
-                if result["newPosts"] > 0:
-                    print(f"  [にこそくX連携] fetched={result['fetched']}件・新規{result['newPosts']}件・"
-                          f"重複{result['duplicates']}件・イベント検出{result['eventsDetected']}件")
-            elif result["status"] == "rate_limited":
-                consecutive_failures += 1
-            else:
-                consecutive_failures += 1
-                print(f"  [にこそくX連携] 取得失敗（{result['status']}）：{result.get('error')}")
+            results = poll_all_market_sources_once(DATABASE_URL, user_id)
+            attempted = {h: r for h, r in results.items() if r is not None}
+            failed = {h: r for h, r in attempted.items() if r.get("status") not in ("ok", "disabled")}
+            for handle, r in attempted.items():
+                if r.get("status") == "ok" and r.get("newPosts", 0) > 0:
+                    print(f"  [{handle}] fetched={r['fetched']}件・新規{r['newPosts']}件・"
+                          f"重複{r['duplicates']}件・イベント検出{r['eventsDetected']}件")
+                elif r.get("status") not in ("ok", "disabled"):
+                    print(f"  [{handle}] 取得失敗（{r.get('status')}）：{r.get('error')}")
+            consecutive_failures = 0 if not failed else consecutive_failures + 1
         except Exception as e:
             consecutive_failures += 1
-            print("  [にこそくX連携] ポーリングループで例外", e)
+            print("  [Market Intelligence] ポーリングループで例外", e)
         backoff_multiplier = min(2 ** consecutive_failures, 16) if consecutive_failures > 0 else 1
-        time.sleep(_nicosoku_poll_interval_seconds() * backoff_multiplier)
+        time.sleep(60 * backoff_multiplier)
 
 
 def generate_opening_30m_report(database_url, user_id, trade_date=None):
@@ -10500,7 +11019,11 @@ class Handler(SimpleHTTPRequestHandler):
             params = urllib.parse.parse_qs(qs)
             limit = int(params.get("limit", ["10"])[0])
             min_importance = params.get("min_importance", [None])[0]
-            resp = build_social_posts_response(DATABASE_URL, self.current_user, limit=limit, min_importance=min_importance)
+            # Market Intelligence Phase6（指示書26番）：?source=でにこそく以外のsourceも
+            # 同じ形式で取得できる（省略時は従来通りにこそく、後方互換）。
+            source_handle = params.get("source", [None])[0]
+            resp = build_social_posts_response(DATABASE_URL, self.current_user, limit=limit,
+                                                 min_importance=min_importance, source_handle=source_handle)
             self._send_json(resp)
         elif self.path.split("?")[0].startswith("/api/social-posts/") and self.path.split("?")[0].endswith("/evaluations"):
             # Phase3新規（指示書15・22番）：投稿単位の評価一覧。
@@ -10529,6 +11052,35 @@ class Handler(SimpleHTTPRequestHandler):
             alerts = investment_db.list_social_signal_alerts_since(DATABASE_URL, NICOSOKU_X_USERNAME, since_iso) \
                 if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"alerts": alerts})
+        elif self.path.split("?")[0] == "/api/market-sources":
+            # Market Intelligence Phase6新規（指示書31番）：設定駆動型market_sourcesの一覧。
+            sources = investment_db.list_market_sources(DATABASE_URL) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"sources": sources, "configs": MARKET_SOURCE_CONFIGS})
+        elif self.path.split("?")[0].startswith("/api/market-sources/") and self.path.split("?")[0].endswith("/diagnostics"):
+            # Market Intelligence Phase6新規（指示書2・30・31番）：source別診断（1sourceの障害が
+            # 他sourceへ波及しない設計）。
+            handle = urllib.parse.unquote(self.path.split("?")[0][len("/api/market-sources/"):-len("/diagnostics")].strip("/"))
+            diag = get_market_source_diagnostics(DATABASE_URL, handle, user_id=self.current_user) \
+                if (investment_db is not None and DATABASE_URL and handle) else {"token_configured": bool(X_API_BEARER_TOKEN)}
+            self._send_json(diag)
+        elif self.path.split("?")[0] == "/api/market-intelligence/recent":
+            # Market Intelligence Phase6新規（指示書22・31番）：4source横断の要約
+            # （既存recent_social_market_signalsは/api/social-signalsで後方互換のまま維持）。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            lookback = int(params.get("lookback_minutes", [str(CONSENSUS_LOOKBACK_MINUTES)])[0])
+            intel = get_recent_market_intelligence(DATABASE_URL, self.current_user, lookback_minutes=lookback) \
+                if (investment_db is not None and DATABASE_URL) else {}
+            self._send_json({"recent_market_intelligence": intel})
+        elif self.path.split("?")[0] == "/api/market-intelligence/consensus":
+            # Market Intelligence Phase6新規（指示書17・18・20・21・31番）：consensus/
+            # disagreementのみを返す軽量版（recentの一部）。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            lookback = int(params.get("lookback_minutes", [str(CONSENSUS_LOOKBACK_MINUTES)])[0])
+            consensus_result = build_market_intelligence_consensus(DATABASE_URL, lookback_minutes=lookback) \
+                if (investment_db is not None and DATABASE_URL) else {"consensus": [], "disagreements": []}
+            self._send_json(consensus_result)
         elif self.path.startswith("/api/social-signals"):
             # 2026-09-10新規：recent_social_market_signals（指示書9番、ChatGPT相談JSON補助情報）。
             qs = urllib.parse.urlparse(self.path).query
@@ -11313,6 +11865,20 @@ class Handler(SimpleHTTPRequestHandler):
             if not self._investment_db_ready():
                 return
             result = nicosoku_poll_once(DATABASE_URL, self.current_user)
+            self._send_json({"ok": result.get("status") == "ok", "status": result.get("status"),
+                              "fetched": result.get("fetched", 0), "inserted": result.get("newPosts", 0),
+                              "duplicates": result.get("duplicates", 0), "error": result.get("error")})
+        elif self.path.split("?")[0].startswith("/api/market-sources/") and self.path.split("?")[0].endswith("/fetch-now"):
+            # Market Intelligence Phase6新規（指示書31番）：source別の手動「今すぐ取得」。
+            # poll_market_source()をそのまま1回呼ぶだけで別実装は作らない（指示書2番と同じ方針）。
+            if not self._investment_db_ready():
+                return
+            handle = urllib.parse.unquote(self.path.split("?")[0][len("/api/market-sources/"):-len("/fetch-now")].strip("/"))
+            cfg = MARKET_SOURCE_BY_HANDLE.get(handle)
+            if not cfg:
+                self._send_json({"error": f"未登録のsourceです: {handle}"})
+                return
+            result = poll_market_source(DATABASE_URL, self.current_user, cfg)
             self._send_json({"ok": result.get("status") == "ok", "status": result.get("status"),
                               "fetched": result.get("fetched", 0), "inserted": result.get("newPosts", 0),
                               "duplicates": result.get("duplicates", 0), "error": result.get("error")})

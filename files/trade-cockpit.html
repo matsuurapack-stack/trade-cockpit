@@ -3574,7 +3574,18 @@ const SOCIAL_EVAL_SECTOR_LABELS = {
   BANK: "銀行", SEMICONDUCTOR: "半導体", SHIPPING: "海運", INSURANCE: "保険",
   AUTO: "自動車", SAAS: "SaaS", AI_INFRA: "AI関連",
 };
+// Market Intelligence Phase6新規（指示書26番）：カード名を「X 市場情報」から
+// 「MARKET INTELLIGENCE」へ拡張。上部タブ（重要/にこそく/Polymarket/急騰/ありゃりゃ）を
+// 追加し、にこそく以外のタブは軽量な専用ビュー（ImportantIntelligenceFeed/
+// SimpleSourcePostsFeed）で表示する。にこそくタブの中身（Phase1〜5の全機能）は既存のまま
+// 一切変更しない（リスクを避けるため、既存コードはタブ条件でラップするだけ）。
+const MARKET_INTELLIGENCE_TABS = [
+  {key:"important", label:"重要"}, {key:"nicosokufx", label:"にこそく"},
+  {key:"polymarketjapan", label:"Polymarket"}, {key:"kgbukabu", label:"急騰"},
+  {key:"aryarya", label:"ありゃりゃ"},
+];
 function XMarketSignalsCard(){
+  const [activeTab,setActiveTab]=useState("important"); // 指示書26番：初期表示は「重要」
   const [posts,setPosts]=useState([]);
   const [status,setStatus]=useState(null);
   const [pendingSummary,setPendingSummary]=useState(null);
@@ -3663,15 +3674,26 @@ function XMarketSignalsCard(){
   const lastFetchAgo=diag&&diag.last_success_at?Math.max(0,Math.round((Date.now()-new Date(diag.last_success_at).getTime())/60000)):null;
   return <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:6,padding:"10px 12px",marginTop:12,marginBottom:12}}>
     <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,flexWrap:"wrap"}}>
-      <div style={{fontWeight:800,fontSize:12.5}}>🐦 X 市場情報<span style={{fontWeight:400,fontSize:10.5,color:"var(--inkFaint)"}}>（にこそく @nicosokufx）</span></div>
+      <div style={{fontWeight:800,fontSize:12.5}}>📡 MARKET INTELLIGENCE</div>
       <div style={{display:"flex",alignItems:"center",gap:8}}>
-        {isDegraded && <span style={{fontSize:10,color:"var(--down)"}} title={status.reason||""}>
+        {activeTab==="nicosokufx"&&isDegraded && <span style={{fontSize:10,color:"var(--down)"}} title={status.reason||""}>
           ⚠ DEGRADED{status.lastSuccessAt?`（最終成功: ${new Date(status.lastSuccessAt).toLocaleString("ja-JP")}）`:"（未取得）"}
         </span>}
-        {diag&&diag.stale&&!isDegraded && <span style={{fontSize:10,color:"var(--down)"}}>⚠ X情報更新停止</span>}
-        <button className="iconbtn" style={{fontSize:11}} onClick={load} disabled={loading} title="更新">{loading?"…":"🔄"}</button>
+        {activeTab==="nicosokufx"&&diag&&diag.stale&&!isDegraded && <span style={{fontSize:10,color:"var(--down)"}}>⚠ X情報更新停止</span>}
+        {activeTab==="nicosokufx" && <button className="iconbtn" style={{fontSize:11}} onClick={load} disabled={loading} title="更新">{loading?"…":"🔄"}</button>}
       </div>
     </div>
+    {/* Phase6新規（指示書26番）：上部タブ。 */}
+    <div style={{display:"flex",gap:4,marginTop:6,flexWrap:"wrap"}}>
+      {MARKET_INTELLIGENCE_TABS.map(t=>
+        <button key={t.key} className={activeTab===t.key?"action-btn":"iconbtn"}
+          style={{fontSize:10.5,padding:"2px 8px"}} onClick={()=>setActiveTab(t.key)}>{t.label}</button>
+      )}
+    </div>
+    {activeTab==="important" && <ImportantIntelligenceFeed/>}
+    {(activeTab==="polymarketjapan"||activeTab==="kgbukabu"||activeTab==="aryarya") &&
+      <SimpleSourcePostsFeed handle={activeTab}/>}
+    {activeTab==="nicosokufx" && <>
     {/* Phase2新規（指示書13番）：X API疎通の小さなステータス表示＋「今すぐ取得」。 */}
     {diagLabel && <div style={{display:"flex",alignItems:"center",gap:6,marginTop:3,fontSize:10,color:"var(--inkFaint)"}}>
       <span>X API: <span style={{color:diagColor,fontWeight:700}}>{diagLabel}</span></span>
@@ -3790,6 +3812,108 @@ function XMarketSignalsCard(){
     <button className="action-btn" style={{fontSize:10.5,marginTop:6,padding:"2px 8px"}} onClick={()=>setExpanded(v=>!v)}>
       {expanded?"▲ 最新3件のみ表示":"▼ 過去の投稿も見る"}
     </button>
+    </>}
+  </div>;
+}
+
+// Market Intelligence Phase6新規（指示書26・27・28番）：「重要」タブ。4source横断の
+// recent_market_intelligenceを取得し、BREAKING/PREDICTION SHIFT/CONSENSUSを簡潔に表示する。
+// 厳密なrelevance/freshness/specialty/confidenceスコアリングでの並び替えは今回実装せず、
+// 種別ごとにグルーピングしposted_at降順で並べる簡易版（既知の制約、完了報告に明記）。
+function ImportantIntelligenceFeed(){
+  const [intel,setIntel]=useState(null);
+  const [loading,setLoading]=useState(false);
+  useEffect(()=>{
+    let alive=true;
+    setLoading(true);
+    fetchJsonSafe("/api/market-intelligence/recent").then(d=>{
+      if(alive&&d&&d.recent_market_intelligence)setIntel(d.recent_market_intelligence);
+    }).catch(()=>{}).finally(()=>{if(alive)setLoading(false);});
+    return ()=>{alive=false;};
+  },[]);
+  if(loading&&!intel)return <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:6}}>読み込み中…</div>;
+  if(!intel)return <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:6}}>取得できませんでした。</div>;
+  const breaking=[...(intel.breaking_stock_signals||[]),...(intel.corporate_breaking||[])];
+  const hasAny=breaking.length||(intel.prediction_market_shifts||[]).length||(intel.consensus||[]).length||(intel.disagreements||[]).length;
+  const ago=(iso)=>{if(!iso)return "—";const min=Math.max(0,Math.round((Date.now()-new Date(iso).getTime())/60000));return min<1?"1分未満前":min<60?`${min}分前`:`${Math.round(min/60)}時間前`;};
+  return <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:6}}>
+    {!hasAny && <div style={{fontSize:11,color:"var(--inkFaint)"}}>重要な情報はまだありません。</div>}
+    {breaking.map((b,i)=>
+      <div key={`b${i}`} style={{padding:"5px 6px",borderRadius:4,background:"var(--bg)",border:"1px solid var(--rule)",fontSize:11}}>
+        <div style={{fontWeight:800,color:"var(--down)"}}>🔴 BREAKING {ago(b.posted_at)}</div>
+        <div style={{color:"var(--inkSoft)",fontSize:10}}>{MARKET_INTELLIGENCE_TABS.find(t=>t.key===b.source)?.label||b.source}</div>
+        <div style={{marginTop:2}}>{b.headline||b.company_name||b.ticker||"—"}{b.change_pct!=null?`（${b.change_pct>0?"+":""}${b.change_pct}%）`:""}</div>
+        {b.linked_domain && <div style={{fontSize:10,color:"var(--inkFaint)"}}>一次情報：{b.primary_source_type||b.linked_domain}</div>}
+        {b.url && <a href={b.url} target="_blank" rel="noopener noreferrer" style={{fontSize:10,color:"var(--accent)"}}>原文を見る↗</a>}
+      </div>
+    )}
+    {(intel.prediction_market_shifts||[]).map((p,i)=>
+      <div key={`p${i}`} style={{padding:"5px 6px",borderRadius:4,background:"var(--bg)",border:"1px solid var(--rule)",fontSize:11}}>
+        <div style={{fontWeight:800,color:"var(--accent)"}}>🟠 PREDICTION SHIFT</div>
+        <div style={{color:"var(--inkSoft)",fontSize:10}}>Polymarket Japan・{ago(p.posted_at)}</div>
+        <div style={{marginTop:2}}>{p.prediction_topic}</div>
+        {p.previous_probability!=null&&p.probability!=null &&
+          <div>{p.previous_probability}% → {p.probability}%（{p.probability_change>0?"+":""}{p.probability_change}pt）</div>}
+      </div>
+    )}
+    {(intel.consensus||[]).map((c,i)=>
+      <div key={`c${i}`} style={{padding:"5px 6px",borderRadius:4,background:"var(--bg)",border:"1px solid var(--rule)",fontSize:11}}>
+        <div style={{fontWeight:800,color:"var(--up)"}}>🟢 CONSENSUS（{c.consensus_strength}）</div>
+        <div style={{marginTop:2}}>{SOCIAL_EVAL_SECTOR_LABELS[c.topic]||c.topic} {c.direction}</div>
+        <div style={{fontSize:10,color:"var(--inkSoft)"}}>
+          {c.sources.map(h=>MARKET_INTELLIGENCE_TABS.find(t=>t.key===h)?.label||h).join(" + ")}
+          ・independent sources: {c.independent_source_count}
+        </div>
+        {c.related_stocks&&c.related_stocks.length>0 && <div style={{fontSize:10,color:"var(--inkSoft)"}}>関連：{c.related_stocks.join("・")}</div>}
+      </div>
+    )}
+    {(intel.disagreements||[]).map((d,i)=>
+      <div key={`d${i}`} style={{padding:"5px 6px",borderRadius:4,background:"var(--bg)",border:"1px solid var(--rule)",fontSize:11}}>
+        <div style={{fontWeight:800,color:"var(--inkFaint)"}}>⚪ SOURCE DISAGREEMENT</div>
+        <div style={{marginTop:2}}>{SOCIAL_EVAL_SECTOR_LABELS[d.topic]||d.topic}：見解が分かれています</div>
+        <div style={{fontSize:10,color:"var(--inkSoft)"}}>
+          {Object.entries(d.directions||{}).map(([h,dir])=>`${MARKET_INTELLIGENCE_TABS.find(t=>t.key===h)?.label||h}=${dir}`).join("・")}
+        </div>
+      </div>
+    )}
+  </div>;
+}
+
+// Market Intelligence Phase6新規（指示書8・9・10・11・26番）：Polymarket/急騰/ありゃりゃの
+// 簡易ビュー。source_type別の抽出結果（prediction_market_json/stock_breaking_json/
+// corporate_breaking_json）があれば添えて表示する。にこそくのような優先度スコア・過去実績
+// パイプラインはこの3sourceにはまだ接続していない（既知の制約、完了報告に明記）。
+function SimpleSourcePostsFeed({handle}){
+  const [posts,setPosts]=useState([]);
+  const [loading,setLoading]=useState(false);
+  useEffect(()=>{
+    let alive=true;
+    setLoading(true);
+    fetchJsonSafe(`/api/social-posts?source=${handle}&limit=10`).then(d=>{
+      if(alive&&d&&Array.isArray(d.posts))setPosts(d.posts);
+    }).catch(()=>{}).finally(()=>{if(alive)setLoading(false);});
+    return ()=>{alive=false;};
+  },[handle]);
+  if(loading&&posts.length===0)return <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:6}}>読み込み中…</div>;
+  if(posts.length===0)return <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:6}}>投稿がまだありません。</div>;
+  return <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:5}}>
+    {posts.map(p=>{
+      const pm=p.prediction_market_json, sb=p.stock_breaking_json, cb=p.corporate_breaking_json;
+      return <div key={p.id} style={{padding:"5px 6px",borderRadius:4,background:"var(--bg)",border:"1px solid var(--rule)",fontSize:11}}>
+        <div style={{color:"var(--inkFaint)",fontSize:10}}>{p.posted_at?new Date(p.posted_at).toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"}):"—"}</div>
+        <div style={{marginTop:2,overflow:"hidden",textOverflow:"ellipsis",display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical"}}>{p.text}</div>
+        {pm && pm.probability!=null && <div style={{fontSize:10,color:"var(--inkSoft)"}}>
+          確率：{pm.previous_probability!=null?`${pm.previous_probability}% → `:""}{pm.probability}%{pm.probability_change!=null?`（${pm.probability_change>0?"+":""}${pm.probability_change}pt）`:""}
+        </div>}
+        {sb && (sb.ticker||sb.company_name) && <div style={{fontSize:10,color:"var(--inkSoft)"}}>
+          銘柄：{sb.company_name||sb.ticker}{sb.change_pct!=null?`（${sb.change_pct>0?"+":""}${sb.change_pct}%）`:""}{sb.limit_status?`［${sb.limit_status}］`:""}
+        </div>}
+        {cb && cb.linked_domain && <div style={{fontSize:10,color:"var(--inkSoft)"}}>
+          一次情報：{p.primary_source_type||cb.linked_domain}
+        </div>}
+        <a href={p.url} target="_blank" rel="noopener noreferrer" style={{fontSize:10,color:"var(--accent)"}}>原文を見る↗</a>
+      </div>;
+    })}
   </div>;
 }
 
@@ -9687,6 +9811,9 @@ function App(){
     // サーバー側get_recent_social_market_signals()が絞り込みを担当）。取得失敗時は空配列
     // （この連携が無くても既存の相談項目だけで成立する、ベストエフォート）。
     const socialSignals=await fetchJsonSafe("/api/social-signals").then(d=>(d&&d.recent_social_market_signals)||[]).catch(()=>[]);
+    // Market Intelligence Phase6新規（指示書22番）：4source横断の要約を追加専用フィールドで
+    // 添える（recent_social_market_signalsは後方互換のため残したまま）。
+    const marketIntelligence=await fetchJsonSafe("/api/market-intelligence/recent").then(d=>(d&&d.recent_market_intelligence)||null).catch(()=>null);
     await copyChatGPTPayload("詳細分析を相談","trade_analysis",{
       stock:{code:w.code,name:w.name,market:w.market,sector:w.sector||null},
       price:{current:a.current,note:"currentは現在値（実勢価格）。levels.entry_theoreticalはテクニカルから算出した押し目エントリー価格帯の理論値で、現在値と同じとは限らない。"},
@@ -9701,6 +9828,7 @@ function App(){
       market_environment:a.marketEnv||null,
       recent_catalysts:recentCatalystsForConsult(w.code,w.sector),
       recent_social_market_signals:socialSignals,
+      recent_market_intelligence:marketIntelligence,
       active_rules:activeRulesForConsult.map(r=>({rule:r.rule_text,confidence:r.confidence,action:r.action_text||null})),
       integrated_judgment:knowledge&&!knowledge.error?{
         judgment:knowledge.judgment.judgment,confidence:knowledge.judgment.confidence,reasons:knowledge.judgment.reasons,

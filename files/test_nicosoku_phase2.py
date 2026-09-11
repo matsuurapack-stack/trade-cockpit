@@ -180,7 +180,7 @@ class DiagnosticsTests(unittest.TestCase):
     def test_diagnostics_normal_mock(self):
         now_iso = _iso(datetime.datetime.now(datetime.timezone.utc))
         with mock.patch.object(server, "X_API_BEARER_TOKEN", "dummy-token"):
-            with mock.patch.object(server, "_nicosoku_x_user_id_cache", "12345"):
+            with mock.patch.object(server, "_x_user_id_cache", {server.NICOSOKU_X_USERNAME: "12345"}):
                 with mock.patch.object(server, "investment_db") as mock_db:
                     mock_db.get_market_source.return_value = {"last_success_at": now_iso, "last_error": None}
                     mock_db.list_recent_social_posts.return_value = [
@@ -211,7 +211,7 @@ class FetchNowTests(unittest.TestCase):
             mock_db.insert_social_post_if_new.return_value = None  # 常に重複
             mock_db.list_market_events.return_value = []
             with mock.patch.object(server, "X_API_BEARER_TOKEN", "dummy-token"):
-                with mock.patch.object(server, "_nicosoku_x_user_id_cache", "12345"):
+                with mock.patch.object(server, "_x_user_id_cache", {server.NICOSOKU_X_USERNAME: "12345"}):
                     with mock.patch.object(server, "_x_fetch_recent_tweets") as mock_fetch:
                         mock_fetch.return_value = ({"data": [{"id": "101", "text": "テスト", "created_at": "2026-09-10T00:00:00Z"}]}, "ok", None)
                         result = server.nicosoku_poll_once("dummy_url", "local")

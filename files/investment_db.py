@@ -937,6 +937,31 @@ CREATE INDEX IF NOT EXISTS idx_social_posts_posted_at ON social_market_posts(pos
 CREATE INDEX IF NOT EXISTS idx_social_posts_importance ON social_market_posts(importance);
 """
 
+# Market Intelligence Phase6（2026-09-12新規）：複数X情報源（@nicosokufx/@polymarketjapan/
+# @kgbukabu/@aryarya）への拡張。market_sourcesを本格利用する設定駆動型へ拡張し（指示書1番）、
+# social_market_postsにはsource_type別の構造化抽出結果・一次情報リンク・
+# intelligence_cluster_idを追加専用で持たせる（指示書5・8・10・11・16番）。既存Phase1〜5の
+# 列・ロジックは一切変更しない（指示書「Phase5後方互換」）。
+_MIGRATE_MARKET_SOURCES_PROFILE_SQL = """
+ALTER TABLE market_sources ADD COLUMN IF NOT EXISTS source_type TEXT;
+ALTER TABLE market_sources ADD COLUMN IF NOT EXISTS poll_interval_market_sec INTEGER;
+ALTER TABLE market_sources ADD COLUMN IF NOT EXISTS poll_interval_off_sec INTEGER;
+ALTER TABLE market_sources ADD COLUMN IF NOT EXISTS strengths_json JSONB;
+ALTER TABLE market_sources ADD COLUMN IF NOT EXISTS evaluation_modes_json JSONB;
+"""
+
+_MIGRATE_SOCIAL_POSTS_INTELLIGENCE_SQL = """
+ALTER TABLE social_market_posts ADD COLUMN IF NOT EXISTS post_classification TEXT;
+ALTER TABLE social_market_posts ADD COLUMN IF NOT EXISTS prediction_market_json JSONB;
+ALTER TABLE social_market_posts ADD COLUMN IF NOT EXISTS stock_breaking_json JSONB;
+ALTER TABLE social_market_posts ADD COLUMN IF NOT EXISTS corporate_breaking_json JSONB;
+ALTER TABLE social_market_posts ADD COLUMN IF NOT EXISTS primary_source_url TEXT;
+ALTER TABLE social_market_posts ADD COLUMN IF NOT EXISTS primary_source_type TEXT;
+ALTER TABLE social_market_posts ADD COLUMN IF NOT EXISTS discovered_via_social BOOLEAN;
+ALTER TABLE social_market_posts ADD COLUMN IF NOT EXISTS intelligence_cluster_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_social_posts_cluster ON social_market_posts(intelligence_cluster_id);
+"""
+
 # 場中レポート（market_intelligence_reports）から直近のにこそく投稿を参照できるように、
 # 追加専用の列を1つ増やすだけ（既存列・既存レポート生成ロジックには一切影響しない、
 # 指示書11・21番「既存機能を壊さない」）。
@@ -999,6 +1024,8 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_STOCK_THESES_SQL)
         conn.execute(_MIGRATE_STOCK_THESES_MORNING_COLUMNS_SQL)
         conn.execute(_SCHEMA_SOCIAL_MARKET_SQL)
+        conn.execute(_MIGRATE_MARKET_SOURCES_PROFILE_SQL)
+        conn.execute(_MIGRATE_SOCIAL_POSTS_INTELLIGENCE_SQL)
         conn.execute(_MIGRATE_MARKET_INTEL_SOCIAL_SQL)
         conn.execute(_MIGRATE_SOCIAL_POSTS_IMAGE_STATUS_SQL)
         conn.execute(_MIGRATE_SOCIAL_POSTS_IMAGE_STATUS_V2_SQL)
@@ -4055,20 +4082,27 @@ def get_stock_thesis_stats(database_url, user_id, days=30):
 
 # ---- market_sources / social_market_posts（にこそく@nicosokufx X投稿連携。2026-09-10新規） ----
 
-def ensure_market_source(database_url, platform, handle, display_name=None, priority="HIGH", categories=None):
+def ensure_market_source(database_url, platform, handle, display_name=None, priority="HIGH", categories=None,
+                          source_type=None, poll_interval_market_sec=None, poll_interval_off_sec=None,
+                          strengths=None, evaluation_modes=None):
     """(platform, handle)の設定行を作る（無ければ）。既存があれば何もしない・既存の
     enabled/priority設定は上書きしない（ユーザーが後で無効化した場合に自動復活させない
-    ため）。"""
+    ため）。Phase6（指示書1・13番）：source_type・ポーリング間隔・capability profile
+    （strengths/evaluation_modes）を初期登録できるよう拡張。これらも既存行があれば上書き
+    しない（設定はDBが唯一の真実、コード側の初期値は「初回のみ」の種に過ぎない）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "INSERT INTO market_sources (platform, handle, display_name, priority, categories_json) "
-                "VALUES (%s,%s,%s,%s,%s::jsonb) "
+                "INSERT INTO market_sources (platform, handle, display_name, priority, categories_json, "
+                "source_type, poll_interval_market_sec, poll_interval_off_sec, strengths_json, evaluation_modes_json) "
+                "VALUES (%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb,%s::jsonb) "
                 "ON CONFLICT (platform, handle) DO NOTHING RETURNING *",
-                [platform, handle, display_name, priority, json.dumps(categories or [], ensure_ascii=False)])
+                [platform, handle, display_name, priority, json.dumps(categories or [], ensure_ascii=False),
+                 source_type, poll_interval_market_sec, poll_interval_off_sec,
+                 json.dumps(strengths or [], ensure_ascii=False), json.dumps(evaluation_modes or [], ensure_ascii=False)])
             row = cur.fetchone()
         conn.commit()
     return _row_to_json(row) if row else get_market_source(database_url, handle, platform)
@@ -4083,6 +4117,26 @@ def get_market_source(database_url, handle, platform="X"):
             cur.execute("SELECT * FROM market_sources WHERE platform=%s AND handle=%s", [platform, handle])
             row = cur.fetchone()
     return _row_to_json(row) if row else None
+
+
+def list_market_sources(database_url, enabled_only=False, platform=None):
+    """Phase6新規（指示書1・29・31番）：GET /api/market-sources・複数source対応pollerの
+    走査対象取得用。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = [], []
+    if enabled_only:
+        where.append("enabled = true")
+    if platform:
+        where.append("platform = %s")
+        params.append(platform)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SELECT * FROM market_sources {clause} ORDER BY handle", params)
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
 
 
 def update_market_source_status(database_url, handle, platform="X", last_seen_post_id=None,
@@ -4120,7 +4174,8 @@ def update_market_source_status(database_url, handle, platform="X", last_seen_po
 
 _SOCIAL_POST_JSON_COLS = ["media_json", "quoted_post_json", "public_metrics_json", "categories_json",
                            "facts_json", "author_opinion_json", "system_inference_json",
-                           "direct_mentions_json", "theme_related_json", "image_analysis_json"]
+                           "direct_mentions_json", "theme_related_json", "image_analysis_json",
+                           "prediction_market_json", "stock_breaking_json", "corporate_breaking_json"]
 
 
 def insert_social_post_if_new(database_url, post):
@@ -4128,7 +4183,10 @@ def insert_social_post_if_new(database_url, post):
     quoted_post,public_metrics,categories,importance,facts,author_opinion,system_inference,
     direct_mentions,theme_related,verification_status}を含むdict。(source_handle,post_id)の
     UNIQUE制約により、既に取り込み済みの投稿は何もしない（指示書2・17番「同一投稿を何度も
-    処理しない」）。戻り値：新規なら作成行(dict)、既存ならNone。"""
+    処理しない」）。Phase6（指示書5・8・10・11・12・16番）：post_classification・
+    prediction_market/stock_breaking/corporate_breaking_json・primary_source_url/type・
+    discovered_via_social・intelligence_cluster_idを追加専用で受け取る（無ければNULLのまま、
+    既存のにこそく投稿には一切影響しない）。戻り値：新規なら作成行(dict)、既存ならNone。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
@@ -4136,11 +4194,14 @@ def insert_social_post_if_new(database_url, post):
                   "public_metrics": "public_metrics_json", "categories": "categories_json",
                   "facts": "facts_json", "author_opinion": "author_opinion_json",
                   "system_inference": "system_inference_json", "direct_mentions": "direct_mentions_json",
-                  "theme_related": "theme_related_json"}
+                  "theme_related": "theme_related_json", "prediction_market": "prediction_market_json",
+                  "stock_breaking": "stock_breaking_json", "corporate_breaking": "corporate_breaking_json"}
     cols = ["source_type", "source_name", "source_handle", "post_id", "posted_at", "text", "url",
             "media_json", "quoted_post_json", "public_metrics_json", "categories_json", "importance",
             "facts_json", "author_opinion_json", "system_inference_json", "direct_mentions_json",
-            "theme_related_json", "verification_status", "image_analysis_status"]
+            "theme_related_json", "verification_status", "image_analysis_status",
+            "post_classification", "prediction_market_json", "stock_breaking_json", "corporate_breaking_json",
+            "primary_source_url", "primary_source_type", "discovered_via_social", "intelligence_cluster_id"]
     values = []
     for c in cols:
         if c == "image_analysis_status":
@@ -4286,6 +4347,38 @@ def merge_social_post_mentions(database_url, source_handle, post_id, extra_direc
             updated = cur.fetchone()
         conn.commit()
     return _row_to_json(updated) if updated else None
+
+
+def set_post_intelligence_cluster(database_url, source_handle, post_id, cluster_id):
+    """Market Intelligence Phase6新規（指示書16・19番）：cross-source entity matchingで
+    同一クラスタに属すると判定した投稿へintelligence_cluster_idを設定する。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE social_market_posts SET intelligence_cluster_id=%s, updated_at=now() "
+                "WHERE source_handle=%s AND post_id=%s RETURNING *",
+                [cluster_id, source_handle, post_id])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_recent_social_posts_all_sources(database_url, since_iso, limit=200):
+    """Market Intelligence Phase6新規（指示書16・17番）：クラスタリング・コンセンサス計算用に
+    全source横断で直近投稿を取得する。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM social_market_posts WHERE posted_at >= %s ORDER BY posted_at DESC LIMIT %s",
+                [since_iso, limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
 
 
 def list_recent_social_posts(database_url, source_handle=None, since_iso=None, min_importance=None, limit=50,
