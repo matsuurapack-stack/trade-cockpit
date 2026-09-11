@@ -706,6 +706,73 @@ CREATE INDEX IF NOT EXISTS idx_trade_decision_events_trade ON trade_decision_eve
 CREATE INDEX IF NOT EXISTS idx_trade_decision_events_symbol ON trade_decision_events(user_id, symbol, event_time DESC);
 """
 
+# 「今日の振り返り」独立タブ化 + 15:30自動評価 + トレード経験/銘柄クセ学習（2026-09-12新規）。
+# ・sync_key：15:30スケジューラ・手動再生成・再起動・retryが重なっても同一トレード/WAITを
+#   重複登録しないための冪等キー（指示書29番）。実トレードは'trade:<trade_history.id>'、
+#   WAIT成功/失敗の記録は'wait:<symbol>:<trade_date>:<event_time>'の形にする（呼び出し側で
+#   組み立てる、ここではUNIQUE制約を持つ列を追加するだけ）。
+# ・decision_quality_score/trade_result_score：「判断品質」と「結果」を分けて保存する
+#   （指示書6番）。既存のexecution_score（0-100、既存のトレード実行そのものの評価）とは
+#   別軸——decision_quality_scoreは主に日次振り返りの5軸スコアから、trade_result_scoreは
+#   純粋なP/Lの符号・比率だけから機械的に算出する（結果の良し悪しで判断の評価を歪めない）。
+_SCHEMA_TRADE_EXPERIENCES_LEARNING_SQL = """
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS sync_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_trade_experiences_sync_key
+    ON trade_experiences(user_id, sync_key) WHERE sync_key IS NOT NULL;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS decision_quality_score NUMERIC;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS trade_result_score NUMERIC;
+
+-- 銘柄ごとの「クセ」を統計的に学習するプロフィール（指示書14・15番）。文章ではなく統計値から
+-- 作る。sample_count<5はLOW、5-14はMEDIUM、15+はHIGH（既存Trade Experience Learningの
+-- classify_pattern_confidence()と同じ閾値・同じ考え方を流用する、二重の基準を作らない）。
+CREATE TABLE IF NOT EXISTS stock_behavior_profiles (
+    id                          SERIAL PRIMARY KEY,
+    user_id                     TEXT NOT NULL,
+    symbol                      TEXT NOT NULL,
+    stock_name                  TEXT,
+    sample_count                INTEGER NOT NULL DEFAULT 0,
+    avg_intraday_range_pct      NUMERIC,
+    gap_up_frequency            NUMERIC,
+    gap_down_frequency          NUMERIC,
+    opening_30m_strength_rate   NUMERIC,
+    morning_high_break_rate     NUMERIC,
+    afternoon_high_break_rate   NUMERIC,
+    afternoon_reversal_rate     NUMERIC,
+    vwap_reclaim_success_rate   NUMERIC,
+    vwap_loss_failure_rate      NUMERIC,
+    oversold_reversal_rate      NUMERIC,
+    breakout_followthrough_rate NUMERIC,
+    breakout_failure_rate       NUMERIC,
+    pullback_success_rate       NUMERIC,
+    late_day_momentum_rate      NUMERIC,
+    late_day_fade_rate          NUMERIC,
+    overnight_win_rate          NUMERIC,
+    overnight_gap_down_rate     NUMERIC,
+    avg_mfe_pct                 NUMERIC,
+    avg_mae_pct                 NUMERIC,
+    best_entry_time_bucket      TEXT,
+    worst_entry_time_bucket     TEXT,
+    time_bucket_stats_json      JSONB,  -- 指示書16番：09:00-09:30等、時間帯別の勝率・反転率
+    preferred_setup_json        JSONB,  -- 指示書17番：BREAKOUT/PULLBACK/VWAP_RECLAIM等セットアップ別の件数・勝率
+    danger_patterns_json        JSONB,
+    confidence_level            TEXT NOT NULL DEFAULT 'LOW',  -- LOW|MEDIUM|HIGH
+    last_updated                TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_stock_behavior_profiles_user ON stock_behavior_profiles(user_id, symbol);
+
+-- daily_reviews側にも同じ「判断品質」と「結果」の分離を追加する（指示書6・7番）。
+-- 既存score_total（process quality寄り、既存の各score_*の合計）は無変更のまま残す。
+ALTER TABLE daily_reviews ADD COLUMN IF NOT EXISTS decision_quality_score NUMERIC;
+ALTER TABLE daily_reviews ADD COLUMN IF NOT EXISTS trade_result_score NUMERIC;
+-- 15:30自動評価スケジューラ（指示書4・11・28番）の状態管理。1日1回の確定生成を記録し、
+-- 冪等性の最終防衛線（daily_reviews.(user_id,review_date)のUNIQUE制約）に加えて、
+-- 「まだ確定していない（リトライ中）」と「確定済み」を区別できるようにする。
+ALTER TABLE daily_reviews ADD COLUMN IF NOT EXISTS is_finalized BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE daily_reviews ADD COLUMN IF NOT EXISTS generation_attempts INTEGER NOT NULL DEFAULT 0;
+"""
+
 # 2026-09-09新規（日次投資レビュー・投資スコア）：daily_reviews。
 _SCHEMA_DAILY_REVIEWS_SQL = """
 CREATE TABLE IF NOT EXISTS daily_reviews (
@@ -1110,6 +1177,7 @@ def init_schema(database_url):
         conn.execute(_MIGRATE_CHATGPT_IMPORT_SQL)
         conn.execute(_SCHEMA_TRADE_RULES_SQL)
         conn.execute(_SCHEMA_TRADE_EXPERIENCES_SQL)
+        conn.execute(_SCHEMA_TRADE_EXPERIENCES_LEARNING_SQL)
         conn.execute(_SCHEMA_DAILY_REVIEWS_SQL)
         conn.execute(_SCHEMA_KNOWLEDGE_ENGINE_SQL)
         conn.execute(_SCHEMA_MORNING_CHECK_SQL)
@@ -2043,7 +2111,7 @@ _TRADE_EXPERIENCE_COLS = (
     "execution_score", "rule_compliance_score", "result_class", "max_favorable_excursion_pct",
     "max_adverse_excursion_pct", "post_exit_max_price", "post_exit_min_price", "profit_capture_ratio",
     "learning_status", "learning_weight", "score_breakdown_json", "decision_snapshot_json",
-    "post_trade_analysis_json", "notes",
+    "post_trade_analysis_json", "notes", "decision_quality_score", "trade_result_score",
 )
 
 
@@ -2220,6 +2288,111 @@ def promote_trade_experience_rule_candidate(database_url, user_id, rule_id, reas
 def list_trade_experience_rule_candidates(database_url, user_id):
     """指示書9・14番：GET /api/trade-experience-patterns向けのRULE_CANDIDATE一覧。"""
     return list_trade_rules(database_url, user_id, status="RULE_CANDIDATE")
+
+
+def upsert_trade_experience_by_sync_key(database_url, user_id, sync_key, fields):
+    """「今日の振り返り」独立タブ化+15:30自動評価（2026-09-12新規、指示書29番）：sync_keyで
+    冪等にupsertする。15:30スケジューラ・手動再生成・サーバー再起動・リトライが重なっても
+    同一トレード/WAIT判断を重複登録しない（UNIQUE(user_id,sync_key)を利用したON CONFLICT）。"""
+    pool = _get_pool(database_url)
+    if pool is None or not sync_key or not (fields or {}).get("symbol"):
+        return None
+    cols = [c for c in _TRADE_EXPERIENCE_COLS if c in fields]
+    values = [fields.get(c) for c in cols]
+    wrapped = [json.dumps(v, ensure_ascii=False) if (c in _TRADE_EXPERIENCE_JSON_COLS and v is not None) else v
+               for c, v in zip(cols, values)]
+    insert_placeholders = ["%s::jsonb" if c in _TRADE_EXPERIENCE_JSON_COLS else "%s" for c in cols]
+    update_clauses = [f"{c}=EXCLUDED.{c}" for c in cols] + ["updated_at=now()"]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO trade_experiences (user_id, sync_key, {', '.join(cols)}) "
+                f"VALUES (%s, %s, {', '.join(insert_placeholders)}) "
+                f"ON CONFLICT (user_id, sync_key) DO UPDATE SET {', '.join(update_clauses)} "
+                f"RETURNING *", [user_id, sync_key] + wrapped)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def upsert_stock_behavior_profile(database_url, user_id, symbol, fields):
+    """銘柄クセ学習（2026-09-12新規、指示書14・15番）：symbol単位で冪等にupsertする
+    （UNIQUE(user_id,symbol)）。"""
+    pool = _get_pool(database_url)
+    if pool is None or not symbol:
+        return None
+    cols = ["stock_name", "sample_count", "avg_intraday_range_pct", "gap_up_frequency", "gap_down_frequency",
+            "opening_30m_strength_rate", "morning_high_break_rate", "afternoon_high_break_rate",
+            "afternoon_reversal_rate", "vwap_reclaim_success_rate", "vwap_loss_failure_rate",
+            "oversold_reversal_rate", "breakout_followthrough_rate", "breakout_failure_rate",
+            "pullback_success_rate", "late_day_momentum_rate", "late_day_fade_rate", "overnight_win_rate",
+            "overnight_gap_down_rate", "avg_mfe_pct", "avg_mae_pct", "best_entry_time_bucket",
+            "worst_entry_time_bucket", "time_bucket_stats_json", "preferred_setup_json",
+            "danger_patterns_json", "confidence_level"]
+    json_cols = {"time_bucket_stats_json", "preferred_setup_json", "danger_patterns_json"}
+    present = [c for c in cols if c in (fields or {})]
+    if not present:
+        return get_stock_behavior_profile(database_url, user_id, symbol)
+    values = [fields.get(c) for c in present]
+    wrapped = [json.dumps(v, ensure_ascii=False) if (c in json_cols and v is not None) else v
+               for c, v in zip(present, values)]
+    insert_placeholders = ["%s::jsonb" if c in json_cols else "%s" for c in present]
+    update_clauses = [f"{c}=EXCLUDED.{c}" for c in present] + ["last_updated=now()"]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO stock_behavior_profiles (user_id, symbol, {', '.join(present)}) "
+                f"VALUES (%s, %s, {', '.join(insert_placeholders)}) "
+                f"ON CONFLICT (user_id, symbol) DO UPDATE SET {', '.join(update_clauses)} "
+                f"RETURNING *", [user_id, symbol] + wrapped)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def get_stock_behavior_profile(database_url, user_id, symbol):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM stock_behavior_profiles WHERE user_id=%s AND symbol=%s", [user_id, symbol])
+            row = cur.fetchone()
+    return _row_to_json(row) if row else None
+
+
+def update_daily_review_learning_scores(database_url, user_id, review_date, decision_quality_score, trade_result_score):
+    """指示書6・7番：「判断品質」と「結果」を分けて保存する。既存score_total（既存5軸の合計、
+    process quality寄り）には一切触れない追加専用の列。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE daily_reviews SET decision_quality_score=%s, trade_result_score=%s, updated_at=now() "
+                "WHERE user_id=%s AND review_date=%s RETURNING *",
+                [decision_quality_score, trade_result_score, user_id, review_date])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def mark_daily_review_finalized(database_url, user_id, review_date):
+    """15:30自動評価スケジューラ（指示書4・11・28・29番）：確定生成の完了を記録する
+    （is_finalized・generation_attempts）。daily_reviewsの行自体はgenerate_daily_review()が
+    ON CONFLICTで作成済みという前提。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE daily_reviews SET is_finalized=true, generation_attempts=generation_attempts+1, "
+                "updated_at=now() WHERE user_id=%s AND review_date=%s RETURNING *", [user_id, review_date])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
 
 
 def sync_rule_updates_to_trade_rules(database_url, user_id, rule_updates, daily_log_id=None, date=None,

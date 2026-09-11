@@ -9972,6 +9972,388 @@ def get_trade_experience_diagnostics(database_url, user_id):
     return {"total_experiences": len(exps), "rule_candidates_pending": len(candidates), "patterns_tracked": len(stats)}
 
 
+# ============================================================
+# 「今日の振り返り」独立タブ化 + 15:30自動評価 + トレード経験/銘柄クセ学習（2026-09-12新規）。
+# 既存daily_reviewsのscore_total計算・既存Trade Experience Learning（Task E）のCRUD/評価関数は
+# 一切変更せず、その上に積む形の追加専用ロジックのみ（指示書冒頭「必ずAIが勝手にACTIVEルールを
+# 変更しない」「経験・クセはまず補助情報」を踏襲）。
+# ============================================================
+
+BEHAVIOR_TIME_BUCKETS = ("09:00-09:30", "09:30-10:30", "10:30-11:30", "12:30-13:30", "13:30-14:30", "14:30-15:30")
+_BEHAVIOR_TIME_BUCKET_RANGES = (
+    ("09:00-09:30", 9 * 60, 9 * 60 + 30), ("09:30-10:30", 9 * 60 + 30, 10 * 60 + 30),
+    ("10:30-11:30", 10 * 60 + 30, 11 * 60 + 30), ("12:30-13:30", 12 * 60 + 30, 13 * 60 + 30),
+    ("13:30-14:30", 13 * 60 + 30, 14 * 60 + 30), ("14:30-15:30", 14 * 60 + 30, 15 * 60 + 30),
+)
+
+
+def classify_behavior_time_bucket(entry_time_iso):
+    """指示書16番：JST基準で6つの時間帯へ分類する（09:00-09:30〜14:30-15:30）。範囲外
+    （寄り前・引け後・昼休み等）や日時が読めない場合はNone。"""
+    if not entry_time_iso:
+        return None
+    try:
+        t = datetime.datetime.fromisoformat(str(entry_time_iso).replace("Z", "+00:00")).astimezone(_JST)
+    except Exception:
+        return None
+    hhmm = t.hour * 60 + t.minute
+    for label, start, end in _BEHAVIOR_TIME_BUCKET_RANGES:
+        if start <= hhmm < end:
+            return label
+    return None
+
+
+def compute_trade_result_score(gross_pnl_pct):
+    """指示書6・7番：「結果」だけを機械的に0-100へ写像する（判断品質＝execution_score/
+    decision_quality_scoreとは完全に独立の軸）。-10%以下→0点、+10%以上→100点の単純な
+    線形写像（恣意的な固定点は使わない）。判定不能時は中立の50点。"""
+    if gross_pnl_pct is None:
+        return 50.0
+    clamped = max(-10.0, min(10.0, gross_pnl_pct))
+    return round((clamped + 10.0) / 20.0 * 100, 1)
+
+
+def evaluate_wait_decision(entry_score_at_wait):
+    """指示書13番：「買わなかった判断」の妥当性を、WAIT時点で分かっていた情報（entry_score）
+    だけで評価する。事後の値動き（急落した／急騰した）は結果の記録にのみ使い、判断の当否
+    そのものには使わない（後知恵禁止、指示書22番と同じ思想）。entry_score_at_wait<55
+    （ENTRY_READY昇格閾値未満）でのWAITは、その後の結果に関わらず判断として妥当
+    （GOOD_WAIT）。>=55（本来ENTRY_READY相当だったのに見送った）は個別確認が必要という
+    意味でNEUTRAL_WAITに留め、単純にBAD認定はしない（指示書「単純にBAD WAITにしない」）。
+    戻り値：(result_class, reason_text)。"""
+    if entry_score_at_wait is None:
+        return "NEUTRAL_WAIT", "判断時点のスコアが不明なため評価不能"
+    if entry_score_at_wait < 55:
+        return "GOOD_WAIT", "判断時点でENTRY条件未達（entry_score<55）のため、その後の値動きに関わらず妥当な判断"
+    return "NEUTRAL_WAIT", "判断時点でentry_score>=55（ENTRY READY相当）だったが見送り——個別確認が必要"
+
+
+def sync_trade_experiences_for_date(database_url, user_id, review_date):
+    """15:30自動評価（指示書12・13・21・26・29番）：当日の実トレード（勝ち/負け/同値/損切り/
+    利確、全部——勝ちトレードだけの登録は禁止）をtrade_experiencesへ冪等にupsertし、WAITのみで
+    終わった判断もGOOD_WAIT等として記録する。sync_key
+    （'trade:<trade_history.id>' / 'wait:<symbol>:<trade_date>:<event_time>'）で重複登録を
+    防ぐ——同じ日に再実行しても増えない（指示書29番）。
+    戻り値：{"trades_synced": N, "waits_synced": N, "experience_ids": [...]}。"""
+    result = {"trades_synced": 0, "waits_synced": 0, "experience_ids": []}
+    if investment_db is None or not database_url:
+        return result
+    history = investment_db.list_trade_history(database_url, user_id, limit=500)
+    exits_today = [t for t in history if str(t.get("closed_at") or "")[:10] == review_date]
+    for t in exits_today:
+        sync_key = f"trade:{t.get('id')}"
+        gross_pnl = t.get("gross_pnl") if t.get("gross_pnl") is not None else t.get("pnl")
+        entry_price, exit_price, qty = t.get("entry_price"), t.get("exit_price"), t.get("shares")
+        gross_pnl_pct = compute_trade_gross_pnl_pct(entry_price, exit_price) if entry_price else None
+        result_class = classify_trade_result(gross_pnl)
+        fields = {
+            "trade_date": review_date, "symbol": t.get("code"), "stock_name": t.get("name"),
+            "side": "BUY", "quantity": qty, "entry_price": entry_price, "exit_price": exit_price,
+            "exit_time": t.get("closed_at"), "gross_pnl": gross_pnl, "gross_pnl_pct": gross_pnl_pct,
+            "result_class": result_class,
+            "trade_result_score": compute_trade_result_score(gross_pnl_pct),
+            "notes": "15:30自動評価による自動登録（sync_trade_experiences_for_date）。",
+        }
+        try:
+            saved = investment_db.upsert_trade_experience_by_sync_key(database_url, user_id, sync_key, fields)
+        except Exception as e:
+            print("  daily-review: trade experience同期で例外（無視して続行）", t.get("code"), e)
+            saved = None
+        if saved:
+            result["trades_synced"] += 1
+            result["experience_ids"].append(saved.get("id"))
+
+    # WAITのみで終わった判断（当日ENTRYに至らなかったWAIT決断イベント）もGOOD_WAIT等として記録する
+    try:
+        events = investment_db.list_trade_decision_events(database_url, user_id, limit=2000)
+    except Exception as e:
+        print("  daily-review: trade decision events取得で例外（無視して続行）", e)
+        events = []
+    today_events = [e for e in events if str(e.get("event_time") or "")[:10] == review_date]
+    entered_symbols = {e.get("symbol") for e in today_events if e.get("decision_type") == "ENTRY"}
+    for e in today_events:
+        if e.get("decision_type") != "WAIT" or e.get("symbol") in entered_symbols:
+            continue
+        snapshot = e.get("technical_snapshot_json") or {}
+        result_class, reason = evaluate_wait_decision(snapshot.get("entry_score"))
+        sync_key = f"wait:{e.get('symbol')}:{review_date}:{e.get('event_time')}"
+        fields = {
+            "trade_date": review_date, "symbol": e.get("symbol"), "side": "WAIT",
+            "pre_entry_state": "WAIT_ONLY", "wait_reason_json": e.get("reason_json"),
+            "result_class": result_class,
+            "post_trade_analysis_json": {"wait_evaluation": reason},
+            "notes": "15:30自動評価によるWAIT判断の自動登録（sync_trade_experiences_for_date）。",
+        }
+        try:
+            saved = investment_db.upsert_trade_experience_by_sync_key(database_url, user_id, sync_key, fields)
+        except Exception as ex:
+            print("  daily-review: WAIT experience同期で例外（無視して続行）", e.get("symbol"), ex)
+            saved = None
+        if saved:
+            result["waits_synced"] += 1
+            result["experience_ids"].append(saved.get("id"))
+    return result
+
+
+def compute_behavior_score(setup_stats_for_current_setup):
+    """指示書19・20番：BEHAVIOR_SCORE 0〜10の補助スコア。既存ENTRY SCOREは一切書き換えない。
+    サンプル<5は強い判断材料として使わない＝上限キャップ（Trade Experience Learningの
+    compute_experience_score()と同じ設計方針）。"""
+    if not setup_stats_for_current_setup:
+        return 0.0
+    count = setup_stats_for_current_setup.get("sample_count") or setup_stats_for_current_setup.get("count") or 0
+    win_rate = setup_stats_for_current_setup.get("win_rate")
+    if not count or win_rate is None:
+        return 0.0
+    raw = win_rate * 10.0
+    if count < 5:
+        raw = min(raw, 2.0)
+    elif count < 15:
+        raw = min(raw, 7.0)
+    return round(min(10.0, raw), 1)
+
+
+def aggregate_stock_behavior_stats(experiences):
+    """指示書14・15・16・17番：symbol単位のtrade_experiencesリストから統計値を算出する純粋
+    関数（文章ではなく統計値から作る）。サンプル不足時も嘘の値は作らずNoneのまま返す。
+    パターン別（SETUP別）統計は既存compute_pattern_statistics()をそのまま再利用する
+    （二重の集計ロジックを作らない）。"""
+    n = len(experiences or [])
+    empty = {"sample_count": 0, "confidence_level": "LOW", "preferred_setup_json": {},
+              "time_bucket_stats_json": {}, "best_entry_time_bucket": None, "worst_entry_time_bucket": None,
+              "avg_mfe_pct": None, "avg_mae_pct": None, "danger_patterns_json": []}
+    if n == 0:
+        return empty
+
+    setup_stats = compute_pattern_statistics(experiences)  # 既存関数の再利用（指示書17番）
+
+    bucket_stats = {}
+    for e in experiences:
+        b = classify_behavior_time_bucket(e.get("entry_time"))
+        if not b:
+            continue
+        st = bucket_stats.setdefault(b, {"count": 0, "wins": 0})
+        st["count"] += 1
+        if e.get("result_class") == "WIN":
+            st["wins"] += 1
+    for st in bucket_stats.values():
+        st["win_rate"] = round(st["wins"] / st["count"], 3) if st["count"] else None
+    # 信頼できる比較には最低限のサンプル（MEDIUM相当=5件）を要求する（指示書20番の思想を時間帯にも適用）
+    comparable = {b: st for b, st in bucket_stats.items() if st["count"] >= 5 and st["win_rate"] is not None}
+    best_bucket = max(comparable, key=lambda b: comparable[b]["win_rate"]) if comparable else None
+    worst_bucket = min(comparable, key=lambda b: comparable[b]["win_rate"]) if comparable else None
+
+    mfes = [e["max_favorable_excursion_pct"] for e in experiences if e.get("max_favorable_excursion_pct") is not None]
+    maes = [e["max_adverse_excursion_pct"] for e in experiences if e.get("max_adverse_excursion_pct") is not None]
+    danger_patterns = [tag for tag, st in setup_stats.items()
+                        if st.get("sample_count", 0) >= 5
+                        and (st.get("win_rate") if st.get("win_rate") is not None else 1.0) < 0.4]
+
+    return {
+        "sample_count": n, "confidence_level": classify_pattern_confidence(n),
+        "preferred_setup_json": setup_stats, "time_bucket_stats_json": bucket_stats,
+        "best_entry_time_bucket": best_bucket, "worst_entry_time_bucket": worst_bucket,
+        "avg_mfe_pct": round(sum(mfes) / len(mfes), 2) if mfes else None,
+        "avg_mae_pct": round(sum(maes) / len(maes), 2) if maes else None,
+        "danger_patterns_json": danger_patterns,
+    }
+
+
+def update_stock_behavior_profile(database_url, user_id, symbol):
+    """指示書21番：取引結果からstock_behavior_profileを再集計・保存する。当日Trade Experience
+    ↓ stock_behavior_profile再集計、の循環の1ステップ。既存プロフィールのstock_nameは
+    trade_experiencesの最新レコードから補う。"""
+    if investment_db is None or not database_url:
+        return None
+    experiences = investment_db.list_trade_experiences(database_url, user_id, symbol=symbol, limit=1000)
+    # WAIT専用行（side='WAIT'）はENTRY/EXITが無いため統計対象から除く——押し目/ブレイク等の
+    # SETUP別集計・時間帯集計は「実際にENTRYした」経験のみを対象にする（指示書14〜17番の
+    # 「銘柄のクセ」はエントリー後の値動きの話であり、見送り判断とは別軸のため）。
+    entered = [e for e in experiences if e.get("side") != "WAIT"]
+    stats = aggregate_stock_behavior_stats(entered)
+    stock_name = next((e.get("stock_name") for e in experiences if e.get("stock_name")), None)
+    fields = {**stats, "stock_name": stock_name}
+    return investment_db.upsert_stock_behavior_profile(database_url, user_id, symbol, fields)
+
+
+def build_learning_accumulation_summary(database_url, user_id, review_date=None):
+    """指示書25・27番：GET /api/trade-learning/summary。「今日の学習」蓄積状況
+    （新規Trade Experience件数・更新された銘柄プロフィール数・新しいPattern Candidate・
+    未承認のRule Candidate件数）を返す。review_date未指定時は当日。"""
+    review_date = review_date or datetime.date.today().isoformat()
+    empty = {"new_trade_experiences": 0, "updated_stock_profiles": 0, "new_pattern_candidates": 0,
+              "rule_candidates_pending": 0}
+    if investment_db is None or not database_url:
+        return empty
+    day_experiences = investment_db.list_trade_experiences(database_url, user_id, trade_date=review_date)
+    symbols_today = {e.get("symbol") for e in day_experiences if e.get("symbol") and e.get("side") != "WAIT"}
+    all_experiences = investment_db.list_trade_experiences(database_url, user_id, limit=1000)
+    pattern_stats = compute_pattern_statistics(all_experiences)
+    new_candidates = propose_rule_candidates_from_pattern_stats(pattern_stats)
+    rule_candidates_pending = investment_db.list_trade_experience_rule_candidates(database_url, user_id)
+    return {
+        "new_trade_experiences": len(day_experiences),
+        "updated_stock_profiles": len(symbols_today),
+        "new_pattern_candidates": len(new_candidates),
+        "rule_candidates_pending": len(rule_candidates_pending),
+    }
+
+
+def build_stock_behavior_summary(database_url, user_id, symbol, current_setup_tags=None):
+    """トレード分析カードのコンパクト表示（指示書18・32番）向け。symbolのプロフィールを
+    取得し、現在Setup（current_setup_tags、ENTRY TOP5/トレード分析が既に算出済みの
+    pattern_tags相当）に対応するBEHAVIOR_SCOREも一緒に返す。プロフィールが無ければ
+    sample_count=0のまま返す（作り物のクセを表示しない）。"""
+    empty = {"profile": None, "behavior_score": 0.0}
+    if investment_db is None or not database_url:
+        return empty
+    profile = investment_db.get_stock_behavior_profile(database_url, user_id, symbol)
+    if not profile:
+        return empty
+    setup_json = profile.get("preferred_setup_json") or {}
+    behavior_score = 0.0
+    if current_setup_tags:
+        for tag in current_setup_tags:
+            if tag in setup_json:
+                behavior_score = max(behavior_score, compute_behavior_score(setup_json[tag]))
+    return {"profile": profile, "behavior_score": behavior_score}
+
+
+def generate_daily_review_with_learning(database_url, user_id, review_date, user_feedback=None, finalize=True):
+    """15:30自動評価パイプライン全体（指示書4・28番）：
+      当日レビュー生成 → trade experience確定 → stock behavior更新 → pattern statistics更新 →
+      rule candidate判定 → daily review保存 → （呼び出し側で）通知
+    既存generate_daily_review()のscore_total計算・既存Trade Experience Learning（Task E）の
+    評価関数には一切触れず、その上に積む追加専用の後続ステップ。finalize=Trueの場合のみ
+    daily_reviews.is_finalizedを立てる（15:30スケジューラのリトライ中はfinalize=Falseで
+    様子見にできる）。
+    戻り値：{"review":..., "sync":..., "behaviorUpdated":[...], "patternCandidatesTracked":N,
+             "ruleCandidatesProposed":[...]}。"""
+    if investment_db is None or not database_url:
+        return None
+    review = investment_db.generate_daily_review(database_url, user_id, review_date, user_feedback=user_feedback)
+
+    sync_result = sync_trade_experiences_for_date(database_url, user_id, review_date)
+
+    day_experiences = investment_db.list_trade_experiences(database_url, user_id, trade_date=review_date)
+    symbols_today = sorted({e.get("symbol") for e in day_experiences if e.get("symbol") and e.get("side") != "WAIT"})
+    behavior_updated = []
+    for sym in symbols_today:
+        try:
+            profile = update_stock_behavior_profile(database_url, user_id, sym)
+            if profile:
+                behavior_updated.append({"symbol": sym, "sample_count": profile.get("sample_count"),
+                                            "confidence_level": profile.get("confidence_level")})
+        except Exception as e:
+            print("  daily-review: stock behavior更新で例外（無視して続行）", sym, e)
+
+    all_experiences = investment_db.list_trade_experiences(database_url, user_id, limit=1000)
+    pattern_stats = compute_pattern_statistics(all_experiences)
+    rule_candidates_proposed = propose_rule_candidates_from_pattern_stats(pattern_stats)
+
+    # 判断品質と結果を分けて日次集計する（指示書6・7番）。今日の実トレード（WAIT以外）の
+    # execution_score平均を「判断品質」、trade_result_score平均を「結果」として保存する——
+    # 既存score_total（process quality寄りの既存5軸合計）は無変更のまま。
+    today_trades = [e for e in day_experiences if e.get("side") != "WAIT"]
+    exec_scores = [e["execution_score"] for e in today_trades if e.get("execution_score") is not None]
+    result_scores = [e["trade_result_score"] for e in today_trades if e.get("trade_result_score") is not None]
+    decision_quality_score = round(sum(exec_scores) / len(exec_scores), 1) if exec_scores else None
+    trade_result_score = round(sum(result_scores) / len(result_scores), 1) if result_scores else None
+    if review and (decision_quality_score is not None or trade_result_score is not None):
+        try:
+            investment_db.update_daily_review_learning_scores(database_url, user_id, review_date,
+                                                                  decision_quality_score, trade_result_score)
+        except Exception as e:
+            print("  daily-review: decision_quality/trade_result保存で例外（無視して続行）", e)
+
+    if finalize:
+        try:
+            finalized_review = investment_db.mark_daily_review_finalized(database_url, user_id, review_date)
+            if finalized_review:
+                review = finalized_review  # 呼び出し元へ返す値をis_finalized/decision_quality等込みの最新状態にする
+        except Exception as e:
+            print("  daily-review: finalizeマークで例外（無視して続行）", e)
+
+    return {
+        "review": review, "sync": sync_result, "behaviorUpdated": behavior_updated,
+        "patternCandidatesTracked": len(pattern_stats), "ruleCandidatesProposed": rule_candidates_proposed,
+    }
+
+
+# 15:30自動評価スケジューラ（指示書4・5・11・28・29・30番）。既存_morning_check_scheduler_loop
+# と全く同じ設計（60秒間隔でJST時刻をチェック、平日のみ、プロセス内fired集合＋DBのUNIQUE
+# 制約の二重防御）を踏襲する。15:30ちょうどには終値等が未確定な場合があるため、15:30〜15:35の
+# 間は30秒間隔で細かくリトライし、15:35時点でその時点のデータのまま確定（finalize）する。
+DAILY_REVIEW_SCHEDULE_HHMM = "15:30"
+DAILY_REVIEW_RETRY_DEADLINE_HHMM = "15:35"
+
+
+def _daily_review_scheduler_users():
+    """定時生成の対象ユーザー一覧（_morning_check_scheduler_users()と同じ考え方）。"""
+    if USERS:
+        return list(USERS.keys())
+    return ["matsuura"]
+
+
+def _daily_review_data_looks_complete(database_url, user_id):
+    """当日終値・高値/安値・出来高が確定しているかの簡易判定（指示書4番）。厳密な「取引所
+    公式の確定値フラグ」は無いため、既存の共有Stage1（run_momentum_stage1）が当日データを
+    保持しているかで代用する——全滅（scanFailed）の場合のみ「未確定/取得失敗」として扱い、
+    それ以外は「取得できている」とみなして確定させる（既知の制約、無限リトライはしない）。"""
+    try:
+        stage1 = run_momentum_stage1()
+        return not stage1.get("scanFailed")
+    except Exception:
+        return False
+
+
+def _daily_review_notify_ready(user_id, review_date, result):
+    """完了通知（指示書8番）のためのプロセス内キュー。フロントは/api/daily-review/latestを
+    ポーリングして generated_at の変化を検知するため、ここではログ出力のみでよい
+    （新規のWebSocket/push基盤は追加しない、既存のポーリング中心の設計に合わせる）。"""
+    review = (result or {}).get("review") or {}
+    print(f"  [DailyReview] {user_id} {review_date} 確定完了。投資スコア{review.get('score_total')}点"
+          f"（trades_synced={result.get('sync', {}).get('trades_synced')}・"
+          f"waits_synced={result.get('sync', {}).get('waits_synced')}・"
+          f"behaviorUpdated={len(result.get('behaviorUpdated', []))}銘柄）")
+
+
+def _daily_review_scheduler_loop():
+    """毎営業日15:30の引け後に当日評価を必ず自動実行するデーモンスレッド（指示書4番）。
+    15:30〜15:35の間、30秒間隔でデータ完成を確認しながらリトライし（指示書「30秒～60秒間隔で
+    再取得、最大15:35までリトライ」）、15:35時点でその時点のデータのまま確定保存する。
+    silent failure禁止（指示書11番）——生成に失敗してもログへ明示し、次のポーリングで再試行、
+    最終的にis_finalizedが立たなければフロント側の手動[再実行]（既存POST /api/daily-review/
+    generate）で救済できる。冪等性はsync_key・(user_id,review_date)のUNIQUE制約が最終防衛線。"""
+    finalized_today = set()  # {(review_date, user_id)}
+    JST = datetime.timezone(datetime.timedelta(hours=9))
+    while True:
+        try:
+            now_jst = datetime.datetime.now(JST)
+            hhmm = now_jst.strftime("%H:%M")
+            if _is_jp_market_business_day(now_jst) and DAILY_REVIEW_SCHEDULE_HHMM <= hhmm <= DAILY_REVIEW_RETRY_DEADLINE_HHMM:
+                review_date = now_jst.date().isoformat()
+                for user_id in _daily_review_scheduler_users():
+                    key = (review_date, user_id)
+                    if key in finalized_today:
+                        continue
+                    data_complete = _daily_review_data_looks_complete(DATABASE_URL, user_id)
+                    at_deadline = hhmm >= DAILY_REVIEW_RETRY_DEADLINE_HHMM
+                    if not data_complete and not at_deadline:
+                        continue  # まだ未確定・締切前 → 次の30秒ポーリングで再試行
+                    try:
+                        result = generate_daily_review_with_learning(DATABASE_URL, user_id, review_date, finalize=True)
+                        finalized_today.add(key)
+                        _daily_review_notify_ready(user_id, review_date, result)
+                    except Exception as e:
+                        print(f"  [DailyReview] {user_id} {review_date} 15:30自動評価に失敗（次回ポーリングで再試行）", e)
+                if len(finalized_today) > 200:
+                    finalized_today = {k for k in finalized_today if k[0] == now_jst.date().isoformat()}
+        except Exception as e:
+            print("  [DailyReview] スケジューラループで例外", e)
+        time.sleep(30)
+
+
 def _nicosoku_morning_commentary(database_url, user_id):
     """指示書10番：朝一チェックの補助材料。前日15:30〜当日08:30(JST)程度の投稿から要点を
     抽出する。既存のmorning_market_check本体ロジックには一切干渉しない、追加専用フィールド。"""
@@ -15222,6 +15604,35 @@ class Handler(SimpleHTTPRequestHandler):
                 trade_date=params.get("date", [None])[0],
             ) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"experiences": exps})
+        # ---- 銘柄クセ学習 / 15:30自動評価（2026-09-12新規、指示書27番）----
+        # /patterns・/time-bucketsは具体的なsuffixなので、汎用の/api/stock-behavior/{symbol}
+        # より前に判定する（Trade Experience Learningと同じ「具体形状を先に」の徹）。
+        elif self.path.split("?")[0].endswith("/patterns") and self.path.split("?")[0].startswith("/api/stock-behavior/"):
+            symbol = self.path.split("?")[0][len("/api/stock-behavior/"):-len("/patterns")]
+            experiences = investment_db.list_trade_experiences(DATABASE_URL, self.current_user, symbol=symbol, limit=1000) \
+                if (investment_db is not None and DATABASE_URL) else []
+            entered = [e for e in experiences if e.get("side") != "WAIT"]
+            self._send_json({"symbol": symbol, "patterns": compute_pattern_statistics(entered)})
+        elif self.path.split("?")[0].endswith("/time-buckets") and self.path.split("?")[0].startswith("/api/stock-behavior/"):
+            symbol = self.path.split("?")[0][len("/api/stock-behavior/"):-len("/time-buckets")]
+            profile = investment_db.get_stock_behavior_profile(DATABASE_URL, self.current_user, symbol) \
+                if (investment_db is not None and DATABASE_URL) else None
+            self._send_json({"symbol": symbol, "timeBuckets": (profile or {}).get("time_bucket_stats_json") or {}})
+        elif self.path.split("?")[0].startswith("/api/stock-behavior/"):
+            symbol = self.path.split("?")[0][len("/api/stock-behavior/"):]
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            tags = [t for t in (params.get("setup", [""])[0] or "").split(",") if t]
+            summary = build_stock_behavior_summary(DATABASE_URL, self.current_user, symbol, current_setup_tags=tags or None) \
+                if (investment_db is not None and DATABASE_URL) else {"profile": None, "behavior_score": 0.0}
+            self._send_json({"symbol": symbol, **summary})
+        elif self.path.split("?")[0] == "/api/trade-learning/summary":
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            date = params.get("date", [None])[0] or datetime.date.today().isoformat()
+            summary = build_learning_accumulation_summary(DATABASE_URL, self.current_user, date) \
+                if (investment_db is not None and DATABASE_URL) else {}
+            self._send_json(summary)
         elif self.path.split("?")[0] == "/api/trade-decision-events":
             qs = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(qs)
@@ -15232,6 +15643,13 @@ class Handler(SimpleHTTPRequestHandler):
             ) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"events": events})
         # ---- 2026-09-09新規（日次投資レビュー・投資スコア、指示書Phase4・5） ----
+        elif self.path.startswith("/api/daily-review/latest"):
+            # 「今日の振り返り」独立タブ化（2026-09-12新規、指示書27番）：直近の生成済みレビュー
+            # （通常は当日分、まだ無ければ最新の過去日）を1件返す。フロントはこれをポーリングし、
+            # generated_at/is_finalizedの変化から完了通知（指示書8番）を出す。
+            reviews = investment_db.list_daily_reviews(DATABASE_URL, self.current_user, limit=1) \
+                if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"review": reviews[0] if reviews else None})
         elif self.path.startswith("/api/daily-review/recent"):
             qs = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(qs)
@@ -16149,14 +16567,25 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json(result)
         # ---- 2026-09-09新規（日次投資レビュー・投資スコア、指示書Phase4・5） ----
         elif self.path == "/api/daily-review/generate":
+            # 「今日の振り返り」独立タブ化+15:30自動評価（2026-09-12更新、指示書11番「[再実行]」・
+            # 指示書28番のパイプライン）：手動再生成もスケジューラと全く同じ
+            # generate_daily_review_with_learning()を通す——Trade Experience同期・銘柄クセ
+            # 再集計まで含めて手動実行できる。既存の{"review":...}レスポンス形は維持しつつ、
+            # 追加フィールドを併記する（既存フロントの呼び出しを壊さない）。
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
             date = body.get("date") or datetime.date.today().isoformat()
-            review = investment_db.generate_daily_review(DATABASE_URL, self.current_user, date)
-            if review is None:
+            try:
+                result = generate_daily_review_with_learning(DATABASE_URL, self.current_user, date, finalize=True)
+            except Exception as e:
+                print("  daily-review/generate: 生成失敗", e)
+                result = None
+            if not result or result.get("review") is None:
                 self._send_json({"error": "レビュー生成に失敗しました"}); return
-            self._send_json({"review": review})
+            self._send_json({"review": result["review"], "sync": result["sync"],
+                              "behaviorUpdated": result["behaviorUpdated"],
+                              "ruleCandidatesProposed": result["ruleCandidatesProposed"]})
         elif self.path == "/api/daily-review/feedback":
             # 指示書18・19番：ユーザー感想を保存し、翌日以降の分析（recent_reflections_for）へ
             # 使えるようにする。保存と同時にreflection_tagsを抽出し、その日のスコアも再計算する
@@ -16218,8 +16647,19 @@ class Handler(SimpleHTTPRequestHandler):
                     trade_experience = build_trade_experience_summary_for_symbol(DATABASE_URL, self.current_user, code)
                 except Exception as e:
                     print("  knowledge-context: trade experience要約取得で例外（無視して続行）", code, e)
+            # 銘柄クセ学習（2026-09-12新規、指示書18・32番）：トレード分析カードのコンパクト
+            # 表示用に、同じレスポンスへ同梱する（追加のfetchを増やさない）。
+            stock_behavior = None
+            if code:
+                try:
+                    current_tags = list((trade_experience or {}).get("similar", {}).get("examples", [{}])[0]
+                                         .get("pattern_tags_json") or []) if trade_experience else None
+                    stock_behavior = build_stock_behavior_summary(DATABASE_URL, self.current_user, code,
+                                                                     current_setup_tags=current_tags)
+                except Exception as e:
+                    print("  knowledge-context: stock behavior要約取得で例外（無視して続行）", code, e)
             self._send_json({"context": context, "judgment": judgment, "logId": (log or {}).get("id"),
-                              "tradeExperience": trade_experience})
+                              "tradeExperience": trade_experience, "stockBehavior": stock_behavior})
         elif self.path == "/api/knowledge-context/top5-flags":
             # 指示書4番：TOP5相談向けの軽量な候補別フラグ（フルコンテキストは取得しない）。
             if not self._investment_db_ready():
@@ -17004,6 +17444,10 @@ def main():
         # デーモンスレッドで起動する。サーバーが起動している間だけ機能する
         # （start.bat/サーバー常駐が前提、CLAUDE.md「使用中は閉じない」と整合）。
         threading.Thread(target=_morning_check_scheduler_loop, daemon=True).start()
+        # 「今日の振り返り」独立タブ化+15:30自動評価（2026-09-12新規、指示書4・28番）：
+        # 毎営業日15:30の引け後に当日評価を自動生成する独立スケジューラ。他のスケジューラと
+        # 同じくサービス分離方針（指示書31番）で別スレッドにする。
+        threading.Thread(target=_daily_review_scheduler_loop, daemon=True).start()
         # 2026-09-10新規（Market Intelligence Timeline、指示書4番）：09:30 OPENING_30Mの
         # 定時スケジューラ（Phase2-A範囲）。別スレッドに分離し、Morning Checkのスケジューラが
         # 万一詰まってもこちらは独立して動く（指示書31番のサービス分離方針）。
