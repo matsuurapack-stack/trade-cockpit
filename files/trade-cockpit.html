@@ -3943,9 +3943,32 @@ function EventDecisionSupportBlock({ds}){
   </div>;
 }
 
+// Market Intelligence Phase10新規（指示書14・15・28・36・38番）：過去時点のdecision_support
+// 再現タイムライン。直近4時間を30分刻みでreplayする（未来データは使わない、hindsight adviceでは
+// ない点を明記）。
+function DecisionReplayTimeline({eventId,ticker}){
+  const [timeline,setTimeline]=useState(null);
+  useEffect(()=>{
+    if(!eventId||!ticker)return;
+    const now=new Date();
+    const times=[];
+    for(let i=8;i>=0;i--)times.push(new Date(now.getTime()-i*30*60000).toISOString());
+    fetchJsonSafe(`/api/stocks/${encodeURIComponent(ticker)}/decision-replay?event_id=${eventId}&times=${times.join(",")}`)
+      .then(d=>{if(d&&Array.isArray(d.replay))setTimeline(d.replay);}).catch(()=>{});
+  },[eventId,ticker]);
+  if(!timeline)return <div style={{fontSize:10,color:"var(--inkFaint)"}}>読み込み中…</div>;
+  return <div style={{fontSize:10,marginTop:4,color:"var(--inkSoft)"}}>
+    <div style={{color:"var(--inkFaint)",marginBottom:2}}>※過去時点で見えていた情報のみで再現（hindsight advice ではありません）</div>
+    {timeline.filter(t=>t.decision_support_state).map((t,i)=>
+      <div key={i}>{new Date(t.as_of).toLocaleTimeString("ja-JP",{hour:"2-digit",minute:"2-digit"})}　{t.decision_support_state}（{t.decision_support_score}）</div>
+    )}
+  </div>;
+}
+
 function EventCard({event}){
   const [expanded,setExpanded]=useState(false);
   const [showReactions,setShowReactions]=useState(false);
+  const [showReplay,setShowReplay]=useState(false);
   const meta=EVENT_CONFIDENCE_META[event.confidence]||EVENT_CONFIDENCE_META.UNVERIFIED;
   const mr=event.market_reaction;
   const primaryReaction=mr&&(mr["30m"]||mr["1h"]||mr["close"]);
@@ -3982,9 +4005,14 @@ function EventCard({event}){
       <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={()=>setShowReactions(v=>!v)}>
         {showReactions?"▲ 反応詳細を隠す":"▼ 反応詳細を見る"}
       </button>
+      {event.direct_tickers&&event.direct_tickers.length>0 &&
+        <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={()=>setShowReplay(v=>!v)}>
+          {showReplay?"▲ replayを隠す":"▼ decision replay"}
+        </button>}
     </div>
     {expanded && <EventEvidenceList eventId={event.event_id}/>}
     {showReactions && <EventReactionList eventId={event.event_id}/>}
+    {showReplay && <DecisionReplayTimeline eventId={event.event_id} ticker={event.direct_tickers[0]}/>}
   </div>;
 }
 
@@ -4050,6 +4078,7 @@ function ImportantIntelligenceFeed(){
       </div>
     )}
     <EventTypePerformancePanel/>
+    <DecisionSupportCalibrationPanel/>
   </div>;
 }
 
@@ -4083,6 +4112,43 @@ function EventTypePerformancePanel(){
           <span style={{color:"var(--inkFaint)"}}>（{v.sample_count}件）</span>
         </div>
       )}
+    </div>}
+  </div>;
+}
+
+// Market Intelligence Phase10新規（指示書37・40番）：Decision Support Calibrationパネル
+// （管理用）。sample count・state別hit rate・平均リターン・提案重みを表示するのみ——
+// 自動適用ボタンは意図的に作らない（指示書17番REQUIRED）。
+function DecisionSupportCalibrationPanel(){
+  const [report,setReport]=useState(null);
+  const [show,setShow]=useState(false);
+  useEffect(()=>{
+    if(!show)return;
+    fetchJsonSafe("/api/market-intelligence/calibration").then(d=>{if(d)setReport(d);}).catch(()=>{});
+  },[show]);
+  const overall=report&&report.overall;
+  return <div style={{marginTop:4}}>
+    <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={()=>setShow(v=>!v)}>
+      {show?"▲ Decision Support Calibrationを隠す":"▼ Decision Support Calibration（管理用）"}
+    </button>
+    {show && <div style={{fontSize:10.5,marginTop:4,color:"var(--inkSoft)",lineHeight:1.7}}>
+      {!overall && <div style={{color:"var(--inkFaint)"}}>読み込み中…</div>}
+      {overall && overall.status==="INSUFFICIENT_SAMPLE" &&
+        <div style={{color:"var(--inkFaint)"}}>サンプル{overall.sample_count}件（30件未満）のため較正は行いません。</div>}
+      {overall && overall.status!=="INSUFFICIENT_SAMPLE" && <>
+        <div>サンプル数 {overall.sample_count}件（{overall.status}）</div>
+        {Object.entries(overall.hit_rate_by_state||{}).map(([state,rate])=>
+          <div key={state}>{state}：勝率{Math.round(rate*100)}%　平均{overall.avg_return_by_state[state]}%</div>)}
+        {overall.suggested_weights && <div style={{marginTop:4}}>
+          提案重み（参考値・自動適用なし）：
+          {Object.entries(overall.suggested_weights.suggested||{}).map(([k,v])=>
+            <span key={k} style={{marginLeft:6}}>{k} {overall.suggested_weights.current[k]}→{v}</span>)}
+        </div>}
+      </>}
+      {report&&report.false_positives&&report.false_positives.length>0 &&
+        <div style={{marginTop:4,color:"var(--down)"}}>False Positive（強支持だったが下落）：{report.false_positives.length}件</div>}
+      {report&&report.false_negatives&&report.false_negatives.length>0 &&
+        <div style={{marginTop:4,color:"var(--accent)"}}>False Negative（慎重すぎたが急騰）：{report.false_negatives.length}件</div>}
     </div>}
   </div>;
 }
@@ -7987,9 +8053,45 @@ function scoreColor(score,max){
   const ratio=score/max;
   return ratio>=0.8?"var(--up)":ratio>=0.5?"var(--accent)":"var(--down)";
 }
+// Market Intelligence Phase10新規（指示書25・26・34番）：日次振り返りへの追加専用セクション。
+// 既存のscore_total計算・表示には一切触れない。
+const DECISION_QUALITY_META = {
+  GOOD_DECISION_GOOD_RESULT: {label:"良い判断・良い結果", color:"var(--up)"},
+  GOOD_DECISION_BAD_RESULT: {label:"良い判断・悪い結果", color:"var(--accent)"},
+  BAD_DECISION_GOOD_RESULT: {label:"悪い判断・良い結果", color:"var(--accent)"},
+  BAD_DECISION_BAD_RESULT: {label:"悪い判断・悪い結果", color:"var(--down)"},
+};
+function DailyDecisionReviewSection({decisionReview}){
+  if(!decisionReview||!decisionReview.items||decisionReview.items.length===0)return null;
+  const dr=decisionReview;
+  return <div className="card" style={{padding:"12px 14px",marginTop:10}}>
+    <div style={{fontWeight:800,fontSize:13}}>🧭 判断品質・タイミング・ルール遵守（Event Support活用）</div>
+    <div style={{fontSize:10.5,color:"var(--inkFaint)",marginTop:2}}>「結果が良かった」と「判断が良かった」は別物として分けて評価します（勝った日だけ高得点にはしません）。</div>
+    <div style={{display:"flex",gap:14,flexWrap:"wrap",marginTop:8,fontSize:11.5}}>
+      <span>良い判断 {dr.good_decisions}件</span><span>悪い判断 {dr.bad_decisions}件</span>
+      <span>追いかけ取引 {dr.chase_entries}件</span><span>正しいWAIT {dr.correct_waits}件</span>
+      <span>良い押し目 {dr.good_pullbacks}件</span><span>機会損失 {dr.missed_breakouts}件</span>
+      {dr.avoided_losses_pct_total>0 && <span style={{color:"var(--up)"}}>回避した損失合計 {dr.avoided_losses_pct_total}%</span>}
+    </div>
+    <div style={{marginTop:8,display:"flex",flexDirection:"column",gap:4}}>
+      {dr.items.map((it,i)=>{
+        const meta=DECISION_QUALITY_META[it.decision_quality]||{label:it.decision_quality||"—",color:"var(--inkSoft)"};
+        return <div key={i} style={{fontSize:11,padding:"3px 5px",borderRadius:3,background:"var(--bg)",border:"1px solid var(--ruleSoft)"}}>
+          <span style={{fontWeight:700}}>{it.ticker}</span>
+          <span style={{color:meta.color,fontWeight:700}}>{meta.label}</span>
+          {it.timing_quality && <span style={{color:"var(--inkSoft)"}}>／{it.timing_quality}</span>}
+          {it.rule_compliance&&it.rule_compliance!=="COMPLIANT" && <span style={{color:"var(--accent)"}}>／{it.rule_compliance}</span>}
+          {it.pnl_pct!=null && <span style={{marginLeft:4,color:it.pnl_pct>=0?"var(--up)":"var(--down)"}}>{it.pnl_pct>0?"+":""}{it.pnl_pct}%</span>}
+        </div>;
+      })}
+    </div>
+  </div>;
+}
+
 function DailyReviewPanel(){
   const [date,setDate]=useState(todayISO());
   const [review,setReview]=useState(null);
+  const [decisionReview,setDecisionReview]=useState(null);
   const [loading,setLoading]=useState(true);
   const [generating,setGenerating]=useState(false);
   const [feedbackDraft,setFeedbackDraft]=useState("");
@@ -8002,6 +8104,7 @@ function DailyReviewPanel(){
     const r=await fetchJsonSafe(`/api/daily-review?date=${d}`);
     const rev=(r&&r.review)||null;
     setReview(rev);
+    setDecisionReview((r&&r.decisionReview)||null);
     setFeedbackDraft(rev?.user_feedback||"");
     setLoading(false);
   };
@@ -8068,6 +8171,7 @@ function DailyReviewPanel(){
           <b style={{fontSize:12,color:"var(--accent)"}}>明日の注意</b>
           <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:12}}>{(review.tomorrow_notes||[]).map((g,i)=><li key={i}>{g}</li>)}</ul>
         </div>}
+        <DailyDecisionReviewSection decisionReview={decisionReview}/>
 
         <div className="card" style={{padding:"10px 12px",marginTop:10}}>
           <b style={{fontSize:12}}>自分の感想</b>

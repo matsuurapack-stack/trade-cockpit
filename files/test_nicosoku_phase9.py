@@ -323,6 +323,7 @@ class ExtendedMoveIntegrationTests(unittest.TestCase):
             mock_db.get_underlying_event.return_value = event
             mock_db.list_event_market_reactions_for_event.return_value = []
             mock_db.create_event_decision_support.side_effect = lambda db, fields: fields
+            mock_db.get_latest_event_decision_support.return_value = None
             result = server.generate_event_decision_support("postgres://x", 1, "7203", market_context={"market_state": None})
         self.assertEqual(result["extension_score"], 85.0)
 
@@ -338,6 +339,7 @@ class MarketRegimeSectorRegimeContextTests(unittest.TestCase):
             mock_db.get_underlying_event.return_value = event
             mock_db.list_event_market_reactions_for_event.return_value = []
             mock_db.create_event_decision_support.side_effect = lambda db, fields: fields
+            mock_db.get_latest_event_decision_support.return_value = None
             result = server.generate_event_decision_support(
                 "postgres://x", 1, "7203",
                 market_context={"market_state": {"nikkei_change_pct": 1.5, "sox_change_pct": 1.0},
@@ -482,6 +484,7 @@ class NoHindsightTests(unittest.TestCase):
             mock_db.get_underlying_event.return_value = event
             mock_db.list_event_market_reactions_for_event.return_value = []
             mock_db.create_event_decision_support.side_effect = lambda db, fields: fields
+            mock_db.get_latest_event_decision_support.return_value = None
             result = server.generate_event_decision_support("postgres://x", 1, "7203", market_context={"market_state": None})
         available_at = datetime.datetime.fromisoformat(result["available_data_at"])
         self.assertGreaterEqual(available_at, before)
@@ -498,6 +501,7 @@ class DecisionTransitionTests(unittest.TestCase):
             mock_db.get_underlying_event.return_value = event
             mock_db.list_event_market_reactions_for_event.return_value = []
             mock_db.create_event_decision_support.side_effect = lambda db, fields: fields
+            mock_db.get_latest_event_decision_support.return_value = None
             server.generate_event_decision_support("postgres://x", 1, "7203", market_context={"market_state": None})
             server.generate_event_decision_support("postgres://x", 1, "7203", market_context={"market_state": None})
         self.assertEqual(mock_db.create_event_decision_support.call_count, 2)

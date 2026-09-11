@@ -1039,6 +1039,7 @@ def init_schema(database_url):
         conn.execute(_MIGRATE_UNDERLYING_EVENTS_V2_SQL)
         conn.execute(_SCHEMA_EVENT_MARKET_REACTIONS_SQL)
         conn.execute(_SCHEMA_EVENT_DECISION_SUPPORT_SQL)
+        conn.execute(_SCHEMA_TRADE_DECISION_CONTEXT_SQL)
         conn.commit()
 
 
@@ -5610,6 +5611,349 @@ def count_event_decision_support_since(database_url, since_iso, flag_col=None, s
         with conn.cursor() as cur:
             cur.execute(f"SELECT COUNT(*) FROM event_decision_support WHERE {' AND '.join(where)}", params)
             return cur.fetchone()[0]
+
+
+# ============================================================
+# Market Intelligence Phase10（2026-09-11新規）：Real-Time Calibration / Decision
+# Support Replay / Trade Review Integration。売買判断（ENTRY/ADD/HOLD/EXIT/STOP）の前後で
+# decision_supportのスナップショットを保存し、後から「結果」と「判断の質」を分離して
+# 評価できるようにする。既存のBUY/WAIT/SELL・ENTRY TOP5のentry_score・AUTO_RS・
+# AUTO_SECTOR・損切り・ポジションサイジングは一切直接変更しない（指示書42番）。
+# trade_decision_contextは immutable（一切UPDATEしない、INSERTのみ）——指示書2番の
+# no hindsight保証をテーブル設計レベルで担保する。
+# ============================================================
+
+_SCHEMA_TRADE_DECISION_CONTEXT_SQL = """
+CREATE TABLE IF NOT EXISTS trade_decision_context (
+    id                          SERIAL PRIMARY KEY,
+    user_id                     TEXT NOT NULL,
+    trade_id                    TEXT NOT NULL,
+    ticker                      TEXT NOT NULL,
+    captured_at                 TIMESTAMPTZ NOT NULL DEFAULT now(),
+    action                      TEXT NOT NULL,   -- ENTRY|ADD|HOLD|EXIT|STOP
+    price                       NUMERIC,
+    entry_score                 NUMERIC,
+    event_support_state         TEXT,
+    material_quality_score      NUMERIC,
+    reaction_quality_score      NUMERIC,
+    extension_score             NUMERIC,
+    decision_support_score      NUMERIC,
+    pullback_candidate          BOOLEAN NOT NULL DEFAULT false,
+    avoid_chase                 BOOLEAN NOT NULL DEFAULT false,
+    active_event_ids_json       JSONB,
+    market_regime_json          JSONB,
+    sector_strength_json        JSONB,
+    available_data_at           TIMESTAMPTZ,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_trade_decision_context_trade ON trade_decision_context(trade_id, captured_at);
+CREATE INDEX IF NOT EXISTS idx_trade_decision_context_ticker ON trade_decision_context(ticker, captured_at DESC);
+CREATE INDEX IF NOT EXISTS idx_trade_decision_context_user ON trade_decision_context(user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS trade_outcome_evaluations (
+    id                            SERIAL PRIMARY KEY,
+    user_id                       TEXT NOT NULL,
+    trade_id                      TEXT NOT NULL,
+    ticker                        TEXT NOT NULL,
+    entry_context_id              INTEGER REFERENCES trade_decision_context(id),
+    exit_context_id                INTEGER REFERENCES trade_decision_context(id),
+    pnl_pct                        NUMERIC,
+    max_favorable_excursion_pct     NUMERIC,
+    max_adverse_excursion_pct       NUMERIC,
+    decision_quality                 TEXT,  -- GOOD/BAD_DECISION_GOOD/BAD_RESULT
+    timing_quality                    TEXT,  -- EARLY_GOOD/GOOD_ENTRY/LATE_ENTRY/CHASE_ENTRY/...
+    rule_compliance                    TEXT,  -- COMPLIANT|RULE_OVERRIDES_EVENT|VIOLATION等
+    event_support_accuracy              TEXT,  -- FALSE_POSITIVE|FALSE_NEGATIVE|ACCURATE|NULL
+    wait_outcome                         TEXT,  -- CORRECT_WAIT|GOOD_PULLBACK|MISSED_BREAKOUT|NO_EDGE
+    opportunity_cost_pct                  NUMERIC,
+    avoided_loss_pct                       NUMERIC,
+    review_notes_json                       JSONB,
+    created_at                               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at                               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (trade_id)
+);
+CREATE INDEX IF NOT EXISTS idx_trade_outcome_evaluations_user ON trade_outcome_evaluations(user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS event_decision_transitions (
+    id                SERIAL PRIMARY KEY,
+    event_id          INTEGER NOT NULL REFERENCES underlying_events(id) ON DELETE CASCADE,
+    ticker            TEXT NOT NULL,
+    from_state        TEXT,
+    to_state          TEXT NOT NULL,
+    transition_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    price             NUMERIC,
+    reason            TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_event_decision_transitions_event ON event_decision_transitions(event_id, ticker, transition_at);
+
+CREATE TABLE IF NOT EXISTS entry_candidate_snapshots (
+    id                  SERIAL PRIMARY KEY,
+    user_id             TEXT NOT NULL,
+    code                TEXT NOT NULL,
+    candidate_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    entry_score         NUMERIC,
+    event_support       TEXT,
+    price_at_candidate  NUMERIC,
+    subsequent_30m_pct  NUMERIC,
+    subsequent_close_pct NUMERIC,
+    was_taken           BOOLEAN NOT NULL DEFAULT false,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_entry_candidate_snapshots_code ON entry_candidate_snapshots(code, candidate_at DESC);
+CREATE INDEX IF NOT EXISTS idx_entry_candidate_snapshots_user ON entry_candidate_snapshots(user_id, created_at);
+"""
+
+
+def create_trade_decision_context(database_url, user_id, fields):
+    """指示書1・2・3番：売買判断snapshotを1件INSERTする（immutable、UPDATEは一切行わない
+    ——no hindsight保証をテーブル設計レベルで担保する）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    cols = ["trade_id", "ticker", "action", "price", "entry_score", "event_support_state",
+            "material_quality_score", "reaction_quality_score", "extension_score", "decision_support_score",
+            "pullback_candidate", "avoid_chase", "active_event_ids_json", "market_regime_json",
+            "sector_strength_json", "available_data_at"]
+    json_cols = {"active_event_ids_json", "market_regime_json", "sector_strength_json"}
+    values = [fields.get(c) for c in cols]
+    wrapped = [json.dumps(v, ensure_ascii=False) if (c in json_cols and v is not None) else v
+               for c, v in zip(cols, values)]
+    placeholders = ["%s::jsonb" if c in json_cols else "%s" for c in cols]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO trade_decision_context (user_id, {', '.join(cols)}) "
+                f"VALUES (%s, {', '.join(placeholders)}) RETURNING *",
+                [user_id] + wrapped)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def get_trade_decision_context(database_url, context_id):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM trade_decision_context WHERE id = %s", [context_id])
+            row = cur.fetchone()
+    return _row_to_json(row) if row else None
+
+
+def list_trade_decision_contexts_for_trade(database_url, trade_id):
+    """指示書3・35番：1つのtrade_idに紐づくENTRY〜EXITの全snapshot（時系列順）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM trade_decision_context WHERE trade_id = %s ORDER BY captured_at ASC",
+                [trade_id])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def list_recent_trade_decision_contexts(database_url, user_id, since_iso, limit=500):
+    """指示書16・39番：calibration dataset・diagnostics向け。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM trade_decision_context WHERE user_id = %s AND created_at >= %s "
+                "ORDER BY created_at DESC LIMIT %s", [user_id, since_iso, limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def count_trade_decision_contexts_since(database_url, user_id, since_iso, action=None):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    where = ["user_id = %s", "created_at >= %s"]
+    params = [user_id, since_iso]
+    if action:
+        where.append("action = %s")
+        params.append(action)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM trade_decision_context WHERE {' AND '.join(where)}", params)
+            return cur.fetchone()[0]
+
+
+def upsert_trade_outcome_evaluation(database_url, user_id, trade_id, fields):
+    """指示書6・7・8番：1trade_id=1行。INSERT ON CONFLICT(trade_id) DO UPDATEで再評価にも
+    対応する（decision_quality等は再計算可能な派生値であり、trade_decision_context自体は
+    不変のまま——immutableなのはsnapshotのみ、という設計）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    cols = ["ticker", "entry_context_id", "exit_context_id", "pnl_pct", "max_favorable_excursion_pct",
+            "max_adverse_excursion_pct", "decision_quality", "timing_quality", "rule_compliance",
+            "event_support_accuracy", "wait_outcome", "opportunity_cost_pct", "avoided_loss_pct",
+            "review_notes_json"]
+    json_cols = {"review_notes_json"}
+    values = [fields.get(c) for c in cols]
+    wrapped = [json.dumps(v, ensure_ascii=False) if (c in json_cols and v is not None) else v
+               for c, v in zip(cols, values)]
+    set_clauses = [f"{c}=COALESCE(EXCLUDED.{c}, trade_outcome_evaluations.{c})" for c in cols]
+    placeholders = ["%s::jsonb" if c in json_cols else "%s" for c in cols]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO trade_outcome_evaluations (user_id, trade_id, {', '.join(cols)}) "
+                f"VALUES (%s, %s, {', '.join(placeholders)}) "
+                f"ON CONFLICT (trade_id) DO UPDATE SET {', '.join(set_clauses)}, updated_at=now() "
+                f"RETURNING *",
+                [user_id, trade_id] + wrapped)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def get_trade_outcome_evaluation(database_url, trade_id):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM trade_outcome_evaluations WHERE trade_id = %s", [trade_id])
+            row = cur.fetchone()
+    return _row_to_json(row) if row else None
+
+
+def list_trade_outcome_evaluations(database_url, user_id, since_iso=None, limit=500):
+    """指示書16・17・18・19・20番：calibration・daily review集計向け。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where = ["user_id = %s"]
+    params = [user_id]
+    if since_iso:
+        where.append("created_at >= %s")
+        params.append(since_iso)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT * FROM trade_outcome_evaluations WHERE {' AND '.join(where)} "
+                f"ORDER BY created_at DESC LIMIT %s", params + [limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def count_trade_outcome_evaluations_since(database_url, user_id, since_iso, decision_quality=None):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    where = ["user_id = %s", "created_at >= %s"]
+    params = [user_id, since_iso]
+    if decision_quality:
+        where.append("decision_quality = %s")
+        params.append(decision_quality)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM trade_outcome_evaluations WHERE {' AND '.join(where)}", params)
+            return cur.fetchone()[0]
+
+
+def create_event_decision_transition(database_url, fields):
+    """指示書12・13番：decision_support_stateの遷移記録（transition理由付き）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    cols = ["event_id", "ticker", "from_state", "to_state", "price", "reason"]
+    values = [fields.get(c) for c in cols]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO event_decision_transitions ({', '.join(cols)}) "
+                f"VALUES ({', '.join(['%s'] * len(cols))}) RETURNING *", values)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_event_decision_transitions_for_event(database_url, event_id, ticker=None):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where = ["event_id = %s"]
+    params = [event_id]
+    if ticker:
+        where.append("ticker = %s")
+        params.append(ticker)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT * FROM event_decision_transitions WHERE {' AND '.join(where)} ORDER BY transition_at ASC",
+                params)
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def create_entry_candidate_snapshot(database_url, user_id, fields):
+    """指示書29番：ENTRY TOP5候補（買わなかったものも含む）のsnapshot。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    cols = ["code", "entry_score", "event_support", "price_at_candidate", "was_taken"]
+    values = [fields.get(c) for c in cols]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO entry_candidate_snapshots (user_id, {', '.join(cols)}) "
+                f"VALUES (%s, {', '.join(['%s'] * len(cols))}) RETURNING *",
+                [user_id] + values)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_due_entry_candidate_snapshots_for_backfill(database_url, older_than_iso, limit=100):
+    """指示書29番：subsequent_30m/subsequent_closeがまだ未計算のsnapshotをbackfill対象として
+    返す（candidate_atからある程度時間が経過したもの）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM entry_candidate_snapshots WHERE subsequent_close_pct IS NULL "
+                "AND candidate_at <= %s ORDER BY candidate_at ASC LIMIT %s", [older_than_iso, limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def save_entry_candidate_snapshot_result(database_url, snapshot_id, subsequent_30m_pct=None, subsequent_close_pct=None):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE entry_candidate_snapshots SET subsequent_30m_pct=COALESCE(%s, subsequent_30m_pct), "
+                "subsequent_close_pct=COALESCE(%s, subsequent_close_pct) WHERE id=%s RETURNING *",
+                [subsequent_30m_pct, subsequent_close_pct, snapshot_id])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_entry_candidate_snapshots_for_code(database_url, code, since_iso, limit=100):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM entry_candidate_snapshots WHERE code = %s AND candidate_at >= %s "
+                "ORDER BY candidate_at DESC LIMIT %s", [code, since_iso, limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
 
 
 # ---- investment_profile（投資プロフィール。2026-09-02新規） ----

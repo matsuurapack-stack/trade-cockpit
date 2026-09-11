@@ -7476,6 +7476,19 @@ def generate_event_decision_support(database_url, event_id, ticker, market_conte
         "sector_strength_at_event": market_context.get("sector_strength_at_event"),
         "reasons_json": reasons, "warnings_json": warnings,
     }
+    # Market Intelligence Phase10新規（指示書12・13・29番）：state遷移を記録する。
+    # 新規行を作る前の「直前の最新state」と比較し、変化があればevent_decision_transitionsへ
+    # 1行残す（transition理由はヒューリスティックな推定、既知の制約）。
+    try:
+        previous = investment_db.get_latest_event_decision_support(database_url, event_id, ticker)
+        if previous and previous.get("decision_support_state") != state:
+            investment_db.create_event_decision_transition(database_url, {
+                "event_id": event_id, "ticker": ticker, "from_state": previous.get("decision_support_state"),
+                "to_state": state, "price": market_context.get("current_price"),
+                "reason": classify_transition_reason(previous, fields),
+            })
+    except Exception as e:
+        print("  Market Intelligence: decision support transition記録で例外（無視して続行）", e)
     return investment_db.create_event_decision_support(database_url, fields)
 
 
@@ -7650,6 +7663,568 @@ def build_morning_overnight_event_digest_safe(database_url, lookback_hours=18):
     except Exception as e:
         print("  Market Intelligence: 朝overnight event digest生成で例外（無視して続行）", e)
         return {"overnight_events": [], "note": "ギャップアップは買いサインではありません（追いかけ注意）。"}
+
+
+# ============================================================
+# Market Intelligence Phase10（2026-09-11新規）：Real-Time Calibration / Decision Support
+# Replay / Trade Review Integration。Phase9までのevent_decision_supportを実際の売買判断
+# （ENTRY/ADD/HOLD/EXIT/STOP）の前後でsnapshot保存し、「結果」と「判断の質」を分離して
+# 評価する。最重要原則（指示書44番）：「結果が良かった」と「判断が良かった」は別物——
+# decision_quality・timing_quality・rule_compliance・outcomeを必ず分離する。
+# 既存のBUY/WAIT/SELL・ENTRY TOP5のentry_score・AUTO_RS・AUTO_SECTOR・損切り・
+# ポジションサイジングは一切直接変更しない（指示書42番）。
+# ============================================================
+
+def classify_transition_reason(previous_row, new_fields):
+    """指示書13番：state遷移の理由をヒューリスティックに推定する（AI不使用のルールベース、
+    他のPhaseと同じ方針）。複数該当すれば全て列挙する。"""
+    reasons = []
+    prev_ext = previous_row.get("extension_score")
+    new_ext = new_fields.get("extension_score")
+    if prev_ext is not None and new_ext is not None and prev_ext - new_ext >= 15:
+        reasons.append("extension normalized")
+    prev_reaction = previous_row.get("reaction_quality_score") or 0
+    new_reaction = new_fields.get("reaction_quality_score") or 0
+    if new_reaction - prev_reaction >= 15:
+        reasons.append("reaction persisted/improved")
+    prev_source = previous_row.get("source_confidence_score") or 0
+    new_source = new_fields.get("source_confidence_score") or 0
+    if new_source > prev_source:
+        reasons.append("new official confirmation")
+    prev_regime = previous_row.get("market_regime") or ""
+    new_regime = new_fields.get("market_regime") or ""
+    if "RISK_ON" in new_regime and "RISK_ON" not in prev_regime:
+        reasons.append("market regime improved")
+    if not reasons:
+        reasons.append("re-evaluation")
+    return "; ".join(reasons)
+
+
+def capture_trade_decision_context(database_url, user_id, trade_id, ticker, action, price=None,
+                                     entry_score=None, market_context=None):
+    """指示書1・2・3・4・5番：売買判断（ENTRY/ADD/HOLD/EXIT/STOP）時点のdecision_support
+    snapshotを保存する。immutable（一切UPDATEしない、呼ぶ度に新しい行を積む）。
+    available_data_at/captured_atは常に「今」——過去に遡って良く見せない（no hindsight、
+    指示書2番）。"""
+    if investment_db is None or not database_url:
+        return None
+    market_context = market_context or {}
+    summary = build_ticker_intelligence_summary(database_url, ticker)
+    since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)).isoformat()
+    rows = investment_db.list_event_decision_support_for_ticker(database_url, ticker, since_iso)
+    best = max(rows, key=lambda r: r.get("decision_support_score") or 0, default=None)
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    fields = {
+        "trade_id": str(trade_id), "ticker": ticker, "action": action, "price": price,
+        "entry_score": entry_score,
+        "event_support_state": (best or {}).get("decision_support_state"),
+        "material_quality_score": (best or {}).get("material_quality_score"),
+        "reaction_quality_score": (best or {}).get("reaction_quality_score"),
+        "extension_score": (best or {}).get("extension_score"),
+        "decision_support_score": (best or {}).get("decision_support_score"),
+        "pullback_candidate": summary.get("pullback_candidate", False),
+        "avoid_chase": summary.get("avoid_chase", False),
+        "active_event_ids_json": [r.get("event_id") for r in rows],
+        "market_regime_json": market_context.get("market_regime") or [],
+        "sector_strength_json": market_context.get("sector_strength") or {},
+        "available_data_at": now_utc.isoformat(),
+    }
+    return investment_db.create_trade_decision_context(database_url, user_id, fields)
+
+
+def capture_trade_decision_context_safe(database_url, user_id, trade_id, ticker, action, price=None,
+                                           entry_score=None, market_context=None):
+    try:
+        return capture_trade_decision_context(database_url, user_id, trade_id, ticker, action, price,
+                                                entry_score, market_context)
+    except Exception as e:
+        print("  Market Intelligence: trade decision context保存で例外（無視して続行）", e)
+        return None
+
+
+# 指示書7番：GOOD/BAD_DECISION × GOOD/BAD_RESULT。「勝った＝正しい判断」「負けた＝悪い判断」
+# としない（指示書44番、最重要原則）。
+def evaluate_decision_was_good(entry_context, rule_compliant=True):
+    """判断が良かったかどうかは、ENTRY時点で見えていた情報だけで判定する（no hindsight）。
+    avoid_chaseで入った・event_support_stateがCAUTION/AVOID/AVOID_CHASEだった・ルール違反が
+    あった、のいずれかがあれば「悪い判断」とみなす。"""
+    if not entry_context:
+        return None
+    if not rule_compliant:
+        return False
+    if entry_context.get("avoid_chase"):
+        return False
+    if entry_context.get("event_support_state") in ("AVOID", "AVOID_CHASE", "CAUTION"):
+        return False
+    return True
+
+
+def classify_decision_quality(decision_was_good, outcome_was_good):
+    """指示書7番：GOOD_DECISION_GOOD_RESULT/GOOD_DECISION_BAD_RESULT/
+    BAD_DECISION_GOOD_RESULT/BAD_DECISION_BAD_RESULT。"""
+    if decision_was_good is None or outcome_was_good is None:
+        return None
+    if decision_was_good and outcome_was_good:
+        return "GOOD_DECISION_GOOD_RESULT"
+    if decision_was_good and not outcome_was_good:
+        return "GOOD_DECISION_BAD_RESULT"
+    if not decision_was_good and outcome_was_good:
+        return "BAD_DECISION_GOOD_RESULT"
+    return "BAD_DECISION_BAD_RESULT"
+
+
+def classify_entry_timing_quality(entry_context):
+    """指示書8番：EARLY_GOOD/GOOD_ENTRY/LATE_ENTRY/CHASE_ENTRY。extension_scoreを軸にする
+    （Phase9のextension_scoreをそのまま再利用、指示書8番の指定通り）。"""
+    if not entry_context:
+        return None
+    if entry_context.get("avoid_chase"):
+        return "CHASE_ENTRY"
+    ext = entry_context.get("extension_score")
+    if ext is None:
+        return "GOOD_ENTRY"
+    if ext <= 20:
+        return "EARLY_GOOD"
+    if ext <= 50:
+        return "GOOD_ENTRY"
+    if ext <= 80:
+        return "LATE_ENTRY"
+    return "CHASE_ENTRY"
+
+
+def classify_exit_timing_quality(exit_context, pnl_pct=None):
+    """指示書8番：PREMATURE_EXIT/GOOD_EXIT/LATE_EXIT。exit時点のevent_support_stateと
+    結果損益を組み合わせる。"""
+    if not exit_context:
+        return None
+    state = exit_context.get("event_support_state")
+    if state in ("AVOID_CHASE", "AVOID") and (pnl_pct or 0) > 0:
+        return "GOOD_EXIT"  # 過熱・弱気化する前に利確できた
+    if state in ("STRONG_SUPPORT", "SUPPORTIVE") and (pnl_pct or 0) > 0:
+        return "PREMATURE_EXIT"  # まだ支持的な状態なのに降りた（machine視点の参考情報）
+    if (pnl_pct or 0) < 0:
+        return "LATE_EXIT"
+    return "GOOD_EXIT"
+
+
+def classify_timing_quality(entry_context, exit_context=None, pnl_pct=None):
+    """指示書8番：entry側のtiming（CHASE_ENTRY/LATE_ENTRY等）を優先し、entry側に問題が
+    無ければexit側の判定を採用する。"""
+    entry_timing = classify_entry_timing_quality(entry_context)
+    if entry_timing in ("CHASE_ENTRY", "LATE_ENTRY"):
+        return entry_timing
+    if exit_context:
+        exit_timing = classify_exit_timing_quality(exit_context, pnl_pct)
+        if exit_timing:
+            return exit_timing
+    return entry_timing
+
+
+def compute_mfe_mae_pct(entry_price, high_since_entry=None, low_since_entry=None):
+    """指示書6番：max_favorable_excursion_pct・max_adverse_excursion_pct。"""
+    if not entry_price:
+        return None, None
+    mfe = round((high_since_entry - entry_price) / entry_price * 100, 2) if high_since_entry is not None else None
+    mae = round((low_since_entry - entry_price) / entry_price * 100, 2) if low_since_entry is not None else None
+    return mfe, mae
+
+
+EVENT_SUPPORT_ACCURACY_FALSE_POSITIVE_STATES = ("STRONG_SUPPORT", "SUPPORTIVE")
+EVENT_SUPPORT_ACCURACY_FALSE_NEGATIVE_STATES = ("CAUTION", "AVOID", "AVOID_CHASE")
+EVENT_SUPPORT_ACCURACY_MISSED_UPSIDE_THRESHOLD_PCT = 10.0
+
+
+def classify_event_support_accuracy(entry_context, pnl_pct):
+    """指示書21・22番：false positive（STRONG_SUPPORT/SUPPORTIVEだったのに下落）・
+    false negative（CAUTION/AVOID/AVOID_CHASEだったのにさらに大きく上昇）を判定する。"""
+    if not entry_context or pnl_pct is None:
+        return None
+    state = entry_context.get("event_support_state")
+    if state is None:
+        return None
+    if state in EVENT_SUPPORT_ACCURACY_FALSE_POSITIVE_STATES and pnl_pct < 0:
+        return "FALSE_POSITIVE"
+    if state in EVENT_SUPPORT_ACCURACY_FALSE_NEGATIVE_STATES and pnl_pct >= EVENT_SUPPORT_ACCURACY_MISSED_UPSIDE_THRESHOLD_PCT:
+        return "FALSE_NEGATIVE"
+    return "ACCURATE"
+
+
+def classify_rule_compliance(rule_triggered, entry_or_exit_event_support_state):
+    """指示書23・24番：既存ルール（NO_OVERNIGHT・-8%強制売却等）とevent_decision_contextを
+    同時に評価する。ルールが発動しevent supportが強気だった場合はRULE_OVERRIDES_EVENT
+    （ルール優先が正しい挙動——ルールを軽視しない）。"""
+    if rule_triggered and entry_or_exit_event_support_state in ("STRONG_SUPPORT", "SUPPORTIVE"):
+        return "RULE_OVERRIDES_EVENT"
+    if rule_triggered:
+        return "RULE_COMPLIANT_EXIT"
+    return "COMPLIANT"
+
+
+WAIT_MISSED_BREAKOUT_THRESHOLD_PCT = 15.0
+
+
+def classify_wait_outcome(subsequent_return_pct, pullback_then_supportive=False):
+    """指示書30・31番：CORRECT_WAIT/GOOD_PULLBACK/MISSED_BREAKOUT/NO_EDGE。"""
+    if pullback_then_supportive:
+        return "GOOD_PULLBACK"
+    if subsequent_return_pct is None:
+        return "NO_EDGE"
+    if subsequent_return_pct <= 0:
+        return "CORRECT_WAIT"
+    if subsequent_return_pct >= WAIT_MISSED_BREAKOUT_THRESHOLD_PCT:
+        return "MISSED_BREAKOUT"
+    return "NO_EDGE"
+
+
+def compute_opportunity_cost_pct(subsequent_return_pct, wait_outcome):
+    """指示書32番：MISSED_BREAKOUTのみopportunity_cost_pctを記録する（損失とは別扱い、
+    daily scoreへの影響は小さくする方針——ここでは値の算出のみ行い、重み付けは呼び出し側）。"""
+    if wait_outcome == "MISSED_BREAKOUT" and subsequent_return_pct is not None:
+        return round(subsequent_return_pct, 2)
+    return None
+
+
+def compute_avoided_loss_pct(subsequent_return_pct, was_avoid_chase):
+    """指示書33番：AVOID_CHASEで見送りその後急落した場合、避けた損失を記録する
+    （「取らなかった利益」だけでなく「避けた損失」も評価する）。"""
+    if was_avoid_chase and subsequent_return_pct is not None and subsequent_return_pct < 0:
+        return round(abs(subsequent_return_pct), 2)
+    return None
+
+
+def evaluate_trade_outcome(database_url, user_id, trade_id, exit_price=None, high_since_entry=None,
+                             low_since_entry=None, rule_triggered=False):
+    """指示書6〜9・21〜24番の統合オーケストレーション。trade_decision_contextの
+    ENTRY/ADD（最初）とEXIT/STOP（最後）を突き合わせ、decision_quality・timing_quality・
+    rule_compliance・event_support_accuracyを算出しtrade_outcome_evaluationsへ保存する。"""
+    if investment_db is None or not database_url:
+        return None
+    contexts = investment_db.list_trade_decision_contexts_for_trade(database_url, str(trade_id))
+    if not contexts:
+        return None
+    entry_context = next((c for c in contexts if c.get("action") in ("ENTRY", "ADD")), contexts[0])
+    exit_context = next((c for c in reversed(contexts) if c.get("action") in ("EXIT", "STOP")), None)
+    entry_price = entry_context.get("price")
+    resolved_exit_price = exit_price if exit_price is not None else (exit_context or {}).get("price")
+    pnl_pct = None
+    if entry_price and resolved_exit_price:
+        pnl_pct = round((resolved_exit_price - entry_price) / entry_price * 100, 2)
+    mfe, mae = compute_mfe_mae_pct(entry_price, high_since_entry, low_since_entry)
+    rule_compliance = classify_rule_compliance(
+        rule_triggered, (exit_context or entry_context).get("event_support_state"))
+    decision_was_good = evaluate_decision_was_good(entry_context, rule_compliant=(rule_compliance != "RULE_OVERRIDES_EVENT" or not rule_triggered))
+    outcome_was_good = (pnl_pct or 0) > 0 if pnl_pct is not None else None
+    decision_quality = classify_decision_quality(decision_was_good, outcome_was_good)
+    timing_quality = classify_timing_quality(entry_context, exit_context, pnl_pct)
+    event_support_accuracy = classify_event_support_accuracy(entry_context, pnl_pct)
+    fields = {
+        "ticker": entry_context.get("ticker"), "entry_context_id": entry_context.get("id"),
+        "exit_context_id": (exit_context or {}).get("id"), "pnl_pct": pnl_pct,
+        "max_favorable_excursion_pct": mfe, "max_adverse_excursion_pct": mae,
+        "decision_quality": decision_quality, "timing_quality": timing_quality,
+        "rule_compliance": rule_compliance, "event_support_accuracy": event_support_accuracy,
+        "review_notes_json": [],
+    }
+    return investment_db.upsert_trade_outcome_evaluation(database_url, user_id, str(trade_id), fields)
+
+
+def evaluate_trade_outcome_safe(database_url, user_id, trade_id, exit_price=None, high_since_entry=None,
+                                   low_since_entry=None, rule_triggered=False):
+    try:
+        return evaluate_trade_outcome(database_url, user_id, trade_id, exit_price, high_since_entry,
+                                        low_since_entry, rule_triggered)
+    except Exception as e:
+        print("  Market Intelligence: trade outcome評価で例外（無視して続行）", e)
+        return None
+
+
+def replay_decision_support_at(database_url, event_id, ticker, as_of_iso, event_type_performance=None):
+    """指示書14・15・28番：過去のある時点(as_of)で「何が見えていたか」だけを使って
+    decision_supportを再現する。as_of以降に得られたevidence・reactionは一切使わない
+    （未来データ禁止、指示書14番）。extension_score（価格系列が必要）は現行では再現不可
+    のためNone（既知の制約、コメントで明記）。"""
+    empty = {"as_of": as_of_iso, "decision_support_state": None, "decision_support_score": None,
+              "note": "この時点のevidence不足のため再現できません。"}
+    if investment_db is None or not database_url:
+        return empty
+    event = investment_db.get_underlying_event(database_url, event_id)
+    if not event:
+        return empty
+    try:
+        as_of = datetime.datetime.fromisoformat(str(as_of_iso).replace("Z", "+00:00"))
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=datetime.timezone.utc)
+    except Exception:
+        return empty
+    evidence = investment_db.list_underlying_event_evidence(database_url, event_id)
+    evidence_at_time = [e for e in evidence if e.get("posted_at") and str(e["posted_at"]) <= as_of_iso]
+    independent_count = compute_independent_source_count(evidence_at_time) if evidence_at_time else \
+        (event.get("independent_source_count") or 0)
+    confidence_level = classify_event_confidence_level(event.get("primary_source_type"), independent_count) \
+        if evidence_at_time else event.get("confidence_level")
+    effective_event = dict(event)
+    effective_event["independent_source_count"] = independent_count
+    effective_event["confidence_level"] = confidence_level
+    material_quality = compute_material_quality_score(effective_event, event_type_performance)
+
+    reactions = investment_db.list_event_market_reactions_for_event(database_url, event_id)
+    evaluated = [r for r in reactions if r.get("evaluation_status") == "EVALUATED" and r.get("ticker") == ticker
+                 and r.get("target_type") == "STOCK" and r.get("evaluated_at") and str(r["evaluated_at"]) <= as_of_iso]
+    returns_by_window = {r["reaction_window"]: r.get("stock_return_pct") for r in evaluated}
+    pattern = classify_reaction_pattern(returns_by_window) if returns_by_window else None
+    reaction_quality = compute_reaction_quality_score(returns_by_window, reaction_pattern=pattern) if returns_by_window else 0.0
+
+    try:
+        market_relevant_at = datetime.datetime.fromisoformat(
+            str(resolve_event_market_relevant_at(event)).replace("Z", "+00:00"))
+        if market_relevant_at.tzinfo is None:
+            market_relevant_at = market_relevant_at.replace(tzinfo=datetime.timezone.utc)
+        minutes_since_event = (as_of - market_relevant_at).total_seconds() / 60
+    except Exception:
+        minutes_since_event = None
+    freshness = compute_freshness_score(minutes_since_event) if minutes_since_event is not None and minutes_since_event >= 0 else None
+
+    perf_entry = (event_type_performance or {}).get(event.get("event_type"))
+    historical_edge, _quality = compute_historical_edge_score(perf_entry)
+    source_confidence = compute_source_confidence_score(confidence_level)
+
+    score = compute_decision_support_score(material_quality, reaction_quality, freshness, historical_edge,
+                                             None, source_confidence)
+    state = classify_decision_support_state(score)
+    return {
+        "as_of": as_of_iso, "material_quality_score": material_quality, "reaction_quality_score": reaction_quality,
+        "freshness_score": freshness, "historical_edge_score": historical_edge, "decision_support_score": score,
+        "decision_support_state": state,
+        "note": "replay: as_of時点で観測可能だった情報のみ使用。extension_scoreは過去の価格系列が"
+                "必要なため今回は再現していません（既知の制約）。",
+    }
+
+
+def replay_decision_support_series(database_url, event_id, ticker, as_of_list, event_type_performance=None):
+    """指示書14・36番：複数時点をまとめてreplayし、タイムライン表示用の配列を返す。"""
+    return [replay_decision_support_at(database_url, event_id, ticker, as_of, event_type_performance)
+            for as_of in (as_of_list or [])]
+
+
+# ---- 指示書16〜20・25・26・37番：calibration（実データに基づく重み較正の準備） ----
+
+CALIBRATION_MIN_SAMPLE = 30
+CALIBRATION_REFERENCE_SAMPLE = 50
+
+
+def _simple_pearson_corr(pairs):
+    """外部統計ライブラリを使わない単純なピアソン相関係数（他のPhaseと同じ方針）。"""
+    pairs = [(x, y) for x, y in pairs if x is not None and y is not None]
+    n = len(pairs)
+    if n < 2:
+        return 0.0
+    mx = sum(p[0] for p in pairs) / n
+    my = sum(p[1] for p in pairs) / n
+    cov = sum((p[0] - mx) * (p[1] - my) for p in pairs)
+    vx = sum((p[0] - mx) ** 2 for p in pairs)
+    vy = sum((p[1] - my) ** 2 for p in pairs)
+    if vx <= 0 or vy <= 0:
+        return 0.0
+    return cov / ((vx ** 0.5) * (vy ** 0.5))
+
+
+def suggest_calibrated_weights(samples, current_weights=None):
+    """指示書17番：現在の重みと、実績相関に基づく緩やかな提案重みを比較する。自動適用は
+    絶対に行わない（呼び出し側もこの戻り値をそのまま保存・自動反映してはならない、
+    指示書17番REQUIRED）。"""
+    current = current_weights or {"material_quality": DECISION_SUPPORT_WEIGHTS["material_quality"],
+                                    "reaction_quality": DECISION_SUPPORT_WEIGHTS["reaction_quality"]}
+    material_corr = _simple_pearson_corr([(s.get("material_quality_score"), s.get("pnl_pct")) for s in samples])
+    reaction_corr = _simple_pearson_corr([(s.get("reaction_quality_score"), s.get("pnl_pct")) for s in samples])
+    correlations = {"material_quality": max(material_corr, 0), "reaction_quality": max(reaction_corr, 0)}
+    corr_total = sum(correlations.values()) or 1e-9
+    total_weight = sum(current.values())
+    suggested = {}
+    for key in current:
+        corr_share = correlations[key] / corr_total
+        # 現在の重みと相関ベース比率の平均でなだらかに寄せる（急激な変更をしない）。
+        suggested[key] = (current[key] + total_weight * corr_share) / 2
+    suggested_total = sum(suggested.values()) or 1e-9
+    factor = total_weight / suggested_total
+    suggested = {k: round(v * factor, 3) for k, v in suggested.items()}
+    return {"current": {k: round(v, 3) for k, v in current.items()}, "suggested": suggested}
+
+
+def compute_decision_support_calibration(samples, current_weights=None):
+    """指示書16・17・18番：sample_count<30は較正禁止（INSUFFICIENT_SAMPLE）、50以上で
+    REFERENCE（参考値として十分）、30〜49はPROVISIONAL。samplesは各要素が
+    material_quality_score/reaction_quality_score/decision_support_state/pnl_pctを持つdict
+    のリスト（trade_outcome_evaluations×entry_contextの結合、呼び出し側で用意する）。"""
+    n = len(samples)
+    if n < CALIBRATION_MIN_SAMPLE:
+        return {"sample_count": n, "status": "INSUFFICIENT_SAMPLE", "hit_rate_by_state": {},
+                "avg_return_by_state": {}, "suggested_weights": None,
+                "note": f"サンプル{n}件（{CALIBRATION_MIN_SAMPLE}件未満）のため較正は行いません。"}
+    status = "REFERENCE" if n >= CALIBRATION_REFERENCE_SAMPLE else "PROVISIONAL"
+    by_state = {}
+    for s in samples:
+        by_state.setdefault(s.get("decision_support_state"), []).append(s)
+    hit_rate_by_state, avg_return_by_state = {}, {}
+    for state, items in by_state.items():
+        pnls = [i["pnl_pct"] for i in items if i.get("pnl_pct") is not None]
+        if pnls:
+            hit_rate_by_state[state] = round(sum(1 for p in pnls if p > 0) / len(pnls), 3)
+            avg_return_by_state[state] = round(sum(pnls) / len(pnls), 2)
+    return {
+        "sample_count": n, "status": status, "hit_rate_by_state": hit_rate_by_state,
+        "avg_return_by_state": avg_return_by_state,
+        "suggested_weights": suggest_calibrated_weights(samples, current_weights),
+        "note": "自動適用は行いません。参考値としてのみ利用してください（指示書17・18番）。",
+    }
+
+
+def compute_calibration_by_market_regime(samples, current_weights=None):
+    """指示書19番：RISK_ON/RISK_OFF/HIGH_VOL等、regime別に較正データを分析可能にする
+    （Phase5のmarket_regime文字列をそのまま再利用）。"""
+    by_regime = {}
+    for s in samples:
+        regimes = (s.get("market_regime") or "UNKNOWN").split(",") if s.get("market_regime") else ["UNKNOWN"]
+        for regime in regimes:
+            by_regime.setdefault(regime or "UNKNOWN", []).append(s)
+    return {regime: compute_decision_support_calibration(items, current_weights) for regime, items in by_regime.items()}
+
+
+def compute_calibration_by_event_type(samples, current_weights=None):
+    """指示書20番：BUYBACK/GUIDANCE_REVISION/TOB_MA/CAPITAL_RAISE等、event_type別に
+    最適な判断基準が異なることを検証可能にする。"""
+    by_type = {}
+    for s in samples:
+        by_type.setdefault(s.get("event_type"), []).append(s)
+    return {et: compute_decision_support_calibration(items, current_weights) for et, items in by_type.items()}
+
+
+def find_decision_support_false_positives(samples, pnl_threshold=0.0):
+    """指示書21番：STRONG_SUPPORT/SUPPORTIVEだったのにその後下落したケースを抽出する。"""
+    return [s for s in samples if s.get("decision_support_state") in ("STRONG_SUPPORT", "SUPPORTIVE")
+            and (s.get("pnl_pct") or 0) < pnl_threshold]
+
+
+def find_decision_support_false_negatives(samples, pnl_threshold=EVENT_SUPPORT_ACCURACY_MISSED_UPSIDE_THRESHOLD_PCT):
+    """指示書22番：CAUTION/AVOID/AVOID_CHASEだったのにさらに大きく上昇したケースを抽出する
+    （systemが慎重すぎた可能性の確認）。"""
+    return [s for s in samples if s.get("decision_support_state") in ("CAUTION", "AVOID", "AVOID_CHASE")
+            and (s.get("pnl_pct") or 0) >= pnl_threshold]
+
+
+def build_daily_decision_review(database_url, user_id, review_date):
+    """指示書25・26番：既存の日次振り返り（daily_reviews、スコア計算は無変更）へ追加する
+    補助セクション。良かった判断・悪かった判断・追いかけた取引・押し目を待てた取引等を
+    分類するだけで、既存score_totalの計算式には一切触れない。"""
+    empty = {"good_decisions": 0, "bad_decisions": 0, "chase_entries": 0, "correct_waits": 0,
+              "good_pullbacks": 0, "missed_breakouts": 0, "avoided_losses_pct_total": 0.0, "items": []}
+    if investment_db is None or not database_url:
+        return empty
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    day_start = datetime.datetime.strptime(review_date, "%Y-%m-%d").replace(tzinfo=jst)
+    since_iso = day_start.astimezone(datetime.timezone.utc).isoformat()
+    until_iso = (day_start + datetime.timedelta(days=1)).astimezone(datetime.timezone.utc).isoformat()
+    evaluations = investment_db.list_trade_outcome_evaluations(database_url, user_id, since_iso=since_iso)
+    evaluations = [e for e in evaluations if str(e.get("created_at")) < until_iso]
+    out = dict(empty)
+    out["items"] = []
+    for e in evaluations:
+        if e.get("decision_quality") in ("GOOD_DECISION_GOOD_RESULT", "GOOD_DECISION_BAD_RESULT"):
+            out["good_decisions"] += 1
+        elif e.get("decision_quality") in ("BAD_DECISION_GOOD_RESULT", "BAD_DECISION_BAD_RESULT"):
+            out["bad_decisions"] += 1
+        if e.get("timing_quality") == "CHASE_ENTRY":
+            out["chase_entries"] += 1
+        if e.get("wait_outcome") == "CORRECT_WAIT":
+            out["correct_waits"] += 1
+        if e.get("wait_outcome") == "GOOD_PULLBACK":
+            out["good_pullbacks"] += 1
+        if e.get("wait_outcome") == "MISSED_BREAKOUT":
+            out["missed_breakouts"] += 1
+        if e.get("avoided_loss_pct"):
+            out["avoided_losses_pct_total"] += e["avoided_loss_pct"]
+        out["items"].append({"ticker": e.get("ticker"), "trade_id": e.get("trade_id"),
+                               "decision_quality": e.get("decision_quality"), "timing_quality": e.get("timing_quality"),
+                               "rule_compliance": e.get("rule_compliance"), "pnl_pct": e.get("pnl_pct")})
+    out["avoided_losses_pct_total"] = round(out["avoided_losses_pct_total"], 2)
+    return out
+
+
+def build_daily_decision_review_safe(database_url, user_id, review_date):
+    try:
+        return build_daily_decision_review(database_url, user_id, review_date)
+    except Exception as e:
+        print("  Market Intelligence: 日次decision review生成で例外（無視して続行）", e)
+        return {"good_decisions": 0, "bad_decisions": 0, "chase_entries": 0, "correct_waits": 0,
+                 "good_pullbacks": 0, "missed_breakouts": 0, "avoided_losses_pct_total": 0.0, "items": []}
+
+
+def build_calibration_report(database_url, user_id):
+    """指示書16〜20・37・40番：calibration分析のAPIレスポンス。専用テーブルは作らず、
+    既存データ（trade_decision_context×trade_outcome_evaluations）から動的生成する
+    （指示書16番「既存データから動的生成」で明示的に許容されている方針）。"""
+    empty = {"overall": {"sample_count": 0, "status": "INSUFFICIENT_SAMPLE"}, "by_market_regime": {},
+              "by_event_type": {}, "false_positives": [], "false_negatives": []}
+    if investment_db is None or not database_url:
+        return empty
+    evaluations = investment_db.list_trade_outcome_evaluations(database_url, user_id, limit=1000)
+    samples = []
+    for e in evaluations:
+        entry_ctx = investment_db.get_trade_decision_context(database_url, e.get("entry_context_id")) \
+            if e.get("entry_context_id") else None
+        if not entry_ctx:
+            continue
+        event_type = None
+        active_ids = entry_ctx.get("active_event_ids_json") or []
+        if active_ids:
+            ev = investment_db.get_underlying_event(database_url, active_ids[0])
+            event_type = ev.get("event_type") if ev else None
+        regimes = entry_ctx.get("market_regime_json") or []
+        samples.append({
+            "material_quality_score": entry_ctx.get("material_quality_score"),
+            "reaction_quality_score": entry_ctx.get("reaction_quality_score"),
+            "decision_support_state": entry_ctx.get("event_support_state"),
+            "pnl_pct": e.get("pnl_pct"), "market_regime": ",".join(regimes) if regimes else None,
+            "event_type": event_type,
+        })
+    return {
+        "overall": compute_decision_support_calibration(samples),
+        "by_market_regime": compute_calibration_by_market_regime(samples),
+        "by_event_type": compute_calibration_by_event_type(samples),
+        "false_positives": find_decision_support_false_positives(samples),
+        "false_negatives": find_decision_support_false_negatives(samples),
+    }
+
+
+def build_calibration_report_safe(database_url, user_id):
+    try:
+        return build_calibration_report(database_url, user_id)
+    except Exception as e:
+        print("  Market Intelligence: calibration report生成で例外（無視して続行）", e)
+        return {"overall": {"sample_count": 0, "status": "INSUFFICIENT_SAMPLE"}, "by_market_regime": {},
+                 "by_event_type": {}, "false_positives": [], "false_negatives": []}
+
+
+def get_trade_decision_diagnostics(database_url, user_id):
+    """指示書39番：decision_contexts_today・evaluated_trades・chase_entries・
+    avoid_chase_successes・wait_outcomes_generated・calibration_sample_count。"""
+    if investment_db is None or not database_url:
+        return {"decision_contexts_today": 0, "evaluated_trades": 0, "chase_entries": 0,
+                "avoid_chase_successes": 0, "wait_outcomes_generated": 0, "calibration_sample_count": 0}
+    today_start_iso = datetime.datetime.now(_JST).replace(hour=0, minute=0, second=0, microsecond=0) \
+        .astimezone(datetime.timezone.utc).isoformat()
+    all_time_iso = "2000-01-01T00:00:00+00:00"
+    evaluations = investment_db.list_trade_outcome_evaluations(database_url, user_id, since_iso=all_time_iso)
+    chase_entries = sum(1 for e in evaluations if e.get("timing_quality") == "CHASE_ENTRY")
+    avoid_chase_successes = sum(1 for e in evaluations if e.get("avoided_loss_pct"))
+    wait_outcomes_generated = sum(1 for e in evaluations if e.get("wait_outcome"))
+    return {
+        "decision_contexts_today": investment_db.count_trade_decision_contexts_since(database_url, user_id, today_start_iso),
+        "evaluated_trades": len(evaluations),
+        "chase_entries": chase_entries,
+        "avoid_chase_successes": avoid_chase_successes,
+        "wait_outcomes_generated": wait_outcomes_generated,
+        "calibration_sample_count": len([e for e in evaluations if e.get("pnl_pct") is not None]),
+    }
 
 
 def _nicosoku_morning_commentary(database_url, user_id):
@@ -12763,7 +13338,10 @@ class Handler(SimpleHTTPRequestHandler):
             date = params.get("date", [None])[0] or datetime.date.today().isoformat()
             review = investment_db.get_daily_review(DATABASE_URL, self.current_user, date) \
                 if (investment_db is not None and DATABASE_URL) else None
-            self._send_json({"review": review})
+            # Market Intelligence Phase10新規（指示書25・26番）：既存score_total計算には
+            # 一切触れず、追加専用セクションとして併記する。
+            decision_review = build_daily_decision_review_safe(DATABASE_URL, self.current_user, date)
+            self._send_json({"review": review, "decisionReview": decision_review})
         # ---- 2026-09-10新規（朝一マーケット自動分析システム） ----
         elif self.path.startswith("/api/morning-check/list"):
             qs = urllib.parse.urlparse(self.path).query
@@ -13024,7 +13602,10 @@ class Handler(SimpleHTTPRequestHandler):
             # Phase7（指示書30番）：Underlying Event Engine全体の診断も併せて返す。
             sources = investment_db.list_market_sources(DATABASE_URL) if (investment_db is not None and DATABASE_URL) else []
             event_diag = get_underlying_event_diagnostics(DATABASE_URL)
-            self._send_json({"sources": sources, "configs": MARKET_SOURCE_CONFIGS, "event_engine": event_diag})
+            # Market Intelligence Phase10新規（指示書39番）。
+            trade_decision_diag = get_trade_decision_diagnostics(DATABASE_URL, self.current_user)
+            self._send_json({"sources": sources, "configs": MARKET_SOURCE_CONFIGS, "event_engine": event_diag,
+                              "trade_decision_engine": trade_decision_diag})
         elif self.path.split("?")[0] == "/api/market-intelligence/events":
             # Market Intelligence Phase7新規（指示書23・29番）：event一覧（「重要」タブ主表示）。
             qs = urllib.parse.urlparse(self.path).query
@@ -13128,6 +13709,47 @@ class Handler(SimpleHTTPRequestHandler):
                 self.path.split("?")[0][len("/api/stocks/"):-len("/intelligence-summary")].strip("/"))
             summary = build_ticker_intelligence_summary(DATABASE_URL, ticker) if ticker else {}
             self._send_json(summary)
+        elif self.path.split("?")[0].startswith("/api/trades/") and self.path.split("?")[0].endswith("/decision-context"):
+            # Market Intelligence Phase10新規（指示書38番）：1トレードのENTRY〜EXIT snapshot履歴。
+            trade_id = self.path.split("?")[0][len("/api/trades/"):-len("/decision-context")].strip("/")
+            contexts = investment_db.list_trade_decision_contexts_for_trade(DATABASE_URL, trade_id) \
+                if (investment_db is not None and DATABASE_URL and trade_id) else []
+            self._send_json({"trade_id": trade_id, "contexts": contexts})
+        elif self.path.split("?")[0].startswith("/api/trades/") and self.path.split("?")[0].endswith("/outcome-evaluation"):
+            # Market Intelligence Phase10新規（指示書38番）。
+            trade_id = self.path.split("?")[0][len("/api/trades/"):-len("/outcome-evaluation")].strip("/")
+            evaluation = investment_db.get_trade_outcome_evaluation(DATABASE_URL, trade_id) \
+                if (investment_db is not None and DATABASE_URL and trade_id) else None
+            self._send_json({"trade_id": trade_id, "evaluation": evaluation})
+        elif self.path.split("?")[0].startswith("/api/stocks/") and self.path.split("?")[0].endswith("/decision-replay"):
+            # Market Intelligence Phase10新規（指示書14・15・36・38番）：過去時点のdecision_support
+            # 再現。?event_id=&times=ISO1,ISO2,...（未来データは使わない）。
+            ticker = urllib.parse.unquote(
+                self.path.split("?")[0][len("/api/stocks/"):-len("/decision-replay")].strip("/"))
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            event_id_raw = params.get("event_id", [None])[0]
+            times_raw = params.get("times", [""])[0]
+            times = [t for t in times_raw.split(",") if t]
+            if not event_id_raw or not times or investment_db is None or not DATABASE_URL:
+                self._send_json({"ticker": ticker, "replay": []})
+                return
+            try:
+                event_id = int(event_id_raw)
+            except ValueError:
+                self._send_json({"error": "不正なevent_idです"})
+                return
+            since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=90)).isoformat()
+            perf = aggregate_event_type_performance(
+                investment_db.list_evaluated_event_market_reactions_since(DATABASE_URL, since_iso))
+            replay = replay_decision_support_series(DATABASE_URL, event_id, ticker, times, event_type_performance=perf)
+            self._send_json({"ticker": ticker, "event_id": event_id, "replay": replay})
+        elif self.path.split("?")[0] == "/api/market-intelligence/calibration":
+            # Market Intelligence Phase10新規（指示書16〜20・37・40番）：較正分析（自動適用は
+            # しない、参考値のみ）。
+            report = build_calibration_report_safe(DATABASE_URL, self.current_user) \
+                if (investment_db is not None and DATABASE_URL) else {}
+            self._send_json(report)
         elif self.path.split("?")[0].startswith("/api/market-intelligence/events/"):
             # Market Intelligence Phase7新規（指示書29番）：event単体の詳細。
             try:
@@ -14073,6 +14695,17 @@ class Handler(SimpleHTTPRequestHandler):
             if updated is None:
                 self._send_json({"error": "買値・枚数は正の数で指定してください"})
                 return
+            # Market Intelligence Phase10新規（指示書3・4番）：ENTRY/ADD時点のdecision_support
+            # snapshotを保存するhook。add_position_entry自体は無変更、失敗しても握りつぶし
+            # レスポンスには影響させない。trade_idはportfolio行id（銘柄の保有ライフサイクルを
+            # 通して安定、全売却でportfolio行が消えてもtrade_decision_context側には残る）。
+            try:
+                action = "ENTRY" if len(updated.get("entries") or []) <= 1 else "ADD"
+                capture_trade_decision_context_safe(
+                    DATABASE_URL, self.current_user, updated.get("id"), body.get("code"), action,
+                    price=body.get("price"))
+            except Exception:
+                pass
             self._send_json({"position": updated})
         elif self.path == "/api/portfolio/exit":
             # 2026-09-07新規：保有カードの「売却」確定から呼ぶ。実現損益を計算しtrade_historyへ
@@ -14080,6 +14713,16 @@ class Handler(SimpleHTTPRequestHandler):
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
+            # Market Intelligence Phase10新規（指示書5番）：EXIT時点のsnapshotはportfolio行
+            # 削除前のidを使うため、削除される前に対象行を引いておく。
+            position_id = None
+            try:
+                existing = investment_db.list_portfolio(DATABASE_URL, self.current_user)
+                match = next((p for p in existing if p.get("code") == body.get("code")
+                              and p.get("market") == (body.get("market") or "JP")), None)
+                position_id = match.get("id") if match else None
+            except Exception:
+                position_id = None
             result = investment_db.add_position_exit(
                 DATABASE_URL, self.current_user, body.get("code"), body.get("market") or "JP",
                 body.get("exitPrice"), body.get("shares"))
@@ -14092,7 +14735,28 @@ class Handler(SimpleHTTPRequestHandler):
                         DATABASE_URL, self.current_user, body.get("code"), result["trade"])
                 except Exception:
                     pass
+                if position_id is not None:
+                    try:
+                        capture_trade_decision_context_safe(
+                            DATABASE_URL, self.current_user, position_id, body.get("code"), "EXIT",
+                            price=body.get("exitPrice"))
+                        evaluate_trade_outcome_safe(DATABASE_URL, self.current_user, position_id,
+                                                       exit_price=body.get("exitPrice"))
+                    except Exception:
+                        pass
             self._send_json(result)
+        elif self.path.split("?")[0].startswith("/api/trades/") and self.path.split("?")[0].endswith("/decision-context"):
+            # Market Intelligence Phase10新規（指示書3・4・5・38番）：HOLD等、明示的にsnapshotを
+            # 残したい場合の手動キャプチャ用API（ENTRY/EXITは/api/portfolio/add-entry・exitの
+            # hookで自動的に記録される）。
+            if not self._investment_db_ready():
+                return
+            trade_id = self.path.split("?")[0][len("/api/trades/"):-len("/decision-context")].strip("/")
+            body = self._read_json_body()
+            saved = capture_trade_decision_context_safe(
+                DATABASE_URL, self.current_user, trade_id, body.get("ticker"),
+                body.get("action") or "HOLD", price=body.get("price"), entry_score=body.get("entryScore"))
+            self._send_json({"context": saved})
         elif self.path == "/api/investment-totals/set-initial":
             # 2026-09-07新規：通算実現損益の初期値をユーザーが最初に手入力するためのAPI。
             if not self._investment_db_ready():
