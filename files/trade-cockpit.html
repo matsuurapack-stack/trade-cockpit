@@ -3853,9 +3853,44 @@ function EventEvidenceList({eventId}){
   </div>;
 }
 
+// Market Intelligence Phase8新規（指示書33番）：reaction_classification→簡潔バッジ。
+const REACTION_BADGE_META = {
+  STRONG_POSITIVE: "🚀 強反応", POSITIVE: "✅ ポジティブ", NEUTRAL: "➖ 無反応",
+  NEGATIVE: "⚠ ネガティブ", STRONG_NEGATIVE: "🔻 強ネガティブ",
+};
+const REACTION_WINDOW_LABELS_JP = {"5m":"5分","30m":"30分","1h":"1時間","close":"引け","next_open":"翌寄り","next_close":"翌引け"};
+
+function EventReactionList({eventId}){
+  const [reactions,setReactions]=useState(null);
+  useEffect(()=>{
+    let alive=true;
+    fetchJsonSafe(`/api/market-intelligence/events/${eventId}/reactions`).then(d=>{
+      if(alive&&d&&Array.isArray(d.reactions))setReactions(d.reactions);
+    }).catch(()=>{});
+    return ()=>{alive=false;};
+  },[eventId]);
+  if(!reactions)return <div style={{fontSize:10,color:"var(--inkFaint)",marginTop:4}}>読み込み中…</div>;
+  const direct=reactions.filter(r=>r.relevance==="DIRECT"&&r.target_type==="STOCK");
+  if(direct.length===0)return <div style={{fontSize:10,color:"var(--inkFaint)",marginTop:4}}>reactionはまだありません。</div>;
+  return <div style={{marginTop:4,display:"flex",flexDirection:"column",gap:2}}>
+    {/* 指示書32番：5M/30M/1H/CLOSE/NEXT_CLOSEを表示。 */}
+    {direct.map(r=>
+      <div key={r.id} style={{fontSize:10,color:"var(--inkSoft)"}}>
+        {r.reaction_window} {r.evaluation_status==="EVALUATED"?
+          `${r.stock_return_pct>0?"+":""}${r.stock_return_pct}%${r.market_relative_return_pct!=null?`（TOPIX比${r.market_relative_return_pct>0?"+":""}${r.market_relative_return_pct}%）`:""}`
+          :r.evaluation_status==="NO_DATA"?"データなし":"評価待ち"}
+        {r.extended_move && <span style={{color:"var(--down)",fontWeight:700}}> ⚠EXTENDED_MOVE</span>}
+      </div>
+    )}
+  </div>;
+}
+
 function EventCard({event}){
   const [expanded,setExpanded]=useState(false);
+  const [showReactions,setShowReactions]=useState(false);
   const meta=EVENT_CONFIDENCE_META[event.confidence]||EVENT_CONFIDENCE_META.UNVERIFIED;
+  const mr=event.market_reaction;
+  const primaryReaction=mr&&(mr["30m"]||mr["1h"]||mr["close"]);
   return <div style={{padding:"5px 6px",borderRadius:4,background:"var(--bg)",border:"1px solid var(--rule)",fontSize:11}}>
     <div style={{fontWeight:800}}>{meta.emoji} {agoLabel(event.latest_update_at)}</div>
     <div style={{marginTop:2}}>
@@ -3867,13 +3902,28 @@ function EventCard({event}){
       {event.independent_source_count!=null && <span>（independent: {event.independent_source_count}）</span>}
     </div>
     {event.impact_score!=null && <div style={{fontSize:10,color:"var(--inkSoft)"}}>Impact {event.impact_score}</div>}
+    {/* Phase8新規（指示書32・33・36・44番）：市場反応の簡潔表示＋EXTENDED_MOVE警告
+        （「良い材料」≠「今から買って良い」、追いかけ買いを肯定する材料にはしない）。 */}
+    {mr && <div style={{fontSize:10,marginTop:2}}>
+      {primaryReaction && <span>{REACTION_BADGE_META[primaryReaction.classification]||""} {primaryReaction.return_pct>0?"+":""}{primaryReaction.return_pct}%
+        {primaryReaction.relative_pct!=null?`（TOPIX比${primaryReaction.relative_pct>0?"+":""}${primaryReaction.relative_pct}%）`:""}</span>}
+      {mr.reaction_pattern && <span style={{color:"var(--inkSoft)"}}>　反応：{mr.reaction_pattern}</span>}
+      {event.extended_move && <div style={{color:"var(--down)",fontWeight:700}}>⚠ EXTENDED_MOVE（既に大きく動いた後——高値掴み注意、買い材料として使わない）</div>}
+    </div>}
+    {event.age_hours!=null && event.age_hours>=24 && <div style={{fontSize:9.5,color:"var(--inkFaint)"}}>※{Math.round(event.age_hours)}時間前の情報</div>}
     {event.discovery_lead_seconds!=null && <div style={{fontSize:10,color:"var(--inkFaint)"}}>
       先行検知差：約{Math.round(Math.abs(event.discovery_lead_seconds)/60)}分（system observed official source at基準）
     </div>}
-    <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px",marginTop:3}} onClick={()=>setExpanded(v=>!v)}>
-      {expanded?"▲ evidenceを隠す":"▼ evidenceを見る"}
-    </button>
+    <div style={{display:"flex",gap:6,marginTop:3}}>
+      <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={()=>setExpanded(v=>!v)}>
+        {expanded?"▲ evidenceを隠す":"▼ evidenceを見る"}
+      </button>
+      <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={()=>setShowReactions(v=>!v)}>
+        {showReactions?"▲ 反応詳細を隠す":"▼ 反応詳細を見る"}
+      </button>
+    </div>
     {expanded && <EventEvidenceList eventId={event.event_id}/>}
+    {showReactions && <EventReactionList eventId={event.event_id}/>}
   </div>;
 }
 
@@ -3919,6 +3969,41 @@ function ImportantIntelligenceFeed(){
         </div>
       </div>
     )}
+    <EventTypePerformancePanel/>
+  </div>;
+}
+
+// Market Intelligence Phase8新規（指示書34番）：「材料実績」の折りたたみ。sample不足
+// （sample_count<5）のevent_typeは表示しない（指示書「sample不足は表示しない」）。
+const EVENT_TYPE_LABELS_JP = {
+  BUYBACK: "自社株買い", GUIDANCE_REVISION: "上方修正等", EARNINGS: "決算", TOB_MA: "TOB/M&A",
+  CAPITAL_RAISE: "増資", DIVIDEND: "配当", CENTRAL_BANK: "中銀", ECONOMIC_INDICATOR: "経済指標",
+};
+function EventTypePerformancePanel(){
+  const [perf,setPerf]=useState(null);
+  const [show,setShow]=useState(false);
+  useEffect(()=>{
+    if(!show)return;
+    fetchJsonSafe("/api/market-intelligence/event-performance").then(d=>{
+      if(d&&d.event_type_performance)setPerf(d.event_type_performance);
+    }).catch(()=>{});
+  },[show]);
+  const entries=Object.entries(perf||{}).filter(([,v])=>v.sample_count>=5);
+  return <div style={{marginTop:4}}>
+    <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={()=>setShow(v=>!v)}>
+      {show?"▲ 材料実績を隠す":"▼ 材料実績を見る"}
+    </button>
+    {show && <div style={{fontSize:10.5,marginTop:4,color:"var(--inkSoft)",lineHeight:1.7}}>
+      {entries.length===0 && <div style={{color:"var(--inkFaint)"}}>サンプル不足のため表示できる材料実績がありません。</div>}
+      {entries.map(([et,v])=>
+        <div key={et}>
+          {EVENT_TYPE_LABELS_JP[et]||et}
+          {v.avg_30m_return!=null && <span>　30M平均 {v.avg_30m_return>0?"+":""}{v.avg_30m_return}%</span>}
+          {v.positive_rate!=null && <span>　positive {Math.round(v.positive_rate*100)}%</span>}
+          <span style={{color:"var(--inkFaint)"}}>（{v.sample_count}件）</span>
+        </div>
+      )}
+    </div>}
   </div>;
 }
 

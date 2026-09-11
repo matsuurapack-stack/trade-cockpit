@@ -1036,6 +1036,8 @@ def init_schema(database_url):
         conn.execute(_MIGRATE_SOCIAL_SIGNAL_EVALUATIONS_V3_SQL)
         conn.execute(_SCHEMA_SOCIAL_SIGNAL_ALERTS_SQL)
         conn.execute(_SCHEMA_UNDERLYING_EVENTS_SQL)
+        conn.execute(_MIGRATE_UNDERLYING_EVENTS_V2_SQL)
+        conn.execute(_SCHEMA_EVENT_MARKET_REACTIONS_SQL)
         conn.commit()
 
 
@@ -4961,8 +4963,13 @@ def create_underlying_event(database_url, data):
                   "sector", "country", "event_at", "primary_source_type", "primary_source_url",
                   "confidence", "confidence_level", "importance", "status", "raw_source_count",
                   "independent_source_count", "primary_source_confirmed", "impact_score",
-                  "intelligence_cluster_id"]
-    json_cols = ["direct_tickers_json", "related_tickers_json", "related_sectors_json", "numerical_fingerprint_json"]
+                  "intelligence_cluster_id",
+                  # Phase8（指示書2・3・4・6・12・15番）：追加専用列。
+                  "event_timing", "market_relevant_at", "system_observed_at", "opening_gap_pct",
+                  "material_magnitude", "effectiveness_score", "reaction_pattern", "resolution_date",
+                  "extended_move", "backfill_source"]
+    json_cols = ["direct_tickers_json", "related_tickers_json", "related_sectors_json", "numerical_fingerprint_json",
+                 "event_type_details_json"]
     cols = plain_cols + json_cols
     values = [data.get(c) for c in plain_cols]
     values += [json.dumps(data.get(c), ensure_ascii=False) if data.get(c) is not None else None for c in json_cols]
@@ -5042,7 +5049,8 @@ def update_underlying_event(database_url, event_id, fields):
     pool = _get_pool(database_url)
     if pool is None:
         return None
-    json_cols = {"direct_tickers_json", "related_tickers_json", "related_sectors_json", "numerical_fingerprint_json"}
+    json_cols = {"direct_tickers_json", "related_tickers_json", "related_sectors_json",
+                 "numerical_fingerprint_json", "event_type_details_json"}
     sets, params = [], []
     for k, v in fields.items():
         if k == "first_seen_at":
@@ -5167,6 +5175,269 @@ def count_underlying_event_evidence_since(database_url, since_iso):
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM underlying_event_evidence WHERE created_at >= %s", [since_iso])
             return cur.fetchone()[0]
+
+
+# ============================================================
+# Market Intelligence Phase8（2026-09-14新規）：Event Reaction Engine / Cross-Source
+# Backfill / Resolution Tracking。underlying_eventsを中心に「材料の強さ（impact）」と
+# 「実際の市場反応（effectiveness）」を分離して記録する（指示書12・44番）。既存Phase1〜7の
+# テーブル・ロジックは一切変更しない。売買スコアへの直接加点は今回も行わない。
+# ============================================================
+
+_MIGRATE_UNDERLYING_EVENTS_V2_SQL = """
+ALTER TABLE underlying_events ADD COLUMN IF NOT EXISTS event_timing TEXT;
+ALTER TABLE underlying_events ADD COLUMN IF NOT EXISTS market_relevant_at TIMESTAMPTZ;
+ALTER TABLE underlying_events ADD COLUMN IF NOT EXISTS system_observed_at TIMESTAMPTZ;
+ALTER TABLE underlying_events ADD COLUMN IF NOT EXISTS opening_gap_pct NUMERIC;
+ALTER TABLE underlying_events ADD COLUMN IF NOT EXISTS material_magnitude NUMERIC;
+ALTER TABLE underlying_events ADD COLUMN IF NOT EXISTS event_type_details_json JSONB;
+ALTER TABLE underlying_events ADD COLUMN IF NOT EXISTS effectiveness_score NUMERIC;
+ALTER TABLE underlying_events ADD COLUMN IF NOT EXISTS reaction_pattern TEXT;
+ALTER TABLE underlying_events ADD COLUMN IF NOT EXISTS resolution_date DATE;
+ALTER TABLE underlying_events ADD COLUMN IF NOT EXISTS extended_move BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE underlying_events ADD COLUMN IF NOT EXISTS backfill_source TEXT;
+"""
+
+_SCHEMA_EVENT_MARKET_REACTIONS_SQL = """
+CREATE TABLE IF NOT EXISTS event_market_reactions (
+    id                          SERIAL PRIMARY KEY,
+    event_id                    INTEGER NOT NULL REFERENCES underlying_events(id) ON DELETE CASCADE,
+    ticker                      TEXT NOT NULL,   -- 銘柄ticker、または市場全体反応なら'MARKET'、セクターなら'SECTOR:BANK'等
+    target_type                 TEXT NOT NULL DEFAULT 'STOCK',  -- STOCK|SECTOR|MARKET
+    relevance                   TEXT NOT NULL DEFAULT 'DIRECT', -- DIRECT|RELATED（指示書7・8番、direct/relatedは混ぜない）
+    reaction_window             TEXT NOT NULL,   -- 5M|30M|1H|CLOSE|NEXT_OPEN|NEXT_CLOSE
+    baseline_at                 TIMESTAMPTZ,
+    baseline_price               NUMERIC,
+    due_at                       TIMESTAMPTZ,
+    result_at                    TIMESTAMPTZ,
+    result_price                  NUMERIC,
+    stock_return_pct              NUMERIC,
+    sector_return_pct              NUMERIC,
+    market_return_pct              NUMERIC,
+    sector_relative_return_pct      NUMERIC,
+    market_relative_return_pct      NUMERIC,
+    volume_ratio                    NUMERIC,
+    breadth                          NUMERIC,
+    evaluation_quality               TEXT,     -- EXACT|NEAR_EXACT|ESTIMATED|NO_DATA（Phase4と同じ語彙を再利用）
+    evaluation_status                TEXT NOT NULL DEFAULT 'PENDING',  -- PENDING|EVALUATED|NO_DATA
+    reaction_classification           TEXT,    -- STRONG_POSITIVE|POSITIVE|NEUTRAL|NEGATIVE|STRONG_NEGATIVE
+    extended_move                     BOOLEAN NOT NULL DEFAULT false,
+    notes                             TEXT,
+    created_at                        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    evaluated_at                      TIMESTAMPTZ,
+    UNIQUE (event_id, ticker, reaction_window)
+);
+CREATE INDEX IF NOT EXISTS idx_event_reactions_due ON event_market_reactions(evaluation_status, due_at);
+CREATE INDEX IF NOT EXISTS idx_event_reactions_event ON event_market_reactions(event_id);
+
+CREATE TABLE IF NOT EXISTS prediction_resolutions (
+    id                          SERIAL PRIMARY KEY,
+    event_id                    INTEGER NOT NULL REFERENCES underlying_events(id) ON DELETE CASCADE,
+    topic                        TEXT,
+    probability_at_first_seen     NUMERIC,
+    peak_probability               NUMERIC,
+    final_probability               NUMERIC,
+    resolved_outcome                 BOOLEAN,
+    resolved_at                       TIMESTAMPTZ,
+    created_at                        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at                        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (event_id)
+);
+"""
+
+
+def create_event_market_reactions(database_url, rows):
+    """指示書1・27番：reaction候補行を一括INSERTする（PENDING状態）。UNIQUE
+    (event_id,ticker,reaction_window)によりON CONFLICT DO NOTHINGで重複を防ぐ
+    （scheduler再起動でも二重生成しない）。戻り値：新規作成行数。"""
+    if not rows:
+        return 0
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    cols = ["event_id", "ticker", "target_type", "relevance", "reaction_window", "baseline_at",
+            "baseline_price", "due_at", "evaluation_status", "notes"]
+    inserted = 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            for r in rows:
+                values = [r.get(c) for c in cols]
+                cur.execute(
+                    f"INSERT INTO event_market_reactions ({', '.join(cols)}) "
+                    f"VALUES ({', '.join(['%s'] * len(cols))}) "
+                    f"ON CONFLICT (event_id, ticker, reaction_window) DO NOTHING",
+                    values)
+                inserted += cur.rowcount
+        conn.commit()
+    return inserted
+
+
+def list_due_event_market_reactions(database_url, now_iso, limit=50):
+    """指示書28番：due_at到来分・PENDINGのみ返す（独立scheduler向け）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM event_market_reactions "
+                "WHERE evaluation_status='PENDING' AND due_at IS NOT NULL AND due_at <= %s "
+                "ORDER BY due_at ASC LIMIT %s",
+                [now_iso, limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def save_event_market_reaction_result(database_url, reaction_id, **fields):
+    """reaction結果を保存する。fieldsはevent_market_reactionsの列名（result_price等）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    allowed = {"result_at", "result_price", "stock_return_pct", "sector_return_pct", "market_return_pct",
+               "sector_relative_return_pct", "market_relative_return_pct", "volume_ratio", "breadth",
+               "evaluation_quality", "evaluation_status", "reaction_classification", "extended_move", "notes"}
+    sets, params = [], []
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        sets.append(f"{k}=%s")
+        params.append(v)
+    if not sets:
+        return None
+    sets.append("evaluated_at=now()")
+    params.append(reaction_id)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"UPDATE event_market_reactions SET {', '.join(sets)} WHERE id=%s RETURNING *", params)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_event_market_reactions_for_event(database_url, event_id):
+    """指示書32・40番：event詳細のreaction一覧（UIカード展開・GET /events/:id/reactions）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM event_market_reactions WHERE event_id=%s ORDER BY reaction_window",
+                [event_id])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def list_evaluated_event_market_reactions_since(database_url, since_iso, limit=1000):
+    """指示書14・24番：event_type別集計（aggregate_event_type_performance）用の生データ取得。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT r.*, e.event_type, e.material_magnitude FROM event_market_reactions r "
+                "JOIN underlying_events e ON e.id = r.event_id "
+                "WHERE r.evaluation_status='EVALUATED' AND r.created_at >= %s "
+                "ORDER BY r.created_at DESC LIMIT %s",
+                [since_iso, limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def count_event_market_reactions(database_url, evaluation_status=None, since_iso=None):
+    """指示書39番：diagnostics向け（pending_event_reactions/reactions_evaluated_today/
+    reaction_no_data_count等）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    where, params = [], []
+    if evaluation_status:
+        where.append("evaluation_status=%s")
+        params.append(evaluation_status)
+    if since_iso:
+        where.append("created_at >= %s" if evaluation_status != "EVALUATED" else "evaluated_at >= %s")
+        params.append(since_iso)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM event_market_reactions {clause}", params)
+            return cur.fetchone()[0]
+
+
+def count_event_market_reactions_by_quality(database_url, evaluation_quality, since_iso):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM event_market_reactions WHERE evaluation_quality=%s AND evaluated_at >= %s",
+                [evaluation_quality, since_iso])
+            return cur.fetchone()[0]
+
+
+def upsert_prediction_resolution(database_url, event_id, fields):
+    """指示書21・22番：prediction_resolutions（peak/final probability・resolved_outcome）。
+    INSERT ON CONFLICT (event_id) DO UPDATEでpeak_probabilityは大きい方を保持する。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    cols = ["event_id", "topic", "probability_at_first_seen", "peak_probability", "final_probability",
+            "resolved_outcome", "resolved_at"]
+    values = [event_id] + [fields.get(c) for c in cols[1:]]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO prediction_resolutions ({', '.join(cols)}) "
+                f"VALUES ({', '.join(['%s'] * len(cols))}) "
+                f"ON CONFLICT (event_id) DO UPDATE SET "
+                f"topic=COALESCE(EXCLUDED.topic, prediction_resolutions.topic), "
+                f"peak_probability=GREATEST(COALESCE(EXCLUDED.peak_probability,0), COALESCE(prediction_resolutions.peak_probability,0)), "
+                f"final_probability=COALESCE(EXCLUDED.final_probability, prediction_resolutions.final_probability), "
+                f"resolved_outcome=COALESCE(EXCLUDED.resolved_outcome, prediction_resolutions.resolved_outcome), "
+                f"resolved_at=COALESCE(EXCLUDED.resolved_at, prediction_resolutions.resolved_at), "
+                f"updated_at=now() RETURNING *",
+                values)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_pending_prediction_resolutions(database_url, limit=50):
+    """指示書39番：diagnostics向け（prediction_resolutions_pending）。resolved_outcomeが
+    未確定のものを返す。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM prediction_resolutions WHERE resolved_outcome IS NULL ORDER BY updated_at DESC LIMIT %s",
+                [limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def count_pending_prediction_resolutions(database_url):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM prediction_resolutions WHERE resolved_outcome IS NULL")
+            return cur.fetchone()[0]
+
+
+def list_news_catalysts_for_backfill(database_url, user_id, since_date, limit=100):
+    """指示書23番：news_catalysts backfill用。既存list_news_catalystsをそのまま使い回す
+    （別実装を作らない）。"""
+    return list_news_catalysts(database_url, user_id, from_date=since_date, limit=limit)
+
+
+def list_market_events_for_backfill(database_url, user_id, since_date, limit=100):
+    """指示書24番：market_events backfill用。既存list_market_eventsをそのまま使い回す。"""
+    return list_market_events(database_url, user_id, from_date=since_date, limit=limit)
 
 
 # ---- investment_profile（投資プロフィール。2026-09-02新規） ----

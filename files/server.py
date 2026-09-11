@@ -5974,6 +5974,14 @@ def ingest_market_intelligence_item(database_url, user_id, candidate, evidence):
     is_new = matched_event is None
     primary_type = SOURCE_KIND_TO_PRIMARY_TYPE.get(evidence.get("source_kind"), "SOCIAL")
     if is_new:
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        market_relevant_at_guess = candidate.get("event_at") or evidence.get("posted_at") or now_iso
+        try:
+            _mra_dt = datetime.datetime.fromisoformat(str(market_relevant_at_guess).replace("Z", "+00:00"))
+            if _mra_dt.tzinfo is None:
+                _mra_dt = _mra_dt.replace(tzinfo=datetime.timezone.utc)
+        except Exception:
+            _mra_dt = datetime.datetime.now(datetime.timezone.utc)
         event = investment_db.create_underlying_event(database_url, {
             "event_key": candidate.get("event_key"), "event_type": candidate["event_type"],
             "title": candidate.get("title"), "normalized_title": candidate.get("normalized_title"),
@@ -5985,6 +5993,12 @@ def ingest_market_intelligence_item(database_url, user_id, candidate, evidence):
             "raw_source_count": 0, "independent_source_count": 0, "primary_source_confirmed": False,
             "numerical_fingerprint_json": candidate.get("numerical_fingerprint"),
             "direct_tickers_json": [candidate["ticker"]] if candidate.get("ticker") else [],
+            # Phase8（指示書2・3・4・15・16・17・18・19番）：timing・material magnitude・
+            # event_type別詳細を初回作成時に確定する。
+            "event_timing": classify_event_timing(_mra_dt), "market_relevant_at": market_relevant_at_guess,
+            "system_observed_at": now_iso,
+            "material_magnitude": extract_material_magnitude(candidate.get("title"), candidate["event_type"]),
+            "event_type_details_json": extract_event_type_details(candidate["event_type"], candidate.get("title")),
         })
     else:
         event = matched_event
@@ -6031,6 +6045,11 @@ def ingest_market_intelligence_item(database_url, user_id, candidate, evidence):
         })
     elif not is_new:
         _event_alert_suppressed_count[0] += 1  # 指示書20番：状態が変わらない追加evidenceはno alert
+    if is_new:
+        # 指示書1・28番：reaction候補はevent新規作成時（=最初にevidenceが付いた時点）だけ
+        # 生成する。以降のevidence追加（primary source昇格等）ではreactionを作り直さない
+        # （UNIQUE制約と合わせ、二重生成を防ぐ）。
+        generate_event_market_reactions_for_event_safe(database_url, user_id, event)
     return {"event_id": event["id"], "is_new": is_new, "match_confidence": level if not is_new else "NEW_EVENT",
             "alert_type": alert_type, "confidence_level": confidence_level, "impact_score": impact_score}
 
@@ -6103,6 +6122,16 @@ def maybe_link_prediction_to_macro_event(database_url, user_id, saved_post):
         "posted_at": saved_post.get("posted_at"), "is_primary": False, "is_independent": True,
         "upstream_source": None, "dependency_group": None, "raw_text_summary": text[:80],
     })
+    if added:
+        # 指示書20・21番：resolution_dateの記録とprobabilityのpeak/final追跡。
+        try:
+            posted_at_dt = datetime.datetime.fromisoformat(str(saved_post.get("posted_at")).replace("Z", "+00:00"))
+        except Exception:
+            posted_at_dt = datetime.datetime.now(datetime.timezone.utc)
+        resolution_date = extract_resolution_date(saved_post.get("text") or "", posted_at_dt)
+        if resolution_date and not matched.get("resolution_date"):
+            investment_db.update_underlying_event(database_url, matched["id"], {"resolution_date": resolution_date})
+        track_prediction_resolution_safe(database_url, matched["id"], pm.get("prediction_topic"), pm.get("probability"))
     return matched["id"] if added else None
 
 
@@ -6114,40 +6143,137 @@ def maybe_link_prediction_to_macro_event_safe(database_url, user_id, saved_post)
         return None
 
 
-def backfill_underlying_events(database_url, user_id, limit, dry_run=True):
-    """指示書28番：既存social_market_postsからevent backfillする。limit・dry_runは
-    誤操作防止のため必須（呼び出し側=APIハンドラで必須化）。dry_run=Trueの場合はDBへ
-    書き込まず対象件数・生成予定候補数だけを返す。LOW confidence matchは統合しない
-    （find_matching_underlying_event/ingest側の既定挙動をそのまま使う）。"""
+EVENT_TYPE_MAP_FROM_MARKET_EVENT = {"ECONOMIC": "ECONOMIC_INDICATOR", "CENTRAL_BANK": "CENTRAL_BANK",
+                                     "EARNINGS": "EARNINGS", "POLITICAL": "GOVERNMENT_POLICY",
+                                     "GEOPOLITICAL": "GEOPOLITICS", "PRODUCT_EVENT": "PRODUCT"}
+EVENT_TYPE_MAP_FROM_NEWS_CATALYST = {"MACRO": "ECONOMIC_INDICATOR", "SECTOR_CATALYST": "CORPORATE_NEWS",
+                                      "STOCK_CATALYST": "CORPORATE_NEWS", "EARNINGS": "EARNINGS",
+                                      "CAPITAL_POLICY": "CAPITAL_RAISE", "REGULATION_POLICY": "REGULATION",
+                                      "GEOPOLITICAL": "GEOPOLITICS", "PRODUCT_CATALYST": "PRODUCT"}
+
+
+def _ingest_market_event_row(database_url, user_id, row):
+    """指示書24番：既存market_events（CPI/FOMC/日銀等）を1件underlying_eventへ統合する。
+    macro_labelはtitleから簡易抽出（決定的event_keyが作れるよう最善を尽くす、作れなければ
+    類似判定にフォールバックする既存の仕組みをそのまま使う）。"""
+    title = row.get("title") or ""
+    event_type = EVENT_TYPE_MAP_FROM_MARKET_EVENT.get(row.get("event_type"), "OTHER")
+    ticker = (row.get("affected_stocks") or [None])[0] if row.get("affected_stocks") else None
+    macro_label = classify_event_type_from_text(title) if event_type in ("ECONOMIC_INDICATOR", "CENTRAL_BANK") else None
+    candidate = build_event_candidate_descriptor(event_type, title, ticker=ticker, event_at=row.get("event_date"),
+                                                  macro_label=title[:20] if macro_label else None)
+    evidence = {"source_kind": "EVENT", "source_name": row.get("source") or "market_events",
+                "source_record_id": f"market_event:{row.get('id')}", "source_url": None,
+                "posted_at": row.get("created_at"), "upstream_source": None, "dependency_group": None,
+                "raw_text_summary": title[:80]}
+    return ingest_market_intelligence_item(database_url, user_id, candidate, evidence)
+
+
+def _ingest_news_catalyst_row(database_url, user_id, row):
+    """指示書23番：既存news_catalystsを1件underlying_eventへ統合する。"""
+    title = row.get("title") or ""
+    event_type = EVENT_TYPE_MAP_FROM_NEWS_CATALYST.get(row.get("category"), classify_event_type_from_text(title))
+    ticker = (row.get("affected_stocks") or [None])[0] if row.get("affected_stocks") else None
+    candidate = build_event_candidate_descriptor(event_type, title, ticker=ticker, event_at=row.get("catalyst_date"))
+    evidence = {"source_kind": "NEWS", "source_name": row.get("source") or "news_catalysts",
+                "source_record_id": f"news_catalyst:{row.get('id')}", "source_url": None,
+                "posted_at": row.get("created_at"), "upstream_source": None, "dependency_group": None,
+                "raw_text_summary": title[:80]}
+    return ingest_market_intelligence_item(database_url, user_id, candidate, evidence)
+
+
+def backfill_underlying_events(database_url, user_id, limit, dry_run=True, sources=None):
+    """指示書23・24・25・28番：既存social_market_posts/news_catalysts/market_eventsから
+    event backfillする。sourcesは["social","news","events"]のサブセット（省略時は
+    ["social"]のみ＝Phase7の既存挙動を維持、後方互換）。limit・dry_runは誤操作防止のため
+    必須（呼び出し側=APIハンドラで必須化）。dry_run=Trueの場合はDBへ書き込まず対象件数・
+    生成予定候補数だけを返す。LOW confidence matchは統合しない（find_matching_underlying_
+    event/ingest側の既定挙動をそのまま使う）。"""
     if investment_db is None or not database_url:
         return {"ok": False, "reason": "DB未設定"}
+    sources = sources or ["social"]
     since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=30)).isoformat()
-    posts = investment_db.list_recent_social_posts_all_sources(database_url, since_iso, limit=limit)
+    since_date = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=30)).date().isoformat()
+    posts = investment_db.list_recent_social_posts_all_sources(database_url, since_iso, limit=limit) if "social" in sources else []
+    news_rows = investment_db.list_news_catalysts_for_backfill(database_url, user_id, since_date, limit=limit) if "news" in sources else []
+    event_rows = investment_db.list_market_events_for_backfill(database_url, user_id, since_date, limit=limit) if "events" in sources else []
     if dry_run:
         candidate_total = sum(1 for p in posts if (p.get("stock_breaking_json") or {}).get("ticker")
                                or (p.get("corporate_breaking_json") or {}).get("linked_url")
                                or classify_event_type_from_text(p.get("text") or "") != "OTHER")
-        return {"ok": True, "dry_run": True, "target_posts": len(posts), "candidate_events": candidate_total}
+        candidate_total += len(news_rows) + len(event_rows)
+        return {"ok": True, "dry_run": True, "sources": sources,
+                "target_posts": len(posts), "target_news": len(news_rows), "target_events": len(event_rows),
+                "candidate_events": candidate_total}
     created, linked = 0, 0
     for p in posts:
         try:
             result = maybe_ingest_event_from_post(database_url, user_id, p)
             if result:
-                if result.get("is_new"):
-                    created += 1
-                else:
-                    linked += 1
+                created += 1 if result.get("is_new") else 0
+                linked += 0 if result.get("is_new") else 1
         except Exception as e:
-            print("  Market Intelligence: backfillで例外", p.get("post_id"), e)
-    return {"ok": True, "dry_run": False, "target_posts": len(posts), "created": created, "linked": linked}
+            print("  Market Intelligence: backfill(social)で例外", p.get("post_id"), e)
+    for row in news_rows:
+        try:
+            result = _ingest_market_intelligence_row_safe(_ingest_news_catalyst_row, database_url, user_id, row)
+            if result:
+                created += 1 if result.get("is_new") else 0
+                linked += 0 if result.get("is_new") else 1
+        except Exception as e:
+            print("  Market Intelligence: backfill(news)で例外", row.get("id"), e)
+    for row in event_rows:
+        try:
+            result = _ingest_market_intelligence_row_safe(_ingest_market_event_row, database_url, user_id, row)
+            if result:
+                created += 1 if result.get("is_new") else 0
+                linked += 0 if result.get("is_new") else 1
+        except Exception as e:
+            print("  Market Intelligence: backfill(events)で例外", row.get("id"), e)
+    return {"ok": True, "dry_run": False, "sources": sources, "target_posts": len(posts),
+            "target_news": len(news_rows), "target_events": len(event_rows), "created": created, "linked": linked}
+
+
+def _ingest_market_intelligence_row_safe(fn, database_url, user_id, row):
+    try:
+        return fn(database_url, user_id, row)
+    except Exception as e:
+        print("  Market Intelligence: backfill行処理で例外", e)
+        return None
+
+
+def backfill_event_market_reactions(database_url, user_id, limit=None, event_ids=None, windows=None, dry_run=True):
+    """指示書26番：既存underlying_eventにreactionを事後生成する。event_ids or limitの
+    どちらかが必須（呼び出し側=APIハンドラで必須化）。過去価格が現在時点でしか取得できない
+    場合はevaluation_quality=ESTIMATEDになる（Phase4のclassify_evaluation_qualityが時刻差
+    から自動判定するため、特別なコードは不要）。"""
+    if investment_db is None or not database_url:
+        return {"ok": False, "reason": "DB未設定"}
+    if event_ids:
+        events = [investment_db.get_underlying_event(database_url, eid) for eid in event_ids]
+        events = [e for e in events if e]
+    else:
+        events = investment_db.list_active_underlying_events(database_url, limit=limit or 20)
+    if dry_run:
+        return {"ok": True, "dry_run": True, "target_events": len(events)}
+    created = 0
+    for event in events:
+        try:
+            created += generate_event_market_reactions_for_event(database_url, user_id, event)
+        except Exception as e:
+            print("  Market Intelligence: reaction backfillで例外", event.get("id"), e)
+    return {"ok": True, "dry_run": False, "target_events": len(events), "created": created}
 
 
 def get_underlying_event_diagnostics(database_url):
-    """指示書30番：Underlying Event Engine全体の診断（source別診断=get_market_source_
-    diagnosticsとは別軸、cross-source集計）。"""
+    """指示書30・39番：Underlying Event Engine全体の診断（source別診断=get_market_source_
+    diagnosticsとは別軸、cross-source集計）。Phase8でreaction/prediction resolution関連の
+    項目を追加。"""
     if investment_db is None or not database_url:
         return {"active_underlying_events": 0, "events_created_today": 0, "merged_evidence_today": 0,
-                "duplicate_alerts_suppressed": _event_alert_suppressed_count[0], "official_confirmations_today": 0}
+                "duplicate_alerts_suppressed": _event_alert_suppressed_count[0], "official_confirmations_today": 0,
+                "pending_event_reactions": 0, "reactions_evaluated_today": 0, "reaction_no_data_count": 0,
+                "reaction_estimated_count": 0, "prediction_resolutions_pending": 0}
     today_start_iso = datetime.datetime.now(_JST).replace(hour=0, minute=0, second=0, microsecond=0) \
         .astimezone(datetime.timezone.utc).isoformat()
     return {
@@ -6157,6 +6283,13 @@ def get_underlying_event_diagnostics(database_url):
         "duplicate_alerts_suppressed": _event_alert_suppressed_count[0],
         "official_confirmations_today": investment_db.count_underlying_events_since(
             database_url, today_start_iso, status="CONFIRMED"),
+        "pending_event_reactions": investment_db.count_event_market_reactions(database_url, evaluation_status="PENDING"),
+        "reactions_evaluated_today": investment_db.count_event_market_reactions(
+            database_url, evaluation_status="EVALUATED", since_iso=today_start_iso),
+        "reaction_no_data_count": investment_db.count_event_market_reactions(database_url, evaluation_status="NO_DATA"),
+        "reaction_estimated_count": investment_db.count_event_market_reactions_by_quality(
+            database_url, "ESTIMATED", today_start_iso),
+        "prediction_resolutions_pending": investment_db.count_pending_prediction_resolutions(database_url),
     }
 
 
@@ -6208,13 +6341,53 @@ def get_recent_market_intelligence(database_url, user_id, lookback_minutes=CONSE
     }
 
 
+_REACTION_WINDOW_JSON_KEY = {"5M": "5m", "30M": "30m", "1H": "1h", "CLOSE": "close",
+                              "NEXT_OPEN": "next_open", "NEXT_CLOSE": "next_close"}
+
+
+def build_event_market_reaction_summary(database_url, event_id):
+    """指示書31番：recent_market_intelligence.events[].market_reactionの形式。データが無い
+    windowはキー自体を省略する（指示書「データが無い場合は省略」）。DIRECT・STOCK限定
+    （related/sector/marketは今回この要約には含めない、既知の制約）。"""
+    reactions = investment_db.list_event_market_reactions_for_event(database_url, event_id) if investment_db else []
+    evaluated = [r for r in reactions if r.get("evaluation_status") == "EVALUATED"
+                 and r.get("relevance") == "DIRECT" and r.get("target_type") == "STOCK"]
+    if not evaluated:
+        return None
+    out = {}
+    for r in evaluated:
+        key = _REACTION_WINDOW_JSON_KEY.get(r.get("reaction_window"))
+        if not key:
+            continue
+        out[key] = {"return_pct": r.get("stock_return_pct"), "relative_pct": r.get("market_relative_return_pct"),
+                    "classification": r.get("reaction_classification"), "extended_move": bool(r.get("extended_move"))}
+    if not out:
+        return None
+    returns_by_window = {r["reaction_window"]: r.get("stock_return_pct") for r in evaluated}
+    pattern = classify_reaction_pattern(returns_by_window)
+    if pattern:
+        out["reaction_pattern"] = pattern
+    return out
+
+
 def build_event_summary(database_url, event):
-    """指示書22・23番：GET /api/market-intelligence/events・recent_market_intelligence向けの
-    event要約。confidenceはevent全体のconfidence_level（OFFICIAL_CONFIRMED等の文字列、
-    指示書22番の例に合わせる——数値のconfidence列とは別）。"""
+    """指示書22・23・31・37・38番：GET /api/market-intelligence/events・
+    recent_market_intelligence向けのevent要約。confidenceはevent全体のconfidence_level
+    （OFFICIAL_CONFIRMED等の文字列、指示書22番の例に合わせる——数値のconfidence列とは別）。
+    Phase8でmarket_reaction（指示書31番）・effectiveness_score・extended_move・age_hours
+    （指示書38番、古いeventを現在の判断へ強く混ぜないための目印）を追加。"""
     evidence = investment_db.list_underlying_event_evidence(database_url, event["id"]) if investment_db else []
     sources = sorted({e.get("source_name") for e in evidence if e.get("source_name")})
-    return {
+    age_hours = None
+    try:
+        last_seen = datetime.datetime.fromisoformat(str(event.get("last_seen_at")).replace("Z", "+00:00"))
+        if last_seen.tzinfo is None:
+            last_seen = last_seen.replace(tzinfo=datetime.timezone.utc)
+        age_hours = round((datetime.datetime.now(datetime.timezone.utc) - last_seen).total_seconds() / 3600, 1)
+    except Exception:
+        pass
+    market_reaction = build_event_market_reaction_summary(database_url, event["id"])
+    summary = {
         "event_id": event.get("id"), "event_type": event.get("event_type"), "title": event.get("title"),
         "confidence": event.get("confidence_level"), "status": event.get("status"),
         "first_seen_at": event.get("first_seen_at"), "latest_update_at": event.get("last_seen_at"),
@@ -6225,7 +6398,567 @@ def build_event_summary(database_url, event):
         "impact_score": event.get("impact_score"),
         "primary_source_type": event.get("primary_source_type"), "primary_source_url": event.get("primary_source_url"),
         "discovery_lead_seconds": compute_discovery_lead_seconds(evidence),
+        "effectiveness_score": event.get("effectiveness_score"), "reaction_pattern": event.get("reaction_pattern"),
+        "extended_move": bool(event.get("extended_move")), "age_hours": age_hours,
     }
+    if market_reaction:
+        summary["market_reaction"] = market_reaction  # 指示書31番：データが無ければキー自体を省略
+    summary["reaction_context"] = build_event_reaction_context(database_url, event)  # 指示書37番
+    return summary
+
+
+def build_event_reaction_context(database_url, event):
+    """指示書37番：ChatGPT相談用に「材料自体の強さ」「現在までの株価反応」「相対強度」
+    「既に織り込みが進んでいるか」を分けて渡す。指示書44番の原則（良い材料≠今買って良い）を
+    そのままpayloadの形に落とし込む——EXTENDED_MOVEならalready_priced_inを明示する。"""
+    reactions = investment_db.list_event_market_reactions_for_event(database_url, event["id"]) if investment_db else []
+    evaluated = [r for r in reactions if r.get("evaluation_status") == "EVALUATED"
+                 and r.get("relevance") == "DIRECT" and r.get("target_type") == "STOCK"]
+    latest = max(evaluated, key=lambda r: r.get("evaluated_at") or "", default=None)
+    return {
+        "material_strength": {"impact_score": event.get("impact_score"), "confidence_level": event.get("confidence_level"),
+                               "material_magnitude": event.get("material_magnitude")},
+        "price_reaction_so_far": {"return_pct": (latest or {}).get("stock_return_pct"),
+                                   "window": (latest or {}).get("reaction_window")} if latest else None,
+        "relative_strength": (latest or {}).get("market_relative_return_pct") if latest else None,
+        "already_priced_in": bool(event.get("extended_move")),  # 指示書36・44番
+    }
+
+
+# ============================================================
+# Market Intelligence Phase8（2026-09-14新規）：Event Reaction Engine。underlying_eventを
+# 中心に「材料の強さ（impact_score、事前重要度）」と「実際の市場反応
+# （effectiveness_score、事後）」を分離して記録する（指示書12・44番）。
+# 「良い材料」と「今から買って良い」は別物——強い反応を検出してもBUYは生成しない
+# （指示書36・44番、EXTENDED_MOVEフラグで高値掴み防止材料として使う）。
+# ============================================================
+
+# 指示書2番：event_typeごとの評価windowセット。BREAKING企業材料は寄り付き後の速い反応
+# （5M/30M/1H/CLOSE）、macro系はより長い時間軸（30M/1H/NEXT_OPEN/NEXT_CLOSE）を見る。
+EVENT_REACTION_WINDOWS_BY_TYPE = {
+    "EARNINGS": ("30M", "1H", "CLOSE", "NEXT_OPEN"),
+    "GUIDANCE_REVISION": ("5M", "30M", "1H", "CLOSE"),
+    "BUYBACK": ("5M", "30M", "1H", "CLOSE"),
+    "DIVIDEND": ("30M", "1H", "CLOSE"),
+    "TOB_MA": ("5M", "30M", "1H", "CLOSE"),
+    "CAPITAL_RAISE": ("5M", "30M", "1H", "CLOSE"),
+    "CB_BOND": ("30M", "1H", "CLOSE"),
+    "GOVERNMENT_POLICY": ("30M", "1H", "NEXT_OPEN"),
+    "REGULATION": ("30M", "1H", "CLOSE"),
+    "ECONOMIC_INDICATOR": ("30M", "1H", "NEXT_OPEN", "NEXT_CLOSE"),
+    "CENTRAL_BANK": ("30M", "1H", "NEXT_OPEN", "NEXT_CLOSE"),
+    "GEOPOLITICS": ("30M", "1H", "NEXT_OPEN"),
+    "PRODUCT": ("30M", "1H", "CLOSE"),
+    "CONTRACT": ("30M", "1H", "CLOSE"),
+    "CORPORATE_NEWS": ("30M", "1H", "CLOSE"),
+    "MARKET_MOVE": ("5M", "30M", "1H", "CLOSE"),
+    "PREDICTION_MARKET": ("1H", "NEXT_OPEN"),
+    "OTHER": ("30M", "1H", "CLOSE"),
+}
+EVENT_REACTION_WINDOW_MINUTES = {"5M": 5, "30M": 30, "1H": 60}
+
+
+def classify_event_timing(dt_utc):
+    """指示書4番：PRE_MARKET/IN_SESSION/LUNCH_BREAK/AFTER_CLOSE/OVERNIGHT/NON_TRADING_DAYを
+    JPX calendar helper（Phase4）を再利用して判定する。時刻の境界はここに集約する
+    （指示書「時刻をコード内に散在させない」の方針をPhase8でも踏襲）。"""
+    dt_jst = dt_utc.astimezone(_JST)
+    if not is_jp_trading_day(dt_jst.date()):
+        return "NON_TRADING_DAY"
+    hhmm = dt_jst.strftime("%H:%M")
+    if hhmm < "06:00":
+        return "OVERNIGHT"
+    if hhmm < "09:00":
+        return "PRE_MARKET"
+    if hhmm < "11:30":
+        return "IN_SESSION"
+    if hhmm < "12:30":
+        return "LUNCH_BREAK"
+    if hhmm < "15:30":
+        return "IN_SESSION"
+    if hhmm < "21:00":
+        return "AFTER_CLOSE"
+    return "OVERNIGHT"
+
+
+def resolve_event_market_relevant_at(event, evidence_list=None):
+    """指示書3番：baselineに使う時刻の優先順位＝official event_at→primary_source posted_at→
+    first_seen_at。system_observed_at（システムが実際に検知した時刻＝now）は別途保持し、
+    look-ahead biasを起こさない（過去に遡ってbaselineを捏造しない——baseline_priceの取得
+    自体はsystem_observed_at時点で行う、Phase4の設計をそのまま踏襲）。"""
+    if event.get("event_at"):
+        return event["event_at"]
+    if evidence_list:
+        primary = next((e for e in evidence_list if e.get("is_primary")), None)
+        if primary and primary.get("posted_at"):
+            return primary["posted_at"]
+        # is_primaryが立っていなくても、現在のprimary_source_typeと一致するevidenceを使う。
+        for e in evidence_list:
+            if e.get("posted_at") and SOURCE_KIND_TO_PRIMARY_TYPE.get(e.get("source_kind")) == event.get("primary_source_type"):
+                return e["posted_at"]
+    return event.get("first_seen_at")
+
+
+def _event_reaction_due_at(market_relevant_at, window, timing):
+    """指示書2・4・5・6番：windowとevent timingに応じてdue_atを計算する。AFTER_CLOSEの
+    企業材料はCLOSEを評価せずNEXT_OPENを最初の反応として重視する（指示書5番）。"""
+    minutes = EVENT_REACTION_WINDOW_MINUTES.get(window)
+    if minutes is not None:
+        return market_relevant_at + datetime.timedelta(minutes=minutes)
+    jst_at = market_relevant_at.astimezone(_JST)
+    if window == "CLOSE":
+        if timing == "AFTER_CLOSE":
+            return None  # 指示書5番：当日CLOSEを評価しない
+        d = jst_at.date() if is_jp_trading_day(jst_at.date()) and jst_at < jp_market_close_dt(jst_at.date()) \
+            else next_jp_trading_day(jst_at.date())
+        return jp_market_close_dt(d).astimezone(datetime.timezone.utc)
+    if window == "NEXT_OPEN":
+        return jp_market_open_dt(next_jp_trading_day(jst_at.date())).astimezone(datetime.timezone.utc)
+    if window == "NEXT_CLOSE":
+        return jp_market_close_dt(next_jp_trading_day(jst_at.date())).astimezone(datetime.timezone.utc)
+    return None
+
+
+def _reaction_windows_for_event(event, timing):
+    """指示書2・5・6番：event_type別windowセットをtimingで調整する。AFTER_CLOSEはCLOSEを
+    除きNEXT_OPEN/NEXT_CLOSEを優先、PRE_MARKETは寄り付き後の短い時間軸を重視する。"""
+    base = set(EVENT_REACTION_WINDOWS_BY_TYPE.get(event.get("event_type"), EVENT_REACTION_WINDOWS_BY_TYPE["OTHER"]))
+    if timing == "AFTER_CLOSE":
+        base.discard("CLOSE")
+        base.add("NEXT_OPEN")
+    elif timing in ("PRE_MARKET", "OVERNIGHT"):
+        base |= {"5M", "30M"}
+    return base
+
+
+def generate_event_market_reactions_for_event(database_url, user_id, event):
+    """指示書1・7・8・9・10番：eventのdirect_tickers（最優先）・related_tickers（別集計）・
+    sector・marketについてreaction候補行をPENDINGで作成する。baselineはこの時点
+    （resolve_event_market_relevant_atの時刻を意識しつつ、実際の価格取得は現在時点で行う、
+    Phase4と同じ設計）で確定する。戻り値：新規作成した行数。"""
+    if investment_db is None or not database_url:
+        return 0
+    evidence = investment_db.list_underlying_event_evidence(database_url, event["id"])
+    market_relevant_at_str = resolve_event_market_relevant_at(event, evidence)
+    try:
+        market_relevant_at = datetime.datetime.fromisoformat(str(market_relevant_at_str).replace("Z", "+00:00"))
+        if market_relevant_at.tzinfo is None:
+            market_relevant_at = market_relevant_at.replace(tzinfo=datetime.timezone.utc)
+    except Exception:
+        market_relevant_at = datetime.datetime.now(datetime.timezone.utc)
+    timing = classify_event_timing(market_relevant_at)
+    windows = _reaction_windows_for_event(event, timing)
+    targets = []
+    for t in (event.get("direct_tickers_json") or []):
+        targets.append(("STOCK", t, "DIRECT"))
+    for t in (event.get("related_tickers_json") or []):
+        targets.append(("STOCK", t, "RELATED"))
+    if event.get("sector"):
+        targets.append(("SECTOR", event["sector"], "DIRECT"))
+    if event.get("event_type") in ("ECONOMIC_INDICATOR", "CENTRAL_BANK", "GEOPOLITICS", "PREDICTION_MARKET"):
+        targets.append(("MARKET", "NIKKEI225", "DIRECT"))
+    if not targets:
+        return 0
+    rows = []
+    for target_type, ticker, relevance in targets:
+        baseline_price, baseline_quality = None, "NO_DATA"
+        try:
+            if target_type == "STOCK":
+                snap = _fetch_raw_price_snapshot("STOCK", ticker)
+            elif target_type == "MARKET":
+                snap = _fetch_raw_price_snapshot("MARKET", ticker)
+            else:
+                snap = None  # SECTORはper-member snapshotが必要なため、result側でまとめて処理する
+            if snap:
+                baseline_price = snap["price"]
+                baseline_quality = _classify_evaluation_quality(snap.get("captured_at"), market_relevant_at, snap.get("quality_hint"))
+        except Exception as e:
+            print("  Market Intelligence: reaction baseline取得失敗", ticker, e)
+        for window in windows:
+            due_at = _event_reaction_due_at(market_relevant_at, window, timing)
+            if due_at is None:
+                continue
+            rows.append({
+                "event_id": event["id"], "ticker": ticker, "target_type": target_type, "relevance": relevance,
+                "reaction_window": window, "baseline_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "baseline_price": baseline_price, "due_at": due_at.isoformat(),
+                "evaluation_status": "PENDING",
+                "notes": None if baseline_price is not None else f"quality={baseline_quality}",
+            })
+    return investment_db.create_event_market_reactions(database_url, rows)
+
+
+def generate_event_market_reactions_for_event_safe(database_url, user_id, event):
+    try:
+        return generate_event_market_reactions_for_event(database_url, user_id, event)
+    except Exception as e:
+        print("  Market Intelligence: reaction生成で例外（無視して続行）", e)
+        return 0
+
+
+EVENT_REACTION_EXTENDED_MOVE_THRESHOLD_PCT = {"5M": 5.0, "30M": 8.0, "1H": 10.0}
+
+
+def classify_extended_move(window, return_pct):
+    """指示書36番：強反応（5M+10%等）をEXTENDED_MOVEとしてフラグする——高値掴み防止材料。
+    「良い材料」と「今から買って良い」は別物という原則をコードで担保する（指示書44番）。"""
+    if return_pct is None:
+        return False
+    threshold = EVENT_REACTION_EXTENDED_MOVE_THRESHOLD_PCT.get(window)
+    if threshold is None:
+        return False
+    return abs(return_pct) >= threshold
+
+
+def classify_event_reaction(stock_return_pct, market_relative_return_pct=None, sector_relative_return_pct=None,
+                             volume_ratio=None):
+    """指示書11番：absolute returnだけでなくmarket/sector relative returnとvolumeも考慮した
+    5段階分類。相対リターンが取れる場合はそちらを優先する（地合いだけの値動きを過大評価
+    しない、Phase5のconfirmation_v2と同じ思想）。"""
+    if stock_return_pct is None:
+        return None
+    base = sector_relative_return_pct if sector_relative_return_pct is not None else \
+        (market_relative_return_pct if market_relative_return_pct is not None else stock_return_pct)
+    volume_confirmed = volume_ratio is not None and volume_ratio >= 1.5
+    if base >= 5 or (base >= 3 and volume_confirmed):
+        return "STRONG_POSITIVE"
+    if base >= 1:
+        return "POSITIVE"
+    if base <= -5 or (base <= -3 and volume_confirmed):
+        return "STRONG_NEGATIVE"
+    if base <= -1:
+        return "NEGATIVE"
+    return "NEUTRAL"
+
+
+def classify_reaction_pattern(returns_by_window):
+    """指示書13番：FADE/PERSISTENT/DELAYED/REVERSAL/NO_REACTIONを判定する。
+    returns_by_windowは{"5M":pct,"30M":pct,"1H":pct,"CLOSE":pct,...}（無い時間軸はNone可）。
+    order（早い順）で値の推移を見る——初動が大きく後で縮小＝FADE、終始拡大＝PERSISTENT、
+    序盤は動かず終盤に動く＝DELAYED、途中で符号反転＝REVERSAL、終始小さい＝NO_REACTION。"""
+    order = ["5M", "30M", "1H", "CLOSE", "NEXT_OPEN", "NEXT_CLOSE"]
+    seq = [(w, returns_by_window[w]) for w in order if returns_by_window.get(w) is not None]
+    if not seq:
+        return None
+    values = [v for _, v in seq]
+    if all(abs(v) < 1 for v in values):
+        return "NO_REACTION"
+    signs = {1 if v > 0 else (-1 if v < 0 else 0) for v in values if abs(v) >= 1}
+    if len(signs) > 1 and 0 not in signs:
+        return "REVERSAL"
+    first, last = values[0], values[-1]
+    if abs(first) < 1 and abs(last) >= 2:
+        return "DELAYED"
+    if abs(first) >= 2 and abs(last) < abs(first) * 0.5:
+        return "FADE"
+    if abs(last) >= abs(first):
+        return "PERSISTENT"
+    return "FADE"
+
+
+def compute_event_effectiveness_score(magnitude=None, relative_strength=None, breadth=None,
+                                        volume_ratio=None, persistence_pattern=None):
+    """指示書12番：0〜100。impact_score（事前重要度）とは完全に別軸——実際にどれだけ動いたか
+    だけを見る。"""
+    score = 0
+    if magnitude is not None:
+        score += min(abs(magnitude) * 6, 40)  # 目安：magnitude 6.7%で満点40
+    if relative_strength is not None:
+        score += min(abs(relative_strength) * 6, 25)
+    if breadth is not None:
+        score += breadth * 15  # breadthは0〜1
+    if volume_ratio is not None and volume_ratio >= 1:
+        score += min((volume_ratio - 1) * 10, 10)
+    persistence_bonus = {"PERSISTENT": 10, "DELAYED": 6, "FADE": 2, "REVERSAL": 0, "NO_REACTION": 0}
+    score += persistence_bonus.get(persistence_pattern, 0)
+    return round(min(score, 100), 1)
+
+
+def run_due_event_market_reactions(database_url, user_id, limit=50):
+    """指示書28番：due_at到来分・PENDINGのみ処理する独立scheduler向け関数。既存の
+    にこそくpoller・social evaluation schedulerとは競合しない（別テーブル・別関数）。"""
+    result = {"evaluated": 0, "no_data": 0}
+    if investment_db is None or not database_url:
+        return result
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    due = investment_db.list_due_event_market_reactions(database_url, now_utc.isoformat(), limit=limit)
+    if not due:
+        return result
+    topix_pct = _concurrent_topix_change_pct()
+    for r in due:
+        result_price, quality, volume_ratio, breadth = None, "NO_DATA", None, None
+        try:
+            if r["target_type"] == "SECTOR":
+                event = investment_db.get_underlying_event(database_url, r["event_id"])
+                snap = _fetch_sector_snapshot(database_url, user_id, r["ticker"]) if event else None
+                if snap:
+                    result_price = snap["price"]
+                    quality = "NEAR_EXACT"
+                    watchlist = investment_db.list_watchlist(database_url, user_id, market="JP")
+                    members = [w for w in watchlist if _matches_sector(w, r["ticker"])]
+                    quotes = get_stock_quotes(members) if members else {}
+                    pcts = [(quotes[w["code"]]["t"] - quotes[w["code"]]["p"]) / quotes[w["code"]]["p"] * 100
+                            for w in members if quotes.get(w["code"]) and quotes[w["code"]].get("p")]
+                    breadth = round(sum(1 for p in pcts if p > 0) / len(pcts), 3) if pcts else None
+            else:
+                snap = _fetch_raw_price_snapshot(r["target_type"], r["ticker"])
+                if snap:
+                    result_price = snap["price"]
+                    quality = _classify_evaluation_quality(snap.get("captured_at"), now_utc, snap.get("quality_hint"))
+        except Exception as e:
+            print("  Market Intelligence: reaction result取得失敗", r.get("ticker"), e)
+        if result_price is None or r.get("baseline_price") is None:
+            investment_db.save_event_market_reaction_result(database_url, r["id"], evaluation_status="NO_DATA",
+                                                               evaluation_quality="NO_DATA", notes="市場データ取得不能")
+            result["no_data"] += 1
+            continue
+        stock_return_pct = round((result_price - float(r["baseline_price"])) / float(r["baseline_price"]) * 100, 3)
+        market_relative = round(stock_return_pct - topix_pct, 3) if topix_pct is not None else None
+        extended = classify_extended_move(r["reaction_window"], stock_return_pct)
+        classification = classify_event_reaction(stock_return_pct, market_relative_return_pct=market_relative,
+                                                   volume_ratio=volume_ratio)
+        investment_db.save_event_market_reaction_result(
+            database_url, r["id"], result_at=now_utc.isoformat(), result_price=result_price,
+            stock_return_pct=stock_return_pct, market_relative_return_pct=market_relative, volume_ratio=volume_ratio,
+            breadth=breadth, evaluation_quality=quality, evaluation_status="EVALUATED",
+            reaction_classification=classification, extended_move=extended)
+        result["evaluated"] += 1
+        _maybe_update_event_after_reaction_safe(database_url, r["event_id"])
+    return result
+
+
+def _maybe_update_event_after_reaction_safe(database_url, event_id):
+    """指示書12・13・35番：reaction評価が入るたびにeffectiveness_score/reaction_patternを
+    再計算し、閾値を満たせばMARKET_REACTION_CONFIRMED alertを出す。"""
+    try:
+        reactions = investment_db.list_event_market_reactions_for_event(database_url, event_id)
+        evaluated = [r for r in reactions if r.get("evaluation_status") == "EVALUATED" and r.get("relevance") == "DIRECT"
+                     and r.get("target_type") == "STOCK"]
+        if not evaluated:
+            return
+        returns_by_window = {r["reaction_window"]: r.get("stock_return_pct") for r in evaluated}
+        pattern = classify_reaction_pattern(returns_by_window)
+        magnitudes = [abs(r.get("stock_return_pct") or 0) for r in evaluated]
+        relatives = [r.get("market_relative_return_pct") for r in evaluated if r.get("market_relative_return_pct") is not None]
+        breadths = [r.get("breadth") for r in evaluated if r.get("breadth") is not None]
+        effectiveness = compute_event_effectiveness_score(
+            magnitude=max(magnitudes) if magnitudes else None,
+            relative_strength=max((abs(x) for x in relatives), default=None) if relatives else None,
+            breadth=max(breadths) if breadths else None, persistence_pattern=pattern)
+        event = investment_db.get_underlying_event(database_url, event_id)
+        if not event:
+            return
+        extended_move = any(r.get("extended_move") for r in evaluated)
+        investment_db.update_underlying_event(database_url, event_id, {
+            "effectiveness_score": effectiveness, "reaction_pattern": pattern, "extended_move": extended_move,
+        })
+        # 指示書35番：MATERIAL_UPDATE等とは別の、材料+実値確認のalert。
+        thirty_m = next((r for r in evaluated if r["reaction_window"] == "30M"), None)
+        if (event.get("impact_score") or 0) >= 70 and thirty_m and \
+                abs(thirty_m.get("market_relative_return_pct") or 0) >= 3.0:
+            investment_db.create_underlying_event_alert(database_url, event_id, "MARKET_REACTION_CONFIRMED", payload={
+                "event_type": event.get("event_type"), "title": event.get("title"),
+                "reaction_30m_relative_pct": thirty_m.get("market_relative_return_pct"),
+            })
+    except Exception as e:
+        print("  Market Intelligence: reaction後のevent更新で例外（無視して続行）", e)
+
+
+def _event_reaction_scheduler_loop():
+    """指示書28番：既存scheduler（にこそくポーリング・social signal評価等）と競合しない
+    独立処理。pending reaction（due_at到来分）だけを5分間隔で処理する。"""
+    while True:
+        try:
+            if investment_db is not None and DATABASE_URL:
+                user_id = _morning_check_scheduler_users()[0]
+                result = run_due_event_market_reactions(DATABASE_URL, user_id, limit=50)
+                if result["evaluated"] or result["no_data"]:
+                    print(f"  [Market Intelligence] event reaction evaluated={result['evaluated']}件 no_data={result['no_data']}件")
+        except Exception as e:
+            print("  [Market Intelligence] event reaction schedulerループで例外", e)
+        time.sleep(300)
+
+
+def aggregate_event_type_performance(reactions, min_sample=5):
+    """指示書14番：event_type別のsample_count・avg_30m_return・avg_close_return・
+    positive_rateを集計する。sample不足のtypeも数値は出す（sample_countで呼び出し側が
+    判断できるようにする、指示書34番のUI側「sample不足は表示しない」はここでは行わない）。"""
+    by_type = {}
+    for r in reactions:
+        by_type.setdefault(r.get("event_type"), []).append(r)
+    out = {}
+    for et, items in by_type.items():
+        thirty_m = [r["stock_return_pct"] for r in items if r.get("reaction_window") == "30M" and r.get("stock_return_pct") is not None]
+        close = [r["stock_return_pct"] for r in items if r.get("reaction_window") == "CLOSE" and r.get("stock_return_pct") is not None]
+        positives = [r for r in items if r.get("reaction_window") == "30M" and (r.get("stock_return_pct") or 0) > 0]
+        directional = [r for r in items if r.get("reaction_window") == "30M"]
+        entry = {"sample_count": len({r.get("event_id") for r in items})}
+        if thirty_m:
+            entry["avg_30m_return"] = round(sum(thirty_m) / len(thirty_m), 2)
+        if close:
+            entry["avg_close_return"] = round(sum(close) / len(close), 2)
+        if directional:
+            entry["positive_rate"] = round(len(positives) / len(directional), 3)
+        out[et] = entry
+    return out
+
+
+# ---- 指示書15・16・17・19番：material magnitude・event_type別の詳細抽出（best-effort） ----
+
+_MATERIAL_AMOUNT_TO_OKU_RE = re.compile(r"(\d+(?:\.\d+)?)\s*億円")
+_MATERIAL_PCT_RE = re.compile(r"上限\s*(\d+(?:\.\d+)?)\s*%|(\d+(?:\.\d+)?)\s*%")
+
+
+def extract_material_magnitude(text, event_type):
+    """指示書15番：同じevent_typeでも規模を考慮する。金額（億円）か%のどちらか大きい方を
+    採用する簡易ヒューリスティック（既知の制約：業種・時価総額に対する相対規模は未考慮）。"""
+    if not text:
+        return None
+    amounts = [float(m.group(1)) for m in _MATERIAL_AMOUNT_TO_OKU_RE.finditer(text)]
+    pcts = [float(m.group(1) or m.group(2)) for m in _MATERIAL_PCT_RE.finditer(text)]
+    if amounts:
+        return max(amounts)
+    if pcts:
+        return max(pcts)
+    return None
+
+
+_GUIDANCE_REVISION_RE = re.compile(r"(売上高|営業利益|純利益|EPS)[^\d]{0,6}(\d+(?:\.\d+)?)\s*%")
+
+
+def extract_guidance_revision_details(text):
+    """指示書16番：revenue/operating_profit/eps revision%を抽出する（見つかった項目だけ）。"""
+    if not text:
+        return {}
+    label_map = {"売上高": "revenue_revision_pct", "営業利益": "operating_profit_revision_pct", "EPS": "eps_revision_pct"}
+    out = {}
+    for m in _GUIDANCE_REVISION_RE.finditer(text):
+        key = label_map.get(m.group(1))
+        if key:
+            out[key] = float(m.group(2))
+    return out
+
+
+_BUYBACK_SHARES_PCT_RE = re.compile(r"発行済株式.{0,10}?(\d+(?:\.\d+)?)\s*%")
+
+
+def extract_buyback_details(text):
+    """指示書17番：buyback_amount（億円）・buyback_pct_shares（発行済株式比率%）を抽出する。
+    buyback_pct_market_capは時価総額データが必要なため今回未実装（既知の制約）。"""
+    if not text:
+        return {}
+    out = {}
+    amounts = [float(m.group(1)) for m in _MATERIAL_AMOUNT_TO_OKU_RE.finditer(text)]
+    if amounts:
+        out["buyback_amount_oku_yen"] = max(amounts)
+    m = _BUYBACK_SHARES_PCT_RE.search(text)
+    if m:
+        out["buyback_pct_shares"] = float(m.group(1))
+    return out
+
+
+_TOB_OFFER_PRICE_RE = re.compile(r"(?:TOB価格|買付価格|公開買付価格)[^\d]{0,4}(\d+(?:\.\d+)?)\s*円")
+
+
+def extract_tob_details(text, pre_event_price=None):
+    """指示書18番：offer_price・pre_event_price・premium_pctを保存する。pre_event_priceは
+    呼び出し側（イベント検知時点の株価スナップショット）から渡す想定。"""
+    if not text:
+        return {}
+    out = {}
+    m = _TOB_OFFER_PRICE_RE.search(text)
+    if m:
+        offer_price = float(m.group(1))
+        out["offer_price"] = offer_price
+        if pre_event_price:
+            out["pre_event_price"] = pre_event_price
+            out["premium_pct"] = round((offer_price - pre_event_price) / pre_event_price * 100, 2)
+    return out
+
+
+_CAPITAL_RAISE_DILUTION_RE = re.compile(r"希薄化率?[^\d]{0,4}(\d+(?:\.\d+)?)\s*%")
+_CAPITAL_RAISE_CONVERSION_PRICE_RE = re.compile(r"転換価額[^\d]{0,4}(\d+(?:\.\d+)?)\s*円")
+
+
+def extract_capital_raise_details(text):
+    """指示書19番：dilution_pct・issue_amount（億円）・conversion_priceを抽出する。"""
+    if not text:
+        return {}
+    out = {}
+    m = _CAPITAL_RAISE_DILUTION_RE.search(text)
+    if m:
+        out["dilution_pct"] = float(m.group(1))
+    amounts = [float(m.group(1)) for m in _MATERIAL_AMOUNT_TO_OKU_RE.finditer(text)]
+    if amounts:
+        out["issue_amount_oku_yen"] = max(amounts)
+    m2 = _CAPITAL_RAISE_CONVERSION_PRICE_RE.search(text)
+    if m2:
+        out["conversion_price"] = float(m2.group(1))
+    return out
+
+
+EVENT_TYPE_DETAIL_EXTRACTORS = {
+    "GUIDANCE_REVISION": extract_guidance_revision_details,
+    "BUYBACK": extract_buyback_details,
+    "CAPITAL_RAISE": extract_capital_raise_details,
+    "CB_BOND": extract_capital_raise_details,
+}
+
+
+def extract_event_type_details(event_type, text, pre_event_price=None):
+    """指示書16・17・18・19番の統合ディスパッチ。TOB_MAだけpre_event_priceを取る特殊系。"""
+    if event_type == "TOB_MA":
+        return extract_tob_details(text, pre_event_price=pre_event_price)
+    extractor = EVENT_TYPE_DETAIL_EXTRACTORS.get(event_type)
+    return extractor(text) if extractor else {}
+
+
+# ---- 指示書20・21・22番：prediction resolution tracking ----
+
+_RESOLUTION_DATE_RE = re.compile(r"(\d{1,2})/(\d{1,2})\s*(?:に|まで)?(?:解決|resolve|締切|期限)")
+
+
+def extract_resolution_date(text, posted_at):
+    """指示書20番：Polymarket投稿からresolution_dateを抽出する（見つからなければNone、
+    無理に推測しない——書式が定まらないことが多いため保守的に実装、既知の制約）。"""
+    if not text:
+        return None
+    m = _RESOLUTION_DATE_RE.search(text)
+    if not m:
+        return None
+    month, day = int(m.group(1)), int(m.group(2))
+    year = posted_at.year if hasattr(posted_at, "year") else datetime.datetime.now(datetime.timezone.utc).year
+    try:
+        d = datetime.date(year, month, day)
+    except ValueError:
+        return None
+    return d.isoformat()
+
+
+def track_prediction_resolution(database_url, event_id, topic, probability):
+    """指示書21・22番：probability_at_first_seen/peak_probability/final_probabilityを
+    更新する（upsert_prediction_resolutionが単調増加のpeak管理を担当）。Brier score等の
+    calibration計算はPhase8では保存中心にとどめる（指示書22番「保存中心でもよい」）。"""
+    if investment_db is None or not database_url or probability is None:
+        return None
+    existing = None
+    try:
+        pending = investment_db.list_pending_prediction_resolutions(database_url, limit=200)
+        existing = next((p for p in pending if p.get("event_id") == event_id), None)
+    except Exception:
+        pass
+    fields = {"topic": topic, "peak_probability": probability / 100 if probability > 1 else probability}
+    if existing is None:
+        fields["probability_at_first_seen"] = probability / 100 if probability > 1 else probability
+    return investment_db.upsert_prediction_resolution(database_url, event_id, fields)
+
+
+def track_prediction_resolution_safe(database_url, event_id, topic, probability):
+    try:
+        return track_prediction_resolution(database_url, event_id, topic, probability)
+    except Exception as e:
+        print("  Market Intelligence: prediction resolution追跡で例外（無視して続行）", e)
+        return None
 
 
 def _nicosoku_morning_commentary(database_url, user_id):
@@ -11620,6 +12353,29 @@ class Handler(SimpleHTTPRequestHandler):
                 if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"event_id": event_id, "evidence": evidence,
                               "discovery_lead_seconds": compute_discovery_lead_seconds(evidence)})
+        elif self.path.split("?")[0].startswith("/api/market-intelligence/events/") \
+                and self.path.split("?")[0].endswith("/reactions"):
+            # Market Intelligence Phase8新規（指示書32・40番）：event詳細のreaction一覧
+            # （5M/30M/1H/CLOSE/NEXT_CLOSE展開表示用）。
+            try:
+                event_id = int(self.path.split("?")[0][len("/api/market-intelligence/events/"):-len("/reactions")].strip("/"))
+            except ValueError:
+                self._send_json({"error": "不正なevent_idです"})
+                return
+            reactions = investment_db.list_event_market_reactions_for_event(DATABASE_URL, event_id) \
+                if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"event_id": event_id, "reactions": reactions})
+        elif self.path.split("?")[0] == "/api/market-intelligence/event-performance":
+            # Market Intelligence Phase8新規（指示書14・34・40番）：event_type別集計
+            # （「材料実績」折りたたみUI用）。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            lookback_days = int(params.get("lookback_days", ["90"])[0])
+            since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=lookback_days)).isoformat()
+            performance = aggregate_event_type_performance(
+                investment_db.list_evaluated_event_market_reactions_since(DATABASE_URL, since_iso)) \
+                if (investment_db is not None and DATABASE_URL) else {}
+            self._send_json({"event_type_performance": performance})
         elif self.path.split("?")[0].startswith("/api/market-intelligence/events/"):
             # Market Intelligence Phase7新規（指示書29番）：event単体の詳細。
             try:
@@ -12495,7 +13251,42 @@ class Handler(SimpleHTTPRequestHandler):
             if limit <= 0 or limit > 200:
                 self._send_json({"error": "limitは1〜200の範囲で指定してください"})
                 return
-            result = backfill_underlying_events(DATABASE_URL, self.current_user, limit, dry_run=bool(body.get("dry_run")))
+            # Market Intelligence Phase8（指示書25番）：sources（social/news/events）を
+            # 追加。後方互換維持（省略時はPhase7と同じ["social"]のみ）。
+            sources = body.get("sources")
+            if sources is not None and (not isinstance(sources, list)
+                                          or any(s not in ("social", "news", "events") for s in sources)):
+                self._send_json({"error": "sourcesはsocial/news/eventsの配列で指定してください"})
+                return
+            result = backfill_underlying_events(DATABASE_URL, self.current_user, limit,
+                                                  dry_run=bool(body.get("dry_run")), sources=sources)
+            self._send_json(result)
+        elif self.path == "/api/market-intelligence/backfill-reactions":
+            # Market Intelligence Phase8新規（指示書26・40番）：既存eventへのreaction backfill。
+            # event_ids or limitのどちらか・windows・dry_runが必須（指示書26番）。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            if "dry_run" not in body:
+                self._send_json({"error": "dry_runは必須です"})
+                return
+            event_ids = body.get("event_ids")
+            limit = body.get("limit")
+            if not event_ids and not limit:
+                self._send_json({"error": "event_ids または limit のいずれかは必須です"})
+                return
+            if limit is not None:
+                try:
+                    limit = int(limit)
+                except (TypeError, ValueError):
+                    self._send_json({"error": "limitは整数で指定してください"})
+                    return
+                if limit <= 0 or limit > 200:
+                    self._send_json({"error": "limitは1〜200の範囲で指定してください"})
+                    return
+            result = backfill_event_market_reactions(DATABASE_URL, self.current_user, limit=limit,
+                                                        event_ids=event_ids, windows=body.get("windows"),
+                                                        dry_run=bool(body.get("dry_run")))
             self._send_json(result)
         elif self.path == "/api/watchlist/migrate":
             # 既存ユーザーのlocalStorage watchlistを1回だけNeonへ取り込む（investmentLogMigratedと
@@ -12690,6 +13481,9 @@ def main():
         # 5分間隔でバックグラウンド処理する（X_API_BEARER_TOKEN有無に関わらず動く——
         # 既にDBにあるANALYZED投稿を評価するだけのため、X APIポーリングとは独立）。
         threading.Thread(target=_social_signal_evaluation_scheduler_loop, daemon=True).start()
+        # Market Intelligence Phase8新規（指示書28番）：event reactionの独立scheduler。
+        # 既存のsocial signal評価scheduler・にこそくpollerとは別テーブル・別関数で競合しない。
+        threading.Thread(target=_event_reaction_scheduler_loop, daemon=True).start()
     try:
         httpd = ThreadingTCPServer((HOST, PORT), Handler)
     except OSError:
