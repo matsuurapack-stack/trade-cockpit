@@ -1035,6 +1035,7 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_SOCIAL_EVENT_EVALUATIONS_SQL)
         conn.execute(_MIGRATE_SOCIAL_SIGNAL_EVALUATIONS_V3_SQL)
         conn.execute(_SCHEMA_SOCIAL_SIGNAL_ALERTS_SQL)
+        conn.execute(_SCHEMA_UNDERLYING_EVENTS_SQL)
         conn.commit()
 
 
@@ -4873,6 +4874,298 @@ def count_duplicate_signal_groups_since(database_url, source_handle, since_iso):
                 "  GROUP BY signal_group_id HAVING COUNT(DISTINCT post_id) > 1"
                 ") sub",
                 [source_handle, since_iso])
+            return cur.fetchone()[0]
+
+
+# ============================================================
+# Market Intelligence Phase7（2026-09-13新規）：Underlying Event Engine。social posts/
+# news catalysts/corporate disclosures/economic events/prediction market shiftsを、同一の
+# 出来事であれば1つのunderlying_eventへ統合する（指示書1・3番）。既存Phase1〜6のテーブル・
+# ロジックは一切変更しない（指示書26番「Phase6後方互換」・intelligence_cluster_idは廃止せず
+# 併存）。売買ロジックへの直接加点はまだ行わない（指示書冒頭）。
+# ============================================================
+
+_SCHEMA_UNDERLYING_EVENTS_SQL = """
+CREATE TABLE IF NOT EXISTS underlying_events (
+    id                      SERIAL PRIMARY KEY,
+    event_key               TEXT,                     -- 決定的key（例: JP:7203:BUYBACK:2026-09-11）。作れない場合はNULL
+    event_type              TEXT NOT NULL,
+    title                   TEXT,
+    normalized_title        TEXT,
+    ticker                  TEXT,
+    company_name            TEXT,
+    sector                  TEXT,
+    country                 TEXT DEFAULT 'JP',
+    event_at                TIMESTAMPTZ,
+    first_seen_at           TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 一次情報昇格でも変更しない（指示書4番）
+    last_seen_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    primary_source_type     TEXT,                     -- TDNET|COMPANY_IR|GOVERNMENT|CENTRAL_BANK_OFFICIAL|
+                                                        -- EXCHANGE_OFFICIAL|NEWS|SOCIAL
+    primary_source_url      TEXT,
+    confidence              NUMERIC,                  -- 0.0〜1.0（内部計算用の生の確度）
+    confidence_level        TEXT,                     -- OFFICIAL_CONFIRMED|MULTI_SOURCE_CONFIRMED|
+                                                        -- SINGLE_RELIABLE_SOURCE|SOCIAL_ONLY|UNVERIFIED
+    importance              TEXT DEFAULT 'MEDIUM',
+    status                  TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE|CONFIRMED|UPDATED|RESOLVED|INVALIDATED
+    direct_tickers_json     JSONB,
+    related_tickers_json    JSONB,
+    related_sectors_json    JSONB,
+    numerical_fingerprint_json JSONB,   -- 金額・%・株数等（指示書8番、重複判定・material update検出用）
+    raw_source_count        INTEGER NOT NULL DEFAULT 0,
+    independent_source_count INTEGER NOT NULL DEFAULT 0,
+    primary_source_confirmed BOOLEAN NOT NULL DEFAULT false,
+    impact_score            NUMERIC,
+    intelligence_cluster_id TEXT,        -- Phase6のcluster機構を廃止せず併存（指示書27番）
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_underlying_events_key ON underlying_events(event_key);
+CREATE INDEX IF NOT EXISTS idx_underlying_events_ticker ON underlying_events(ticker);
+CREATE INDEX IF NOT EXISTS idx_underlying_events_status ON underlying_events(status, last_seen_at DESC);
+
+CREATE TABLE IF NOT EXISTS underlying_event_evidence (
+    id                  SERIAL PRIMARY KEY,
+    event_id            INTEGER NOT NULL REFERENCES underlying_events(id) ON DELETE CASCADE,
+    source_kind         TEXT NOT NULL,   -- SOCIAL|NEWS|IR|TDNET|EVENT|PREDICTION
+    source_name         TEXT NOT NULL,   -- 例: aryarya, TDnet, Reuters
+    source_record_id    TEXT NOT NULL,
+    source_url          TEXT,
+    posted_at           TIMESTAMPTZ,
+    is_primary          BOOLEAN NOT NULL DEFAULT false,
+    is_independent      BOOLEAN NOT NULL DEFAULT true,
+    upstream_source      TEXT,           -- 転載元（例: aryarya/kgbukabuが共にTDnet由来ならTDnet）
+    dependency_group      TEXT,          -- 同一upstreamのevidenceをまとめる識別子
+    raw_text_summary      TEXT,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (event_id, source_kind, source_record_id)
+);
+CREATE INDEX IF NOT EXISTS idx_event_evidence_event ON underlying_event_evidence(event_id, posted_at);
+
+CREATE TABLE IF NOT EXISTS underlying_event_alerts (
+    id          SERIAL PRIMARY KEY,
+    event_id    INTEGER NOT NULL REFERENCES underlying_events(id) ON DELETE CASCADE,
+    alert_type  TEXT NOT NULL,   -- NEW_EVENT|MATERIAL_UPDATE|CONFIDENCE_UPGRADE|IMPACT_UPGRADE
+    payload_json JSONB,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_event_alerts_event ON underlying_event_alerts(event_id, created_at DESC);
+"""
+
+
+def create_underlying_event(database_url, data):
+    """指示書1番：新規underlying_eventを1件作成する。戻り値：作成行（dict）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    plain_cols = ["event_key", "event_type", "title", "normalized_title", "ticker", "company_name",
+                  "sector", "country", "event_at", "primary_source_type", "primary_source_url",
+                  "confidence", "confidence_level", "importance", "status", "raw_source_count",
+                  "independent_source_count", "primary_source_confirmed", "impact_score",
+                  "intelligence_cluster_id"]
+    json_cols = ["direct_tickers_json", "related_tickers_json", "related_sectors_json", "numerical_fingerprint_json"]
+    cols = plain_cols + json_cols
+    values = [data.get(c) for c in plain_cols]
+    values += [json.dumps(data.get(c), ensure_ascii=False) if data.get(c) is not None else None for c in json_cols]
+    placeholders = ", ".join(["%s"] * len(plain_cols) + ["%s::jsonb"] * len(json_cols))
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO underlying_events ({', '.join(cols)}) VALUES ({placeholders}) RETURNING *",
+                values)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def get_underlying_event(database_url, event_id):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM underlying_events WHERE id=%s", [event_id])
+            row = cur.fetchone()
+    return _row_to_json(row) if row else None
+
+
+def list_underlying_event_candidates(database_url, event_type=None, ticker=None, since_iso=None, limit=50):
+    """指示書5番：matcher向けの候補取得。event_type・ticker・期間で絞り込む
+    （指示書31番「tickerだけで統合しない」を担保するため、呼び出し側は必ずevent_typeも
+    条件に含める設計を推奨するが、この関数自体はticker単独指定も許容する——安全弁は
+    matcher側のロジックに置く）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = ["status != 'INVALIDATED'"], []
+    if event_type:
+        where.append("event_type=%s")
+        params.append(event_type)
+    if ticker:
+        where.append("ticker=%s")
+        params.append(ticker)
+    if since_iso:
+        where.append("last_seen_at >= %s")
+        params.append(since_iso)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    params.append(limit)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SELECT * FROM underlying_events {clause} ORDER BY last_seen_at DESC LIMIT %s", params)
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def list_active_underlying_events(database_url, since_iso=None, limit=50):
+    """指示書23・29・30番：UI「重要」タブ・GET /api/market-intelligence/events向け。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = ["status != 'INVALIDATED'"], []
+    if since_iso:
+        where.append("last_seen_at >= %s")
+        params.append(since_iso)
+    clause = f"WHERE {' AND '.join(where)}"
+    params.append(limit)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SELECT * FROM underlying_events {clause} ORDER BY last_seen_at DESC LIMIT %s", params)
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def update_underlying_event(database_url, event_id, fields):
+    """汎用UPDATE。fieldsのキーはunderlying_eventsの列名（JSON列はdict/listのまま渡せる）。
+    first_seen_atは呼び出し側が絶対に渡さない設計にする（指示書4番、一次情報昇格でも
+    変更しない）。"""
+    if not fields:
+        return get_underlying_event(database_url, event_id)
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    json_cols = {"direct_tickers_json", "related_tickers_json", "related_sectors_json", "numerical_fingerprint_json"}
+    sets, params = [], []
+    for k, v in fields.items():
+        if k == "first_seen_at":
+            continue  # 指示書4番のガード
+        if k in json_cols:
+            sets.append(f"{k}=%s::jsonb")
+            params.append(json.dumps(v, ensure_ascii=False) if v is not None else None)
+        elif v == "NOW()":
+            sets.append(f"{k}=now()")
+        else:
+            sets.append(f"{k}=%s")
+            params.append(v)
+    sets.append("updated_at=now()")
+    params.append(event_id)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"UPDATE underlying_events SET {', '.join(sets)} WHERE id=%s RETURNING *", params)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def add_underlying_event_evidence(database_url, evidence):
+    """指示書3番：evidenceを1件追加する。UNIQUE(event_id,source_kind,source_record_id)により
+    同一投稿を二重にevidence化しない（指示書「raw_source_count/independent_source_countの
+    正確化」の前提）。戻り値：新規追加ならdict、既存（重複）ならNone。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    cols = ["event_id", "source_kind", "source_name", "source_record_id", "source_url", "posted_at",
+            "is_primary", "is_independent", "upstream_source", "dependency_group", "raw_text_summary"]
+    values = [evidence.get(c) for c in cols]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO underlying_event_evidence ({', '.join(cols)}) VALUES ({', '.join(['%s'] * len(cols))}) "
+                f"ON CONFLICT (event_id, source_kind, source_record_id) DO NOTHING RETURNING *",
+                values)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_underlying_event_evidence(database_url, event_id):
+    """指示書25番：event詳細のtimeline表示用（posted_at昇順＝時系列）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM underlying_event_evidence WHERE event_id=%s ORDER BY posted_at ASC NULLS LAST",
+                [event_id])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def create_underlying_event_alert(database_url, event_id, alert_type, payload=None):
+    """指示書20・21番：NEW_EVENT/MATERIAL_UPDATE/CONFIDENCE_UPGRADE/IMPACT_UPGRADEのみ記録する
+    （呼び出し側=server.pyが「単なる転載」では呼ばない設計、指示書20番「多重発火防止」）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "INSERT INTO underlying_event_alerts (event_id, alert_type, payload_json) "
+                "VALUES (%s,%s,%s::jsonb) RETURNING *",
+                [event_id, alert_type, json.dumps(payload or {}, ensure_ascii=False)])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def count_underlying_event_alerts_since(database_url, since_iso, alert_type=None):
+    """指示書30番：diagnostics向け（duplicate_alerts_suppressedは呼び出し側でsuppress回数を
+    別途カウントするため、ここはalert_type別の「実際に出したalert数」を返す）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    where, params = ["created_at >= %s"], [since_iso]
+    if alert_type:
+        where.append("alert_type=%s")
+        params.append(alert_type)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM underlying_event_alerts WHERE {' AND '.join(where)}", params)
+            return cur.fetchone()[0]
+
+
+def count_underlying_events_since(database_url, since_iso, status=None):
+    """指示書30番：diagnostics向け（active_underlying_events/events_created_today）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    where, params = ["created_at >= %s"], [since_iso]
+    if status:
+        where.append("status=%s")
+        params.append(status)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM underlying_events WHERE {' AND '.join(where)}", params)
+            return cur.fetchone()[0]
+
+
+def count_active_underlying_events(database_url):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM underlying_events WHERE status NOT IN ('RESOLVED','INVALIDATED')")
+            return cur.fetchone()[0]
+
+
+def count_underlying_event_evidence_since(database_url, since_iso):
+    """指示書30番：diagnostics向け（merged_evidence_today）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM underlying_event_evidence WHERE created_at >= %s", [since_iso])
             return cur.fetchone()[0]
 
 

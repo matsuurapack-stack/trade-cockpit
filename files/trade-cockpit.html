@@ -3820,54 +3820,97 @@ function XMarketSignalsCard(){
 // recent_market_intelligenceを取得し、BREAKING/PREDICTION SHIFT/CONSENSUSを簡潔に表示する。
 // 厳密なrelevance/freshness/specialty/confidenceスコアリングでの並び替えは今回実装せず、
 // 種別ごとにグルーピングしposted_at降順で並べる簡易版（既知の制約、完了報告に明記）。
-function ImportantIntelligenceFeed(){
-  const [intel,setIntel]=useState(null);
-  const [loading,setLoading]=useState(false);
+// Market Intelligence Phase7新規（指示書23・24番）：「重要」タブはevent一覧（EVENT-centric）
+// を主表示にする。にこそく/Polymarket/急騰/ありゃりゃの各タブは従来通り投稿一覧のまま
+// （SimpleSourcePostsFeed・にこそくタブ本体は無変更）。
+const EVENT_CONFIDENCE_META = {
+  OFFICIAL_CONFIRMED: {emoji:"🔴", label:"公式確認済"}, MULTI_SOURCE_CONFIRMED: {emoji:"🟠", label:"複数媒体確認"},
+  SINGLE_RELIABLE_SOURCE: {emoji:"🟡", label:"単独信頼情報源"}, SOCIAL_ONLY: {emoji:"⚪", label:"SNSのみ"},
+  UNVERIFIED: {emoji:"⚪", label:"未確認"},
+};
+const agoLabel=(iso)=>{if(!iso)return "—";const min=Math.max(0,Math.round((Date.now()-new Date(iso).getTime())/60000));return min<1?"1分未満前":min<60?`${min}分前`:`${Math.round(min/60)}時間前`;};
+
+function EventEvidenceList({eventId}){
+  const [evidence,setEvidence]=useState(null);
   useEffect(()=>{
     let alive=true;
-    setLoading(true);
-    fetchJsonSafe("/api/market-intelligence/recent").then(d=>{
-      if(alive&&d&&d.recent_market_intelligence)setIntel(d.recent_market_intelligence);
-    }).catch(()=>{}).finally(()=>{if(alive)setLoading(false);});
+    fetchJsonSafe(`/api/market-intelligence/events/${eventId}/evidence`).then(d=>{
+      if(alive&&d&&Array.isArray(d.evidence))setEvidence(d.evidence);
+    }).catch(()=>{});
     return ()=>{alive=false;};
-  },[]);
-  if(loading&&!intel)return <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:6}}>読み込み中…</div>;
-  if(!intel)return <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:6}}>取得できませんでした。</div>;
-  const breaking=[...(intel.breaking_stock_signals||[]),...(intel.corporate_breaking||[])];
-  const hasAny=breaking.length||(intel.prediction_market_shifts||[]).length||(intel.consensus||[]).length||(intel.disagreements||[]).length;
-  const ago=(iso)=>{if(!iso)return "—";const min=Math.max(0,Math.round((Date.now()-new Date(iso).getTime())/60000));return min<1?"1分未満前":min<60?`${min}分前`:`${Math.round(min/60)}時間前`;};
-  return <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:6}}>
-    {!hasAny && <div style={{fontSize:11,color:"var(--inkFaint)"}}>重要な情報はまだありません。</div>}
-    {breaking.map((b,i)=>
-      <div key={`b${i}`} style={{padding:"5px 6px",borderRadius:4,background:"var(--bg)",border:"1px solid var(--rule)",fontSize:11}}>
-        <div style={{fontWeight:800,color:"var(--down)"}}>🔴 BREAKING {ago(b.posted_at)}</div>
-        <div style={{color:"var(--inkSoft)",fontSize:10}}>{MARKET_INTELLIGENCE_TABS.find(t=>t.key===b.source)?.label||b.source}</div>
-        <div style={{marginTop:2}}>{b.headline||b.company_name||b.ticker||"—"}{b.change_pct!=null?`（${b.change_pct>0?"+":""}${b.change_pct}%）`:""}</div>
-        {b.linked_domain && <div style={{fontSize:10,color:"var(--inkFaint)"}}>一次情報：{b.primary_source_type||b.linked_domain}</div>}
-        {b.url && <a href={b.url} target="_blank" rel="noopener noreferrer" style={{fontSize:10,color:"var(--accent)"}}>原文を見る↗</a>}
+  },[eventId]);
+  if(!evidence)return <div style={{fontSize:10,color:"var(--inkFaint)",marginTop:4}}>読み込み中…</div>;
+  if(evidence.length===0)return <div style={{fontSize:10,color:"var(--inkFaint)",marginTop:4}}>evidenceがありません。</div>;
+  return <div style={{marginTop:4,paddingLeft:8,borderLeft:"2px solid var(--rule)",display:"flex",flexDirection:"column",gap:2}}>
+    {/* 指示書25番：時系列（誰が早かったか）。 */}
+    {evidence.map(e=>
+      <div key={e.id} style={{fontSize:10,color:"var(--inkSoft)"}}>
+        {e.posted_at?new Date(e.posted_at).toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"}):"—"}
+        {" "}{e.source_name}（{e.source_kind}）
+        {e.source_url && <a href={e.source_url} target="_blank" rel="noopener noreferrer" style={{marginLeft:4,color:"var(--accent)"}}>↗</a>}
       </div>
     )}
-    {(intel.prediction_market_shifts||[]).map((p,i)=>
+  </div>;
+}
+
+function EventCard({event}){
+  const [expanded,setExpanded]=useState(false);
+  const meta=EVENT_CONFIDENCE_META[event.confidence]||EVENT_CONFIDENCE_META.UNVERIFIED;
+  return <div style={{padding:"5px 6px",borderRadius:4,background:"var(--bg)",border:"1px solid var(--rule)",fontSize:11}}>
+    <div style={{fontWeight:800}}>{meta.emoji} {agoLabel(event.latest_update_at)}</div>
+    <div style={{marginTop:2}}>
+      {event.direct_tickers&&event.direct_tickers.length>0 && <span style={{fontWeight:700}}>{event.direct_tickers.join("・")} </span>}
+      {event.title}
+    </div>
+    <div style={{fontSize:10,color:"var(--inkSoft)",marginTop:2}}>
+      {meta.label}・Sources: {(event.sources||[]).join(" + ")||"—"}
+      {event.independent_source_count!=null && <span>（independent: {event.independent_source_count}）</span>}
+    </div>
+    {event.impact_score!=null && <div style={{fontSize:10,color:"var(--inkSoft)"}}>Impact {event.impact_score}</div>}
+    {event.discovery_lead_seconds!=null && <div style={{fontSize:10,color:"var(--inkFaint)"}}>
+      先行検知差：約{Math.round(Math.abs(event.discovery_lead_seconds)/60)}分（system observed official source at基準）
+    </div>}
+    <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px",marginTop:3}} onClick={()=>setExpanded(v=>!v)}>
+      {expanded?"▲ evidenceを隠す":"▼ evidenceを見る"}
+    </button>
+    {expanded && <EventEvidenceList eventId={event.event_id}/>}
+  </div>;
+}
+
+function ImportantIntelligenceFeed(){
+  const [events,setEvents]=useState(null);
+  const [intel,setIntel]=useState(null);
+  const [loading,setLoading]=useState(false);
+  const load=()=>{
+    setLoading(true);
+    Promise.all([
+      fetchJsonSafe("/api/market-intelligence/events"),
+      fetchJsonSafe("/api/market-intelligence/recent"),
+    ]).then(([ev,rec])=>{
+      if(ev&&Array.isArray(ev.events))setEvents(ev.events);
+      if(rec&&rec.recent_market_intelligence)setIntel(rec.recent_market_intelligence);
+    }).catch(()=>{}).finally(()=>setLoading(false));
+  };
+  useEffect(()=>{load();},[]); // eslint-disable-line
+  if(loading&&!events)return <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:6}}>読み込み中…</div>;
+  const hasEvents=events&&events.length>0;
+  const shifts=(intel&&intel.prediction_market_shifts)||[];
+  const disagreements=(intel&&intel.disagreements)||[];
+  const hasAny=hasEvents||shifts.length||disagreements.length;
+  return <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:6}}>
+    {!hasAny && <div style={{fontSize:11,color:"var(--inkFaint)"}}>重要な情報はまだありません。</div>}
+    {/* 指示書23番：EVENT一覧が主表示。 */}
+    {(events||[]).map(ev=><EventCard key={ev.event_id} event={ev}/>)}
+    {shifts.map((p,i)=>
       <div key={`p${i}`} style={{padding:"5px 6px",borderRadius:4,background:"var(--bg)",border:"1px solid var(--rule)",fontSize:11}}>
         <div style={{fontWeight:800,color:"var(--accent)"}}>🟠 PREDICTION SHIFT</div>
-        <div style={{color:"var(--inkSoft)",fontSize:10}}>Polymarket Japan・{ago(p.posted_at)}</div>
+        <div style={{color:"var(--inkSoft)",fontSize:10}}>Polymarket Japan・{agoLabel(p.posted_at)}</div>
         <div style={{marginTop:2}}>{p.prediction_topic}</div>
         {p.previous_probability!=null&&p.probability!=null &&
           <div>{p.previous_probability}% → {p.probability}%（{p.probability_change>0?"+":""}{p.probability_change}pt）</div>}
       </div>
     )}
-    {(intel.consensus||[]).map((c,i)=>
-      <div key={`c${i}`} style={{padding:"5px 6px",borderRadius:4,background:"var(--bg)",border:"1px solid var(--rule)",fontSize:11}}>
-        <div style={{fontWeight:800,color:"var(--up)"}}>🟢 CONSENSUS（{c.consensus_strength}）</div>
-        <div style={{marginTop:2}}>{SOCIAL_EVAL_SECTOR_LABELS[c.topic]||c.topic} {c.direction}</div>
-        <div style={{fontSize:10,color:"var(--inkSoft)"}}>
-          {c.sources.map(h=>MARKET_INTELLIGENCE_TABS.find(t=>t.key===h)?.label||h).join(" + ")}
-          ・independent sources: {c.independent_source_count}
-        </div>
-        {c.related_stocks&&c.related_stocks.length>0 && <div style={{fontSize:10,color:"var(--inkSoft)"}}>関連：{c.related_stocks.join("・")}</div>}
-      </div>
-    )}
-    {(intel.disagreements||[]).map((d,i)=>
+    {disagreements.map((d,i)=>
       <div key={`d${i}`} style={{padding:"5px 6px",borderRadius:4,background:"var(--bg)",border:"1px solid var(--rule)",fontSize:11}}>
         <div style={{fontWeight:800,color:"var(--inkFaint)"}}>⚪ SOURCE DISAGREEMENT</div>
         <div style={{marginTop:2}}>{SOCIAL_EVAL_SECTOR_LABELS[d.topic]||d.topic}：見解が分かれています</div>

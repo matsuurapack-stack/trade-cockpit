@@ -5325,6 +5325,18 @@ def poll_market_source(database_url, user_id, source_config):
             generate_social_event_evaluations_for_post_safe(database_url, user_id, saved)
             # Market Intelligence Phase6新規（指示書16・19番）：cross-source entity matching。
             assign_intelligence_cluster_safe(database_url, saved)
+            # Market Intelligence Phase7新規（指示書33番D）：kgbukabu/aryaryaの投稿を
+            # underlying_eventへevidence統合する（STOCK_BREAKING/CORPORATE_BREAKING限定、
+            # にこそく等の一般的な相場コメントはevent化しない——誤統合防止）。
+            try:
+                if source_config.get("source_type") in ("STOCK_BREAKING", "CORPORATE_BREAKING"):
+                    maybe_ingest_event_from_post(database_url, user_id, saved)
+                # 指示書15番：Polymarketのmacro予測は既存eventへのevidenceとしてのみ紐付ける
+                # （予測単独では新規eventを作らない）。
+                elif source_config.get("source_type") == "PREDICTION_MARKET":
+                    maybe_link_prediction_to_macro_event_safe(database_url, user_id, saved)
+            except Exception as e:
+                print(f"  [{handle}] event ingestで例外（無視して続行）", e)
         else:
             result["duplicates"] += 1
         if tweet.get("id") and (max_id is None or int(tweet["id"]) > int(max_id)):
@@ -5645,6 +5657,509 @@ def build_market_intelligence_consensus(database_url, lookback_minutes=CONSENSUS
     return {"consensus": consensus, "disagreements": disagreements}
 
 
+# ============================================================
+# Market Intelligence Phase7（2026-09-13新規）：Underlying Event Engine。social posts/
+# news catalysts/corporate disclosures/economic events/prediction market shiftsを、同一の
+# 出来事であれば1つのunderlying_eventへ統合する（指示書1・3・35番「10媒体が報じても
+# 1つの出来事+10個のevidence」）。誤統合が重複より危険（指示書9・31番）——tickerだけでは
+# 絶対に統合せず、event_typeの一致を必須条件にする。
+# ============================================================
+
+# 指示書30番：diagnostics向けプロセス内カウンタ（duplicate_alerts_suppressed）。
+# リスト1要素に入れているのはネストした関数内でglobal宣言せずインクリメントするため。
+_event_alert_suppressed_count = [0]
+
+EVENT_TYPES = ("EARNINGS", "GUIDANCE_REVISION", "BUYBACK", "DIVIDEND", "TOB_MA", "CAPITAL_RAISE",
+               "CB_BOND", "GOVERNMENT_POLICY", "REGULATION", "ECONOMIC_INDICATOR", "CENTRAL_BANK",
+               "GEOPOLITICS", "PRODUCT", "CONTRACT", "CORPORATE_NEWS", "MARKET_MOVE", "PREDICTION_MARKET", "OTHER")
+
+EVENT_TYPE_KEYWORDS = {
+    "EARNINGS": ["決算", "四半期決算", "通期決算", "決算発表"],
+    "GUIDANCE_REVISION": ["上方修正", "下方修正", "業績修正", "見通し修正"],
+    "BUYBACK": ["自社株買い", "自己株式取得"],
+    "DIVIDEND": ["配当", "増配", "減配", "配当性向"],
+    "TOB_MA": ["TOB", "M&A", "買収", "経営統合", "合併"],
+    "CAPITAL_RAISE": ["増資", "公募増資", "第三者割当"],
+    "CB_BOND": ["転換社債", "CB発行", "社債発行"],
+    "GOVERNMENT_POLICY": ["税制", "補助金", "政府方針", "規制緩和"],
+    "REGULATION": ["行政処分", "業務改善命令", "認可"],
+    "ECONOMIC_INDICATOR": ["CPI", "PPI", "GDP", "雇用統計", "小売売上高", "経済指標"],
+    "CENTRAL_BANK": ["FOMC", "FRB", "日銀", "ECB", "利上げ", "利下げ", "金融政策決定会合"],
+    "GEOPOLITICS": ["地政学", "紛争", "制裁", "戦争"],
+    "PRODUCT": ["新製品", "新サービス", "発売開始"],
+    "CONTRACT": ["受注", "業務提携", "契約締結"],
+    "CORPORATE_NEWS": ["不祥事", "役員人事", "社長交代"],
+    "MARKET_MOVE": ["急騰", "急落", "ストップ高", "ストップ安"],
+    "PREDICTION_MARKET": ["Polymarket", "予測市場"],
+}
+
+
+def classify_event_type_from_text(text):
+    """指示書2番：event_type分類（キーワードベース、既存AUTO系エンジンと同じ方針）。"""
+    if not text:
+        return "OTHER"
+    for et, kws in EVENT_TYPE_KEYWORDS.items():
+        if any(kw in text for kw in kws):
+            return et
+    return "OTHER"
+
+
+# 指示書7番：headline normalization。金額・比率等の重要数値は消さない
+# （URLと絵文字と記号とticker表記（丸括弧付きの4桁）と時刻表現のみ除去）。
+_HEADLINE_URL_RE = re.compile(r"https?://\S+")
+_HEADLINE_EMOJI_RE = re.compile(
+    "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF✀-➿]")
+_HEADLINE_COMPANY_SUFFIX_RE = re.compile(r"株式会社|\(株\)|（株）")
+_HEADLINE_TICKER_PAREN_RE = re.compile(r"[\(（]\s*\d{4}\s*[\)）]")
+_HEADLINE_TIME_RE = re.compile(r"\d{1,2}[:：]\d{2}")
+_HEADLINE_SYMBOL_RE = re.compile(r"[!！?？…\"'「」『』【】\[\]#＃@＠▲△▼▽◆■●]")
+
+
+def normalize_headline(text):
+    """指示書7番：見出し正規化。全角半角統一(NFKC)＋URL/絵文字/社名接尾辞/ticker表記
+    （丸括弧付き）/時刻表現/記号を除去する。金額・%・株数等の数値はそのまま残す
+    （extract_numerical_fingerprintと役割分担）。"""
+    if not text:
+        return ""
+    t = unicodedata.normalize("NFKC", text)
+    t = _HEADLINE_URL_RE.sub("", t)
+    t = _HEADLINE_EMOJI_RE.sub("", t)
+    t = _HEADLINE_COMPANY_SUFFIX_RE.sub("", t)
+    t = _HEADLINE_TICKER_PAREN_RE.sub("", t)
+    t = _HEADLINE_TIME_RE.sub("", t)
+    t = _HEADLINE_SYMBOL_RE.sub("", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+# 指示書8番：numerical fingerprint。金額・%・株数を正規化して抽出する
+# （EPS・配当・probabilityは%か円建てで表現されることが多く、上記2パターンで概ね拾える）。
+_FINGERPRINT_AMOUNT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(億円|万円|百万円|円|億ドル|百万ドル)")
+_FINGERPRINT_PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+_FINGERPRINT_SHARES_RE = re.compile(r"(\d[\d,]*)\s*株")
+
+
+def extract_numerical_fingerprint(text):
+    """指示書8番：重複判定精度向上のための数値指紋。順不同・重複除去済みリストで返す。"""
+    if not text:
+        return []
+    fp = set()
+    for m in _FINGERPRINT_AMOUNT_RE.finditer(text):
+        fp.add(f"AMOUNT:{m.group(1)}{m.group(2)}")
+    for m in _FINGERPRINT_PERCENT_RE.finditer(text):
+        fp.add(f"PCT:{m.group(1)}")
+    for m in _FINGERPRINT_SHARES_RE.finditer(text):
+        fp.add(f"SHARES:{m.group(1).replace(',', '')}")
+    return sorted(fp)
+
+
+def generate_event_key(event_type, ticker=None, event_date=None, country="JP", macro_label=None):
+    """指示書6番：決定的keyを可能な場合だけ作る（作れなければNone→呼び出し側は類似判定に
+    フォールバックする）。例：JP:7203:BUYBACK:2026-09-11、FOMC:2026-09-17。"""
+    if event_type in ("ECONOMIC_INDICATOR", "CENTRAL_BANK") and macro_label and event_date:
+        return f"{macro_label}:{event_date}"
+    if ticker and event_type and event_date:
+        return f"{country}:{ticker}:{event_type}:{event_date}"
+    return None
+
+
+def build_event_candidate_descriptor(event_type, title, ticker=None, company_name=None, sector=None,
+                                      country="JP", event_at=None, macro_label=None):
+    """1件の新規情報からmatcher/create共通で使うdescriptorを組み立てる。"""
+    normalized = normalize_headline(title)
+    fingerprint = extract_numerical_fingerprint(title)
+    event_date = None
+    if event_at:
+        try:
+            event_date = datetime.datetime.fromisoformat(str(event_at).replace("Z", "+00:00")).date().isoformat()
+        except Exception:
+            event_date = None
+    key = generate_event_key(event_type, ticker=ticker, event_date=event_date, country=country, macro_label=macro_label)
+    return {"event_type": event_type, "title": title, "normalized_title": normalized, "ticker": ticker,
+            "company_name": company_name, "sector": sector, "country": country, "event_at": event_at,
+            "event_key": key, "numerical_fingerprint": fingerprint}
+
+
+def _headline_similarity(a, b):
+    """正規化済みテキストの文字集合オーバーラップ（形態素解析は使わない軽量版、既知の制約）。"""
+    a_set, b_set = set(normalize_headline(a) or ""), set(normalize_headline(b) or "")
+    if not a_set or not b_set:
+        return 0.0
+    return len(a_set & b_set) / max(1, min(len(a_set), len(b_set)))
+
+
+EVENT_CONFIDENCE_LEVELS = ("EXACT", "HIGH", "MEDIUM", "LOW", "NEW_EVENT")
+EVENT_AUTO_MERGE_LEVELS = ("EXACT", "HIGH", "MEDIUM")  # 指示書9番：LOWは自動統合しない
+
+
+def compute_event_match_confidence(existing_event, candidate):
+    """指示書5・6・7・8・9・31番：2つのevent記述子を比較しEXACT/HIGH/MEDIUM/LOW/NEW_EVENTを
+    返す。event_typeが一致しなければ問答無用でNEW_EVENT（指示書31番「tickerだけで統合
+    しない」「同日同社でも自社株買い/決算/配当は別event」を最優先で担保する）。"""
+    if candidate.get("event_type") != existing_event.get("event_type"):
+        return "NEW_EVENT"
+    cand_key, ex_key = candidate.get("event_key"), existing_event.get("event_key")
+    if cand_key and ex_key and cand_key == ex_key:
+        return "EXACT"
+    same_ticker = bool(candidate.get("ticker")) and candidate.get("ticker") == existing_event.get("ticker")
+    sim = _headline_similarity(candidate.get("normalized_title") or "", existing_event.get("normalized_title") or "")
+    fp_overlap = bool(set(candidate.get("numerical_fingerprint") or []) & set(existing_event.get("numerical_fingerprint") or []))
+    if same_ticker and sim >= 0.6 and fp_overlap:
+        return "HIGH"
+    if same_ticker and (sim >= 0.6 or fp_overlap):
+        return "MEDIUM"
+    if same_ticker and sim >= 0.3:
+        return "LOW"
+    if not candidate.get("ticker") and not existing_event.get("ticker"):
+        # tickerが無いケース（マクロイベント等）はheadline類似度＋数値指紋のみで判定する。
+        if sim >= 0.7 and fp_overlap:
+            return "HIGH"
+        if sim >= 0.5:
+            return "MEDIUM"
+        if sim >= 0.3:
+            return "LOW"
+    return "NEW_EVENT"
+
+
+def find_matching_underlying_event(database_url, candidate, lookback_days=14):
+    """指示書5番：候補と既存underlying_eventを照合する。戻り値：(matched_event_or_None,
+    confidence_level)。LOW/NEW_EVENTの場合はmatched_eventはNone（自動統合しない、指示書9番）。"""
+    if investment_db is None or not database_url:
+        return None, "NEW_EVENT"
+    since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=lookback_days)).isoformat()
+    existing = investment_db.list_underlying_event_candidates(
+        database_url, event_type=candidate.get("event_type"), ticker=candidate.get("ticker"),
+        since_iso=since_iso, limit=20)
+    if not existing and not candidate.get("ticker"):
+        existing = investment_db.list_underlying_event_candidates(
+            database_url, event_type=candidate.get("event_type"), since_iso=since_iso, limit=20)
+    level_rank = {"NEW_EVENT": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "EXACT": 4}
+    best_event, best_level = None, "NEW_EVENT"
+    for ev in existing:
+        descriptor = {"event_key": ev.get("event_key"), "event_type": ev.get("event_type"),
+                      "ticker": ev.get("ticker"), "normalized_title": ev.get("normalized_title"),
+                      "numerical_fingerprint": ev.get("numerical_fingerprint_json") or []}
+        level = compute_event_match_confidence(descriptor, candidate)
+        if level_rank[level] > level_rank[best_level]:
+            best_event, best_level = ev, level
+    if best_level not in EVENT_AUTO_MERGE_LEVELS:
+        return None, best_level
+    return best_event, best_level
+
+
+# 指示書4番：primary source優先順位（高いほど優先）。
+PRIMARY_SOURCE_PRIORITY = {
+    "TDNET": 100, "COMPANY_IR": 95, "GOVERNMENT": 90, "CENTRAL_BANK_OFFICIAL": 90,
+    "EXCHANGE_OFFICIAL": 85, "NEWS": 50, "SOCIAL": 10,
+}
+SOURCE_KIND_TO_PRIMARY_TYPE = {"TDNET": "TDNET", "IR": "COMPANY_IR", "EVENT": "GOVERNMENT",
+                                 "NEWS": "NEWS", "SOCIAL": "SOCIAL", "PREDICTION": "SOCIAL"}
+
+
+def maybe_promote_primary_source(event, candidate_primary_type, candidate_primary_url):
+    """指示書4番：Xが先に検知しても、後で公式IRが見つかればprimary_source_type/urlを更新する。
+    first_seen_atは呼び出し側（update_underlying_event）が変更しない設計で担保する。"""
+    current = PRIMARY_SOURCE_PRIORITY.get(event.get("primary_source_type"), 0)
+    new = PRIMARY_SOURCE_PRIORITY.get(candidate_primary_type, 0)
+    if new > current:
+        return {"primary_source_type": candidate_primary_type, "primary_source_url": candidate_primary_url}
+    return None
+
+
+def compute_independent_source_count(evidence_list):
+    """指示書10・11番：dependency_group/upstream_source/source_urlの優先順でグルーピングし、
+    同一記事の転載を1件に数える。どれも無ければsource_name単位（=別々の主体）とみなす。"""
+    seen = set()
+    for e in evidence_list:
+        key = e.get("dependency_group") or e.get("upstream_source") or e.get("source_url") \
+            or f"name:{e.get('source_name')}"
+        seen.add(key)
+    return len(seen)
+
+
+def classify_event_confidence_level(primary_source_type, independent_source_count):
+    """指示書12番：OFFICIAL_CONFIRMED/MULTI_SOURCE_CONFIRMED/SINGLE_RELIABLE_SOURCE/
+    SOCIAL_ONLY/UNVERIFIED。"""
+    if primary_source_type in ("TDNET", "COMPANY_IR", "GOVERNMENT", "CENTRAL_BANK_OFFICIAL", "EXCHANGE_OFFICIAL"):
+        return "OFFICIAL_CONFIRMED"
+    if independent_source_count >= 2:
+        return "MULTI_SOURCE_CONFIRMED"
+    if primary_source_type == "NEWS":
+        return "SINGLE_RELIABLE_SOURCE"
+    if primary_source_type == "SOCIAL":
+        return "SOCIAL_ONLY"
+    return "UNVERIFIED"
+
+
+_EVENT_TYPE_IMPACT_BONUS = {"TOB_MA": 15, "GUIDANCE_REVISION": 12, "BUYBACK": 10, "EARNINGS": 10,
+                             "CENTRAL_BANK": 10, "CAPITAL_RAISE": 8, "CB_BOND": 6}
+_EVENT_CONFIDENCE_IMPACT_BONUS = {"OFFICIAL_CONFIRMED": 20, "MULTI_SOURCE_CONFIRMED": 14,
+                                    "SINGLE_RELIABLE_SOURCE": 8, "SOCIAL_ONLY": 3, "UNVERIFIED": 0}
+
+
+def compute_event_impact_score(direct_position_hit=False, watch_related=False, entry_top5_related=False,
+                                confidence_level=None, event_type=None, freshness_minutes=None):
+    """指示書18番：0〜100。売買点数（thesis score等）とは別軸。position/watchlist/ENTRY TOP5
+    関連性・source confidence・event_type・freshnessから算出する（市場反応=market reaction
+    (指示書19番)は今回未接続、既知の制約）。"""
+    score = 0
+    if direct_position_hit:
+        score += 30
+    if entry_top5_related:
+        score += 20
+    if watch_related:
+        score += 15
+    score += _EVENT_CONFIDENCE_IMPACT_BONUS.get(confidence_level, 0)
+    score += _EVENT_TYPE_IMPACT_BONUS.get(event_type, 5)
+    if freshness_minutes is not None:
+        if freshness_minutes <= 30:
+            score += 10
+        elif freshness_minutes <= 120:
+            score += 5
+    return min(score, 100)
+
+
+_EVENT_CONFIDENCE_RANK = {"UNVERIFIED": 0, "SOCIAL_ONLY": 1, "SINGLE_RELIABLE_SOURCE": 2,
+                           "MULTI_SOURCE_CONFIRMED": 3, "OFFICIAL_CONFIRMED": 4}
+EVENT_IMPACT_UPGRADE_THRESHOLD = 15
+
+
+def classify_underlying_event_alert_type(is_new, before=None, after=None):
+    """指示書20・21番：NEW_EVENT/MATERIAL_UPDATE/CONFIDENCE_UPGRADE/IMPACT_UPGRADEのみalertを
+    生成する。単なる転載（evidence追加だけで状態が変わらない）はNoneを返す＝alertを出さない
+    （指示書20番「5分後 同じX転載 → no alert」）。"""
+    if is_new:
+        return "NEW_EVENT"
+    if before is None or after is None:
+        return None
+    if _EVENT_CONFIDENCE_RANK.get(after.get("confidence_level"), 0) > _EVENT_CONFIDENCE_RANK.get(before.get("confidence_level"), 0):
+        return "CONFIDENCE_UPGRADE"
+    if (after.get("impact_score") or 0) - (before.get("impact_score") or 0) >= EVENT_IMPACT_UPGRADE_THRESHOLD:
+        return "IMPACT_UPGRADE"
+    if set(after.get("numerical_fingerprint") or []) - set(before.get("numerical_fingerprint") or []):
+        return "MATERIAL_UPDATE"  # 指示書21番：金額変更等の新しい数値が加われば重要な更新とみなす
+    return None
+
+
+def compute_discovery_lead_seconds(evidence_list):
+    """指示書26番：最初のSOCIAL evidenceと最初の公式（TDNET/IR/EVENT）evidenceの時間差
+    （秒）。「公式より前」と断定はせず、あくまで両者の観測時刻差として扱う（指示書26番の
+    注記通り）。どちらか片方が無ければNone。"""
+    def _parse(iso):
+        try:
+            dt = datetime.datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            return dt
+        except Exception:
+            return None
+    social_times = [t for t in (_parse(e.get("posted_at")) for e in evidence_list if e.get("source_kind") == "SOCIAL") if t]
+    official_times = [t for t in (_parse(e.get("posted_at")) for e in evidence_list
+                                    if e.get("source_kind") in ("TDNET", "IR", "EVENT")) if t]
+    if not social_times or not official_times:
+        return None
+    return round((min(official_times) - min(social_times)).total_seconds())
+
+
+def ingest_market_intelligence_item(database_url, user_id, candidate, evidence):
+    """指示書33番B〜F相当の統合パイプライン。candidateはbuild_event_candidate_descriptor()の
+    戻り値。evidenceは{"source_kind","source_name","source_record_id","source_url",
+    "posted_at","upstream_source","dependency_group","raw_text_summary"}。既存
+    underlying_eventと一致（EXACT/HIGH/MEDIUM）すればそこへevidenceを追加、なければ
+    新規作成する（指示書9番、LOWは新規作成——誤統合よりは重複の方が安全という方針）。
+    戻り値：{"event_id","is_new","match_confidence","alert_type","confidence_level",
+    "impact_score"}かNone（DB未接続時）。"""
+    if investment_db is None or not database_url:
+        return None
+    matched_event, level = find_matching_underlying_event(database_url, candidate)
+    is_new = matched_event is None
+    primary_type = SOURCE_KIND_TO_PRIMARY_TYPE.get(evidence.get("source_kind"), "SOCIAL")
+    if is_new:
+        event = investment_db.create_underlying_event(database_url, {
+            "event_key": candidate.get("event_key"), "event_type": candidate["event_type"],
+            "title": candidate.get("title"), "normalized_title": candidate.get("normalized_title"),
+            "ticker": candidate.get("ticker"), "company_name": candidate.get("company_name"),
+            "sector": candidate.get("sector"), "country": candidate.get("country", "JP"),
+            "event_at": candidate.get("event_at"), "primary_source_type": primary_type,
+            "primary_source_url": evidence.get("source_url"), "confidence": 0.4,
+            "confidence_level": "UNVERIFIED", "importance": "MEDIUM", "status": "ACTIVE",
+            "raw_source_count": 0, "independent_source_count": 0, "primary_source_confirmed": False,
+            "numerical_fingerprint_json": candidate.get("numerical_fingerprint"),
+            "direct_tickers_json": [candidate["ticker"]] if candidate.get("ticker") else [],
+        })
+    else:
+        event = matched_event
+    if event is None:
+        return None
+    before_state = {"confidence_level": event.get("confidence_level"), "impact_score": event.get("impact_score"),
+                     "numerical_fingerprint": event.get("numerical_fingerprint_json") or []}
+    added = investment_db.add_underlying_event_evidence(database_url, {
+        "event_id": event["id"], "source_kind": evidence.get("source_kind"),
+        "source_name": evidence.get("source_name"), "source_record_id": evidence.get("source_record_id"),
+        "source_url": evidence.get("source_url"), "posted_at": evidence.get("posted_at"),
+        "is_primary": False, "is_independent": True, "upstream_source": evidence.get("upstream_source"),
+        "dependency_group": evidence.get("dependency_group"), "raw_text_summary": evidence.get("raw_text_summary"),
+    })
+    if added is None and not is_new:
+        _event_alert_suppressed_count[0] += 1  # 指示書30番：完全に同一のevidence（純粋な転載）
+        return {"event_id": event["id"], "is_new": False, "match_confidence": level, "alert_type": None,
+                "confidence_level": event.get("confidence_level"), "impact_score": event.get("impact_score")}
+    all_evidence = investment_db.list_underlying_event_evidence(database_url, event["id"])
+    raw_count = len(all_evidence)
+    independent_count = compute_independent_source_count(all_evidence)
+    promotion = maybe_promote_primary_source(event, primary_type, evidence.get("source_url"))
+    new_primary_type = (promotion or {}).get("primary_source_type", event.get("primary_source_type"))
+    confidence_level = classify_event_confidence_level(new_primary_type, independent_count)
+    merged_fingerprint = sorted(set(event.get("numerical_fingerprint_json") or [])
+                                 | set(candidate.get("numerical_fingerprint") or []))
+    impact_score = compute_event_impact_score(confidence_level=confidence_level, event_type=event.get("event_type"))
+    update_fields = {
+        "last_seen_at": "NOW()", "raw_source_count": raw_count, "independent_source_count": independent_count,
+        "confidence_level": confidence_level, "primary_source_confirmed": new_primary_type not in ("SOCIAL", None),
+        "numerical_fingerprint_json": merged_fingerprint, "impact_score": impact_score,
+    }
+    if promotion:
+        update_fields.update(promotion)
+    if confidence_level == "OFFICIAL_CONFIRMED" and event.get("status") == "ACTIVE":
+        update_fields["status"] = "CONFIRMED"
+    investment_db.update_underlying_event(database_url, event["id"], update_fields)
+    after_state = {"confidence_level": confidence_level, "impact_score": impact_score,
+                   "numerical_fingerprint": merged_fingerprint}
+    alert_type = classify_underlying_event_alert_type(is_new, before_state, after_state)
+    if alert_type:
+        investment_db.create_underlying_event_alert(database_url, event["id"], alert_type, payload={
+            "event_type": event.get("event_type"), "title": event.get("title"), "confidence_level": confidence_level,
+        })
+    elif not is_new:
+        _event_alert_suppressed_count[0] += 1  # 指示書20番：状態が変わらない追加evidenceはno alert
+    return {"event_id": event["id"], "is_new": is_new, "match_confidence": level if not is_new else "NEW_EVENT",
+            "alert_type": alert_type, "confidence_level": confidence_level, "impact_score": impact_score}
+
+
+def ingest_market_intelligence_item_safe(database_url, user_id, candidate, evidence):
+    """指示書冒頭の精神：event統合の失敗が投稿保存自体を壊さないようにする。"""
+    try:
+        return ingest_market_intelligence_item(database_url, user_id, candidate, evidence)
+    except Exception as e:
+        print("  Market Intelligence: event ingestで例外（無視して続行）", e)
+        return None
+
+
+def _evidence_source_kind_for_post(saved_post):
+    """保存済み投稿のprimary_source_typeからevidenceのsource_kind/source_nameを決める。"""
+    ptype = saved_post.get("primary_source_type")
+    if ptype == "TDNET":
+        return "TDNET", "TDnet"
+    if ptype in ("COMPANY_IR", "IR"):
+        return "IR", saved_post.get("company_name") or "企業IR"
+    if ptype == "GOV":
+        return "EVENT", "官公庁"
+    if ptype == "NEWS":
+        return "NEWS", saved_post.get("primary_source_url") or "NEWS"
+    return "SOCIAL", saved_post.get("source_handle")
+
+
+def maybe_ingest_event_from_post(database_url, user_id, saved_post):
+    """指示書33番D：kgbukabu/aryaryaのSTOCK_BREAKING/CORPORATE_BREAKING投稿をevidence化する。
+    材料性が薄い投稿（ticker/一次情報リンクどちらも無くevent_typeもOTHER）はevent化しない
+    （指示書31番の精神＝不確かな断片を無理にイベント化しない）。"""
+    sb = saved_post.get("stock_breaking_json") or {}
+    cb = saved_post.get("corporate_breaking_json") or {}
+    text = saved_post.get("text") or ""
+    ticker = sb.get("ticker")
+    company_name = sb.get("company_name")
+    event_type = classify_event_type_from_text(text)
+    if event_type == "OTHER" and not ticker and not cb.get("linked_url"):
+        return None
+    candidate = build_event_candidate_descriptor(event_type, text[:80], ticker=ticker, company_name=company_name,
+                                                  event_at=saved_post.get("posted_at"))
+    source_kind, source_name = _evidence_source_kind_for_post(saved_post)
+    evidence = {
+        "source_kind": source_kind,
+        "source_name": source_name if source_kind != "SOCIAL" else saved_post.get("source_handle"),
+        "source_record_id": saved_post.get("post_id"),
+        "source_url": saved_post.get("primary_source_url") or saved_post.get("url"),
+        "posted_at": saved_post.get("posted_at"), "upstream_source": saved_post.get("primary_source_url"),
+        "dependency_group": saved_post.get("primary_source_url"), "raw_text_summary": text[:80],
+    }
+    return ingest_market_intelligence_item_safe(database_url, user_id, candidate, evidence)
+
+
+def maybe_link_prediction_to_macro_event(database_url, user_id, saved_post):
+    """指示書15番：Polymarketの予測はevent本体ではなく既存macro eventへのevidenceとして
+    紐付ける。一致するevent（LOW未満は除く＝find_matching_underlying_eventの既定挙動）が
+    無ければ何もしない——予測だけでは新規eventを作らない。"""
+    pm = saved_post.get("prediction_market_json") or {}
+    if pm.get("category") != "MACRO":
+        return None
+    text = pm.get("prediction_topic") or saved_post.get("text") or ""
+    event_type = "CENTRAL_BANK" if any(k in text for k in ["FOMC", "FRB", "日銀", "利下げ", "利上げ"]) else "ECONOMIC_INDICATOR"
+    candidate = build_event_candidate_descriptor(event_type, text[:80], event_at=saved_post.get("posted_at"))
+    matched, _level = find_matching_underlying_event(database_url, candidate)
+    if not matched:
+        return None
+    added = investment_db.add_underlying_event_evidence(database_url, {
+        "event_id": matched["id"], "source_kind": "PREDICTION", "source_name": saved_post.get("source_handle"),
+        "source_record_id": saved_post.get("post_id"), "source_url": saved_post.get("url"),
+        "posted_at": saved_post.get("posted_at"), "is_primary": False, "is_independent": True,
+        "upstream_source": None, "dependency_group": None, "raw_text_summary": text[:80],
+    })
+    return matched["id"] if added else None
+
+
+def maybe_link_prediction_to_macro_event_safe(database_url, user_id, saved_post):
+    try:
+        return maybe_link_prediction_to_macro_event(database_url, user_id, saved_post)
+    except Exception as e:
+        print("  Market Intelligence: prediction linkageで例外（無視して続行）", e)
+        return None
+
+
+def backfill_underlying_events(database_url, user_id, limit, dry_run=True):
+    """指示書28番：既存social_market_postsからevent backfillする。limit・dry_runは
+    誤操作防止のため必須（呼び出し側=APIハンドラで必須化）。dry_run=Trueの場合はDBへ
+    書き込まず対象件数・生成予定候補数だけを返す。LOW confidence matchは統合しない
+    （find_matching_underlying_event/ingest側の既定挙動をそのまま使う）。"""
+    if investment_db is None or not database_url:
+        return {"ok": False, "reason": "DB未設定"}
+    since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=30)).isoformat()
+    posts = investment_db.list_recent_social_posts_all_sources(database_url, since_iso, limit=limit)
+    if dry_run:
+        candidate_total = sum(1 for p in posts if (p.get("stock_breaking_json") or {}).get("ticker")
+                               or (p.get("corporate_breaking_json") or {}).get("linked_url")
+                               or classify_event_type_from_text(p.get("text") or "") != "OTHER")
+        return {"ok": True, "dry_run": True, "target_posts": len(posts), "candidate_events": candidate_total}
+    created, linked = 0, 0
+    for p in posts:
+        try:
+            result = maybe_ingest_event_from_post(database_url, user_id, p)
+            if result:
+                if result.get("is_new"):
+                    created += 1
+                else:
+                    linked += 1
+        except Exception as e:
+            print("  Market Intelligence: backfillで例外", p.get("post_id"), e)
+    return {"ok": True, "dry_run": False, "target_posts": len(posts), "created": created, "linked": linked}
+
+
+def get_underlying_event_diagnostics(database_url):
+    """指示書30番：Underlying Event Engine全体の診断（source別診断=get_market_source_
+    diagnosticsとは別軸、cross-source集計）。"""
+    if investment_db is None or not database_url:
+        return {"active_underlying_events": 0, "events_created_today": 0, "merged_evidence_today": 0,
+                "duplicate_alerts_suppressed": _event_alert_suppressed_count[0], "official_confirmations_today": 0}
+    today_start_iso = datetime.datetime.now(_JST).replace(hour=0, minute=0, second=0, microsecond=0) \
+        .astimezone(datetime.timezone.utc).isoformat()
+    return {
+        "active_underlying_events": investment_db.count_active_underlying_events(database_url),
+        "events_created_today": investment_db.count_underlying_events_since(database_url, today_start_iso),
+        "merged_evidence_today": investment_db.count_underlying_event_evidence_since(database_url, today_start_iso),
+        "duplicate_alerts_suppressed": _event_alert_suppressed_count[0],
+        "official_confirmations_today": investment_db.count_underlying_events_since(
+            database_url, today_start_iso, status="CONFIRMED"),
+    }
+
+
 def get_recent_market_intelligence(database_url, user_id, lookback_minutes=CONSENSUS_LOOKBACK_MINUTES):
     """指示書22番：ChatGPT相談payload向けrecent_market_intelligence。既存
     recent_social_market_signals（にこそく専用）は後方互換のため別途維持し、この関数は
@@ -5682,10 +6197,34 @@ def get_recent_market_intelligence(database_url, user_id, lookback_minutes=CONSE
                 "primary_source_type": p.get("primary_source_type"), "url": p.get("url"),
             })
     consensus_result = build_market_intelligence_consensus(database_url, lookback_minutes=lookback_minutes)
+    events_since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)).isoformat()
+    events = [build_event_summary(database_url, ev)
+              for ev in investment_db.list_active_underlying_events(database_url, since_iso=events_since_iso, limit=30)]
     return {
         "social_signals": social_signals, "prediction_market_shifts": prediction_shifts,
         "breaking_stock_signals": breaking_stock, "corporate_breaking": corporate_breaking,
         "consensus": consensus_result["consensus"], "disagreements": consensus_result["disagreements"],
+        "events": events,  # Phase7新規（指示書22番）：event中心のpayload
+    }
+
+
+def build_event_summary(database_url, event):
+    """指示書22・23番：GET /api/market-intelligence/events・recent_market_intelligence向けの
+    event要約。confidenceはevent全体のconfidence_level（OFFICIAL_CONFIRMED等の文字列、
+    指示書22番の例に合わせる——数値のconfidence列とは別）。"""
+    evidence = investment_db.list_underlying_event_evidence(database_url, event["id"]) if investment_db else []
+    sources = sorted({e.get("source_name") for e in evidence if e.get("source_name")})
+    return {
+        "event_id": event.get("id"), "event_type": event.get("event_type"), "title": event.get("title"),
+        "confidence": event.get("confidence_level"), "status": event.get("status"),
+        "first_seen_at": event.get("first_seen_at"), "latest_update_at": event.get("last_seen_at"),
+        "independent_source_count": event.get("independent_source_count"),
+        "raw_source_count": event.get("raw_source_count"), "sources": sources,
+        "direct_tickers": event.get("direct_tickers_json") or [],
+        "related_tickers": event.get("related_tickers_json") or [],
+        "impact_score": event.get("impact_score"),
+        "primary_source_type": event.get("primary_source_type"), "primary_source_url": event.get("primary_source_url"),
+        "discovery_lead_seconds": compute_discovery_lead_seconds(evidence),
     }
 
 
@@ -11054,8 +11593,45 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json({"alerts": alerts})
         elif self.path.split("?")[0] == "/api/market-sources":
             # Market Intelligence Phase6新規（指示書31番）：設定駆動型market_sourcesの一覧。
+            # Phase7（指示書30番）：Underlying Event Engine全体の診断も併せて返す。
             sources = investment_db.list_market_sources(DATABASE_URL) if (investment_db is not None and DATABASE_URL) else []
-            self._send_json({"sources": sources, "configs": MARKET_SOURCE_CONFIGS})
+            event_diag = get_underlying_event_diagnostics(DATABASE_URL)
+            self._send_json({"sources": sources, "configs": MARKET_SOURCE_CONFIGS, "event_engine": event_diag})
+        elif self.path.split("?")[0] == "/api/market-intelligence/events":
+            # Market Intelligence Phase7新規（指示書23・29番）：event一覧（「重要」タブ主表示）。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            limit = int(params.get("limit", ["30"])[0])
+            lookback_days = int(params.get("lookback_days", ["7"])[0])
+            since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=lookback_days)).isoformat()
+            events = [build_event_summary(DATABASE_URL, ev)
+                      for ev in investment_db.list_active_underlying_events(DATABASE_URL, since_iso=since_iso, limit=limit)] \
+                if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"events": events})
+        elif self.path.split("?")[0].startswith("/api/market-intelligence/events/") \
+                and self.path.split("?")[0].endswith("/evidence"):
+            # Market Intelligence Phase7新規（指示書25・29番）：event詳細のtimeline（evidence一覧）。
+            try:
+                event_id = int(self.path.split("?")[0][len("/api/market-intelligence/events/"):-len("/evidence")].strip("/"))
+            except ValueError:
+                self._send_json({"error": "不正なevent_idです"})
+                return
+            evidence = investment_db.list_underlying_event_evidence(DATABASE_URL, event_id) \
+                if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"event_id": event_id, "evidence": evidence,
+                              "discovery_lead_seconds": compute_discovery_lead_seconds(evidence)})
+        elif self.path.split("?")[0].startswith("/api/market-intelligence/events/"):
+            # Market Intelligence Phase7新規（指示書29番）：event単体の詳細。
+            try:
+                event_id = int(self.path.split("?")[0][len("/api/market-intelligence/events/"):].strip("/"))
+            except ValueError:
+                self._send_json({"error": "不正なevent_idです"})
+                return
+            event = investment_db.get_underlying_event(DATABASE_URL, event_id) if (investment_db is not None and DATABASE_URL) else None
+            if event is None:
+                self._send_json({"error": "対象のeventが見つかりません"})
+                return
+            self._send_json(build_event_summary(DATABASE_URL, event))
         elif self.path.split("?")[0].startswith("/api/market-sources/") and self.path.split("?")[0].endswith("/diagnostics"):
             # Market Intelligence Phase6新規（指示書2・30・31番）：source別診断（1sourceの障害が
             # 他sourceへ波及しない設計）。
@@ -11902,6 +12478,24 @@ class Handler(SimpleHTTPRequestHandler):
             result = backfill_social_signal_evaluations(DATABASE_URL, self.current_user, limit,
                                                           dry_run=bool(body.get("dry_run")),
                                                           recompute=bool(body.get("recompute")))
+            self._send_json(result)
+        elif self.path == "/api/market-intelligence/backfill-events":
+            # Market Intelligence Phase7新規（指示書28・29番）：既存投稿からのevent backfill。
+            # limit・dry_runは誤操作防止のため必須（自動で大量処理しない）。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            if "limit" not in body or "dry_run" not in body:
+                self._send_json({"error": "limit・dry_runは必須です"})
+                return
+            try:
+                limit = int(body.get("limit"))
+            except (TypeError, ValueError):
+                limit = 0
+            if limit <= 0 or limit > 200:
+                self._send_json({"error": "limitは1〜200の範囲で指定してください"})
+                return
+            result = backfill_underlying_events(DATABASE_URL, self.current_user, limit, dry_run=bool(body.get("dry_run")))
             self._send_json(result)
         elif self.path == "/api/watchlist/migrate":
             # 既存ユーザーのlocalStorage watchlistを1回だけNeonへ取り込む（investmentLogMigratedと
