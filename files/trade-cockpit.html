@@ -3479,6 +3479,13 @@ function buildSignalsFromAnalysis(a){
     high_update:!!findCk(a.tradeRules?.entryTimingChecklist,"highUpdate"),
   };
 }
+// UI方針変更（2026-09-11）：EXPERT VIEW全文・適用ルール一覧を通常画面へ常時表示しない
+// （ユーザー指示）。有識者見解・ルール・イベント・地合い等は引き続きsynthesize_trade_
+// judgment()（investment_db.py、既存・無変更）が内部で統合して総合判断・確信度・reasonsを
+// 生成しており、判断ロジック自体はこのUI変更で一切弱めていない——変更するのは「見せ方」
+// のみ。通常表示は「総合判断／確信度／重要ポイント（最大3件）」に絞り、有識者見解全文・
+// ルール全文・使用した市場データは「判断根拠の詳細」に折りたたむ（既定は閉じたまま、
+// ユーザーが明示的に開いた場合のみ表示）。
 function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
   const [result,setResult]=useState(null);
   const [detailOpen,setDetailOpen]=useState(false);
@@ -3495,22 +3502,40 @@ function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
   if(!result)return null;
   const{judgment,context}=result;
   const jm=TRADE_JUDGMENT_META[judgment.judgment]||{label:judgment.judgment,color:"var(--ink)"};
+  const keyPoints=(judgment.reasons||[]).slice(0,3); // 指示書：重要ポイントは最大3件程度
+  const activeRules=(context.relevant_rules||[]).filter(r=>r.status==="ACTIVE");
   return <div style={{border:`1px solid ${jm.color}`,borderRadius:4,padding:"8px 10px",marginBottom:8,background:"var(--band)"}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:6}}>
       <div style={{fontWeight:800,fontSize:13,color:jm.color}}>総合判断：{jm.label}</div>
       <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>確信度 {judgment.confidence}%</div>
     </div>
-    {judgment.reasons.length>0 && <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:11.5}}>
-      {judgment.reasons.map((r,i)=><li key={i}>{r}</li>)}
+    {keyPoints.length>0 && <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:11.5}}>
+      {keyPoints.map((r,i)=><li key={i}>{r}</li>)}
     </ul>}
-    <button className="iconbtn" style={{fontSize:10.5,marginTop:4}} onClick={()=>setDetailOpen(v=>!v)}>{detailOpen?"▾":"▸"} 詳細データ</button>
-    {detailOpen && <div style={{fontSize:11,color:"var(--inkSoft)",marginTop:4,display:"flex",flexDirection:"column",gap:2}}>
+    <button className="iconbtn" style={{fontSize:10.5,marginTop:4}} onClick={()=>setDetailOpen(v=>!v)}>{detailOpen?"▾":"▸"} 判断根拠の詳細</button>
+    {detailOpen && <div style={{fontSize:11,color:"var(--inkSoft)",marginTop:4,display:"flex",flexDirection:"column",gap:6}}>
+      {/* 指示書：詳細を開いた場合のみ、どの有識者見解・どのルール・どの市場データが影響したかを
+          確認できるようにする（全文はDB/ExpertViewsPanel・トレードルール管理画面が原本）。 */}
+      {context.expert_views.length>0 && <div>
+        <div style={{fontWeight:700,color:"var(--ink)"}}>有識者見解（{context.expert_views.length}件が判断に影響）</div>
+        {context.expert_views.slice(0,3).map((e,i)=><div key={i} style={{marginTop:1}}>
+          🎓 {e.expert_name}{e.status?`（${e.status}）`:""}：{e.outlook||e.thesis||"—"}
+        </div>)}
+      </div>}
+      {activeRules.length>0 && <div>
+        <div style={{fontWeight:700,color:"var(--ink)"}}>適用ルール（{activeRules.length}件がヒット）</div>
+        {activeRules.slice(0,5).map(r=><div key={r.id} style={{marginTop:1}}>
+          {TRADE_RULE_CONFIDENCE_META[r.confidence]?.icon||""} {r.rule_text}{r.action_text&&<span style={{color:"var(--inkFaint)"}}> → {r.action_text}</span>}
+        </div>)}
+      </div>}
       {context.recent_news.length>0 && <div>ニュース {context.recent_news.length}件（最新：{context.recent_news[0].title}）</div>}
       {context.upcoming_events.length>0 && <div>直近イベント {context.upcoming_events.length}件（{context.upcoming_events[0].title||context.upcoming_events[0].event}まであと{context.upcoming_events[0].business_days_until}営業日）</div>}
       {context.matched_playbooks.length>0 && <div>プレイブック適合：{context.matched_playbooks[0].name}（{context.matched_playbooks[0].matchScore}%）</div>}
-      {context.expert_views.length>0 && <div>関連する有識者見解 {context.expert_views.length}件</div>}
       {context.similar_trades.length>0 && <div>過去の同銘柄取引 {context.similar_trades.length}件</div>}
       {context.behavioral_warnings.length>0 && <div style={{color:"var(--down)"}}>行動警告：{context.behavioral_warnings.map(w=>w.code).join("・")}</div>}
+      {judgment.reasons.length>keyPoints.length && <div style={{color:"var(--inkFaint)"}}>
+        その他の判断材料：{judgment.reasons.slice(keyPoints.length).join("／")}
+      </div>}
     </div>}
   </div>;
 }
@@ -10965,13 +10990,17 @@ function App(){
                           <RelevantMarketSummary w={w} metrics={s.metrics}/>
                           {/* 2026-09-09新規（判断エンジン強化）：知識コンテキストを実際の分析へ
                               利用した総合判断（買い候補/様子見/利確優先等）・確信度・理由を表示
-                              （指示書21〜23番）。既存のEventRiskNote/CatalystNote/ExpertViewNote
-                              等の個別表示は無変更のまま維持し、その上に統合判断を追加する形。 */}
+                              （指示書21〜23番）。
+                              UI方針変更（2026-09-11）：EXPERT VIEW全文（ExpertViewNote非compact）・
+                              適用ルール一覧（AppliedRulesPanel）は通常画面から削除した。両者の
+                              情報はKnowledgeJudgmentPanelの内部判断（synthesize_trade_judgment、
+                              investment_db.py・無変更）に既に統合されており、「判断根拠の詳細」
+                              トグルを開けば実際にヒットした有識者見解・ルールを確認できる
+                              （指示書：内部では使う・画面には要約するのみ表示する）。 */}
                           <KnowledgeJudgmentPanel code={w.code} sector={w.sector} market={w.market}
                             tradeStyle={enr?.status==="ACTIVE_BREAK"||enr?.status==="HOT"?"DAY":undefined} baseSignal={enr?.actionStatus} a={a}/>
                           <EventRiskNote events={marketEvents} code={w.code} sector={w.sector}/>
                           <CatalystNote catalysts={newsCatalysts} code={w.code} sector={w.sector}/>
-                          <ExpertViewNote views={expertViews} code={w.code} sector={w.sector} market={w.market}/>
                           {/* ===== 2026-09-08刷新（分析カードUI改善：DECISION_FIRST_LAYOUT）=====
                               指示書のvisible_fields（総合評価・Action Status・Market Risk・RS・
                               押し目候補・短期ブレイク価格・初期損切り・利確①・RR・重要な理由3件
@@ -10983,10 +11012,9 @@ function App(){
                           {/* 総合評価・Action Status・Market Risk・RS（対市場・対セクター）は
                               既存AssessmentCardが既に1枚でまとめて表示している（新規計算なし）。 */}
                           {a.assessment && enr && <AssessmentCard assessment={a.assessment} marginBadge={a.tradeRules?.marginBadge} marginRatio={a.tradeRules?.marginRatio} enr={enr} sectorRank={sectorRankMap.get(w.sector)}/>}
-                          {/* 2026-09-09新規（ルール学習システム、指示書13番）：「なぜこの分析結果になったか」を
-                              確認できるよう、関連するACTIVE/TESTINGルールを表示する。既存の売買判定
-                              ロジックへは一切混ぜない（指示書14番：補助表示のみ）。 */}
-                          <AppliedRulesPanel sector={w.sector} theme={w.theme}/>
+                          {/* UI方針変更（2026-09-11）：「適用ルール○件」の全文一覧（AppliedRulesPanel）は
+                              通常画面から削除した。ヒットしたルールはKnowledgeJudgmentPanelの「判断根拠の
+                              詳細」トグル内で確認できる（指示書：内部利用は継続、表示のみ要約）。 */}
                           {/* 重要な理由3件以内：StatusReasonPanel側で表示件数を3件にキャップ済み（既存の
                               riskReasons/waitReasons自体は無変更、表示だけ絞る）。 */}
                           {enr && <StatusReasonPanel enr={enr} a={a}/>}
