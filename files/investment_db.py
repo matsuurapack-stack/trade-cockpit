@@ -1043,6 +1043,7 @@ def init_schema(database_url):
         conn.execute(_MIGRATE_ENTRY_CANDIDATE_SNAPSHOTS_V2_SQL)
         conn.execute(_MIGRATE_VALIDATION_SESSIONS_V2_SQL)
         conn.execute(_SCHEMA_PARSER_FAILURE_QUEUE_SQL)
+        conn.execute(_SCHEMA_CONFIG_CHANGE_LOG_SQL)
         conn.commit()
 
 
@@ -6289,6 +6290,106 @@ def check_schema_integrity(database_url):
     tables = {t: (t in existing) for t in EXPECTED_MARKET_INTELLIGENCE_TABLES}
     missing = [t for t, ok in tables.items() if not ok]
     return {"ok": len(missing) == 0, "tables": tables, "missing": missing}
+
+
+# ============================================================
+# Market Intelligence Phase12.5（2026-09-11新規）：Live Activation / Shadow Data
+# Accumulation / Operational Runbook。判断閾値・重み（DS_V1）は原則変更しない
+# （指示書34番）——変更した場合のみここへ記録する（指示書35番）。
+# ============================================================
+
+_SCHEMA_CONFIG_CHANGE_LOG_SQL = """
+CREATE TABLE IF NOT EXISTS config_change_log (
+    id           SERIAL PRIMARY KEY,
+    changed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reason       TEXT NOT NULL,
+    before_json  JSONB,
+    after_json   JSONB,
+    commit_hash  TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_config_change_log_changed_at ON config_change_log(changed_at DESC);
+"""
+
+
+def record_config_change(database_url, reason, before, after, commit_hash=None):
+    """指示書35番：判断閾値・重みをどうしても変更した場合の監査ログ。Phase12.5期間中は
+    原則呼ばれない想定（指示書34番）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "INSERT INTO config_change_log (reason, before_json, after_json, commit_hash) "
+                "VALUES (%s, %s::jsonb, %s::jsonb, %s) RETURNING *",
+                [reason, json.dumps(before, ensure_ascii=False), json.dumps(after, ensure_ascii=False), commit_hash])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_config_changes(database_url, limit=50):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM config_change_log ORDER BY changed_at DESC LIMIT %s", [limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def count_underlying_events_total(database_url):
+    """指示書26・41番：累計underlying_events件数（Phase13検討前サンプル目標との比較用）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM underlying_events")
+            return cur.fetchone()[0]
+
+
+def count_entry_candidate_snapshots_total(database_url, user_id, candidate_type=None):
+    """指示書26・41番：累計candidate snapshot件数（type別も可）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    where = ["user_id = %s"]
+    params = [user_id]
+    if candidate_type:
+        where.append("candidate_type = %s")
+        params.append(candidate_type)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM entry_candidate_snapshots WHERE {' AND '.join(where)}", params)
+            return cur.fetchone()[0]
+
+
+def count_validation_sessions(database_url):
+    """指示書15・27番：Shadow modeで起動した日数（validation_sessionsは1日1行、
+    session_dateにUNIQUE制約があるため件数=稼働日数の近似値）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM validation_sessions")
+            return cur.fetchone()[0]
+
+
+def count_entry_candidate_snapshots_evaluated_total(database_url, user_id):
+    """指示書26・41番：累計evaluated outcome件数（outcome_status確定済み）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM entry_candidate_snapshots WHERE user_id=%s AND outcome_status IS NOT NULL",
+                [user_id])
+            return cur.fetchone()[0]
 
 
 def get_or_create_validation_session(database_url, session_date, app_version=None, commit_hash=None,

@@ -9212,6 +9212,171 @@ def build_daily_validation_report_safe(database_url, user_id, review_date):
                  "low_quality_samples": 0, "decision_state_counts": {}, "wait_outcomes": {}}
 
 
+# ============================================================
+# Market Intelligence Phase12.5（2026-09-11新規）：Live Activation / Shadow Data
+# Accumulation / Operational Runbook。新しいロジックはほぼ追加しない（指示書冒頭・最重要
+# 原則：「コードを書くこと」ではなく「実市場で検証すること」が目的）。ここは進捗・
+# readiness判定・config変更監査・replay drift理由分類の補助のみ。
+# ============================================================
+
+# 指示書26・49番：Phase13検討前サンプル目標。
+PHASE13_SAMPLE_TARGETS = {
+    "candidate_snapshots": 100, "evaluated_outcomes": 80, "wait_samples": 20,
+    "avoid_chase_samples": 15, "underlying_events": 30, "trading_days": 5,
+}
+
+
+def get_live_candidate_counts(database_url, user_id):
+    """指示書26・41番：progress/readiness判定向けの累計カウント。trading_daysは
+    validation_sessions（起動日ごとに1行）の件数で近似する（既知の簡略化——実際の
+    「取引が行われた日数」ではなく「サーバーがShadow modeで起動した日数」）。"""
+    empty = {"candidate_snapshots": 0, "evaluated_outcomes": 0, "wait_samples": 0, "avoid_chase_samples": 0,
+              "underlying_events": 0, "trading_days": 0}
+    if investment_db is None or not database_url:
+        return empty
+    return {
+        "candidate_snapshots": investment_db.count_entry_candidate_snapshots_total(database_url, user_id),
+        "evaluated_outcomes": investment_db.count_entry_candidate_snapshots_evaluated_total(database_url, user_id),
+        "wait_samples": investment_db.count_entry_candidate_snapshots_total(database_url, user_id, candidate_type="WAIT"),
+        "avoid_chase_samples": investment_db.count_entry_candidate_snapshots_total(
+            database_url, user_id, candidate_type="AVOID_CHASE"),
+        "underlying_events": investment_db.count_underlying_events_total(database_url),
+        "trading_days": investment_db.count_validation_sessions(database_url),
+    }
+
+
+def compute_phase13_progress(counts):
+    """指示書41番：各サンプル目標に対する進捗（current/target/pct）。"""
+    return {k: {"current": counts.get(k, 0), "target": target,
+                 "pct": round(min(counts.get(k, 0) / target, 1.0) * 100, 1) if target else None}
+             for k, target in PHASE13_SAMPLE_TARGETS.items()}
+
+
+def compute_phase13_readiness(counts, critical_duplicate=0, critical_orphan=0):
+    """指示書42・43番：NOT_READY/COLLECTING/REVIEW_REQUIRED/READY_FOR_PHASE13_REVIEW。
+    自動でPhase13を有効にはしない——判定を返すのみ（指示書43番REQUIRED）。"""
+    if critical_duplicate > 0 or critical_orphan > 0:
+        return "REVIEW_REQUIRED"
+    any_progress = any((counts.get(k) or 0) > 0 for k in PHASE13_SAMPLE_TARGETS)
+    if not any_progress:
+        return "NOT_READY"
+    targets_met = all((counts.get(k) or 0) >= target for k, target in PHASE13_SAMPLE_TARGETS.items())
+    if targets_met:
+        return "READY_FOR_PHASE13_REVIEW"
+    return "COLLECTING"
+
+
+def build_validation_progress_report(database_url, user_id):
+    """指示書41・47番：GET /api/market-intelligence/validation/progress。"""
+    if investment_db is None or not database_url:
+        counts = {k: 0 for k in PHASE13_SAMPLE_TARGETS}
+        return {"counts": counts, "progress": compute_phase13_progress(counts), "readiness": "NOT_READY"}
+    counts = get_live_candidate_counts(database_url, user_id)
+    duplicates = run_duplicate_audit(database_url)
+    orphans = run_orphan_audit(database_url)
+    readiness = compute_phase13_readiness(counts, critical_duplicate=sum(duplicates.values()),
+                                            critical_orphan=sum(orphans.values()))
+    return {"counts": counts, "progress": compute_phase13_progress(counts), "readiness": readiness}
+
+
+def build_validation_progress_report_safe(database_url, user_id):
+    try:
+        return build_validation_progress_report(database_url, user_id)
+    except Exception as e:
+        print("  Market Intelligence: validation progress report生成で例外（無視して続行）", e)
+        counts = {k: 0 for k in PHASE13_SAMPLE_TARGETS}
+        return {"counts": counts, "progress": compute_phase13_progress(counts), "readiness": "NOT_READY"}
+
+
+def build_phase13_readiness_report(database_url, user_id):
+    """指示書44番：READY_FOR_PHASE13_REVIEW到達時にまとめるべき内容のひな形。達していなくても
+    現状値を返す（判定はUI/人間が行う、指示書43番「自動でPhase13を有効にしない」）。"""
+    progress = build_validation_progress_report_safe(database_url, user_id)
+    calibration = build_calibration_report_safe(database_url, user_id) if (investment_db is not None and database_url) else {}
+    return {
+        "readiness": progress["readiness"], "counts": progress["counts"], "progress": progress["progress"],
+        "event_support_vs_returns": calibration.get("overall", {}),
+        "false_positives_sample": (calibration.get("false_positives") or [])[:10],
+        "false_negatives_sample": (calibration.get("false_negatives") or [])[:10],
+        "note": "自動でPhase13を有効にしていません。GO/NO-GOは人間が最終判断してください（指示書43・61・62番）。",
+    }
+
+
+def build_source_quality_report(database_url):
+    """指示書25番：source別のparser accuracy（暫定、parser_failure件数の裏返し）・latency・
+    poller稼働状況を保存する。まだ順位付けしない（指示書25番）。"""
+    if investment_db is None or not database_url:
+        return {cfg["handle"]: {"sample_count": 0, "note": "DB未設定"} for cfg in MARKET_SOURCE_CONFIGS}
+    out = {}
+    for cfg in MARKET_SOURCE_CONFIGS:
+        handle = cfg["handle"]
+        try:
+            diag = get_market_source_diagnostics(database_url, handle, user_id=_morning_check_scheduler_users()[0])
+        except Exception:
+            diag = {}
+        parser_failures = 0
+        try:
+            rows = investment_db.list_parser_failures(database_url, status=None, limit=500)
+            parser_failures = sum(1 for r in rows if r.get("source") == handle)
+        except Exception:
+            pass
+        out[handle] = {
+            "poller_running": diag.get("poller_running"), "consecutive_failures": diag.get("consecutive_failures"),
+            "parser_failures": parser_failures, "sample_count": diag.get("fetched_total") or 0,
+            "note": "PROVISIONAL（順位付けはまだ行わない、指示書25・50番）",
+        }
+    return out
+
+
+def build_source_quality_report_safe(database_url):
+    try:
+        return build_source_quality_report(database_url)
+    except Exception as e:
+        print("  Market Intelligence: source quality report生成で例外（無視して続行）", e)
+        return {cfg["handle"]: {"sample_count": 0} for cfg in MARKET_SOURCE_CONFIGS}
+
+
+# 指示書38番：replay不一致の理由分類（既存classify_replay_matchのDRIFT判定を補足する）。
+REPLAY_DRIFT_REASONS = ("PRICE_DATA_DIFFERENCE", "VWAP_DIFFERENCE", "EVENT_DATA_DIFFERENCE",
+                          "SOURCE_DATA_DIFFERENCE", "CODE_VERSION_DIFFERENCE", "UNKNOWN")
+
+
+def classify_replay_drift_reason(actual, replay):
+    """指示書38番：DRIFTと判定された場合の理由をヒューリスティックに分類する。actual/replay
+    は{"price":..,"vwap":..,"independent_source_count":..,"source_confidence_score":..,
+    "config_version":..}を想定（無い項目はNoneのまま渡してよい）。"""
+    actual, replay = actual or {}, replay or {}
+    a_price, r_price = actual.get("price"), replay.get("price")
+    if a_price is not None and r_price is not None and a_price:
+        if abs(r_price - a_price) / a_price * 100 > REPLAY_PRICE_TOLERANCE_PCT:
+            return "PRICE_DATA_DIFFERENCE"
+    a_vwap, r_vwap = actual.get("vwap"), replay.get("vwap")
+    if a_vwap is not None and r_vwap is not None and a_vwap:
+        if abs(r_vwap - a_vwap) / a_vwap * 100 > REPLAY_VWAP_TOLERANCE_PCT:
+            return "VWAP_DIFFERENCE"
+    if actual.get("independent_source_count") is not None and replay.get("independent_source_count") is not None \
+            and actual["independent_source_count"] != replay["independent_source_count"]:
+        return "EVENT_DATA_DIFFERENCE"
+    if actual.get("config_version") and replay.get("config_version") and actual["config_version"] != replay["config_version"]:
+        return "CODE_VERSION_DIFFERENCE"
+    if actual.get("source_confidence_score") is not None and replay.get("source_confidence_score") is not None \
+            and actual["source_confidence_score"] != replay["source_confidence_score"]:
+        return "SOURCE_DATA_DIFFERENCE"
+    return "UNKNOWN"
+
+
+def record_config_change_safe(database_url, reason, before, after, commit_hash=None):
+    """指示書34・35番：判断閾値・重みを変更した場合のみ呼ぶ（Phase12.5期間中は原則凍結、
+    指示書1・14・34番）。記録自体の失敗で変更処理を止めない。"""
+    if investment_db is None or not database_url:
+        return None
+    try:
+        return investment_db.record_config_change(database_url, reason, before, after, commit_hash)
+    except Exception as e:
+        print("  Market Intelligence: config change記録で例外（無視して続行）", e)
+        return None
+
+
 def _nicosoku_morning_commentary(database_url, user_id):
     """指示書10番：朝一チェックの補助材料。前日15:30〜当日08:30(JST)程度の投稿から要点を
     抽出する。既存のmorning_market_check本体ロジックには一切干渉しない、追加専用フィールド。"""
@@ -14793,6 +14958,21 @@ class Handler(SimpleHTTPRequestHandler):
         elif self.path.split("?")[0] == "/api/market-intelligence/validation/schedulers":
             # Market Intelligence Phase12新規（指示書12・13・56番）：scheduler registry+heartbeat。
             self._send_json({"schedulers": get_scheduler_diagnostics()})
+        elif self.path.split("?")[0] == "/api/market-intelligence/validation/progress":
+            # Market Intelligence Phase12.5新規（指示書41・47番）：Phase13検討前サンプル進捗。
+            self._send_json(build_validation_progress_report_safe(DATABASE_URL, self.current_user)
+                             if (investment_db is not None and DATABASE_URL) else
+                             {"counts": {}, "progress": {}, "readiness": "NOT_READY"})
+        elif self.path.split("?")[0] == "/api/market-intelligence/validation/readiness":
+            # Market Intelligence Phase12.5新規（指示書42・43・44・47番）：自動でPhase13を
+            # 有効にはしない、判定と根拠データを返すのみ。
+            report = build_phase13_readiness_report(DATABASE_URL, self.current_user) \
+                if (investment_db is not None and DATABASE_URL) else \
+                {"readiness": "NOT_READY", "counts": {}, "progress": {}}
+            self._send_json(report)
+        elif self.path.split("?")[0] == "/api/market-intelligence/validation/source-quality":
+            # Market Intelligence Phase12.5新規（指示書25・47番）：source別品質（まだ順位付けしない）。
+            self._send_json(build_source_quality_report_safe(DATABASE_URL))
         elif self.path.split("?")[0].startswith("/api/market-intelligence/events/"):
             # Market Intelligence Phase7新規（指示書29番）：event単体の詳細。
             try:

@@ -4174,12 +4174,20 @@ async function fetchJsonSafeTimeout(url,ms=8000){
 // Market Intelligence Phase12新規（指示書40・41・56番）：LIVE VALIDATIONダッシュボード
 // （traffic light表示）。売買判断UIには一切影響しない、システム品質の可視化専用。
 const HEALTH_COLOR = {GREEN:"var(--up)", YELLOW:"var(--accent)", RED:"var(--down)"};
+// Market Intelligence Phase12.5新規（指示書42番）：readiness状態の表示ラベル。
+const READINESS_LABELS_JP = {
+  NOT_READY: "NOT READY（データ蓄積前）", COLLECTING: "COLLECTING（蓄積中）",
+  REVIEW_REQUIRED: "REVIEW REQUIRED（品質要確認）", READY_FOR_PHASE13_REVIEW: "READY FOR PHASE13 REVIEW",
+};
 function LiveValidationPanel(){
   const [status,setStatus]=useState(null);
+  const [progress,setProgress]=useState(null);
   const [show,setShow]=useState(false);
   useEffect(()=>{
     if(!show)return;
     fetchJsonSafeTimeout("/api/market-intelligence/validation/status").then(d=>{if(d&&!d.error)setStatus(d);}).catch(()=>{});
+    // Market Intelligence Phase12.5新規（指示書40・41・42番）：Shadow Data蓄積の進捗＋readiness。
+    fetchJsonSafeTimeout("/api/market-intelligence/validation/progress").then(d=>{if(d&&!d.error)setProgress(d);}).catch(()=>{});
   },[show]);
   const sourcesOk=status&&Object.values(status.sources||{}).filter(s=>s==="OK").length;
   const sourcesTotal=status&&Object.keys(status.sources||{}).length;
@@ -4203,6 +4211,13 @@ function LiveValidationPanel(){
         {status.duplicate_audit && <div>Duplicate Audit　{Object.values(status.duplicate_audit).reduce((a,b)=>a+(b||0),0)}件</div>}
         {status.orphan_audit && <div>Orphan Audit　{Object.values(status.orphan_audit).reduce((a,b)=>a+(b||0),0)}件</div>}
       </>}
+      {progress && <div style={{marginTop:6,paddingTop:6,borderTop:"1px solid var(--ruleSoft)"}}>
+        <div style={{fontWeight:800}}>Phase13 Readiness：{READINESS_LABELS_JP[progress.readiness]||progress.readiness}</div>
+        <div>Trading Days　{progress.counts?.trading_days||0} / {progress.progress?.trading_days?.target}</div>
+        {Object.entries(progress.progress||{}).filter(([k])=>k!=="trading_days").map(([k,v])=>
+          <div key={k}>{k}　{v.current} / {v.target}</div>
+        )}
+      </div>}
     </div>}
   </div>;
 }
