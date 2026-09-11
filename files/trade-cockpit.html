@@ -1743,7 +1743,7 @@ const TAB_GROUPS=[
   // 指示書の推奨順（投資判断ログ／ChatGPT連携／今日の振り返り／ルール／統計）に合わせて
   // 並び替え。tabキー自体は無変更（"journal"は既存の「記録」サブタブのまま、日次レビューは
   // 新設の"dailyreview"）。
-  {key:"record",label:"記録",tabs:[{key:"journal",label:"記録"},{key:"investlog",label:"投資判断ログ"},{key:"chatgptimport",label:"ChatGPT連携"},{key:"dailyreview",label:"今日の振り返り"},{key:"traderules",label:"ルール"},{key:"stats",label:"統計"}]},
+  {key:"record",label:"記録",tabs:[{key:"journal",label:"記録"},{key:"investlog",label:"投資判断ログ"},{key:"chatgptimport",label:"ChatGPT連携"},{key:"dailyreview",label:"今日の振り返り"},{key:"traderules",label:"ルール"},{key:"tradeexperience",label:"Trade Experience"},{key:"stats",label:"統計"}]},
 ];
 
 // v3-6（2026-09-04・Primary/Action 2軸化）：Primary Status＝銘柄そのものの強さ・状態。
@@ -3500,10 +3500,16 @@ function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[code,sector,market,tradeStyle,baseSignal]);
   if(!result)return null;
-  const{judgment,context}=result;
+  const{judgment,context,tradeExperience}=result;
   const jm=TRADE_JUDGMENT_META[judgment.judgment]||{label:judgment.judgment,color:"var(--ink)"};
   const keyPoints=(judgment.reasons||[]).slice(0,3); // 指示書：重要ポイントは最大3件程度
   const activeRules=(context.relevant_rules||[]).filter(r=>r.status==="ACTIVE");
+  // Trade Experience Learning新規（指示書8・18番）：compact表示「🧠 経験 N件 / 勝率X%」。
+  const sim=tradeExperience&&tradeExperience.similar;
+  const winExamples=(sim&&sim.examples||[]).filter(e=>e.result_class==="WIN");
+  const lossExamples=(sim&&sim.examples||[]).filter(e=>e.result_class==="LOSS");
+  const tagCounts=list=>{const c={};list.forEach(e=>(e.pattern_tags_json||[]).forEach(t=>c[t]=(c[t]||0)+1));
+    return Object.entries(c).sort((a,b)=>b[1]-a[1]).slice(0,4).map(([t])=>t);};
   return <div style={{border:`1px solid ${jm.color}`,borderRadius:4,padding:"8px 10px",marginBottom:8,background:"var(--band)"}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:6}}>
       <div style={{fontWeight:800,fontSize:13,color:jm.color}}>総合判断：{jm.label}</div>
@@ -3512,6 +3518,10 @@ function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
     {keyPoints.length>0 && <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:11.5}}>
       {keyPoints.map((r,i)=><li key={i}>{r}</li>)}
     </ul>}
+    {sim&&sim.similar_count>0 && <div style={{fontSize:11,color:"var(--inkSoft)",marginTop:4}}>
+      🧠 経験 {sim.similar_count}件{sim.win_rate!=null?` / 勝率${Math.round(sim.win_rate*100)}%`:""}
+      {tradeExperience.experience_score!=null && <span style={{marginLeft:6,fontWeight:700}}>経験値 {tradeExperience.experience_score}/10</span>}
+    </div>}
     <button className="iconbtn" style={{fontSize:10.5,marginTop:4}} onClick={()=>setDetailOpen(v=>!v)}>{detailOpen?"▾":"▸"} 判断根拠の詳細</button>
     {detailOpen && <div style={{fontSize:11,color:"var(--inkSoft)",marginTop:4,display:"flex",flexDirection:"column",gap:6}}>
       {/* 指示書：詳細を開いた場合のみ、どの有識者見解・どのルール・どの市場データが影響したかを
@@ -3535,6 +3545,15 @@ function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
       {context.behavioral_warnings.length>0 && <div style={{color:"var(--down)"}}>行動警告：{context.behavioral_warnings.map(w=>w.code).join("・")}</div>}
       {judgment.reasons.length>keyPoints.length && <div style={{color:"var(--inkFaint)"}}>
         その他の判断材料：{judgment.reasons.slice(keyPoints.length).join("／")}
+      </div>}
+      {sim&&sim.similar_count>0 && <div>
+        <div style={{fontWeight:700,color:"var(--ink)"}}>過去経験：類似{sim.similar_count}件（勝{sim.wins}・負{sim.losses}）
+          {sim.avg_return_pct!=null && `　平均損益 ${sim.avg_return_pct>0?"+":""}${sim.avg_return_pct}%`}</div>
+        {winExamples.length>0 && <div style={{marginTop:1}}>成功しやすい条件：{tagCounts(winExamples).join("・")||"—"}</div>}
+        {lossExamples.length>0 && <div style={{color:"var(--down)"}}>失敗しやすい条件：{tagCounts(lossExamples).join("・")||"—"}</div>}
+        {(sim.examples||[]).slice(0,1).map((e,i)=><div key={i} style={{marginTop:2,color:"var(--inkFaint)"}}>
+          代表例：{e.symbol} {e.stock_name||""}　{e.entry_price}→{e.exit_price}（{e.gross_pnl_pct>0?"+":""}{e.gross_pnl_pct}%）
+        </div>)}
       </div>}
     </div>}
   </div>;
@@ -4707,6 +4726,12 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                       {c.eventSupport && <span style={{fontSize:10,fontWeight:700,whiteSpace:"nowrap",
                         color:c.eventSupport==="AVOID_CHASE"?"var(--down)":c.eventSupport==="STRONG"?"var(--up)":"var(--inkSoft)"}}>
                         Event Support: {ENTRY_EVENT_SUPPORT_LABELS[c.eventSupport]||c.eventSupport}
+                      </span>}
+                      {/* Trade Experience Learning新規（指示書7・20番）：entry_score自体は不変、
+                          隣に並べるだけの補助スコア（0〜10）。 */}
+                      {c.experienceScore!=null && <span style={{fontSize:10,fontWeight:700,whiteSpace:"nowrap",color:"var(--inkSoft)"}}
+                        title={c.experienceSummary&&c.experienceSummary.similar_count?`類似${c.experienceSummary.similar_count}件・勝率${c.experienceSummary.win_rate!=null?Math.round(c.experienceSummary.win_rate*100)+"%":"—"}`:"類似トレードがまだありません"}>
+                        経験値 {c.experienceScore}/10
                       </span>}
                       {c.analysisConfidence==="LOW" && <span style={{fontSize:10,color:"var(--down)"}}>確信度LOW</span>}
                       {isException && <span style={{fontSize:10,fontWeight:700,color:"var(--accent)"}}>⚠逆行耐性例外</span>}
@@ -8094,6 +8119,83 @@ function TradeRuleDetail({ruleId,onChanged,onClose}){
   </div>;
 }
 
+// Trade Experience Learning新規（2026-09-11、指示書18番④）：記録タブ「Trade Experience」。
+// UIを肥大化させない——一覧は簡潔に、詳細（judgment・スコア内訳）は展開のみ。ACTIVEルールは
+// ここからも変更できない（ルール候補の昇格ボタンはTESTINGへのみ、指示書9番）。
+function TradeExperiencePanel(){
+  const [experiences,setExperiences]=useState([]);
+  const [patternData,setPatternData]=useState(null);
+  const [loading,setLoading]=useState(true);
+  const [promoting,setPromoting]=useState(null);
+  const [msg,setMsg]=useState("");
+  const load=async()=>{
+    setLoading(true);
+    const [er,pr]=await Promise.all([
+      fetchJsonSafe("/api/trade-experiences"),
+      fetchJsonSafe("/api/trade-experience-patterns"),
+    ]);
+    setExperiences((er&&er.experiences)||[]);
+    setPatternData(pr||null);
+    setLoading(false);
+  };
+  useEffect(()=>{load();},[]);
+  const promote=async(ruleId)=>{
+    setPromoting(ruleId);
+    const r=await fetchJsonSafe(`/api/trade-experience-rule-candidates/${ruleId}/promote`,{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify({reason:"ユーザーが記録タブから承認"})});
+    setPromoting(null);
+    if(r&&r.rule){setMsg(`「${r.rule.rule_text.slice(0,24)}…」をTESTINGへ昇格しました`);load();}
+    else setMsg("昇格に失敗しました");
+  };
+  return <div>
+    <div className="sec-head">Trade Experience</div>
+    <div className="sec-note">日々の実トレードから勝ちパターン・負けパターン・WAIT条件を記録します。ACTIVEルールへは自動で昇格しません——候補（RULE_CANDIDATE）はここで確認・承認してください。</div>
+    {loading && <div style={{fontSize:12,color:"var(--inkFaint)",marginTop:10}}>読み込み中…</div>}
+    {msg && <div style={{fontSize:12,color:"var(--inkSoft)",marginTop:6}}>{msg}</div>}
+
+    {patternData&&patternData.rule_candidates&&patternData.rule_candidates.length>0 && <div className="card" style={{padding:"10px 12px",marginTop:10}}>
+      <div style={{fontWeight:800,fontSize:13}}>ルール候補（RULE_CANDIDATE）</div>
+      {patternData.rule_candidates.map(r=><div key={r.id} style={{padding:"6px 0",borderTop:"1px solid var(--ruleSoft)",fontSize:12}}>
+        <div>{r.rule_text}</div>
+        <div style={{fontSize:10.5,color:"var(--inkFaint)"}}>信頼度 {r.confidence}　エビデンス{r.evidence_count}件</div>
+        <button className="action-btn" style={{fontSize:10.5,marginTop:4}} disabled={promoting===r.id} onClick={()=>promote(r.id)}>
+          {promoting===r.id?"昇格中…":"TESTINGへ昇格"}
+        </button>
+      </div>)}
+    </div>}
+
+    {patternData&&patternData.proposed_candidates&&patternData.proposed_candidates.length>0 && <div className="card" style={{padding:"10px 12px",marginTop:10}}>
+      <div style={{fontWeight:800,fontSize:13}}>統計から見つかった候補（未生成、参考）</div>
+      {patternData.proposed_candidates.map((p,i)=><div key={i} style={{padding:"6px 0",borderTop:"1px solid var(--ruleSoft)",fontSize:12}}>
+        <div>{p.rule_text}</div>
+        <div style={{fontSize:10.5,color:"var(--inkFaint)"}}>{p.pattern}　サンプル{p.sample_count}件　勝率{Math.round((p.win_rate||0)*100)}%　信頼度{p.confidence_level}</div>
+      </div>)}
+    </div>}
+
+    {patternData&&patternData.patterns&&Object.keys(patternData.patterns).length>0 && <div className="card" style={{padding:"10px 12px",marginTop:10}}>
+      <div style={{fontWeight:800,fontSize:13}}>パターン統計</div>
+      {Object.entries(patternData.patterns).map(([tag,s])=><div key={tag} style={{fontSize:11.5,padding:"3px 0"}}>
+        {tag}：{s.sample_count}件　勝率{s.win_rate!=null?Math.round(s.win_rate*100)+"%":"—"}　平均{s.avg_pnl_pct!=null?(s.avg_pnl_pct>0?"+":"")+s.avg_pnl_pct+"%":"—"}
+        <span style={{marginLeft:6,color:"var(--inkFaint)"}}>信頼度{s.confidence_level}</span>
+      </div>)}
+    </div>}
+
+    <div style={{marginTop:10}}>
+      <div style={{fontWeight:800,fontSize:13}}>トレード履歴（{experiences.length}件）</div>
+      {experiences.length===0 && !loading && <div style={{fontSize:12,color:"var(--inkFaint)",marginTop:6}}>まだ記録がありません。</div>}
+      {experiences.map(t=><div key={t.id} className="card" style={{padding:"8px 10px",marginTop:6,fontSize:12}}>
+        <div style={{fontWeight:700}}>{t.symbol} {t.stock_name||""}　{t.trade_date}
+          <span style={{marginLeft:8,color:t.result_class==="WIN"?"var(--up)":t.result_class==="LOSS"?"var(--down)":"var(--inkSoft)"}}>{t.result_class}</span></div>
+        <div style={{color:"var(--inkSoft)"}}>{t.entry_price}→{t.exit_price}　{t.quantity}株
+          {t.gross_pnl!=null && <span>{t.gross_pnl>0?"+":""}{Math.round(t.gross_pnl).toLocaleString()}円</span>}
+          {t.gross_pnl_pct!=null && <span>（{t.gross_pnl_pct>0?"+":""}{t.gross_pnl_pct}%）</span>}
+        </div>
+        {t.pattern_tags_json&&t.pattern_tags_json.length>0 && <div style={{fontSize:10.5,color:"var(--inkFaint)",marginTop:2}}>{t.pattern_tags_json.join("・")}</div>}
+      </div>)}
+    </div>
+  </div>;
+}
+
 function TradeRulesPanel(){
   const [rules,setRules]=useState([]);
   const [loading,setLoading]=useState(true);
@@ -8267,10 +8369,34 @@ function DailyDecisionReviewSection({decisionReview}){
   </div>;
 }
 
+// Trade Experience Learning新規（指示書12・18番）：「今日の学習」。既存score_total計算には
+// 一切触れない追加専用セクション。
+function TodaysLearningSection({tradeLearning}){
+  if(!tradeLearning)return null;
+  const tl=tradeLearning;
+  const hasAny=tl.best_trade||tl.worst_trade||tl.best_wait||(tl.rule_violations&&tl.rule_violations.length)||(tl.learning_notes&&tl.learning_notes.length);
+  if(!hasAny)return null;
+  return <div className="card" style={{padding:"12px 14px",marginTop:10}}>
+    <div style={{fontWeight:800,fontSize:13}}>🧠 今日の学習</div>
+    <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:4,fontSize:11.5}}>
+      {tl.best_trade && <div><b>Best Trade：</b>{tl.best_trade.symbol} {tl.best_trade.stock_name||""}
+        {tl.best_trade.gross_pnl_pct!=null && <span style={{color:"var(--up)",marginLeft:4}}>{tl.best_trade.gross_pnl_pct>0?"+":""}{tl.best_trade.gross_pnl_pct}%</span>}</div>}
+      {tl.worst_trade && <div><b>Worst Trade：</b>{tl.worst_trade.symbol} {tl.worst_trade.stock_name||""}
+        {tl.worst_trade.gross_pnl_pct!=null && <span style={{color:"var(--down)",marginLeft:4}}>{tl.worst_trade.gross_pnl_pct>0?"+":""}{tl.worst_trade.gross_pnl_pct}%</span>}</div>}
+      {tl.best_wait && <div><b>Best WAIT：</b>{tl.best_wait.symbol}　{(tl.best_wait.reasons||[]).join("・")}</div>}
+      {tl.rule_violations&&tl.rule_violations.length>0 && <div style={{color:"var(--down)"}}>
+        <b>Rule Violation：</b>{tl.rule_violations.map(v=>v.symbol).join("・")}
+      </div>}
+      {tl.learning_notes&&tl.learning_notes.map((n,i)=><div key={i} style={{color:"var(--inkSoft)"}}>💡 {n}</div>)}
+    </div>
+  </div>;
+}
+
 function DailyReviewPanel(){
   const [date,setDate]=useState(todayISO());
   const [review,setReview]=useState(null);
   const [decisionReview,setDecisionReview]=useState(null);
+  const [tradeLearning,setTradeLearning]=useState(null);
   const [loading,setLoading]=useState(true);
   const [generating,setGenerating]=useState(false);
   const [feedbackDraft,setFeedbackDraft]=useState("");
@@ -8284,6 +8410,7 @@ function DailyReviewPanel(){
     const rev=(r&&r.review)||null;
     setReview(rev);
     setDecisionReview((r&&r.decisionReview)||null);
+    setTradeLearning((r&&r.tradeLearning)||null);
     setFeedbackDraft(rev?.user_feedback||"");
     setLoading(false);
   };
@@ -8351,6 +8478,7 @@ function DailyReviewPanel(){
           <ul style={{margin:"6px 0 0",paddingLeft:18,fontSize:12}}>{(review.tomorrow_notes||[]).map((g,i)=><li key={i}>{g}</li>)}</ul>
         </div>}
         <DailyDecisionReviewSection decisionReview={decisionReview}/>
+        <TodaysLearningSection tradeLearning={tradeLearning}/>
 
         <div className="card" style={{padding:"10px 12px",marginTop:10}}>
           <b style={{fontSize:12}}>自分の感想</b>
@@ -11413,6 +11541,9 @@ function App(){
 
       {/* ===== ルール（学習システム、2026-09-09新規） ===== */}
       {tab==="traderules" && <TradeRulesPanel/>}
+
+      {/* ===== Trade Experience Learning（2026-09-11新規） ===== */}
+      {tab==="tradeexperience" && <TradeExperiencePanel/>}
 
       {/* ===== 今日の振り返り（日次投資レビュー、2026-09-09新規） ===== */}
       {tab==="dailyreview" && <DailyReviewPanel/>}

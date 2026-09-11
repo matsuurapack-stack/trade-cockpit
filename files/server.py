@@ -2765,6 +2765,16 @@ def _score_entry_candidates(database_url, user_id):
         except Exception as e:
             print("  entry-candidates: event support表示取得で例外（無視して続行）", code, e)
 
+        # Trade Experience Learning新規（指示書7・20番）：EXPERIENCE_SCORE（0〜10）。
+        # 既存entry_scoreには一切加点しない、完全に別枠の補助スコア。
+        experience_score, experience_summary = None, None
+        try:
+            exp_summary = build_trade_experience_summary_for_symbol(database_url, user_id, code)
+            experience_score = exp_summary["experience_score"]
+            experience_summary = exp_summary["similar"]
+        except Exception as e:
+            print("  entry-candidates: experience score取得で例外（無視して続行）", code, e)
+
         candidates.append({
             "code": code, "name": w.get("name"), "sector": w.get("sector"),
             "current": row.get("current"),
@@ -2774,6 +2784,7 @@ def _score_entry_candidates(database_url, user_id):
             "analysisConfidence": analysis_confidence, "dataQuality": data_quality,
             "scoreBreakdown": comp, "reasons": reasons or ["総合スコア上位"], "risks": risks,
             "eventSupport": event_support,
+            "experienceScore": experience_score, "experienceSummary": experience_summary,
         })
 
     # 指示書6番「値上がり率だけでは選ばない」：ソート基準はentry_score（既に過熱ペナルティ・
@@ -9377,6 +9388,410 @@ def record_config_change_safe(database_url, reason, before, after, commit_hash=N
         return None
 
 
+# ============================================================
+# Trade Experience Learning（2026-09-11新規）：日々の実トレードから、ユーザー固有の
+# 「勝ちパターン・負けパターン・WAIT条件・利確条件」を蓄積し、ENTRY TOP5・トレード分析・
+# ルール評価・日中レポートへ反映する学習基盤。指示書20番：stock_theses・ENTRY TOP5・
+# applied rules・expert views・intraday reports・daily review・smart import・ChatGPT共有JSON
+# の上に追加する補助レイヤーであり、既存スコアへの直接介入は最小限（記録→類似検索→統計→
+# 候補提示まで。自動で売買判断は書き換えない、指示書20・21番）。
+# ============================================================
+
+TRADE_EXPERIENCE_PATTERN_TAGS = (
+    "OVERSOLD_REVERSAL", "SHORT_MA_RECLAIM", "ROUND_NUMBER_RECLAIM", "VOLUME_EXPANSION",
+    "AFTERNOON_MOMENTUM", "AFTERNOON_REVERSAL", "WAIT_TO_ENTRY", "MOMENTUM_STOCK",
+    "FULL_EXIT_PROFIT_TAKING", "FALLING_KNIFE",
+)
+
+# 指示書17番：学習対象外（誤発注・約定事故等）はlearning_weightを下げる。ACTIVEルールを
+# 直接は変更しないため、ここでは「統計に強く効かせない」ための重みだけを扱う。
+TRADE_EXPERIENCE_LOW_WEIGHT_KEYWORDS = ("誤発注", "約定事故", "特殊材料直後", "ストップ高", "ストップ安",
+                                          "板が極端に薄い", "システム障害", "再現性なし")
+
+
+def classify_trade_result(gross_pnl):
+    """WIN/LOSS/BREAKEVEN。"""
+    if gross_pnl is None:
+        return None
+    if gross_pnl > 0:
+        return "WIN"
+    if gross_pnl < 0:
+        return "LOSS"
+    return "BREAKEVEN"
+
+
+def compute_trade_gross_pnl(entry_price, exit_price, quantity, side="BUY"):
+    """指示書19番：(2760-2600)*200=32000の検算対象。"""
+    if entry_price is None or exit_price is None or quantity is None:
+        return None
+    diff = (exit_price - entry_price) if side == "BUY" else (entry_price - exit_price)
+    return round(diff * quantity, 2)
+
+
+def compute_trade_gross_pnl_pct(entry_price, exit_price, side="BUY"):
+    """指示書19番：約6.1538%の検算対象。"""
+    if not entry_price or exit_price is None:
+        return None
+    diff_pct = ((exit_price - entry_price) / entry_price * 100) if side == "BUY" \
+        else ((entry_price - exit_price) / entry_price * 100)
+    return round(diff_pct, 4)
+
+
+def compute_holding_minutes(entry_time_iso, exit_time_iso):
+    if not entry_time_iso or not exit_time_iso:
+        return None
+    try:
+        et = datetime.datetime.fromisoformat(str(entry_time_iso).replace("Z", "+00:00"))
+        xt = datetime.datetime.fromisoformat(str(exit_time_iso).replace("Z", "+00:00"))
+        return max(0, round((xt - et).total_seconds() / 60))
+    except Exception:
+        return None
+
+
+def classify_trade_experience_learning_weight(notes):
+    """指示書17番：誤発注・約定事故等のキーワードが含まれる場合は学習重みを大きく下げる
+    （0を使わないのは「参考には残す」ため、指示書のlearning_weight 0.0〜1.0のレンジ内）。"""
+    if not notes:
+        return 1.0
+    if any(kw in notes for kw in TRADE_EXPERIENCE_LOW_WEIGHT_KEYWORDS):
+        return 0.1
+    return 1.0
+
+
+def build_trade_experience_features(trade):
+    """指示書4番：build_trade_experience_features(trade)。既存フィールドから軽量な特徴量を
+    抽出するだけで、新しい市場データ取得は行わない。"""
+    trade = trade or {}
+    tags = set(trade.get("pattern_tags_json") or [])
+    rsi_entry = trade.get("rsi_at_entry")
+    entry_setup = {
+        "oversold": (rsi_entry is not None and rsi_entry <= 35) or "OVERSOLD_REVERSAL" in tags,
+        "rsi_recovery": "OVERSOLD_REVERSAL" in tags,
+        "short_ma_reclaim": "SHORT_MA_RECLAIM" in tags,
+        "round_number_reclaim": "ROUND_NUMBER_RECLAIM" in tags,
+        "volume_expansion": "VOLUME_EXPANSION" in tags or (trade.get("volume_ratio") or 0) >= 1.5,
+        "relative_strength_improving": (trade.get("relative_strength") or 0) > 0,
+    }
+    session, minutes_to_close = None, None
+    entry_time = trade.get("entry_time")
+    if entry_time:
+        try:
+            et = datetime.datetime.fromisoformat(str(entry_time).replace("Z", "+00:00")).astimezone(_JST)
+            hhmm = et.hour * 60 + et.minute
+            session = "MORNING" if hhmm < 11 * 60 + 30 else ("LUNCH" if hhmm < 12 * 60 + 30 else "AFTERNOON")
+            minutes_to_close = max(0, (15 * 60 + 30) - hhmm)
+        except Exception:
+            pass
+    timing = {"session": session, "minutes_to_close": minutes_to_close}
+    risk = {
+        "high_volatility": (trade.get("volatility_score") or 0) >= 60 or "MOMENTUM_STOCK" in tags,
+        "momentum_stock": "MOMENTUM_STOCK" in tags,
+        "falling_knife_entry": "FALLING_KNIFE" in tags,
+    }
+    execution = {
+        "wait_before_entry": "WAIT_TO_ENTRY" in tags or bool(trade.get("wait_reason_json")),
+        "entered_after_confirmation": bool(trade.get("pre_entry_state")) and "WAIT" not in str(trade.get("pre_entry_state") or ""),
+        "full_exit": "FULL_EXIT_PROFIT_TAKING" in tags,
+    }
+    return {"entry_setup": entry_setup, "timing": timing, "risk": risk, "execution": execution}
+
+
+def _trade_experience_similarity(current_tags, other_tags, current_features, other_features):
+    """指示書5番：pattern_tags／RSI・MA回復／出来高／時間帯／地合いで類似度を計算する
+    （AI不使用、タグのJaccard類似度＋特徴量一致率の加重平均という単純なルールベース）。"""
+    a_tags, b_tags = set(current_tags or []), set(other_tags or [])
+    tag_sim = (len(a_tags & b_tags) / len(a_tags | b_tags)) if (a_tags or b_tags) else 0.0
+    feat_matches, feat_total = 0, 0
+    for group in ("entry_setup", "risk", "execution"):
+        ag, bg = (current_features or {}).get(group) or {}, (other_features or {}).get(group) or {}
+        for k in set(ag) | set(bg):
+            feat_total += 1
+            if ag.get(k) == bg.get(k):
+                feat_matches += 1
+    feat_sim = (feat_matches / feat_total) if feat_total else 0.0
+    return round(tag_sim * 0.6 + feat_sim * 0.4, 3)
+
+
+TRADE_EXPERIENCE_MIN_LEARNING_WEIGHT = 0.3  # 指示書17番：低重み（誤発注等）は類似検索・統計から除外
+
+
+def find_similar_trade_experiences(database_url, user_id, symbol=None, current_tags=None,
+                                      current_features=None, limit=20, min_similarity=0.3):
+    """指示書5番：単純な銘柄一致だけでなく、pattern_tags/RSI/MA回復/出来高/時間帯/地合いで
+    類似度を計算する。symbol一致は類似度1.0として最優先で拾う（指示書「find_similar_trade_
+    experiences(symbol=...)」の呼び出し例に対応）。"""
+    empty = {"similar_count": 0, "wins": 0, "losses": 0, "win_rate": None, "avg_return_pct": None,
+              "median_return_pct": None, "avg_mfe_pct": None, "avg_mae_pct": None, "max_similarity": 0.0,
+              "recent_10_win_rate": None, "examples": []}
+    if investment_db is None or not database_url:
+        return empty
+    all_exps = investment_db.list_trade_experiences(database_url, user_id, limit=1000)
+    scored = []
+    for t in all_exps:
+        if (t.get("learning_weight") if t.get("learning_weight") is not None else 1.0) < TRADE_EXPERIENCE_MIN_LEARNING_WEIGHT:
+            continue
+        sim = 1.0 if (symbol and t.get("symbol") == symbol) else 0.0
+        if current_tags is not None or current_features is not None:
+            t_feat = build_trade_experience_features(t)
+            sim = max(sim, _trade_experience_similarity(current_tags, t.get("pattern_tags_json"), current_features, t_feat))
+        if sim >= min_similarity:
+            scored.append((sim, t))
+    scored.sort(key=lambda x: -x[0])
+    top = scored[:limit]
+    if not top:
+        return empty
+    wins = sum(1 for _, t in top if t.get("result_class") == "WIN")
+    losses = sum(1 for _, t in top if t.get("result_class") == "LOSS")
+    returns = [t["gross_pnl_pct"] for _, t in top if t.get("gross_pnl_pct") is not None]
+    mfes = [t["max_favorable_excursion_pct"] for _, t in top if t.get("max_favorable_excursion_pct") is not None]
+    maes = [t["max_adverse_excursion_pct"] for _, t in top if t.get("max_adverse_excursion_pct") is not None]
+    n = len(top)
+    recent10 = sorted(top, key=lambda x: x[1].get("trade_date") or "", reverse=True)[:10]
+    recent10_wins = sum(1 for _, t in recent10 if t.get("result_class") == "WIN")
+    return {
+        "similar_count": n, "wins": wins, "losses": losses,
+        "win_rate": round(wins / n, 3) if n else None,
+        "avg_return_pct": round(sum(returns) / len(returns), 2) if returns else None,
+        "median_return_pct": round(sorted(returns)[len(returns) // 2], 2) if returns else None,
+        "avg_mfe_pct": round(sum(mfes) / len(mfes), 2) if mfes else None,
+        "avg_mae_pct": round(sum(maes) / len(maes), 2) if maes else None,
+        "max_similarity": top[0][0], "recent_10_win_rate": round(recent10_wins / len(recent10), 3) if recent10 else None,
+        "examples": [t for _, t in top[:5]],
+    }
+
+
+def classify_pattern_confidence(sample_count):
+    """指示書6番：LOW(<5)/MEDIUM(5〜14)/HIGH(15+)。サンプル数が少ない段階では強い根拠として
+    扱わない、との指示に対応するラベル。"""
+    if sample_count < 5:
+        return "LOW"
+    if sample_count <= 14:
+        return "MEDIUM"
+    return "HIGH"
+
+
+def compute_pattern_statistics(experiences):
+    """指示書6番：pattern_statistics。パターンごとのsample_count/win_rate/avg_pnl_pct/
+    median_pnl_pct/avg_mfe/avg_mae/avg_holding_minutes/latest_10_win_rate/confidence_levelを
+    集計する。"""
+    by_pattern = {}
+    for t in experiences or []:
+        if (t.get("learning_weight") if t.get("learning_weight") is not None else 1.0) < TRADE_EXPERIENCE_MIN_LEARNING_WEIGHT:
+            continue
+        for tag in (t.get("pattern_tags_json") or []):
+            by_pattern.setdefault(tag, []).append(t)
+    out = {}
+    for tag, items in by_pattern.items():
+        n = len(items)
+        wins = sum(1 for t in items if t.get("result_class") == "WIN")
+        losses = sum(1 for t in items if t.get("result_class") == "LOSS")
+        pnls = [t["gross_pnl_pct"] for t in items if t.get("gross_pnl_pct") is not None]
+        mfes = [t["max_favorable_excursion_pct"] for t in items if t.get("max_favorable_excursion_pct") is not None]
+        maes = [t["max_adverse_excursion_pct"] for t in items if t.get("max_adverse_excursion_pct") is not None]
+        holds = [t["holding_minutes"] for t in items if t.get("holding_minutes") is not None]
+        recent10 = sorted(items, key=lambda t: t.get("trade_date") or "", reverse=True)[:10]
+        recent10_wins = sum(1 for t in recent10 if t.get("result_class") == "WIN")
+        out[tag] = {
+            "sample_count": n, "win_count": wins, "loss_count": losses,
+            "win_rate": round(wins / n, 3) if n else None,
+            "avg_pnl_pct": round(sum(pnls) / len(pnls), 2) if pnls else None,
+            "median_pnl_pct": round(sorted(pnls)[len(pnls) // 2], 2) if pnls else None,
+            "avg_mfe": round(sum(mfes) / len(mfes), 2) if mfes else None,
+            "avg_mae": round(sum(maes) / len(maes), 2) if maes else None,
+            "avg_holding_minutes": round(sum(holds) / len(holds), 1) if holds else None,
+            "latest_10_win_rate": round(recent10_wins / len(recent10), 3) if recent10 else None,
+            "confidence_level": classify_pattern_confidence(n),
+        }
+    return out
+
+
+def compute_experience_score(similar_result):
+    """指示書7番：EXPERIENCE_SCORE 0〜10点。sample_count<5なら最大+2まで（過大評価防止）。
+    既存のENTRY_SCORE本体には一切加点しない、完全に別枠の補助スコア。"""
+    if not similar_result:
+        return 0.0
+    n = similar_result.get("similar_count") or 0
+    win_rate = similar_result.get("win_rate") or 0
+    avg_return = similar_result.get("avg_return_pct")
+    max_sim = similar_result.get("max_similarity") or 0
+    recent10_win_rate = similar_result.get("recent_10_win_rate")
+    examples = similar_result.get("examples") or []
+    score = 0.0
+    if n >= 10 and win_rate >= 0.70:
+        score += 3
+    if avg_return is not None and avg_return >= 2.0:
+        score += 2
+    if any("WAIT_TO_ENTRY" in (e.get("pattern_tags_json") or []) and e.get("result_class") == "WIN" for e in examples):
+        score += 2
+    if max_sim >= 0.80:
+        score += 2
+    if recent10_win_rate is not None and recent10_win_rate >= win_rate:
+        score += 1
+    cap = 2.0 if n < 5 else 10.0
+    return round(min(score, cap), 1)
+
+
+def evaluate_trade_experience(trade):
+    """指示書15番：entry_timing(0-25)/risk_control(0-20)/exit_execution(0-20)/
+    rule_compliance(0-20)/repeatability(0-15)＝合計100点。恣意的な固定点数を付けず、
+    採点根拠（score_breakdown）をそのまま返す＝呼び出し側がJSON保存できる。"""
+    trade = trade or {}
+    tags = set(trade.get("pattern_tags_json") or [])
+    breakdown = {}
+
+    entry_timing = 0
+    if "WAIT_TO_ENTRY" in tags:
+        entry_timing += 10  # 飛びつかず確認待ちができた
+    if "SHORT_MA_RECLAIM" in tags or "ROUND_NUMBER_RECLAIM" in tags:
+        entry_timing += 8  # 節目・短期MA奪回を確認してからENTRY
+    if "OVERSOLD_REVERSAL" in tags:
+        entry_timing += 7  # 売られすぎからの反転を確認
+    breakdown["entry_timing_score"] = min(entry_timing, 25)
+
+    risk_control = 10
+    mae = trade.get("max_adverse_excursion_pct")
+    if mae is not None:
+        risk_control += 10 if mae > -3 else (5 if mae > -6 else 0)
+    breakdown["risk_control_score"] = min(risk_control, 20)
+
+    exit_execution = 0
+    if "FULL_EXIT_PROFIT_TAKING" in tags:
+        exit_execution += 10
+    if trade.get("result_class") == "WIN":
+        exit_execution += 10
+    breakdown["exit_execution_score"] = min(exit_execution, 20)
+
+    rc = trade.get("rule_compliance_score")
+    breakdown["rule_compliance_score"] = min(20, round(rc / 5)) if rc is not None else 14
+
+    repeatability = 8
+    if len(tags) >= 4:
+        repeatability += 4
+    if "MOMENTUM_STOCK" in tags:
+        repeatability += 3
+    breakdown["repeatability_score"] = min(repeatability, 15)
+
+    total = sum(breakdown.values())
+    breakdown["total"] = total
+    return total, breakdown
+
+
+# 指示書9番：sample_count/win_rateがこの水準を超えたパターンのみ「候補」として提示する
+# （自動でACTIVEにはしない、指示書冒頭「重要」）。
+RULE_CANDIDATE_MIN_SAMPLE = 15
+RULE_CANDIDATE_MIN_WIN_RATE = 0.65
+TRADE_EXPERIENCE_PATTERN_RULE_TEXT = {
+    "WAIT_TO_ENTRY": "RSI30以下等の下落銘柄は、短期MA＋節目価格の奪回確認後にENTRYする（先回りしない）",
+    "OVERSOLD_REVERSAL": "売られすぎ（RSI低水準）だけでENTRYせず、反転確認を待つ",
+    "SHORT_MA_RECLAIM": "短期移動平均の奪回を確認してからENTRYする",
+    "VOLUME_EXPANSION": "出来高増加を伴わないブレイクは見送る",
+    "AFTERNOON_MOMENTUM": "午後のモメンタム急騰は全戻しリスクを踏まえ早めの利確を優先する",
+    "MOMENTUM_STOCK": "モメンタム株は高ボラティリティのため利益率優先で利確する",
+}
+
+
+def propose_rule_candidates_from_pattern_stats(pattern_stats):
+    """指示書9番：経験データから「実績上有効そう」な候補だけを提示する。ACTIVEルールへは
+    自動で変更しない（呼び出し側がpromote_trade_experience_rule_candidate()を明示的に呼んだ
+    場合のみTESTINGへ昇格、指示書9番REQUIRED）。"""
+    proposals = []
+    for tag, stats in (pattern_stats or {}).items():
+        if stats.get("sample_count", 0) >= RULE_CANDIDATE_MIN_SAMPLE and (stats.get("win_rate") or 0) >= RULE_CANDIDATE_MIN_WIN_RATE:
+            proposals.append({
+                "pattern": tag,
+                "rule_text": TRADE_EXPERIENCE_PATTERN_RULE_TEXT.get(tag, f"{tag}パターンは実績上有効そう（要ユーザー確認）"),
+                "sample_count": stats["sample_count"], "win_rate": stats["win_rate"],
+                "avg_pnl_pct": stats.get("avg_pnl_pct"), "confidence_level": stats["confidence_level"],
+            })
+    return proposals
+
+
+def compute_momentum_stock_stats(experiences):
+    """指示書11番：MOMENTUM_STOCKタグのトレードだけの別集計。ENTRY後5/15/30分の値動き・
+    翌日GD率・持ち越し成績は現状データを収集していないため未算出（既知の制約、noteに明記）。"""
+    momentum = [t for t in (experiences or []) if "MOMENTUM_STOCK" in (t.get("pattern_tags_json") or [])]
+    if not momentum:
+        return {"sample_count": 0, "avg_mfe_pct": None, "avg_mae_pct": None,
+                 "afternoon_full_exit_count": 0, "note": "MOMENTUM_STOCKタグのサンプルがまだありません。"}
+    mfes = [t["max_favorable_excursion_pct"] for t in momentum if t.get("max_favorable_excursion_pct") is not None]
+    maes = [t["max_adverse_excursion_pct"] for t in momentum if t.get("max_adverse_excursion_pct") is not None]
+    afternoon_full_exit = sum(1 for t in momentum if "AFTERNOON" in "".join(t.get("pattern_tags_json") or [])
+                                and "FULL_EXIT_PROFIT_TAKING" in (t.get("pattern_tags_json") or []))
+    return {
+        "sample_count": len(momentum),
+        "avg_mfe_pct": round(sum(mfes) / len(mfes), 2) if mfes else None,
+        "avg_mae_pct": round(sum(maes) / len(maes), 2) if maes else None,
+        "afternoon_full_exit_count": afternoon_full_exit,
+        "note": "ENTRY後5/15/30分足の値動き・翌日GD率・持ち越し成績は未収集のため未算出（既知の制約）。",
+    }
+
+
+def build_daily_trade_learning_summary(experiences_for_day):
+    """指示書12番：Best Trade/Worst Trade/Best WAIT/Rule Violation/New Pattern Candidateを
+    自動生成する（既存daily_reviewsのスコア計算には一切触れない、追加専用集計）。"""
+    empty = {"best_trade": None, "worst_trade": None, "best_wait": None, "rule_violations": [],
+              "learning_notes": []}
+    if not experiences_for_day:
+        return empty
+    ranked = sorted(experiences_for_day, key=lambda t: t.get("gross_pnl_pct") if t.get("gross_pnl_pct") is not None else 0,
+                      reverse=True)
+    best, worst = ranked[0], (ranked[-1] if len(ranked) > 1 else None)
+    best_wait = next((t for t in experiences_for_day if t.get("wait_reason_json")), None)
+    violations = [t for t in experiences_for_day
+                   if t.get("rule_compliance_score") is not None and t["rule_compliance_score"] < 60]
+    learning_notes = []
+    for t in experiences_for_day:
+        if t.get("pre_entry_state") and "WAIT" in str(t["pre_entry_state"]) and t.get("result_class") == "WIN":
+            learning_notes.append(f"「売られすぎ」だけではENTRYせず、反転条件確認後に入る方が再現性が高い可能性（{t.get('symbol')}）")
+    return {
+        "best_trade": {"symbol": best.get("symbol"), "stock_name": best.get("stock_name"),
+                         "gross_pnl_pct": best.get("gross_pnl_pct"), "gross_pnl": best.get("gross_pnl")} if best else None,
+        "worst_trade": {"symbol": worst.get("symbol"), "stock_name": worst.get("stock_name"),
+                          "gross_pnl_pct": worst.get("gross_pnl_pct")} if worst else None,
+        "best_wait": {"symbol": best_wait.get("symbol"), "reasons": best_wait.get("wait_reason_json")} if best_wait else None,
+        "rule_violations": [{"symbol": t.get("symbol"), "rule_compliance_score": t.get("rule_compliance_score")}
+                              for t in violations],
+        "learning_notes": learning_notes,
+    }
+
+
+def build_trade_experience_summary_for_symbol(database_url, user_id, symbol, current_tags=None, current_features=None):
+    """指示書7・8番：トレード分析／ENTRY TOP5の両方から呼ぶ共通の「経験値」要約。
+    similar_result＋EXPERIENCE_SCOREをまとめて返す。"""
+    similar = find_similar_trade_experiences(database_url, user_id, symbol=symbol, current_tags=current_tags,
+                                                current_features=current_features)
+    score = compute_experience_score(similar)
+    return {"experience_score": score, "similar": similar}
+
+
+def build_trade_experience_payload(trade):
+    """指示書13番：ChatGPT/Claude Code共有JSON向け。後知恵禁止（指示書16番）——entry_reasonには
+    decision_snapshot_json（ENTRY時点で分かっていたことだけ）を使い、EXIT後に判明した情報
+    （post_trade_analysis_json）は混ぜない。"""
+    if not trade:
+        return None
+    return {
+        "symbol": trade.get("symbol"), "stock_name": trade.get("stock_name"), "trade_date": str(trade.get("trade_date")),
+        "entry_price": trade.get("entry_price"), "exit_price": trade.get("exit_price"), "quantity": trade.get("quantity"),
+        "gross_pnl": trade.get("gross_pnl"), "gross_pnl_pct": trade.get("gross_pnl_pct"),
+        "pre_entry_decision": (trade.get("decision_snapshot_json") or {}).get("pre_entry_decision"),
+        "entry_pattern": trade.get("pattern_tags_json") or [],
+        "exit_pattern": trade.get("exit_reason_json") or [],
+        "result": trade.get("result_class"),
+        "learning_summary": (trade.get("post_trade_analysis_json") or {}).get("learning_summary"),
+    }
+
+
+def get_trade_experience_diagnostics(database_url, user_id):
+    """指示書：件数の可視化（記録タブ・診断向け）。"""
+    if investment_db is None or not database_url:
+        return {"total_experiences": 0, "rule_candidates_pending": 0, "patterns_tracked": 0}
+    exps = investment_db.list_trade_experiences(database_url, user_id, limit=1000)
+    stats = compute_pattern_statistics(exps)
+    candidates = investment_db.list_trade_experience_rule_candidates(database_url, user_id)
+    return {"total_experiences": len(exps), "rule_candidates_pending": len(candidates), "patterns_tracked": len(stats)}
+
+
 def _nicosoku_morning_commentary(database_url, user_id):
     """指示書10番：朝一チェックの補助材料。前日15:30〜当日08:30(JST)程度の投稿から要点を
     抽出する。既存のmorning_market_check本体ロジックには一切干渉しない、追加専用フィールド。"""
@@ -14570,6 +14985,53 @@ class Handler(SimpleHTTPRequestHandler):
                 category=params.get("category", [None])[0], rule_type=params.get("ruleType", [None])[0],
             ) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"rules": rules})
+        # ---- Trade Experience Learning（2026-09-11新規）----
+        # 指示書14番：GET系。/similar・/{id}は具体的な形なので、汎用の/api/trade-experiences
+        # （一覧）より前に判定する（Phase9で見つけた「startswithによる先取り」不具合と同じ
+        # 轍を踏まない——具体的なsuffix/形状のチェックを先に、汎用prefixチェックを最後に）。
+        elif self.path.split("?")[0] == "/api/trade-experiences/similar":
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            symbol = params.get("symbol", [None])[0]
+            result = find_similar_trade_experiences(DATABASE_URL, self.current_user, symbol=symbol) \
+                if (investment_db is not None and DATABASE_URL) else {}
+            self._send_json(result)
+        elif self.path.split("?")[0] == "/api/trade-experience-patterns":
+            if investment_db is not None and DATABASE_URL:
+                exps = investment_db.list_trade_experiences(DATABASE_URL, self.current_user, limit=1000)
+                pattern_stats = compute_pattern_statistics(exps)
+                candidates = investment_db.list_trade_experience_rule_candidates(DATABASE_URL, self.current_user)
+                proposals = propose_rule_candidates_from_pattern_stats(pattern_stats)
+                momentum = compute_momentum_stock_stats(exps)
+            else:
+                pattern_stats, candidates, proposals, momentum = {}, [], [], {}
+            self._send_json({"patterns": pattern_stats, "rule_candidates": candidates,
+                              "proposed_candidates": proposals, "momentum_stock": momentum})
+        elif self.path.split("?")[0].startswith("/api/trade-experiences/") and \
+                self.path.split("?")[0][len("/api/trade-experiences/"):].isdigit():
+            experience_id = int(self.path.split("?")[0][len("/api/trade-experiences/"):])
+            exp = investment_db.get_trade_experience(DATABASE_URL, self.current_user, experience_id) \
+                if (investment_db is not None and DATABASE_URL) else None
+            if exp is None:
+                self._send_json({"error": "対象のtrade experienceが見つかりません"}); return
+            self._send_json({"experience": exp})
+        elif self.path.split("?")[0] == "/api/trade-experiences":
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            exps = investment_db.list_trade_experiences(
+                DATABASE_URL, self.current_user, symbol=params.get("symbol", [None])[0],
+                trade_date=params.get("date", [None])[0],
+            ) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"experiences": exps})
+        elif self.path.split("?")[0] == "/api/trade-decision-events":
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            tid = params.get("tradeExperienceId", [None])[0]
+            events = investment_db.list_trade_decision_events(
+                DATABASE_URL, self.current_user, trade_experience_id=int(tid) if tid else None,
+                symbol=params.get("symbol", [None])[0],
+            ) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"events": events})
         # ---- 2026-09-09新規（日次投資レビュー・投資スコア、指示書Phase4・5） ----
         elif self.path.startswith("/api/daily-review/recent"):
             qs = urllib.parse.urlparse(self.path).query
@@ -14591,7 +15053,18 @@ class Handler(SimpleHTTPRequestHandler):
             # Market Intelligence Phase10新規（指示書25・26番）：既存score_total計算には
             # 一切触れず、追加専用セクションとして併記する。
             decision_review = build_daily_decision_review_safe(DATABASE_URL, self.current_user, date)
-            self._send_json({"review": review, "decisionReview": decision_review})
+            # Trade Experience Learning新規（指示書12番）：「今日の学習」。既存score_total計算
+            # には触れない追加専用セクション。
+            trade_learning = {"best_trade": None, "worst_trade": None, "best_wait": None,
+                                "rule_violations": [], "learning_notes": []}
+            try:
+                if investment_db is not None and DATABASE_URL:
+                    day_experiences = investment_db.list_trade_experiences(DATABASE_URL, self.current_user,
+                                                                              trade_date=date)
+                    trade_learning = build_daily_trade_learning_summary(day_experiences)
+            except Exception as e:
+                print("  daily-review: trade learning summary生成で例外（無視して続行）", e)
+            self._send_json({"review": review, "decisionReview": decision_review, "tradeLearning": trade_learning})
         # ---- 2026-09-10新規（朝一マーケット自動分析システム） ----
         elif self.path.startswith("/api/morning-check/list"):
             qs = urllib.parse.urlparse(self.path).query
@@ -15520,7 +15993,16 @@ class Handler(SimpleHTTPRequestHandler):
                 log = investment_db.save_analysis_context_log(
                     DATABASE_URL, self.current_user, code, body.get("analysisType") or scope,
                     judgment, context, analysis_date=body.get("date"))
-            self._send_json({"context": context, "judgment": judgment, "logId": (log or {}).get("id")})
+            # Trade Experience Learning新規（指示書8・18番）：compact表示用の経験値要約を同じ
+            # レスポンスに同梱する（追加のfetchを増やさない）。既存のcontext/judgmentは無変更。
+            trade_experience = None
+            if code:
+                try:
+                    trade_experience = build_trade_experience_summary_for_symbol(DATABASE_URL, self.current_user, code)
+                except Exception as e:
+                    print("  knowledge-context: trade experience要約取得で例外（無視して続行）", code, e)
+            self._send_json({"context": context, "judgment": judgment, "logId": (log or {}).get("id"),
+                              "tradeExperience": trade_experience})
         elif self.path == "/api/knowledge-context/top5-flags":
             # 指示書4番：TOP5相談向けの軽量な候補別フラグ（フルコンテキストは取得しない）。
             if not self._investment_db_ready():
@@ -15559,6 +16041,70 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             created = investment_db.generate_rule_candidates_from_reflections(DATABASE_URL, self.current_user)
             self._send_json({"candidates": created})
+        # ---- Trade Experience Learning（2026-09-11新規）----
+        elif self.path == "/api/trade-decision-events":
+            # 指示書2番：WAIT/ENTRY_READY/ENTRY/HOLD/EXIT_READY/EXIT/INVALIDATEDの各時点を保存。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            saved = investment_db.create_trade_decision_event(DATABASE_URL, self.current_user, body)
+            if saved is None:
+                self._send_json({"error": "symbol・decisionTypeを確認してください"}); return
+            self._send_json({"event": saved})
+        elif self.path == "/api/trade-experiences":
+            # 指示書1・3・14番：trade_experiences 1件を登録する。gross_pnl等はクライアントが
+            # 未算出でも受け取った値をそのまま使い、既存計算関数（compute_trade_gross_pnl等）
+            # 未使用時のサーバー側再計算はしない（呼び出し側の算出値を信頼する、他APIと同じ
+            # 方針）。空ならサーバー側で計算する。
+            if not self._investment_db_ready():
+                return
+            body = dict(self._read_json_body() or {})
+            if body.get("gross_pnl") is None:
+                body["gross_pnl"] = compute_trade_gross_pnl(body.get("entry_price"), body.get("exit_price"),
+                                                               body.get("quantity"), body.get("side") or "BUY")
+            if body.get("gross_pnl_pct") is None:
+                body["gross_pnl_pct"] = compute_trade_gross_pnl_pct(body.get("entry_price"), body.get("exit_price"),
+                                                                        body.get("side") or "BUY")
+            if body.get("holding_minutes") is None:
+                body["holding_minutes"] = compute_holding_minutes(body.get("entry_time"), body.get("exit_time"))
+            if body.get("result_class") is None:
+                body["result_class"] = classify_trade_result(body.get("gross_pnl"))
+            if body.get("learning_weight") is None:
+                body["learning_weight"] = classify_trade_experience_learning_weight(body.get("notes"))
+            saved = investment_db.create_trade_experience(DATABASE_URL, self.current_user, body)
+            if saved is None:
+                self._send_json({"error": "symbolを確認してください"}); return
+            self._send_json({"experience": saved})
+        elif self.path.split("?")[0].startswith("/api/trade-experiences/") and self.path.split("?")[0].endswith("/evaluate"):
+            # 指示書15番：evaluate_trade_experience()で採点し、score_breakdown_jsonごと保存する。
+            if not self._investment_db_ready():
+                return
+            try:
+                experience_id = int(self.path.split("?")[0][len("/api/trade-experiences/"):-len("/evaluate")])
+            except ValueError:
+                self._send_json({"error": "不正なidです"}); return
+            trade = investment_db.get_trade_experience(DATABASE_URL, self.current_user, experience_id)
+            if trade is None:
+                self._send_json({"error": "対象のtrade experienceが見つかりません"}); return
+            total, breakdown = evaluate_trade_experience(trade)
+            saved = investment_db.update_trade_experience(DATABASE_URL, self.current_user, experience_id,
+                {"execution_score": total, "score_breakdown_json": breakdown})
+            self._send_json({"execution_score": total, "score_breakdown": breakdown, "experience": saved})
+        elif self.path.split("?")[0].startswith("/api/trade-experience-rule-candidates/") and \
+                self.path.split("?")[0].endswith("/promote"):
+            # 指示書9番：RULE_CANDIDATE→TESTINGはユーザー承認制。
+            if not self._investment_db_ready():
+                return
+            try:
+                rule_id = int(self.path.split("?")[0][len("/api/trade-experience-rule-candidates/"):-len("/promote")])
+            except ValueError:
+                self._send_json({"error": "不正なidです"}); return
+            body = self._read_json_body()
+            promoted = investment_db.promote_trade_experience_rule_candidate(
+                DATABASE_URL, self.current_user, rule_id, reason=body.get("reason"))
+            if promoted is None:
+                self._send_json({"error": "対象がRULE_CANDIDATEではないか、見つかりません"}); return
+            self._send_json({"rule": promoted})
         elif self.path == "/api/morning-check/generate":
             # 指示書21番：定時以外でも現在時点の臨時レポートを作成する手動更新（MANUAL）。
             # スケジューラが呼ぶ定時生成もsnapshot_time（T0530等）を指定してこの同じ関数を

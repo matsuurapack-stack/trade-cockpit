@@ -620,6 +620,92 @@ CREATE TABLE IF NOT EXISTS trade_rule_history (
 CREATE INDEX IF NOT EXISTS idx_trade_rule_history_rule ON trade_rule_history(rule_id, created_at DESC);
 """
 
+# ============================================================
+# Trade Experience Learning（2026-09-11新規）：日々の実トレードから、ユーザー固有の
+# 「勝ちパターン・負けパターン・WAIT条件・利確条件」を蓄積し、ENTRY TOP5・トレード分析・
+# ルール評価・日中レポートへ反映するための学習基盤。指示書20番：既存機能（stock_theses・
+# ENTRY TOP5・applied rules・expert views・intraday reports・daily review・smart import・
+# ChatGPT共有JSON）の上に追加する補助レイヤーであり、既存スコアへは介入しない。
+# ACTIVEルールへの自動昇格はしない——RULE_CANDIDATE状態はtrade_rules.statusの新しい値として
+# 追加するのみで、新規テーブルは作らない（既存の昇格フロー・trade_rule_historyをそのまま
+# 再利用する、指示書9・20番）。
+# ============================================================
+
+_SCHEMA_TRADE_EXPERIENCES_SQL = """
+CREATE TABLE IF NOT EXISTS trade_experiences (
+    id                            SERIAL PRIMARY KEY,
+    user_id                       TEXT NOT NULL,
+    trade_date                    DATE NOT NULL,
+    symbol                        TEXT NOT NULL,
+    stock_name                    TEXT,
+    side                          TEXT NOT NULL DEFAULT 'BUY',   -- BUY|SELL
+    trade_style                   TEXT,                           -- DAY|SWING
+    quantity                      NUMERIC,
+    entry_price                   NUMERIC,
+    exit_price                    NUMERIC,
+    entry_time                    TIMESTAMPTZ,
+    exit_time                     TIMESTAMPTZ,
+    gross_pnl                     NUMERIC,
+    gross_pnl_pct                  NUMERIC,
+    holding_minutes                 INTEGER,
+    pre_entry_state                  TEXT,   -- WAIT/ENTRY_READY/BREAKOUT/REVERSAL等
+    wait_reason_json                   JSONB,
+    entry_reason_json                    JSONB,
+    exit_reason_json                       JSONB,
+    invalidation_reason_json                 JSONB,
+    market_condition                           TEXT,
+    sector_condition                             TEXT,
+    nikkei_change_pct                             NUMERIC,
+    relative_strength                              NUMERIC,
+    rsi_at_entry                                    NUMERIC,
+    rsi_at_exit                                      NUMERIC,
+    short_ma                                          NUMERIC,
+    mid_ma                                             NUMERIC,
+    long_ma                                             NUMERIC,
+    volume_ratio                                         NUMERIC,
+    intraday_low                                          NUMERIC,
+    intraday_high                                          NUMERIC,
+    distance_from_low_pct                                   NUMERIC,
+    distance_from_high_pct                                   NUMERIC,
+    volatility_score                                          NUMERIC,
+    pattern_tags_json                                          JSONB,
+    execution_score                                             NUMERIC,   -- 1-100
+    rule_compliance_score                                        NUMERIC,   -- 1-100
+    result_class                                                  TEXT,      -- WIN|LOSS|BREAKEVEN
+    max_favorable_excursion_pct                                    NUMERIC,
+    max_adverse_excursion_pct                                       NUMERIC,
+    post_exit_max_price                                              NUMERIC,
+    post_exit_min_price                                               NUMERIC,
+    profit_capture_ratio                                               NUMERIC,  -- 指示書10番：参考値、評価点には強く効かせない
+    learning_status                                                     TEXT NOT NULL DEFAULT 'PENDING', -- PENDING|VALIDATED|EXCLUDED
+    learning_weight                                                      NUMERIC NOT NULL DEFAULT 1.0,    -- 0.0〜1.0
+    score_breakdown_json                                                  JSONB,  -- 指示書15番：採点根拠（恣意的な点数を禁止）
+    decision_snapshot_json                                                 JSONB, -- 指示書16番：ENTRY時点で分かっていたことだけ
+    post_trade_analysis_json                                                JSONB, -- 指示書16番：EXIT後に判明した情報はここのみ
+    notes                                                                    TEXT,
+    created_at                                                               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at                                                                TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_trade_experiences_user_date ON trade_experiences(user_id, trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_trade_experiences_symbol ON trade_experiences(user_id, symbol);
+
+CREATE TABLE IF NOT EXISTS trade_decision_events (
+    id                          SERIAL PRIMARY KEY,
+    user_id                     TEXT NOT NULL,
+    trade_experience_id         INTEGER REFERENCES trade_experiences(id) ON DELETE SET NULL,
+    event_time                  TIMESTAMPTZ NOT NULL,
+    symbol                      TEXT NOT NULL,
+    decision_type               TEXT NOT NULL,  -- WAIT|ENTRY_READY|ENTRY|HOLD|EXIT_READY|EXIT|INVALIDATED
+    price                       NUMERIC,
+    reason_json                 JSONB,
+    technical_snapshot_json     JSONB,
+    market_snapshot_json        JSONB,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_trade_decision_events_trade ON trade_decision_events(trade_experience_id, event_time);
+CREATE INDEX IF NOT EXISTS idx_trade_decision_events_symbol ON trade_decision_events(user_id, symbol, event_time DESC);
+"""
+
 # 2026-09-09新規（日次投資レビュー・投資スコア）：daily_reviews。
 _SCHEMA_DAILY_REVIEWS_SQL = """
 CREATE TABLE IF NOT EXISTS daily_reviews (
@@ -1023,6 +1109,7 @@ def init_schema(database_url):
         conn.execute(_MIGRATE_MULTIUSER_SQL)
         conn.execute(_MIGRATE_CHATGPT_IMPORT_SQL)
         conn.execute(_SCHEMA_TRADE_RULES_SQL)
+        conn.execute(_SCHEMA_TRADE_EXPERIENCES_SQL)
         conn.execute(_SCHEMA_DAILY_REVIEWS_SQL)
         conn.execute(_SCHEMA_KNOWLEDGE_ENGINE_SQL)
         conn.execute(_SCHEMA_MORNING_CHECK_SQL)
@@ -1939,6 +2026,200 @@ def relevant_trade_rules_for(database_url, user_id, categories=None, limit=8):
                 f"CASE confidence WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END, evidence_count DESC "
                 f"LIMIT %s", params + [limit])
             return [_trade_rule_row_to_json(r) for r in cur.fetchall()]
+
+
+# ---- Trade Experience Learning（2026-09-11新規）：CRUD ----
+
+_TRADE_EXPERIENCE_JSON_COLS = ("wait_reason_json", "entry_reason_json", "exit_reason_json",
+                                 "invalidation_reason_json", "pattern_tags_json", "score_breakdown_json",
+                                 "decision_snapshot_json", "post_trade_analysis_json")
+_TRADE_EXPERIENCE_COLS = (
+    "trade_date", "symbol", "stock_name", "side", "trade_style", "quantity", "entry_price", "exit_price",
+    "entry_time", "exit_time", "gross_pnl", "gross_pnl_pct", "holding_minutes", "pre_entry_state",
+    "wait_reason_json", "entry_reason_json", "exit_reason_json", "invalidation_reason_json",
+    "market_condition", "sector_condition", "nikkei_change_pct", "relative_strength", "rsi_at_entry",
+    "rsi_at_exit", "short_ma", "mid_ma", "long_ma", "volume_ratio", "intraday_low", "intraday_high",
+    "distance_from_low_pct", "distance_from_high_pct", "volatility_score", "pattern_tags_json",
+    "execution_score", "rule_compliance_score", "result_class", "max_favorable_excursion_pct",
+    "max_adverse_excursion_pct", "post_exit_max_price", "post_exit_min_price", "profit_capture_ratio",
+    "learning_status", "learning_weight", "score_breakdown_json", "decision_snapshot_json",
+    "post_trade_analysis_json", "notes",
+)
+
+
+def create_trade_experience(database_url, user_id, fields):
+    """指示書1・3番：trade_experiences 1件をINSERTする。symbolが無ければNoneを返す。"""
+    pool = _get_pool(database_url)
+    if pool is None or not (fields or {}).get("symbol"):
+        return None
+    cols = [c for c in _TRADE_EXPERIENCE_COLS if c in fields]
+    values = [fields.get(c) for c in cols]
+    wrapped = [json.dumps(v, ensure_ascii=False) if (c in _TRADE_EXPERIENCE_JSON_COLS and v is not None) else v
+               for c, v in zip(cols, values)]
+    placeholders = ["%s::jsonb" if c in _TRADE_EXPERIENCE_JSON_COLS else "%s" for c in cols]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO trade_experiences (user_id, {', '.join(cols)}) "
+                f"VALUES (%s, {', '.join(placeholders)}) RETURNING *", [user_id] + wrapped)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def update_trade_experience(database_url, user_id, experience_id, fields):
+    """指示書6・9・15番：evaluate_trade_experienceの採点結果等、後から追記する場合に使う。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    cols = [c for c in _TRADE_EXPERIENCE_COLS if c in fields]
+    if not cols:
+        return None
+    values = [fields.get(c) for c in cols]
+    wrapped = [json.dumps(v, ensure_ascii=False) if (c in _TRADE_EXPERIENCE_JSON_COLS and v is not None) else v
+               for c, v in zip(cols, values)]
+    set_clauses = [f"{c}=%s::jsonb" if c in _TRADE_EXPERIENCE_JSON_COLS else f"{c}=%s" for c in cols]
+    set_clauses.append("updated_at=now()")
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"UPDATE trade_experiences SET {', '.join(set_clauses)} WHERE id=%s AND user_id=%s RETURNING *",
+                wrapped + [experience_id, user_id])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def get_trade_experience(database_url, user_id, experience_id):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM trade_experiences WHERE id=%s AND user_id=%s", [experience_id, user_id])
+            row = cur.fetchone()
+    return _row_to_json(row) if row else None
+
+
+def list_trade_experiences(database_url, user_id, symbol=None, trade_date=None, limit=200):
+    """指示書14番：GET /api/trade-experiences。symbol/trade_date（YYYY-MM-DD）で絞り込み可能。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = ["user_id=%s"], [user_id]
+    if symbol:
+        where.append("symbol=%s")
+        params.append(symbol)
+    if trade_date:
+        where.append("trade_date=%s")
+        params.append(trade_date)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT * FROM trade_experiences WHERE {' AND '.join(where)} "
+                f"ORDER BY trade_date DESC, entry_time DESC NULLS LAST LIMIT %s", params + [limit])
+            return [_row_to_json(r) for r in cur.fetchall()]
+
+
+def create_trade_decision_event(database_url, user_id, fields):
+    """指示書2番：WAIT/ENTRY_READY/ENTRY/HOLD/EXIT_READY/EXIT/INVALIDATEDの各時点を保存する。"""
+    pool = _get_pool(database_url)
+    if pool is None or not (fields or {}).get("symbol") or not (fields or {}).get("decision_type"):
+        return None
+    cols = ["trade_experience_id", "event_time", "symbol", "decision_type", "price", "reason_json",
+            "technical_snapshot_json", "market_snapshot_json"]
+    json_cols = {"reason_json", "technical_snapshot_json", "market_snapshot_json"}
+    values = [fields.get(c) for c in cols]
+    wrapped = [json.dumps(v, ensure_ascii=False) if (c in json_cols and v is not None) else v
+               for c, v in zip(cols, values)]
+    placeholders = ["%s::jsonb" if c in json_cols else "%s" for c in cols]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO trade_decision_events (user_id, {', '.join(cols)}) "
+                f"VALUES (%s, {', '.join(placeholders)}) RETURNING *", [user_id] + wrapped)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_trade_decision_events(database_url, user_id, trade_experience_id=None, symbol=None, limit=100):
+    """指示書2・21番：時系列順（event_time ASC）で返す——WAIT→ENTRY_READY→ENTRY→…の順序を
+    確認できるようにする。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = ["user_id=%s"], [user_id]
+    if trade_experience_id:
+        where.append("trade_experience_id=%s")
+        params.append(trade_experience_id)
+    if symbol:
+        where.append("symbol=%s")
+        params.append(symbol)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT * FROM trade_decision_events WHERE {' AND '.join(where)} "
+                f"ORDER BY event_time ASC LIMIT %s", params + [limit])
+            return [_row_to_json(r) for r in cur.fetchall()]
+
+
+def create_trade_experience_rule_candidate(database_url, user_id, rule_text, category=None, action_text=None,
+                                              evidence=None, extra_fields=None):
+    """指示書9番：経験学習から抽出したルール候補をtrade_rules.status='RULE_CANDIDATE'として
+    保存する（既存のupsert_trade_rule_from_text/_evaluate_rule_promotionは一切経由しない、
+    自動昇格ロジックに巻き込まれないようにするため）。ACTIVEはおろかTESTINGへも自動では
+    昇格しない——promote_trade_experience_rule_candidate()を明示的に呼んだ場合のみ。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    rule_text = (rule_text or "").strip()
+    if not rule_text:
+        return None
+    rule_key = _normalize_rule_key(rule_text)
+    extra = extra_fields or {}
+    today = datetime.date.today().isoformat()
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT id FROM trade_rules WHERE user_id=%s AND rule_key=%s", [user_id, rule_key])
+            existing = cur.fetchone()
+            if existing:
+                return get_trade_rule(database_url, user_id, existing["id"])
+            cur.execute(
+                "INSERT INTO trade_rules (user_id, rule_key, title, rule_text, category, scope, rule_type, "
+                "status, confidence, evidence_count, first_seen_date, last_seen_date, action_text, "
+                "source_json, notes, created_from) "
+                "VALUES (%s,%s,%s,%s,%s,%s,'TESTING','RULE_CANDIDATE',%s,%s,%s,%s,%s,%s::jsonb,%s,%s) RETURNING id",
+                [user_id, rule_key, rule_text[:80], rule_text, category or "market", extra.get("scope") or "global",
+                 extra.get("confidence") or "MEDIUM", extra.get("evidence_count") or 1, today, today, action_text,
+                 json.dumps([evidence] if evidence else [], ensure_ascii=False), extra.get("notes"),
+                 "trade_experience_learning"])
+            new_id = cur.fetchone()["id"]
+            cur.execute(
+                "INSERT INTO trade_rule_history (user_id,rule_id,event_type,new_status,new_confidence,reason,source) "
+                "VALUES (%s,%s,'CREATED',%s,%s,%s,%s)",
+                [user_id, new_id, "RULE_CANDIDATE", extra.get("confidence") or "MEDIUM",
+                 extra.get("reason") or "trade experience learningからの自動候補", "trade_experience_learning"])
+        conn.commit()
+    return get_trade_rule(database_url, user_id, new_id)
+
+
+def promote_trade_experience_rule_candidate(database_url, user_id, rule_id, reason=None):
+    """指示書9番：RULE_CANDIDATE→TESTINGはユーザー承認制。既存のupdate_trade_rule()（履歴記録
+    込み）をそのまま再利用する——新しい昇格経路を別途作らない。RULE_CANDIDATE以外の状態の
+    ルールには使わない（誤って他ステータスを巻き戻さないため）。"""
+    rule = get_trade_rule(database_url, user_id, rule_id)
+    if not rule or rule.get("status") != "RULE_CANDIDATE":
+        return None
+    ok = update_trade_rule(database_url, user_id, rule_id, {"status": "TESTING"},
+                             reason=reason or "ユーザーがTrade Experience Learningの候補を承認",
+                             source="trade_experience_learning_promote")
+    return get_trade_rule(database_url, user_id, rule_id) if ok else None
+
+
+def list_trade_experience_rule_candidates(database_url, user_id):
+    """指示書9・14番：GET /api/trade-experience-patterns向けのRULE_CANDIDATE一覧。"""
+    return list_trade_rules(database_url, user_id, status="RULE_CANDIDATE")
 
 
 def sync_rule_updates_to_trade_rules(database_url, user_id, rule_updates, daily_log_id=None, date=None,
