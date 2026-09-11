@@ -2787,6 +2787,24 @@ def _score_entry_candidates(database_url, user_id):
     overall_quality = "FULL" if quality_counts["DEGRADED"] == 0 and quality_counts["PARTIAL"] == 0 else (
         "DEGRADED" if quality_counts["FULL"] == 0 else "PARTIAL")
 
+    # Market Intelligence Phase11新規（指示書1・3・4・29・30番）：ENTRY TOP5・WAIT候補は
+    # 買わなかったものも含め原則すべてsnapshot保存する（survivorship bias防止）。entry_score・
+    # entryState自体は一切変更しない、隣で記録するだけ。dedupe_keyが1日・銘柄・状態単位で
+    # 重複保存を防ぐ。
+    try:
+        for i, c in enumerate(entry_ready_top5):
+            capture_entry_candidate_snapshot_safe(
+                database_url, user_id, c["code"], "ENTRY", price=c.get("current"), entry_score=c.get("entryScore"),
+                event_support=c.get("eventSupport"), candidate_state=c.get("eventSupport") or c.get("entryState"),
+                candidate_rank=i + 1)
+        for c in watch_candidates:
+            capture_entry_candidate_snapshot_safe(
+                database_url, user_id, c["code"], "WAIT", price=c.get("current"), entry_score=c.get("entryScore"),
+                event_support=c.get("eventSupport"), candidate_state=c.get("eventSupport") or c.get("entryState"),
+                wait_reason=c.get("entryState"))
+    except Exception as e:
+        print("  entry-candidates: candidate snapshot保存で例外（無視して続行）", e)
+
     return {
         "entryReadyTop5": [{**c, "rank": i + 1} for i, c in enumerate(entry_ready_top5)],
         "watchCandidates": watch_candidates,
@@ -7938,11 +7956,46 @@ def evaluate_trade_outcome_safe(database_url, user_id, trade_id, exit_price=None
         return None
 
 
-def replay_decision_support_at(database_url, event_id, ticker, as_of_iso, event_type_performance=None):
+def get_intraday_snapshot_at(as_of_iso, price_series=None):
+    """Market Intelligence Phase11新規（指示書12・13番）：as_of時点までのbarだけを使って
+    price/vwap/ma5m20/atr/day_high_so_far/day_low_so_farを再構築する。price_seriesは
+    呼び出し側が用意する[{"timestamp":iso,"high":..,"low":..,"close":..,"volume":..}, ...]
+    （順不同可）。as_of**より後**のbarは必ず除外する——day_high_so_far/day_low_so_farに
+    未来の高値・安値を混ぜないのがこの関数の唯一の責務（指示書13番）。"""
+    empty = {"price": None, "vwap": None, "ma5m20": None, "atr": None,
+              "day_high_so_far": None, "day_low_so_far": None, "quality": "NO_DATA"}
+    if not price_series:
+        return empty
+    bars = sorted((b for b in price_series if b.get("timestamp") and str(b["timestamp"]) <= as_of_iso),
+                  key=lambda b: b["timestamp"])
+    if not bars:
+        return empty
+    price = bars[-1]["close"]
+    total_vol = sum(b.get("volume") or 0 for b in bars)
+    vwap = (sum(b["close"] * (b.get("volume") or 0) for b in bars) / total_vol) if total_vol > 0 \
+        else (sum(b["close"] for b in bars) / len(bars))
+    recent20 = bars[-20:]
+    ma5m20 = sum(b["close"] for b in recent20) / len(recent20)
+    trs = []
+    for i in range(1, len(bars)):
+        h, l, prev_close = bars[i]["high"], bars[i]["low"], bars[i - 1]["close"]
+        trs.append(max(h - l, abs(h - prev_close), abs(l - prev_close)))
+    atr = (sum(trs[-14:]) / len(trs[-14:])) if trs else None
+    day_high = max(b["high"] for b in bars)
+    day_low = min(b["low"] for b in bars)
+    quality = "EXACT" if len(bars) >= 5 else "ESTIMATED"
+    return {"price": round(price, 2), "vwap": round(vwap, 2), "ma5m20": round(ma5m20, 2),
+            "atr": round(atr, 2) if atr is not None else None, "day_high_so_far": round(day_high, 2),
+            "day_low_so_far": round(day_low, 2), "quality": quality}
+
+
+def replay_decision_support_at(database_url, event_id, ticker, as_of_iso, event_type_performance=None,
+                                  price_series=None, event_baseline_price=None):
     """指示書14・15・28番：過去のある時点(as_of)で「何が見えていたか」だけを使って
     decision_supportを再現する。as_of以降に得られたevidence・reactionは一切使わない
-    （未来データ禁止、指示書14番）。extension_score（価格系列が必要）は現行では再現不可
-    のためNone（既知の制約、コメントで明記）。"""
+    （未来データ禁止、指示書14番）。Phase11新規（指示書12番）：price_series・
+    event_baseline_priceが渡された場合はget_intraday_snapshot_atでextension_scoreも
+    再構築する（未指定なら従来通りNone、既知の制約は維持）。"""
     empty = {"as_of": as_of_iso, "decision_support_state": None, "decision_support_score": None,
               "note": "この時点のevidence不足のため再現できません。"}
     if investment_db is None or not database_url:
@@ -7988,21 +8041,37 @@ def replay_decision_support_at(database_url, event_id, ticker, as_of_iso, event_
     historical_edge, _quality = compute_historical_edge_score(perf_entry)
     source_confidence = compute_source_confidence_score(confidence_level)
 
+    # Phase11新規（指示書12・13番）：price_series・event_baseline_priceが与えられた場合のみ
+    # extension_scoreを再構築する（未来データを含まないget_intraday_snapshot_atを経由）。
+    extension = None
+    intraday_snapshot = None
+    if price_series and event_baseline_price:
+        intraday_snapshot = get_intraday_snapshot_at(as_of_iso, price_series)
+        if intraday_snapshot.get("price") is not None:
+            extension = compute_extension_score(
+                current_price=intraday_snapshot["price"], event_baseline_price=event_baseline_price,
+                vwap=intraday_snapshot.get("vwap"), ma5=intraday_snapshot.get("ma5m20"),
+                atr=intraday_snapshot.get("atr"))
+
     score = compute_decision_support_score(material_quality, reaction_quality, freshness, historical_edge,
-                                             None, source_confidence)
+                                             extension, source_confidence)
     state = classify_decision_support_state(score)
+    note = "replay: as_of時点で観測可能だった情報のみ使用。" + (
+        "extension_scoreはas_of時点までのintraday dataから再構築しています。"
+        if extension is not None else
+        "extension_scoreは過去の価格系列が渡されなかったため再現していません（既知の制約）。")
     return {
         "as_of": as_of_iso, "material_quality_score": material_quality, "reaction_quality_score": reaction_quality,
-        "freshness_score": freshness, "historical_edge_score": historical_edge, "decision_support_score": score,
-        "decision_support_state": state,
-        "note": "replay: as_of時点で観測可能だった情報のみ使用。extension_scoreは過去の価格系列が"
-                "必要なため今回は再現していません（既知の制約）。",
+        "freshness_score": freshness, "historical_edge_score": historical_edge, "extension_score": extension,
+        "decision_support_score": score, "decision_support_state": state, "note": note,
     }
 
 
-def replay_decision_support_series(database_url, event_id, ticker, as_of_list, event_type_performance=None):
+def replay_decision_support_series(database_url, event_id, ticker, as_of_list, event_type_performance=None,
+                                      price_series=None, event_baseline_price=None):
     """指示書14・36番：複数時点をまとめてreplayし、タイムライン表示用の配列を返す。"""
-    return [replay_decision_support_at(database_url, event_id, ticker, as_of, event_type_performance)
+    return [replay_decision_support_at(database_url, event_id, ticker, as_of, event_type_performance,
+                                          price_series=price_series, event_baseline_price=event_baseline_price)
             for as_of in (as_of_list or [])]
 
 
@@ -8224,6 +8293,431 @@ def get_trade_decision_diagnostics(database_url, user_id):
         "avoid_chase_successes": avoid_chase_successes,
         "wait_outcomes_generated": wait_outcomes_generated,
         "calibration_sample_count": len([e for e in evaluations if e.get("pnl_pct") is not None]),
+    }
+
+
+# ============================================================
+# Market Intelligence Phase11（2026-09-11新規）：Candidate Outcome Engine / Historical
+# Replay Accuracy / Live Validation。Phase10までに作った判断が「本当に役に立ったか」を
+# 測ることを優先する（指示書48番、最重要原則）——ENTRYした結果だけでなく、WAITした結果・
+# AVOIDした結果・買わなかったTOP5候補まで必ず評価する。新しい売買判断ロジックは追加しない
+# （指示書冒頭）。
+# ============================================================
+
+MARKET_INTELLIGENCE_VALIDATION_MODE = os.environ.get("MARKET_INTELLIGENCE_VALIDATION_MODE", "false").lower() == "true"
+DECISION_SUPPORT_CONFIG_VERSION = "DS_V1"  # 指示書25番：将来重み変更後、古いデータと混ぜない
+
+
+def build_candidate_dedupe_key(code, candidate_type, candidate_at_iso, candidate_state=None):
+    """指示書3・4番：1日・銘柄・候補タイプ・状態ごとにdedupeする。状態が変われば
+    （例：09:10 WAIT→10:05 SUPPORTIVE）別dedupe_keyとなり新規snapshotとして保存される。"""
+    day = str(candidate_at_iso)[:10]
+    return f"{code}:{candidate_type}:{day}:{candidate_state or 'NONE'}"
+
+
+CANDIDATE_OUTCOME_SUCCESS_THRESHOLD_PCT = 2.0
+CANDIDATE_OUTCOME_FAILED_THRESHOLD_PCT = -2.0
+CANDIDATE_CHASE_TRAP_EXTENSION_THRESHOLD = 80.0
+CANDIDATE_AVOIDED_LOSS_THRESHOLD_PCT = -5.0
+
+
+def classify_candidate_outcome(candidate_type, subsequent_close_pct=None, mfe_pct=None, mae_pct=None,
+                                  extension_score=None, pullback_then_supportive=False):
+    """指示書5〜9番：SUCCESS/FAILED/CORRECT_WAIT/GOOD_PULLBACK/MISSED_BREAKOUT/AVOIDED_LOSS/
+    CHASE_TRAP/NO_EDGE。candidate_typeごとに評価軸を切り替え、単純な終値だけで判定しない
+    （MFE/MAEも考慮する、指示書6番）。"""
+    if candidate_type == "WAIT":
+        return classify_wait_outcome(subsequent_close_pct, pullback_then_supportive=pullback_then_supportive)
+    if candidate_type == "AVOID_CHASE":
+        if subsequent_close_pct is not None and subsequent_close_pct <= CANDIDATE_AVOIDED_LOSS_THRESHOLD_PCT:
+            return "AVOIDED_LOSS"  # 指示書8番：追いかけなかったことで損失を避けられた
+        if subsequent_close_pct is not None and subsequent_close_pct >= WAIT_MISSED_BREAKOUT_THRESHOLD_PCT:
+            return "MISSED_BREAKOUT"  # 指示書8番：「判断ミス」と即断せず機会損失として記録するのみ
+        return "NO_EDGE"
+    # ENTRY/DAYTRADE/PULLBACKはこちらの軸で評価する。
+    if extension_score is not None and extension_score >= CANDIDATE_CHASE_TRAP_EXTENSION_THRESHOLD \
+            and mfe_pct is not None and mfe_pct > 0 and subsequent_close_pct is not None and subsequent_close_pct <= 0:
+        return "CHASE_TRAP"  # 指示書9番：候補時点で過熱＋直後上昇→その後baseline以下
+    if subsequent_close_pct is None:
+        return "NO_EDGE"
+    if subsequent_close_pct >= CANDIDATE_OUTCOME_SUCCESS_THRESHOLD_PCT:
+        return "SUCCESS"
+    if subsequent_close_pct <= CANDIDATE_OUTCOME_FAILED_THRESHOLD_PCT:
+        return "FAILED"
+    return "NO_EDGE"
+
+
+def compute_candidate_mfe_mae(candidate_price, high_since_candidate=None, low_since_candidate=None,
+                                 data_quality_hint="ESTIMATED"):
+    """指示書11番：candidate時点からのhigh/lowベースでMFE/MAEを算出する（終値ベースではなく
+    intraday high/lowベース）。データ粒度不足の場合はevaluation_quality=ESTIMATEDとする。"""
+    mfe, mae = compute_mfe_mae_pct(candidate_price, high_since_candidate, low_since_candidate)
+    quality = "EXACT" if (data_quality_hint == "EXACT" and high_since_candidate is not None
+                            and low_since_candidate is not None) else "ESTIMATED"
+    return mfe, mae, quality
+
+
+def compute_replay_drift(actual_history, replay_series):
+    """指示書15・16番：保存済みhistory（実際のstate遷移、evaluated_at昇順を想定しない）と
+    replayの結果を突き合わせ、不一致をreplay_driftとして検出する。各replay時点について、
+    その時点以前で最も新しい実測値と比較する（当然、as_of以降の実測値と比べない＝
+    未来データでreplayを採点しない）。"""
+    matches, drifts = 0, []
+    for r in (replay_series or []):
+        state = r.get("decision_support_state")
+        as_of = r.get("as_of")
+        if not state or not as_of:
+            continue
+        candidates = [a for a in (actual_history or []) if a.get("evaluated_at") and str(a["evaluated_at"]) <= str(as_of)]
+        if not candidates:
+            continue
+        nearest = max(candidates, key=lambda a: a["evaluated_at"])
+        if nearest.get("decision_support_state") == state:
+            matches += 1
+        else:
+            drifts.append({"as_of": as_of, "actual": nearest.get("decision_support_state"), "replay": state})
+    total = matches + len(drifts)
+    return {"replay_samples": total, "replay_match_rate": round(matches / total, 3) if total else None,
+             "replay_drift_count": len(drifts), "drifts": drifts}
+
+
+CANDIDATE_SUCCESS_OUTCOME_STATUSES = ("SUCCESS", "CORRECT_WAIT", "GOOD_PULLBACK", "AVOIDED_LOSS")
+
+
+def aggregate_candidate_performance(snapshots):
+    """指示書17番：candidate_type別のcount/success_rate/avg_30m_return/avg_mfe/avg_mae。"""
+    by_type = {}
+    for s in snapshots or []:
+        by_type.setdefault(s.get("candidate_type") or "ENTRY", []).append(s)
+    out = {}
+    for ct, items in by_type.items():
+        n = len(items)
+        entry = {"count": n}
+        successes = sum(1 for i in items if i.get("outcome_status") in CANDIDATE_SUCCESS_OUTCOME_STATUSES)
+        evaluated = [i for i in items if i.get("outcome_status")]
+        if evaluated:
+            entry["success_rate"] = round(successes / len(evaluated), 3)
+        returns30 = [i["subsequent_30m_pct"] for i in items if i.get("subsequent_30m_pct") is not None]
+        if returns30:
+            entry["avg_30m_return"] = round(sum(returns30) / len(returns30), 2)
+        mfes = [i["mfe_pct"] for i in items if i.get("mfe_pct") is not None]
+        if mfes:
+            entry["avg_mfe"] = round(sum(mfes) / len(mfes), 2)
+        maes = [i["mae_pct"] for i in items if i.get("mae_pct") is not None]
+        if maes:
+            entry["avg_mae"] = round(sum(maes) / len(maes), 2)
+        out[ct] = entry
+    return out
+
+
+def aggregate_candidate_performance_by_rank(snapshots):
+    """指示書18番：ENTRY TOP5のrank別実績（entry_score自体は変更しない、集計のみ）。"""
+    by_rank = {}
+    for s in snapshots or []:
+        if (s.get("candidate_type") or "ENTRY") != "ENTRY" or s.get("candidate_rank") is None:
+            continue
+        by_rank.setdefault(int(s["candidate_rank"]), []).append(s)
+    out = {}
+    for rank, items in by_rank.items():
+        returns30 = [i["subsequent_30m_pct"] for i in items if i.get("subsequent_30m_pct") is not None]
+        out[f"TOP{rank}"] = {"count": len(items),
+                                "avg_30m_return": round(sum(returns30) / len(returns30), 2) if returns30 else None}
+    return out
+
+
+def aggregate_candidate_performance_by_event_support(snapshots):
+    """指示書19番：STRONG/SUPPORTIVE/NEUTRAL/CAUTION/AVOID_CHASEごとのsubsequent return・
+    MFE・MAE・win rateを集計する。"""
+    by_state = {}
+    for s in snapshots or []:
+        by_state.setdefault(s.get("candidate_state") or s.get("event_support"), []).append(s)
+    out = {}
+    for state, items in by_state.items():
+        if not state:
+            continue
+        returns = [i["subsequent_close_pct"] for i in items if i.get("subsequent_close_pct") is not None]
+        mfes = [i["mfe_pct"] for i in items if i.get("mfe_pct") is not None]
+        maes = [i["mae_pct"] for i in items if i.get("mae_pct") is not None]
+        out[state] = {
+            "count": len(items),
+            "win_rate": round(sum(1 for r in returns if r > 0) / len(returns), 3) if returns else None,
+            "avg_return": round(sum(returns) / len(returns), 2) if returns else None,
+            "avg_mfe": round(sum(mfes) / len(mfes), 2) if mfes else None,
+            "avg_mae": round(sum(maes) / len(maes), 2) if maes else None,
+        }
+    return out
+
+
+def aggregate_candidate_performance_by_wait_reason(snapshots):
+    """指示書20番：WAIT理由（EXTENDED/LOW_VOLUME/MARKET_WEAK/SECTOR_WEAK/
+    ENTRY_CONDITION_NOT_MET/EVENT_UNCONFIRMED等）別に、どの理由が有効だったかを評価する。"""
+    by_reason = {}
+    for s in snapshots or []:
+        if (s.get("candidate_type") or "") != "WAIT" or not s.get("wait_reason"):
+            continue
+        by_reason.setdefault(s["wait_reason"], []).append(s)
+    out = {}
+    for reason, items in by_reason.items():
+        correct = sum(1 for i in items if i.get("outcome_status") in ("CORRECT_WAIT", "GOOD_PULLBACK"))
+        evaluated = [i for i in items if i.get("outcome_status")]
+        out[reason] = {"count": len(items),
+                         "correct_rate": round(correct / len(evaluated), 3) if evaluated else None}
+    return out
+
+
+def evaluate_rule_linked_wait(subsequent_return_pct):
+    """指示書21番：FOMC前・決算前等ルールに基づくWAITは「取り逃した」と即断せず、
+    risk_avoided（下落した場合）とopportunity_missed（上昇した場合）を両方の枠で記録する。"""
+    if subsequent_return_pct is None:
+        return {"risk_avoided_pct": None, "opportunity_missed_pct": None}
+    if subsequent_return_pct < 0:
+        return {"risk_avoided_pct": round(abs(subsequent_return_pct), 2), "opportunity_missed_pct": None}
+    return {"risk_avoided_pct": None, "opportunity_missed_pct": round(subsequent_return_pct, 2)}
+
+
+def compute_data_quality_score(evaluation_quality=None, confidence_level=None, has_vwap=True,
+                                  source_only_social=False):
+    """指示書27番：0〜100。intraday実測＋公式ソース＋完全なbenchmarkなら高、推定値・VWAP欠損・
+    social-onlyなら低。"""
+    score = 50.0
+    if evaluation_quality == "EXACT":
+        score += 30
+    elif evaluation_quality == "ESTIMATED":
+        score += 10
+    if confidence_level == "OFFICIAL_CONFIRMED":
+        score += 20
+    elif confidence_level in ("MULTI_SOURCE_CONFIRMED", "SINGLE_RELIABLE_SOURCE"):
+        score += 8
+    elif confidence_level == "SOCIAL_ONLY":
+        score -= 20
+    if not has_vwap:
+        score -= 15
+    if source_only_social:
+        score -= 10
+    return round(max(0.0, min(score, 100.0)), 1)
+
+
+CALIBRATION_DATA_QUALITY_MIN = 60.0
+
+
+def filter_calibration_samples_by_quality(samples, min_quality=CALIBRATION_DATA_QUALITY_MIN):
+    """指示書27・28番：data_quality_score<60は重み較正の対象から除外する（参考統計には
+    残してよいので、この関数はcompute_decision_support_calibrationの入力を絞る用途のみ）。
+    data_quality_score未設定（None）の既存データは後方互換のため除外しない。"""
+    return [s for s in (samples or [])
+            if s.get("data_quality_score") is None or s.get("data_quality_score") >= min_quality]
+
+
+def compute_sample_integrity(snapshots):
+    """指示書29番：raw_snapshot_count（保存された全snapshot数）とindependent_candidate_count
+    （同一銘柄・同一日・同一候補タイプを1件と数えた数）を分ける——同じ銘柄の同じイベントで
+    5回snapshotされたものを独立5サンプルと数えない。"""
+    raw = len(snapshots or [])
+    independent_keys = {(s.get("code"), s.get("candidate_type"), str(s.get("candidate_at"))[:10])
+                          for s in (snapshots or [])}
+    return {"raw_snapshot_count": raw, "independent_candidate_count": len(independent_keys)}
+
+
+def compute_candidate_coverage_rate(eligible_count, saved_count):
+    """指示書30・31番：survivorship bias防止。生成された候補のうち何%が実際にsnapshot保存
+    されたかを示す——低coverageなら結果を過信しない、との警告に使う指標。"""
+    if not eligible_count:
+        return None
+    return round(min(saved_count, eligible_count) / eligible_count, 3)
+
+
+def capture_entry_candidate_snapshot(database_url, user_id, code, candidate_type, price=None, entry_score=None,
+                                        event_support=None, candidate_state=None, candidate_rank=None,
+                                        extension_score=None, wait_reason=None, data_quality_score=None,
+                                        was_taken=False):
+    """指示書1・3・4・29・30番：ENTRY TOP5・WAIT・PULLBACK・AVOID_CHASE候補（買わなかった
+    ものも含め原則すべて）のsnapshotを保存する。dedupe_keyにより1日・銘柄・候補タイプ・
+    状態単位で重複を防ぐ。"""
+    if investment_db is None or not database_url:
+        return None
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    dedupe_key = build_candidate_dedupe_key(code, candidate_type, now_iso, candidate_state)
+    fields = {
+        "code": code, "entry_score": entry_score, "event_support": event_support,
+        "price_at_candidate": price, "was_taken": was_taken, "candidate_type": candidate_type,
+        "candidate_state": candidate_state, "candidate_rank": candidate_rank, "extension_score": extension_score,
+        "wait_reason": wait_reason, "data_quality_score": data_quality_score, "dedupe_key": dedupe_key,
+        "config_version": DECISION_SUPPORT_CONFIG_VERSION,
+    }
+    return investment_db.create_entry_candidate_snapshot(database_url, user_id, fields)
+
+
+def capture_entry_candidate_snapshot_safe(database_url, user_id, code, candidate_type, **kwargs):
+    try:
+        return capture_entry_candidate_snapshot(database_url, user_id, code, candidate_type, **kwargs)
+    except Exception as e:
+        print("  Market Intelligence: candidate snapshot保存で例外（無視して続行）", code, e)
+        return None
+
+
+def run_due_candidate_outcomes(database_url, user_id, limit=50):
+    """指示書10・11番：due（candidate_at<=now-30分）かつoutcome_status未確定のsnapshotのみ
+    処理する独立scheduler向け関数。5分周期を想定（呼び出し側でtime.sleepする）。"""
+    result = {"evaluated": 0, "no_data": 0}
+    if investment_db is None or not database_url:
+        return result
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = (now_utc - datetime.timedelta(minutes=30)).isoformat()
+    due = investment_db.list_due_entry_candidate_snapshots_for_backfill(database_url, cutoff, limit=limit)
+    for snap in due:
+        try:
+            candidate_price = snap.get("price_at_candidate")
+            if not candidate_price:
+                investment_db.save_entry_candidate_snapshot_result(
+                    database_url, snap["id"], outcome_status="NO_EDGE",
+                    outcome_evaluated_at=now_utc.isoformat(), evaluation_quality="NO_DATA")
+                result["no_data"] += 1
+                continue
+            quotes = get_stock_quotes([{"code": snap["code"], "market": "JP"}])
+            quote = quotes.get(snap["code"]) if quotes else None
+            if not quote or quote.get("t") is None:
+                result["no_data"] += 1
+                continue
+            current_price = quote["t"]
+            candidate_at = datetime.datetime.fromisoformat(str(snap["candidate_at"]).replace("Z", "+00:00"))
+            if candidate_at.tzinfo is None:
+                candidate_at = candidate_at.replace(tzinfo=datetime.timezone.utc)
+            elapsed_minutes = (now_utc - candidate_at).total_seconds() / 60
+            subsequent_pct = round((current_price - candidate_price) / candidate_price * 100, 2)
+            fields = {}
+            if elapsed_minutes >= 30 and snap.get("subsequent_30m_pct") is None:
+                fields["subsequent_30m_pct"] = subsequent_pct
+            if elapsed_minutes >= 60 and snap.get("subsequent_1h_pct") is None:
+                fields["subsequent_1h_pct"] = subsequent_pct
+            timing = classify_event_timing(now_utc)
+            if timing in ("AFTER_CLOSE", "OVERNIGHT", "NON_TRADING_DAY") and snap.get("subsequent_close_pct") is None:
+                fields["subsequent_close_pct"] = subsequent_pct
+                has_hl = quote.get("high") is not None and quote.get("low") is not None
+                mfe, mae, quality = compute_candidate_mfe_mae(
+                    candidate_price, quote.get("high"), quote.get("low"),
+                    data_quality_hint="EXACT" if has_hl else "ESTIMATED")
+                fields["mfe_pct"], fields["mae_pct"], fields["evaluation_quality"] = mfe, mae, quality
+                fields["outcome_status"] = classify_candidate_outcome(
+                    snap.get("candidate_type") or "ENTRY", subsequent_close_pct=subsequent_pct, mfe_pct=mfe,
+                    mae_pct=mae, extension_score=snap.get("extension_score"))
+                fields["outcome_evaluated_at"] = now_utc.isoformat()
+                fields["data_quality_score"] = compute_data_quality_score(evaluation_quality=quality)
+            if fields:
+                investment_db.save_entry_candidate_snapshot_result(database_url, snap["id"], **fields)
+                result["evaluated"] += 1
+        except Exception as e:
+            print("  Market Intelligence: candidate outcome評価で例外（無視して続行）", snap.get("code"), e)
+    return result
+
+
+def run_due_candidate_outcomes_safe(database_url, user_id, limit=50):
+    try:
+        return run_due_candidate_outcomes(database_url, user_id, limit)
+    except Exception as e:
+        print("  Market Intelligence: candidate outcome scheduler処理で例外（無視して続行）", e)
+        return {"evaluated": 0, "no_data": 0}
+
+
+def _candidate_outcome_scheduler_loop():
+    """指示書10番：既存scheduler（にこそくポーリング・event reaction評価等）と競合しない
+    独立処理。due（30分以上経過・未評価）のcandidateだけを5分間隔で処理する。"""
+    while True:
+        try:
+            if investment_db is not None and DATABASE_URL:
+                user_id = _morning_check_scheduler_users()[0]
+                result = run_due_candidate_outcomes(DATABASE_URL, user_id, limit=50)
+                if result["evaluated"] or result["no_data"]:
+                    print(f"  [Market Intelligence] candidate outcome evaluated={result['evaluated']}件 "
+                          f"no_data={result['no_data']}件")
+        except Exception as e:
+            print("  [Market Intelligence] candidate outcome schedulerループで例外", e)
+        time.sleep(300)
+
+
+def backfill_candidate_outcomes(database_url, user_id, limit=100, dry_run=True):
+    """指示書32番：POST /api/market-intelligence/backfill-candidate-outcomes向け。dry_run=True
+    なら対象件数のみ返し実際の更新は行わない（他Phaseのbackfillと同じ方針）。"""
+    if investment_db is None or not database_url:
+        return {"dry_run": dry_run, "target_count": 0, "result": None}
+    cutoff = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    due = investment_db.list_due_entry_candidate_snapshots_for_backfill(database_url, cutoff, limit=limit)
+    if dry_run:
+        return {"dry_run": True, "target_count": len(due), "result": None}
+    result = run_due_candidate_outcomes(database_url, user_id, limit=limit)
+    return {"dry_run": False, "target_count": len(due), "result": result}
+
+
+def build_candidate_performance_report(database_url, user_id, lookback_days=30):
+    """指示書17〜20・27・28・29・31・35番：GET /api/market-intelligence/candidate-performance。"""
+    empty = {"by_type": {}, "by_rank": {}, "by_event_support": {}, "by_wait_reason": {},
+              "sample_integrity": {"raw_snapshot_count": 0, "independent_candidate_count": 0}}
+    if investment_db is None or not database_url:
+        return empty
+    since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=lookback_days)).isoformat()
+    snapshots = investment_db.list_entry_candidate_snapshots(database_url, user_id, since_iso)
+    return {
+        "by_type": aggregate_candidate_performance(snapshots),
+        "by_rank": aggregate_candidate_performance_by_rank(snapshots),
+        "by_event_support": aggregate_candidate_performance_by_event_support(snapshots),
+        "by_wait_reason": aggregate_candidate_performance_by_wait_reason(snapshots),
+        "sample_integrity": compute_sample_integrity(snapshots),
+    }
+
+
+def build_candidate_performance_report_safe(database_url, user_id, lookback_days=30):
+    try:
+        return build_candidate_performance_report(database_url, user_id, lookback_days)
+    except Exception as e:
+        print("  Market Intelligence: candidate performance report生成で例外（無視して続行）", e)
+        return {"by_type": {}, "by_rank": {}, "by_event_support": {}, "by_wait_reason": {},
+                 "sample_integrity": {"raw_snapshot_count": 0, "independent_candidate_count": 0}}
+
+
+def build_replay_diagnostics_report(database_url, event_id, ticker, as_of_list, event_type_performance=None):
+    """指示書14〜16・36・44番：replay_samples/replay_match_rate/replay_drift_countを算出する。
+    実際の保存済みhistoryとreplay結果を突き合わせる。"""
+    empty = {"replay_samples": 0, "replay_match_rate": None, "replay_drift_count": 0, "drifts": []}
+    if investment_db is None or not database_url:
+        return empty
+    actual_history = investment_db.list_event_decision_support_history(database_url, event_id, ticker)
+    replay_series = replay_decision_support_series(database_url, event_id, ticker, as_of_list, event_type_performance)
+    return compute_replay_drift(actual_history, replay_series)
+
+
+def get_candidate_diagnostics(database_url, user_id):
+    """指示書44番：candidate_snapshots_today・candidate_outcomes_pending・
+    candidate_outcomes_evaluated・low_quality_samples・validation_mode・
+    candidate_coverage_rate。replay_match_rateは対象eventが必要なため、直近30日の
+    event_decision_support履歴全体からサンプリングして算出する（既知の簡略化）。"""
+    empty = {"candidate_snapshots_today": 0, "candidate_outcomes_pending": 0, "candidate_outcomes_evaluated": 0,
+              "replay_match_rate": None, "low_quality_samples": 0, "validation_mode": MARKET_INTELLIGENCE_VALIDATION_MODE,
+              "validation_session": None, "candidate_coverage_rate": None}
+    if investment_db is None or not database_url:
+        return empty
+    today_start_iso = datetime.datetime.now(_JST).replace(hour=0, minute=0, second=0, microsecond=0) \
+        .astimezone(datetime.timezone.utc).isoformat()
+    snapshots_today = investment_db.count_entry_candidate_snapshots_since(database_url, user_id, today_start_iso)
+    since_30d = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=30)).isoformat()
+    recent_snapshots = investment_db.list_entry_candidate_snapshots(database_url, user_id, since_30d)
+    low_quality = sum(1 for s in recent_snapshots
+                        if s.get("data_quality_score") is not None and s["data_quality_score"] < CALIBRATION_DATA_QUALITY_MIN)
+    session = None
+    try:
+        today_date = datetime.datetime.now(_JST).date().isoformat()
+        session = investment_db.get_or_create_validation_session(
+            database_url, today_date, config_version=DECISION_SUPPORT_CONFIG_VERSION)
+    except Exception:
+        session = None
+    return {
+        "candidate_snapshots_today": snapshots_today,
+        "candidate_outcomes_pending": investment_db.count_entry_candidate_snapshots_pending(database_url, user_id),
+        "candidate_outcomes_evaluated": investment_db.count_entry_candidate_snapshots_evaluated_since(
+            database_url, user_id, today_start_iso),
+        "replay_match_rate": None,  # 特定eventが必要なため、ここでは常時算出しない（既知の簡略化）
+        "low_quality_samples": low_quality,
+        "validation_mode": MARKET_INTELLIGENCE_VALIDATION_MODE,
+        "validation_session": session,
+        "candidate_coverage_rate": None,  # eligible候補数は呼び出し元（entry-candidatesスキャン）でのみ分かるため既定None
     }
 
 
@@ -13604,8 +14098,10 @@ class Handler(SimpleHTTPRequestHandler):
             event_diag = get_underlying_event_diagnostics(DATABASE_URL)
             # Market Intelligence Phase10新規（指示書39番）。
             trade_decision_diag = get_trade_decision_diagnostics(DATABASE_URL, self.current_user)
+            # Market Intelligence Phase11新規（指示書44番）。
+            candidate_diag = get_candidate_diagnostics(DATABASE_URL, self.current_user)
             self._send_json({"sources": sources, "configs": MARKET_SOURCE_CONFIGS, "event_engine": event_diag,
-                              "trade_decision_engine": trade_decision_diag})
+                              "trade_decision_engine": trade_decision_diag, "candidate_engine": candidate_diag})
         elif self.path.split("?")[0] == "/api/market-intelligence/events":
             # Market Intelligence Phase7新規（指示書23・29番）：event一覧（「重要」タブ主表示）。
             qs = urllib.parse.urlparse(self.path).query
@@ -13749,6 +14245,39 @@ class Handler(SimpleHTTPRequestHandler):
             # しない、参考値のみ）。
             report = build_calibration_report_safe(DATABASE_URL, self.current_user) \
                 if (investment_db is not None and DATABASE_URL) else {}
+            self._send_json(report)
+        elif self.path.split("?")[0] == "/api/market-intelligence/candidate-performance":
+            # Market Intelligence Phase11新規（指示書17〜20・32・35番）。
+            report = build_candidate_performance_report_safe(DATABASE_URL, self.current_user) \
+                if (investment_db is not None and DATABASE_URL) else {}
+            self._send_json(report)
+        elif self.path.split("?")[0].startswith("/api/market-intelligence/candidate-performance/"):
+            # Market Intelligence Phase11新規（指示書32番）：銘柄単体の候補実績。
+            code = urllib.parse.unquote(self.path.split("?")[0][len("/api/market-intelligence/candidate-performance/"):].strip("/"))
+            since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=30)).isoformat()
+            snapshots = investment_db.list_entry_candidate_snapshots_for_code(DATABASE_URL, code, since_iso) \
+                if (investment_db is not None and DATABASE_URL and code) else []
+            self._send_json({"code": code, "snapshots": snapshots,
+                              "by_type": aggregate_candidate_performance(snapshots)})
+        elif self.path.split("?")[0] == "/api/market-intelligence/replay-diagnostics":
+            # Market Intelligence Phase11新規（指示書14〜16・32・44番）：?event_id=&ticker=&times=
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            event_id_raw = params.get("event_id", [None])[0]
+            ticker = params.get("ticker", [None])[0]
+            times = [t for t in (params.get("times", [""])[0]).split(",") if t]
+            if not event_id_raw or not ticker or not times or investment_db is None or not DATABASE_URL:
+                self._send_json({"replay_samples": 0, "replay_match_rate": None, "replay_drift_count": 0, "drifts": []})
+                return
+            try:
+                event_id = int(event_id_raw)
+            except ValueError:
+                self._send_json({"error": "不正なevent_idです"})
+                return
+            since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=90)).isoformat()
+            perf = aggregate_event_type_performance(
+                investment_db.list_evaluated_event_market_reactions_since(DATABASE_URL, since_iso))
+            report = build_replay_diagnostics_report(DATABASE_URL, event_id, ticker, times, event_type_performance=perf)
             self._send_json(report)
         elif self.path.split("?")[0].startswith("/api/market-intelligence/events/"):
             # Market Intelligence Phase7新規（指示書29番）：event単体の詳細。
@@ -14662,6 +15191,30 @@ class Handler(SimpleHTTPRequestHandler):
                                                         event_ids=event_ids, windows=body.get("windows"),
                                                         dry_run=bool(body.get("dry_run")))
             self._send_json(result)
+        elif self.path == "/api/market-intelligence/backfill-candidate-outcomes":
+            # Market Intelligence Phase11新規（指示書10・32番）：due（候補生成から一定時間
+            # 経過・未評価）のcandidate outcomeをまとめて処理する。dry_run・limit必須。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            if "dry_run" not in body:
+                self._send_json({"error": "dry_runは必須です"})
+                return
+            limit = body.get("limit")
+            if limit is None:
+                self._send_json({"error": "limitは必須です"})
+                return
+            try:
+                limit = int(limit)
+            except (TypeError, ValueError):
+                self._send_json({"error": "limitは整数で指定してください"})
+                return
+            if limit <= 0 or limit > 500:
+                self._send_json({"error": "limitは1〜500の範囲で指定してください"})
+                return
+            result = backfill_candidate_outcomes(DATABASE_URL, self.current_user, limit=limit,
+                                                    dry_run=bool(body.get("dry_run")))
+            self._send_json(result)
         elif self.path == "/api/watchlist/migrate":
             # 既存ユーザーのlocalStorage watchlistを1回だけNeonへ取り込む（investmentLogMigratedと
             # 同じパターン）。冪等（同じcode+marketは上書きになるだけ）。
@@ -14900,6 +15453,7 @@ def main():
         # Market Intelligence Phase8新規（指示書28番）：event reactionの独立scheduler。
         # 既存のsocial signal評価scheduler・にこそくpollerとは別テーブル・別関数で競合しない。
         threading.Thread(target=_event_reaction_scheduler_loop, daemon=True).start()
+        threading.Thread(target=_candidate_outcome_scheduler_loop, daemon=True).start()
     try:
         httpd = ThreadingTCPServer((HOST, PORT), Handler)
     except OSError:

@@ -4078,6 +4078,7 @@ function ImportantIntelligenceFeed(){
       </div>
     )}
     <EventTypePerformancePanel/>
+    <CandidatePerformancePanel/>
     <DecisionSupportCalibrationPanel/>
   </div>;
 }
@@ -4149,6 +4150,46 @@ function DecisionSupportCalibrationPanel(){
         <div style={{marginTop:4,color:"var(--down)"}}>False Positive（強支持だったが下落）：{report.false_positives.length}件</div>}
       {report&&report.false_negatives&&report.false_negatives.length>0 &&
         <div style={{marginTop:4,color:"var(--accent)"}}>False Negative（慎重すぎたが急騰）：{report.false_negatives.length}件</div>}
+    </div>}
+  </div>;
+}
+
+// Market Intelligence Phase11新規（指示書33・34・35・44番）：候補実績パネル（ENTRY/WAIT/
+// AVOID_CHASEの実績を簡潔に表示。sample不足は表示しない、指示書35番）。
+const CANDIDATE_TYPE_LABELS_JP = {ENTRY: "ENTRY", WAIT: "WAIT", AVOID_CHASE: "AVOID_CHASE"};
+function CandidatePerformancePanel(){
+  const [report,setReport]=useState(null);
+  const [show,setShow]=useState(false);
+  useEffect(()=>{
+    if(!show)return;
+    fetchJsonSafe("/api/market-intelligence/candidate-performance").then(d=>{if(d)setReport(d);}).catch(()=>{});
+  },[show]);
+  const byType=(report&&report.by_type)||{};
+  const byRank=(report&&report.by_rank)||{};
+  const integrity=report&&report.sample_integrity;
+  return <div style={{marginTop:4}}>
+    <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={()=>setShow(v=>!v)}>
+      {show?"▲ 候補実績を隠す":"▼ 候補実績（ENTRY/WAIT/AVOID_CHASE）"}
+    </button>
+    {show && <div style={{fontSize:10.5,marginTop:4,color:"var(--inkSoft)",lineHeight:1.7}}>
+      {!report && <div style={{color:"var(--inkFaint)"}}>読み込み中…</div>}
+      {report && Object.keys(byType).length===0 && <div style={{color:"var(--inkFaint)"}}>まだ候補実績データがありません。</div>}
+      {Object.entries(byType).filter(([,v])=>v.count>=5).map(([ct,v])=>
+        <div key={ct}>
+          {CANDIDATE_TYPE_LABELS_JP[ct]||ct}：{v.count}件
+          {v.success_rate!=null && <span>　成功率{Math.round(v.success_rate*100)}%</span>}
+          {v.avg_30m_return!=null && <span>　30M平均{v.avg_30m_return>0?"+":""}{v.avg_30m_return}%</span>}
+          {v.avg_mfe!=null && <span>　MFE {v.avg_mfe}%</span>}
+          {v.avg_mae!=null && <span>　MAE {v.avg_mae}%</span>}
+        </div>
+      )}
+      {Object.keys(byRank).length>0 && <div style={{marginTop:4}}>
+        {Object.entries(byRank).filter(([,v])=>v.count>=5).map(([rank,v])=>
+          <span key={rank} style={{marginRight:8}}>{rank} 30M {v.avg_30m_return>0?"+":""}{v.avg_30m_return}%</span>)}
+      </div>}
+      {integrity && integrity.raw_snapshot_count>0 && <div style={{marginTop:4,color:"var(--inkFaint)"}}>
+        独立候補数 {integrity.independent_candidate_count}件（生snapshot {integrity.raw_snapshot_count}件）
+      </div>}
     </div>}
   </div>;
 }

@@ -1040,6 +1040,7 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_EVENT_MARKET_REACTIONS_SQL)
         conn.execute(_SCHEMA_EVENT_DECISION_SUPPORT_SQL)
         conn.execute(_SCHEMA_TRADE_DECISION_CONTEXT_SQL)
+        conn.execute(_MIGRATE_ENTRY_CANDIDATE_SNAPSHOTS_V2_SQL)
         conn.commit()
 
 
@@ -5704,6 +5705,48 @@ CREATE INDEX IF NOT EXISTS idx_entry_candidate_snapshots_code ON entry_candidate
 CREATE INDEX IF NOT EXISTS idx_entry_candidate_snapshots_user ON entry_candidate_snapshots(user_id, created_at);
 """
 
+# ============================================================
+# Market Intelligence Phase11（2026-09-11新規）：Candidate Outcome Engine / Historical
+# Replay Accuracy / Live Validation。entry_candidate_snapshotsを拡張し、ENTRY/WAIT/
+# PULLBACK/AVOID_CHASE候補（買わなかったものも含む）を自動追跡・評価できるようにする
+# （指示書1〜11・29・30番）。既存列（price_at_candidate等）と重複する列は追加しない
+# （指示書2番）。
+# ============================================================
+
+_MIGRATE_ENTRY_CANDIDATE_SNAPSHOTS_V2_SQL = """
+ALTER TABLE entry_candidate_snapshots ADD COLUMN IF NOT EXISTS candidate_type TEXT NOT NULL DEFAULT 'ENTRY';
+ALTER TABLE entry_candidate_snapshots ADD COLUMN IF NOT EXISTS candidate_state TEXT;
+ALTER TABLE entry_candidate_snapshots ADD COLUMN IF NOT EXISTS candidate_rank INTEGER;
+ALTER TABLE entry_candidate_snapshots ADD COLUMN IF NOT EXISTS extension_score NUMERIC;
+ALTER TABLE entry_candidate_snapshots ADD COLUMN IF NOT EXISTS wait_reason TEXT;
+ALTER TABLE entry_candidate_snapshots ADD COLUMN IF NOT EXISTS subsequent_5m_pct NUMERIC;
+ALTER TABLE entry_candidate_snapshots ADD COLUMN IF NOT EXISTS subsequent_1h_pct NUMERIC;
+ALTER TABLE entry_candidate_snapshots ADD COLUMN IF NOT EXISTS subsequent_next_close_pct NUMERIC;
+ALTER TABLE entry_candidate_snapshots ADD COLUMN IF NOT EXISTS mfe_pct NUMERIC;
+ALTER TABLE entry_candidate_snapshots ADD COLUMN IF NOT EXISTS mae_pct NUMERIC;
+ALTER TABLE entry_candidate_snapshots ADD COLUMN IF NOT EXISTS outcome_status TEXT;
+ALTER TABLE entry_candidate_snapshots ADD COLUMN IF NOT EXISTS outcome_evaluated_at TIMESTAMPTZ;
+ALTER TABLE entry_candidate_snapshots ADD COLUMN IF NOT EXISTS evaluation_quality TEXT;
+ALTER TABLE entry_candidate_snapshots ADD COLUMN IF NOT EXISTS data_quality_score NUMERIC;
+ALTER TABLE entry_candidate_snapshots ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
+ALTER TABLE entry_candidate_snapshots ADD COLUMN IF NOT EXISTS config_version TEXT NOT NULL DEFAULT 'DS_V1';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entry_candidate_snapshots_dedupe
+    ON entry_candidate_snapshots(dedupe_key) WHERE dedupe_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_entry_candidate_snapshots_outcome_due
+    ON entry_candidate_snapshots(outcome_status, candidate_at);
+CREATE INDEX IF NOT EXISTS idx_entry_candidate_snapshots_type ON entry_candidate_snapshots(candidate_type);
+
+CREATE TABLE IF NOT EXISTS validation_sessions (
+    id             SERIAL PRIMARY KEY,
+    session_date   DATE NOT NULL,
+    app_version    TEXT,
+    commit_hash    TEXT,
+    config_version TEXT,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (session_date)
+);
+"""
+
 
 def create_trade_decision_context(database_url, user_id, fields):
     """指示書1・2・3番：売買判断snapshotを1件INSERTする（immutable、UPDATEは一切行わない
@@ -5896,17 +5939,23 @@ def list_event_decision_transitions_for_event(database_url, event_id, ticker=Non
 
 
 def create_entry_candidate_snapshot(database_url, user_id, fields):
-    """指示書29番：ENTRY TOP5候補（買わなかったものも含む）のsnapshot。"""
+    """指示書3・4・29・30番：ENTRY TOP5/WAIT/PULLBACK/AVOID_CHASE候補（買わなかったものも
+    含む）のsnapshot。dedupe_keyにUNIQUE partial indexがあるためON CONFLICT DO NOTHINGで
+    1日・銘柄・候補タイプ・状態ごとの重複保存を防ぐ（状態が変われば別dedupe_keyになり新規
+    snapshotとして保存される、指示書4番の「状態変化した場合は新snapshot可」に対応）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
-    cols = ["code", "entry_score", "event_support", "price_at_candidate", "was_taken"]
+    cols = ["code", "entry_score", "event_support", "price_at_candidate", "was_taken",
+            "candidate_type", "candidate_state", "candidate_rank", "extension_score", "wait_reason",
+            "data_quality_score", "dedupe_key", "config_version"]
     values = [fields.get(c) for c in cols]
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 f"INSERT INTO entry_candidate_snapshots (user_id, {', '.join(cols)}) "
-                f"VALUES (%s, {', '.join(['%s'] * len(cols))}) RETURNING *",
+                f"VALUES (%s, {', '.join(['%s'] * len(cols))}) "
+                f"ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING RETURNING *",
                 [user_id] + values)
             row = cur.fetchone()
         conn.commit()
@@ -5914,30 +5963,42 @@ def create_entry_candidate_snapshot(database_url, user_id, fields):
 
 
 def list_due_entry_candidate_snapshots_for_backfill(database_url, older_than_iso, limit=100):
-    """指示書29番：subsequent_30m/subsequent_closeがまだ未計算のsnapshotをbackfill対象として
-    返す（candidate_atからある程度時間が経過したもの）。"""
+    """指示書10・11番：outcome_statusが未確定・candidate_atからある程度時間が経過した
+    snapshotをscheduler向けに返す（due AND not evaluated）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return []
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT * FROM entry_candidate_snapshots WHERE subsequent_close_pct IS NULL "
+                "SELECT * FROM entry_candidate_snapshots WHERE outcome_status IS NULL "
                 "AND candidate_at <= %s ORDER BY candidate_at ASC LIMIT %s", [older_than_iso, limit])
             rows = cur.fetchall()
     return [_row_to_json(r) for r in rows]
 
 
-def save_entry_candidate_snapshot_result(database_url, snapshot_id, subsequent_30m_pct=None, subsequent_close_pct=None):
+def save_entry_candidate_snapshot_result(database_url, snapshot_id, **fields):
+    """指示書2・6・7・11番：subsequent_*/mfe_pct/mae_pct/outcome_status等をUPDATEする。
+    candidate自体（candidate_price・candidate_state等）はimmutable、outcome系フィールドの
+    みここで更新可能にする。"""
+    allowed = {"subsequent_5m_pct", "subsequent_30m_pct", "subsequent_1h_pct", "subsequent_close_pct",
+               "subsequent_next_close_pct", "mfe_pct", "mae_pct", "outcome_status", "outcome_evaluated_at",
+               "evaluation_quality", "data_quality_score"}
     pool = _get_pool(database_url)
     if pool is None:
         return None
+    sets, params = [], []
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        sets.append(f"{k}=COALESCE(%s, {k})")
+        params.append(v)
+    if not sets:
+        return None
+    params.append(snapshot_id)
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                "UPDATE entry_candidate_snapshots SET subsequent_30m_pct=COALESCE(%s, subsequent_30m_pct), "
-                "subsequent_close_pct=COALESCE(%s, subsequent_close_pct) WHERE id=%s RETURNING *",
-                [subsequent_30m_pct, subsequent_close_pct, snapshot_id])
+            cur.execute(f"UPDATE entry_candidate_snapshots SET {', '.join(sets)} WHERE id=%s RETURNING *", params)
             row = cur.fetchone()
         conn.commit()
     return _row_to_json(row) if row else None
@@ -5954,6 +6015,78 @@ def list_entry_candidate_snapshots_for_code(database_url, code, since_iso, limit
                 "ORDER BY candidate_at DESC LIMIT %s", [code, since_iso, limit])
             rows = cur.fetchall()
     return [_row_to_json(r) for r in rows]
+
+
+def list_entry_candidate_snapshots(database_url, user_id, since_iso, candidate_type=None, limit=1000):
+    """指示書17〜21・27・29・31番：performance集計・coverage rate算出向けの全件取得。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where = ["user_id = %s", "candidate_at >= %s"]
+    params = [user_id, since_iso]
+    if candidate_type:
+        where.append("candidate_type = %s")
+        params.append(candidate_type)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT * FROM entry_candidate_snapshots WHERE {' AND '.join(where)} "
+                f"ORDER BY candidate_at DESC LIMIT %s", params + [limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def count_entry_candidate_snapshots_since(database_url, user_id, since_iso):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM entry_candidate_snapshots WHERE user_id=%s AND created_at >= %s",
+                [user_id, since_iso])
+            return cur.fetchone()[0]
+
+
+def count_entry_candidate_snapshots_pending(database_url, user_id):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM entry_candidate_snapshots WHERE user_id=%s AND outcome_status IS NULL",
+                [user_id])
+            return cur.fetchone()[0]
+
+
+def count_entry_candidate_snapshots_evaluated_since(database_url, user_id, since_iso):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM entry_candidate_snapshots WHERE user_id=%s "
+                "AND outcome_evaluated_at >= %s", [user_id, since_iso])
+            return cur.fetchone()[0]
+
+
+def get_or_create_validation_session(database_url, session_date, app_version=None, commit_hash=None, config_version=None):
+    """指示書24・25番：日ごとのvalidation_session（app_version・commit_hash・config_version）。
+    既にあればそのまま返す（同じロジック版での結果比較のため上書きしない）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "INSERT INTO validation_sessions (session_date, app_version, commit_hash, config_version) "
+                "VALUES (%s, %s, %s, %s) ON CONFLICT (session_date) DO UPDATE SET session_date=EXCLUDED.session_date "
+                "RETURNING *", [session_date, app_version, commit_hash, config_version])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
 
 
 # ---- investment_profile（投資プロフィール。2026-09-02新規） ----
