@@ -1041,6 +1041,8 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_EVENT_DECISION_SUPPORT_SQL)
         conn.execute(_SCHEMA_TRADE_DECISION_CONTEXT_SQL)
         conn.execute(_MIGRATE_ENTRY_CANDIDATE_SNAPSHOTS_V2_SQL)
+        conn.execute(_MIGRATE_VALIDATION_SESSIONS_V2_SQL)
+        conn.execute(_SCHEMA_PARSER_FAILURE_QUEUE_SQL)
         conn.commit()
 
 
@@ -5737,12 +5739,16 @@ CREATE INDEX IF NOT EXISTS idx_entry_candidate_snapshots_outcome_due
 CREATE INDEX IF NOT EXISTS idx_entry_candidate_snapshots_type ON entry_candidate_snapshots(candidate_type);
 
 CREATE TABLE IF NOT EXISTS validation_sessions (
-    id             SERIAL PRIMARY KEY,
-    session_date   DATE NOT NULL,
-    app_version    TEXT,
-    commit_hash    TEXT,
-    config_version TEXT,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    id                 SERIAL PRIMARY KEY,
+    session_date       DATE NOT NULL,
+    app_version        TEXT,
+    commit_hash        TEXT,
+    config_version     TEXT,
+    validation_version TEXT,
+    mode               TEXT,
+    environment        TEXT,
+    started_at         TIMESTAMPTZ,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (session_date)
 );
 """
@@ -6072,18 +6078,236 @@ def count_entry_candidate_snapshots_evaluated_since(database_url, user_id, since
             return cur.fetchone()[0]
 
 
-def get_or_create_validation_session(database_url, session_date, app_version=None, commit_hash=None, config_version=None):
-    """指示書24・25番：日ごとのvalidation_session（app_version・commit_hash・config_version）。
-    既にあればそのまま返す（同じロジック版での結果比較のため上書きしない）。"""
+# ============================================================
+# Market Intelligence Phase12（2026-09-11新規）：Live Validation / Production Hardening。
+# 新しい売買判断ロジックは追加しない（指示書冒頭）——ここはDB整合性監査・parser失敗キュー・
+# validation metadataのみ。
+# ============================================================
+
+_MIGRATE_VALIDATION_SESSIONS_V2_SQL = """
+ALTER TABLE validation_sessions ADD COLUMN IF NOT EXISTS validation_version TEXT;
+ALTER TABLE validation_sessions ADD COLUMN IF NOT EXISTS mode TEXT;
+ALTER TABLE validation_sessions ADD COLUMN IF NOT EXISTS environment TEXT;
+ALTER TABLE validation_sessions ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+"""
+
+_SCHEMA_PARSER_FAILURE_QUEUE_SQL = """
+CREATE TABLE IF NOT EXISTS parser_failure_queue (
+    id            SERIAL PRIMARY KEY,
+    source        TEXT NOT NULL,
+    post_id       TEXT,
+    parser        TEXT,
+    error         TEXT,
+    retryable     BOOLEAN NOT NULL DEFAULT true,
+    retry_count   INTEGER NOT NULL DEFAULT 0,
+    status        TEXT NOT NULL DEFAULT 'PENDING',
+    failed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_parser_failure_queue_status ON parser_failure_queue(status, failed_at);
+"""
+
+# 指示書8・27・28番：同じレコード（source+post_id+parser）が繰り返し失敗した場合に1行へ集約する
+# （retry_countを積み上げる、無限行を作らない）。
+PARSER_FAILURE_DEAD_LETTER_RETRY_THRESHOLD = 5
+
+
+def record_parser_failure(database_url, source, post_id, parser, error, retryable=True):
+    """指示書27・28番：parser失敗を黙って捨てない。同一source+post_id+parserの既存行があれば
+    retry_countを増やし、閾値超過でDEAD_LETTERへ隔離する（無限retry禁止）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "INSERT INTO validation_sessions (session_date, app_version, commit_hash, config_version) "
-                "VALUES (%s, %s, %s, %s) ON CONFLICT (session_date) DO UPDATE SET session_date=EXCLUDED.session_date "
-                "RETURNING *", [session_date, app_version, commit_hash, config_version])
+                "SELECT * FROM parser_failure_queue WHERE source=%s AND post_id=%s AND parser=%s "
+                "AND status != 'DEAD_LETTER'", [source, post_id, parser])
+            existing = cur.fetchone()
+            if existing:
+                new_count = (existing.get("retry_count") or 0) + 1
+                status = "DEAD_LETTER" if new_count >= PARSER_FAILURE_DEAD_LETTER_RETRY_THRESHOLD else "PENDING"
+                cur.execute(
+                    "UPDATE parser_failure_queue SET retry_count=%s, status=%s, error=%s, updated_at=now() "
+                    "WHERE id=%s RETURNING *", [new_count, status, error, existing["id"]])
+            else:
+                cur.execute(
+                    "INSERT INTO parser_failure_queue (source, post_id, parser, error, retryable) "
+                    "VALUES (%s, %s, %s, %s, %s) RETURNING *", [source, post_id, parser, error, retryable])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_parser_failures(database_url, status=None, limit=100):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = [], []
+    if status:
+        where.append("status = %s")
+        params.append(status)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SELECT * FROM parser_failure_queue {clause} ORDER BY failed_at DESC LIMIT %s",
+                        params + [limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def count_parser_failures(database_url, status=None):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    where, params = [], []
+    if status:
+        where.append("status = %s")
+        params.append(status)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM parser_failure_queue {clause}", params)
+            return cur.fetchone()[0]
+
+
+# ---- 指示書15・16番：duplicate audit / orphan audit（自動削除はしない、報告のみ） ----
+
+def count_duplicate_underlying_events(database_url):
+    """event_keyが同一で複数行存在する（本来マージされるべきもの）。event_key未生成の素材は
+    対象外（generate_event_keyがNoneを返すケース、既知の制約）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM (SELECT event_key FROM underlying_events WHERE event_key IS NOT NULL "
+                "GROUP BY event_key HAVING COUNT(*) > 1) t")
+            return cur.fetchone()[0]
+
+
+def count_duplicate_candidate_snapshots(database_url):
+    """dedupe_keyにUNIQUE partial indexがあるため通常0のはず——0でなければindex破損等の
+    異常を示す。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM (SELECT dedupe_key FROM entry_candidate_snapshots "
+                "WHERE dedupe_key IS NOT NULL GROUP BY dedupe_key HAVING COUNT(*) > 1) t")
+            return cur.fetchone()[0]
+
+
+def count_duplicate_event_market_reactions(database_url):
+    """UNIQUE(event_id,ticker,reaction_window)があるため通常0のはず。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM (SELECT event_id, ticker, reaction_window FROM event_market_reactions "
+                "GROUP BY event_id, ticker, reaction_window HAVING COUNT(*) > 1) t")
+            return cur.fetchone()[0]
+
+
+def count_orphan_evidence(database_url):
+    """event_idにFK（ON DELETE CASCADE）があるため構造的には発生しないはずだが、監査として
+    明示的に確認する（指示書16番「自動削除しない、報告のみ」）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM underlying_event_evidence e "
+                "WHERE NOT EXISTS (SELECT 1 FROM underlying_events u WHERE u.id = e.event_id)")
+            return cur.fetchone()[0]
+
+
+def count_orphan_event_market_reactions(database_url):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM event_market_reactions r "
+                "WHERE NOT EXISTS (SELECT 1 FROM underlying_events u WHERE u.id = r.event_id)")
+            return cur.fetchone()[0]
+
+
+def count_orphan_event_decision_support(database_url):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM event_decision_support d "
+                "WHERE NOT EXISTS (SELECT 1 FROM underlying_events u WHERE u.id = d.event_id)")
+            return cur.fetchone()[0]
+
+
+def count_orphan_event_decision_transitions(database_url):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM event_decision_transitions t "
+                "WHERE NOT EXISTS (SELECT 1 FROM underlying_events u WHERE u.id = t.event_id)")
+            return cur.fetchone()[0]
+
+
+# 指示書11番：起動時・diagnosticsでの簡易スキーマ整合性チェック（存在確認のみ、DBを勝手に
+# 修復しない）。
+EXPECTED_MARKET_INTELLIGENCE_TABLES = [
+    "underlying_events", "underlying_event_evidence", "event_market_reactions", "prediction_resolutions",
+    "event_decision_support", "trade_decision_context", "trade_outcome_evaluations",
+    "event_decision_transitions", "entry_candidate_snapshots", "validation_sessions", "parser_failure_queue",
+]
+
+
+def check_schema_integrity(database_url):
+    """指示書11番：expected tableの存在確認。列単位までは踏み込まない（軽量チェック、
+    既知の制約）。不整合は報告するのみで自動修復はしない。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return {"ok": False, "tables": {t: False for t in EXPECTED_MARKET_INTELLIGENCE_TABLES},
+                 "missing": list(EXPECTED_MARKET_INTELLIGENCE_TABLES)}
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema='public' "
+                "AND table_name = ANY(%s)", [EXPECTED_MARKET_INTELLIGENCE_TABLES])
+            existing = {r[0] for r in cur.fetchall()}
+    tables = {t: (t in existing) for t in EXPECTED_MARKET_INTELLIGENCE_TABLES}
+    missing = [t for t, ok in tables.items() if not ok]
+    return {"ok": len(missing) == 0, "tables": tables, "missing": missing}
+
+
+def get_or_create_validation_session(database_url, session_date, app_version=None, commit_hash=None,
+                                        config_version=None, validation_version=None, mode=None, environment=None):
+    """指示書2・3・24・25番：日ごとのvalidation_session（app_version・commit_hash・
+    config_version・validation_version・mode・environment）。既にあればそのまま返す
+    （同じロジック版での結果比較のため上書きしない——Phase12期間中は固定、指示書1・2番）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "INSERT INTO validation_sessions (session_date, app_version, commit_hash, config_version, "
+                "validation_version, mode, environment, started_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, now()) "
+                "ON CONFLICT (session_date) DO UPDATE SET session_date=EXCLUDED.session_date "
+                "RETURNING *", [session_date, app_version, commit_hash, config_version, validation_version,
+                                  mode, environment])
             row = cur.fetchone()
         conn.commit()
     return _row_to_json(row) if row else None

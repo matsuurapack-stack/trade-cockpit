@@ -4080,6 +4080,7 @@ function ImportantIntelligenceFeed(){
     <EventTypePerformancePanel/>
     <CandidatePerformancePanel/>
     <DecisionSupportCalibrationPanel/>
+    <LiveValidationPanel/>
   </div>;
 }
 
@@ -4150,6 +4151,58 @@ function DecisionSupportCalibrationPanel(){
         <div style={{marginTop:4,color:"var(--down)"}}>False Positive（強支持だったが下落）：{report.false_positives.length}件</div>}
       {report&&report.false_negatives&&report.false_negatives.length>0 &&
         <div style={{marginTop:4,color:"var(--accent)"}}>False Negative（慎重すぎたが急騰）：{report.false_negatives.length}件</div>}
+    </div>}
+  </div>;
+}
+
+// Market Intelligence Phase12新規（指示書54番）：Market Intelligence系fetchにタイムアウトを
+// 設定する（情報取得失敗で画面全体を待たせない）。既存の共通fetchJsonSafeは他の重要機能
+// 全体で使われているため変更せず、新設のvalidation/calibration/候補実績パネル専用に
+// タイムアウト付きラッパーを別途用意する。
+async function fetchJsonSafeTimeout(url,ms=8000){
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),ms);
+  try{
+    return await fetchJsonSafe(url,{signal:controller.signal});
+  }catch(e){
+    return {error:`タイムアウトまたは通信エラー: ${e.message}`};
+  }finally{
+    clearTimeout(timer);
+  }
+}
+
+// Market Intelligence Phase12新規（指示書40・41・56番）：LIVE VALIDATIONダッシュボード
+// （traffic light表示）。売買判断UIには一切影響しない、システム品質の可視化専用。
+const HEALTH_COLOR = {GREEN:"var(--up)", YELLOW:"var(--accent)", RED:"var(--down)"};
+function LiveValidationPanel(){
+  const [status,setStatus]=useState(null);
+  const [show,setShow]=useState(false);
+  useEffect(()=>{
+    if(!show)return;
+    fetchJsonSafeTimeout("/api/market-intelligence/validation/status").then(d=>{if(d&&!d.error)setStatus(d);}).catch(()=>{});
+  },[show]);
+  const sourcesOk=status&&Object.values(status.sources||{}).filter(s=>s==="OK").length;
+  const sourcesTotal=status&&Object.keys(status.sources||{}).length;
+  const schedOk=status&&Object.values(status.schedulers||{}).filter(s=>!s.last_error_at||s.last_success_at>s.last_error_at).length;
+  const schedTotal=status&&Object.keys(status.schedulers||{}).length;
+  return <div style={{marginTop:4}}>
+    <button className="iconbtn" style={{fontSize:9.5,padding:"0 5px"}} onClick={()=>setShow(v=>!v)}>
+      {show?"▲ LIVE VALIDATIONを隠す":"▼ LIVE VALIDATION（システム品質）"}
+    </button>
+    {show && <div style={{fontSize:10.5,marginTop:4,color:"var(--inkSoft)",lineHeight:1.7}}>
+      {!status && <div style={{color:"var(--inkFaint)"}}>読み込み中…</div>}
+      {status && <>
+        <div style={{fontWeight:800,color:HEALTH_COLOR[status.overall_health]||"var(--inkSoft)"}}>
+          ● {status.overall_health}（{status.shadow_mode?"SHADOW":"LIVE"}モード）
+        </div>
+        <div>X Sources　{sourcesOk}/{sourcesTotal} OK</div>
+        <div>DB　{status.db_ok?"OK":"NG"}</div>
+        <div>Schedulers　{schedOk}/{schedTotal}</div>
+        {status.outcome_completion!=null && <div>Outcome Complete　{Math.round(status.outcome_completion*100)}%</div>}
+        <div>Parser Failures　{status.parser_failures}</div>
+        {status.duplicate_audit && <div>Duplicate Audit　{Object.values(status.duplicate_audit).reduce((a,b)=>a+(b||0),0)}件</div>}
+        {status.orphan_audit && <div>Orphan Audit　{Object.values(status.orphan_audit).reduce((a,b)=>a+(b||0),0)}件</div>}
+      </>}
     </div>}
   </div>;
 }
