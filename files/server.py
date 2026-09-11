@@ -2668,6 +2668,71 @@ def _classify_entry_state(entry_score, row, stage2, snapshot, data_quality, even
     return "WEAK", exception_applied
 
 
+ENTRY_TOP5_TIER2_MIN_SCORE = 60
+ENTRY_TOP5_TIER3_MIN_SCORE = 45
+ENTRY_TOP5_TIER1_STATES = ("NOW_BUYABLE", "ENTRY_READY")
+ENTRY_TOP5_TIER2_STATES = ("WAIT_BREAKOUT", "WAIT_PULLBACK")
+ENTRY_TOP5_RISK_STATES = ("CHASE_RISK", "INVALID")
+
+
+def _select_entry_ready_top5(candidates):
+    """TOP5表示ロジック修正指示（2026-09-12）：entry_score降順ソート済みのcandidates
+    （_score_entry_candidates()の中間結果、各要素はentryState/entryScore/codeを持つdict）から
+    entry_ready_top5・watch_candidates・デバッグ集計を算出する純粋関数（DB書き込みなし、
+    ネットワークアクセスなし）。単体テストしやすいよう_score_entry_candidates()から分離した。
+
+    「TOP5は必ず5件」ではなく「候補があるだけ表示（0〜5件）」に統一。ENTRY READY銘柄が
+    ありながらTOP5が0件になる不整合を無くすため、候補母集団をentry_state単独ではなく
+    優先度3階層（Tier）に広げる：
+      Tier1: NOW_BUYABLE / ENTRY_READY（そのまま今買える）
+      Tier2: WAIT_BREAKOUT / WAIT_PULLBACK かつ entry_score>=ENTRY_TOP5_TIER2_MIN_SCORE
+             （指示書の「ACTIVE BREAKかつentry_score高」に相当。まだブレイク/押し目待ちだが
+             スコアが高く「もうすぐ入れる」候補）
+      Tier3: WATCH かつ entry_score>=ENTRY_TOP5_TIER3_MIN_SCORE
+             （指示書の「WATCHだが直近でENTRY READY昇格条件に近い」。ENTRY_READY昇格の
+             entry_score閾値55に対し、45以上を「近い」とみなす）
+    CHASE_RISK/INVALID（RISK相当）・WEAK・PROVISIONAL（データ不足で確信度LOW固定、指示書
+    26番の既存方針を維持）はTier対象外＝原則TOP5に出さない。Tier内はentry_score降順（呼び出し
+    元で既にソート済み）、Tier間はTier1→2→3の優先順位（Tierをまたいで単純スコア降順には
+    しない＝「今すぐ入れる」を常に最優先する）。
+
+    戻り値：(entry_ready_top5, watch_candidates, debug)。debugは指示書7番の開発用デバッグ
+    表示用（0件時にどの条件で候補が落ちたかを追える）。"""
+    tier1 = [c for c in candidates if c["entryState"] in ENTRY_TOP5_TIER1_STATES]
+    tier2 = [c for c in candidates if c["entryState"] in ENTRY_TOP5_TIER2_STATES and c["entryScore"] >= ENTRY_TOP5_TIER2_MIN_SCORE]
+    tier3 = [c for c in candidates if c["entryState"] == "WATCH" and c["entryScore"] >= ENTRY_TOP5_TIER3_MIN_SCORE]
+    risk_excluded = [c for c in candidates if c["entryState"] in ENTRY_TOP5_RISK_STATES]
+    weak_excluded = [c for c in candidates if c["entryState"] == "WEAK"]
+    provisional_excluded = [c for c in candidates if c["entryState"] == "PROVISIONAL"]
+
+    for c in tier1:
+        c["candidateTier"] = 1
+    for c in tier2:
+        c["candidateTier"] = 2
+    for c in tier3:
+        c["candidateTier"] = 3
+
+    entry_ready_top5 = (tier1 + tier2 + tier3)[:5]
+    top5_codes = {c["code"] for c in entry_ready_top5}
+    watch_candidates = [c for c in candidates
+                         if c["entryState"] in ("WAIT_PULLBACK", "WAIT_BREAKOUT", "WATCH")
+                         and c["code"] not in top5_codes][:15]
+
+    debug = {
+        "scanned": len(candidates),
+        "entry_ready": len(tier1),
+        "active_break": len(tier2),
+        "watch_near_ready": len(tier3),
+        "risk_excluded": len(risk_excluded),
+        "failed_break_excluded": 0,  # breakType/FAILED_BREAKはフロント側enrichWatchRow()専用の概念（サーバー側entry_stateには存在しない）
+        "weak_excluded": len(weak_excluded),
+        "provisional_excluded": len(provisional_excluded),
+        "final_candidates": len(entry_ready_top5),
+        "rendered": len(entry_ready_top5),
+    }
+    return entry_ready_top5, watch_candidates, debug
+
+
 def _score_entry_candidates(database_url, user_id):
     """今買い時TOP5（entry_ready_top5）とWatch候補を算出する純粋関数（DB書き込みなし）。
     既存の共有Stage1（run_momentum_stage1、複数AUTOエンジンとキャッシュ共有）・
@@ -2680,7 +2745,10 @@ def _score_entry_candidates(database_url, user_id):
     永続化（stock_thesesへの書き込み）はしない副作用フリーな関数にし、呼び出し側
     （generate_morning_market_check）だけが朝TOP5として結果を保存する設計にした（指示書
     22・23番「Current TOP5とMorning TOP5は別物、Morning TOP5は後から書き換えない」）。"""
-    empty = {"entryReadyTop5": [], "watchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None}
+    empty = {"entryReadyTop5": [], "watchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None,
+             "debug": {"scanned": 0, "entry_ready": 0, "active_break": 0, "watch_near_ready": 0,
+                       "risk_excluded": 0, "failed_break_excluded": 0, "weak_excluded": 0,
+                       "provisional_excluded": 0, "final_candidates": 0, "rendered": 0}}
     if investment_db is None or not database_url:
         return empty
     watchlist = investment_db.list_watchlist(database_url, user_id, market="JP")
@@ -2790,11 +2858,8 @@ def _score_entry_candidates(database_url, user_id):
     # 指示書6番「値上がり率だけでは選ばない」：ソート基準はentry_score（既に過熱ペナルティ・
     # VWAP/構造/RS等を織り込み済み）であり、changePct単純降順ではない。
     candidates.sort(key=lambda c: -c["entryScore"])
-    entry_ready_top5 = [c for c in candidates if c["entryState"] in ("NOW_BUYABLE", "ENTRY_READY")][:5]
-    top5_codes = {c["code"] for c in entry_ready_top5}
-    watch_candidates = [c for c in candidates
-                         if c["entryState"] in ("WAIT_PULLBACK", "WAIT_BREAKOUT", "WATCH")
-                         and c["code"] not in top5_codes][:15]
+
+    entry_ready_top5, watch_candidates, debug = _select_entry_ready_top5(candidates)
     overall_quality = "FULL" if quality_counts["DEGRADED"] == 0 and quality_counts["PARTIAL"] == 0 else (
         "DEGRADED" if quality_counts["FULL"] == 0 else "PARTIAL")
 
@@ -2821,6 +2886,7 @@ def _score_entry_candidates(database_url, user_id):
         "watchCandidates": watch_candidates,
         "dataQuality": overall_quality,
         "generatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "debug": debug,
     }
 
 

@@ -1614,7 +1614,9 @@ function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysi
     actionStatus=primaryQualifies?"ENTRY_READY":"NONE";
   }
 
-  return {...w,pct,marketRS,sectorRS,rsScore,volRatio,status,breakType,breakQuality,actionStatus,riskReasons,waitReasons};
+  // TOP5表示ロジック修正指示（2026-09-12）：「今日の注目TOP5」のマイナス銘柄例外判定
+  // （isResilienceExceptionCandidate）で「地合いが悪いか」を見るためmarketPctを持ち回す。
+  return {...w,pct,marketRS,sectorRS,rsScore,volRatio,status,breakType,breakQuality,actionStatus,riskReasons,waitReasons,marketPct};
 }
 
 // v3-4（監視銘柄タブ「今日の注目TOP5」用）：enrichWatchRow()の軽量出力（rsScore/status/
@@ -3627,11 +3629,47 @@ function computeEnrichedWatch(items,stockQuotes,metrics,watchlistAll,breakoutLev
   return items.map(w=>enrichWatchRow(w,stockQuotes,marketPct,sectorAvgMap[w.sector],breakoutLevels,analysisData,marketRiskLabel));
 }
 // v3-6：RISK（actionStatus==="RISK"）とWEAK（Primary Status）は「デイトレ候補」としては出さない。
+// TOP5表示ロジック修正指示（2026-09-12）：「今日の注目TOP5」は原則 前日比>0 の銘柄のみ
+// （ユーザー要望「上がっている銘柄の中で今一番買い時TOP5」）。前日比マイナスでも、地合い悪化の
+// 中で相対的に強い「逆行耐性」が明確な場合のみ例外的に候補へ含めるが、通常候補と黙って
+// 混ぜず isResilienceException:true を付けてUI側で明示ラベル表示させる。
+//   例外条件（全て満たす場合のみ）：
+//   ①地合いが軟調（日経平均marketPct<=-1.0%）②当該銘柄の下落は小幅（pct>=-1.0%）
+//   ③対市場RSが強い（marketRS>=+1.5pt）④対セクターRSも強い（sectorRS>=+1.5pt）
+//   ⑤Primary StatusがWEAKではない
+// バックエンド_classify_entry_state()の逆行耐性例外（VWAP回復・5分足反転構造等）と完全に同一の
+// 判定はクライアント側の軽量データ（分析未実施の銘柄も含む）では再現できないため、相対強度
+// （marketRS/sectorRS）ベースの近似判定にとどめる（この関数の限界として明記）。
+function isResilienceExceptionCandidate(w){
+  if(w.pct==null||w.pct>0)return false;
+  const marketSelloff=w.marketPct!=null&&w.marketPct<=-1.0;
+  const smallDecline=w.pct>=-1.0;
+  const strongVsMarket=w.marketRS!=null&&w.marketRS>=1.5;
+  const strongVsSector=w.sectorRS!=null&&w.sectorRS>=1.5;
+  return marketSelloff&&smallDecline&&strongVsMarket&&strongVsSector&&w.status!=="WEAK";
+}
 function rankTop5(enriched,stockQuotes){
-  return [...enriched]
-    .filter(w=>w.rsScore!=null&&num(stockQuotes[w.code]?.t)!=null&&w.status!=="WEAK"&&w.actionStatus!=="RISK")
+  const withData=[...enriched].filter(w=>w.rsScore!=null&&num(stockQuotes[w.code]?.t)!=null&&w.status!=="WEAK"&&w.actionStatus!=="RISK");
+  const positive=withData.filter(w=>w.pct!=null&&w.pct>0);
+  const exceptions=withData.filter(w=>isResilienceExceptionCandidate(w)).map(w=>({...w,isResilienceException:true}));
+  return [...positive,...exceptions]
     .sort((a,b)=>PRIMARY_STATUS_META[a.status].order-PRIMARY_STATUS_META[b.status].order||(b.rsScore-a.rsScore))
     .slice(0,5);
+}
+// 指示書7番：0件時にどの条件で候補が落ちたのかを追えるようにするデバッグ集計。
+function computeTop5Debug(enriched,stockQuotes){
+  const withData=[...enriched].filter(w=>w.rsScore!=null&&num(stockQuotes[w.code]?.t)!=null);
+  const riskExcluded=withData.filter(w=>w.actionStatus==="RISK").length;
+  const weakExcluded=withData.filter(w=>w.status==="WEAK"&&w.actionStatus!=="RISK").length;
+  const eligible=withData.filter(w=>w.status!=="WEAK"&&w.actionStatus!=="RISK");
+  const positiveCount=eligible.filter(w=>w.pct!=null&&w.pct>0).length;
+  const negativeExcluded=eligible.filter(w=>w.pct!=null&&w.pct<=0&&!isResilienceExceptionCandidate(w)).length;
+  const exceptionCount=eligible.filter(w=>isResilienceExceptionCandidate(w)).length;
+  return {
+    scanned:enriched.length, positive_return_candidates:positiveCount, negative_excluded:negativeExcluded,
+    exception_negative_candidates:exceptionCount, risk_excluded:riskExcluded, weak_excluded:weakExcluded,
+    final_top5:Math.min(5,positiveCount+exceptionCount),
+  };
 }
 
 // 2026-09-10新規（にこそく@nicosokufx X投稿 自動取得・市場分析連携、指示書14番）：
@@ -4364,6 +4402,7 @@ function SimpleSourcePostsFeed({handle}){
 
 function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan,newsCatalysts,entryScanning,entryResult,onEntryScan,thesisStats,todayTheses}){
   const [expandedScoreCode,setExpandedScoreCode]=useState(null); // スコア内訳の折りたたみ展開（指示書21番）
+  const [entryDebugOpen,setEntryDebugOpen]=useState(false); // TOP5表示ロジック修正指示・指示書7番：開発用デバッグ表示（既定は折りたたみ）
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
 
@@ -4377,6 +4416,8 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
   // RISK（過熱・急落注意）とWEAK（弱い）は「デイトレ候補」としては出さない（除外）。
   // 残りをPrimary Status優先度→RS Scoreの順で並べ、上位5件を採用する。
   const top5=useMemo(()=>rankTop5(enriched,stockQuotes),[enriched,stockQuotes]);
+  const top5Debug=useMemo(()=>computeTop5Debug(enriched,stockQuotes),[enriched,stockQuotes]);
+  const [top5DebugOpen,setTop5DebugOpen]=useState(false); // 指示書7番：開発用デバッグ表示（既定は折りたたみ）
 
   const [sortKey,setSortKey]=useState("priority");
   const sorted=useMemo(()=>{
@@ -4639,8 +4680,20 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
     <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:6,padding:"12px 14px",marginTop:12}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6,marginBottom:8}}>
         <div style={{fontWeight:800,fontSize:13.5}}>🎯 今日の注目 TOP5</div>
-        <button className="action-btn" onClick={copyWatchTop5Consult} disabled={top5.length===0}>🤖 今日のTOP5を相談</button>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <button className="chip" style={{fontSize:10.5}} onClick={()=>setTop5DebugOpen(v=>!v)}>🔧 デバッグ {top5DebugOpen?"▲":"▼"}</button>
+          <button className="action-btn" onClick={copyWatchTop5Consult} disabled={top5.length===0}>🤖 今日のTOP5を相談</button>
+        </div>
       </div>
+      {top5DebugOpen && <div style={{fontSize:10.5,color:"var(--inkFaint)",marginBottom:8,padding:"4px 6px",background:"var(--bg)",borderRadius:4,display:"flex",flexWrap:"wrap",gap:"2px 12px"}} className="mono">
+        <span>scanned: {top5Debug.scanned}</span>
+        <span>positive_return_candidates: {top5Debug.positive_return_candidates}</span>
+        <span>negative_excluded: {top5Debug.negative_excluded}</span>
+        <span>exception_negative_candidates: {top5Debug.exception_negative_candidates}</span>
+        <span>risk_excluded: {top5Debug.risk_excluded}</span>
+        <span>weak_excluded: {top5Debug.weak_excluded}</span>
+        <span>final_top5: {top5Debug.final_top5}</span>
+      </div>}
       {top5.length===0
         ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>判定可能な銘柄がまだありません（データ取得中か、RISK/WEAKのみの状態です）。</div>
         : <div style={{display:"flex",flexDirection:"column",gap:6}}>
@@ -4655,7 +4708,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                   横スクロールを発生させていた。flexWrap+minWidth:0で折り返し・省略を機能させる。 */}
               return <div key={w.code} onClick={()=>onOpenAnalysis(w.code)}
                 style={{display:"flex",alignItems:"center",gap:10,padding:"7px 8px",borderRadius:4,cursor:"pointer",
-                  background:"var(--bg)",border:"1px solid var(--rule)",flexWrap:"wrap"}}
+                  background:"var(--bg)",border:w.isResilienceException?"1px solid var(--accent)":"1px solid var(--rule)",flexWrap:"wrap"}}
                 title="クリックでトレード分析へ">
                 <div style={{fontSize:13,fontWeight:800,color:"var(--inkFaint)",width:16,textAlign:"center"}}>{i+1}</div>
                 <div style={{width:56,fontSize:11.5,color:"var(--inkSoft)"}} className="mono">{w.code}</div>
@@ -4666,6 +4719,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                 </div>
                 {grade && <span style={{fontSize:11,fontWeight:800,color:GRADE_COLOR[grade],border:`1px solid ${GRADE_COLOR[grade]}`,borderRadius:3,padding:"1px 6px"}}>{grade}</span>}
                 {actionMeta && <span style={{fontSize:10.5,fontWeight:700,color:actionMeta.color,border:`1px solid ${actionMeta.color}`,borderRadius:3,padding:"1px 6px",whiteSpace:"nowrap"}}>{actionMeta.label}</span>}
+                {w.isResilienceException && <span style={{fontSize:10,fontWeight:700,color:"var(--accent)",whiteSpace:"nowrap"}} title="前日比マイナスだが、地合い悪化の中で対市場・対セクターとも明確に優位な逆行耐性候補（通常の値上がり銘柄とは別枠の例外表示）">🛡 逆行耐性例外</span>}
                 <div style={{flex:"1 1 140px",minWidth:0,fontSize:11,color:"var(--inkSoft)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{lightweightReason(w)}</div>
                 {/* 2026-09-09新規（監視銘柄・市場チャートの時間足切替、対象画面「TOP5」対応）：
                     既存のonOpenChart（監視銘柄一覧の「⋮」チャートボタンと同じ、共通ChartModalを開くだけ）
@@ -4688,20 +4742,31 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
           {thesisStats && thesisStats.totalFinalized>0 && <span style={{fontSize:11,color:"var(--inkFaint)"}}>
             直近30日 勝率{thesisStats.winRate}%（確定{thesisStats.totalFinalized}件）
           </span>}
+          {entryResult && <button className="chip" style={{fontSize:10.5}} onClick={()=>setEntryDebugOpen(v=>!v)}>🔧 デバッグ {entryDebugOpen?"▲":"▼"}</button>}
           <button className="action-btn" style={{fontSize:12}} disabled={entryScanning} onClick={onEntryScan}>
             {entryScanning?"🎯 スキャン中…":"🎯 今買い時TOP5を更新"}
           </button>
         </div>
       </div>
       <div style={{fontSize:10.5,color:"var(--inkFaint)",marginBottom:8}}>
-        「一番上がっている銘柄」ではなく「今から入ってもリスクリワードが良い銘柄」を上位表示します。原則プラス銘柄のみ、マイナス銘柄は逆行耐性の根拠がある場合のみ例外表示。
+        「一番上がっている銘柄」ではなく「今から入ってもリスクリワードが良い銘柄」を上位表示します。ENTRY READY最優先、次点でスコアの高いブレイク待ち・押し目待ち候補も表示します（候補数は0〜5件、必ず5件揃える表示ではありません）。
       </div>
+      {entryResult && entryDebugOpen && <div style={{fontSize:10.5,color:"var(--inkFaint)",marginBottom:8,padding:"4px 6px",background:"var(--bg)",borderRadius:4,display:"flex",flexWrap:"wrap",gap:"2px 12px"}} className="mono">
+        <span>scanned: {entryResult.debug?.scanned??"—"}</span>
+        <span>entry_ready: {entryResult.debug?.entry_ready??"—"}</span>
+        <span>active_break: {entryResult.debug?.active_break??"—"}</span>
+        <span>watch_near_ready: {entryResult.debug?.watch_near_ready??"—"}</span>
+        <span>risk_excluded: {entryResult.debug?.risk_excluded??"—"}</span>
+        <span>weak_excluded: {entryResult.debug?.weak_excluded??"—"}</span>
+        <span>provisional_excluded: {entryResult.debug?.provisional_excluded??"—"}</span>
+        <span>final_candidates: {entryResult.debug?.final_candidates??"—"}</span>
+      </div>}
       {!entryResult
         ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>「今買い時TOP5を更新」を押すと、監視銘柄の中から現在最もエントリー条件が整っている候補をENTRY SCOREで算出します。</div>
         : <>
           {entryResult.dataQuality==="DEGRADED" && <div style={{fontSize:11,color:"var(--down)",fontWeight:700,marginBottom:6}}>⚠ データ取得が不十分なため、一部の判定は暫定（PROVISIONAL）です。</div>}
           {entryResult.entryReadyTop5.length===0
-            ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>現時点でNOW_BUYABLE/ENTRY_READYの候補はありません（マイナス銘柄・条件不足の銘柄はTOP5に表示しません）。</div>
+            ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>現在ENTRY条件を満たす銘柄はありません。</div>
             : <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:entryResult.watchCandidates.length>0?10:0}}>
                 {entryResult.entryReadyTop5.map(c=>{
                   const stMeta=ENTRY_STATE_META[c.entryState]||{label:c.entryState,color:"var(--inkFaint)"};
