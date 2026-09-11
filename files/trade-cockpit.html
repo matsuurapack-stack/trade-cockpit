@@ -1393,7 +1393,8 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                   <td className="mono" style={{fontWeight:700,fontSize:13}}>{w.code}</td>
                   <td style={{fontSize:15,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={w.name}>
                     {w.watch==="優先"&&<span style={{color:"var(--star)",marginRight:4}}>★</span>}{w.name}
-                    <NewsBadge catalysts={newsCatalysts} code={w.code} sector={w.sector}/></td>
+                    <NewsBadge catalysts={newsCatalysts} code={w.code} sector={w.sector}/>
+                    {isOpen && <WatchlistEventTag code={w.code}/>}</td>
                   <td className="mono" style={{textAlign:"right",fontWeight:700,fontSize:14.5,color:isJumpTarget?"var(--card)":fg,whiteSpace:"nowrap"}}>{ct!=null?ct.toLocaleString():"—"}</td>
                   <td className="mono" style={{textAlign:"right",fontWeight:600,fontSize:14,color:isJumpTarget?"var(--card)":fg,whiteSpace:"nowrap"}}>{enr.pct!=null?(enr.pct>0?"+":"")+enr.pct.toFixed(2)+"%":"—"}</td>
                   <td className="mono" style={{textAlign:"right",fontSize:13,fontWeight:700,whiteSpace:"nowrap"}}>{enr.marketRS!=null?(enr.marketRS>0?"+":"")+enr.marketRS.toFixed(1):"—"}</td>
@@ -2360,6 +2361,34 @@ function CatalystNote({catalysts,code,sector}){
 // 出典・要約を表示する。鮮度：当日=強調（不透明度1・太字）／1営業日前=やや弱／
 // 2〜3営業日前=小さく／それ以前は原則非表示（ニュース履歴自体はnews_catalystsに残り続け、
 // CatalystsPanelの一覧やCatalystNoteの「やや古い情報」表示からは引き続き参照できる）。
+// Market Intelligence Phase9新規（指示書22・37番）：監視銘柄カード用の軽量タグ
+// （EVENT+/EVENT⚠/PULLBACK）。UIを重くしないためモジュールレベルの簡易キャッシュを持ち、
+// 同一コードへの重複fetchを防ぐ（既存のenrichWatchRow等の判定ロジックには一切触れない）。
+const _watchlistEventTagCache={};
+function WatchlistEventTag({code}){
+  const [tags,setTags]=useState(()=>_watchlistEventTagCache[code]||null);
+  useEffect(()=>{
+    if(_watchlistEventTagCache[code]!==undefined){setTags(_watchlistEventTagCache[code]);return;}
+    let cancelled=false;
+    fetchJsonSafe(`/api/stocks/${encodeURIComponent(code)}/intelligence-summary`).then(d=>{
+      if(!d)return;
+      const t=[];
+      if(d.active_events){
+        if(d.avoid_chase)t.push("EVENT⚠");
+        else if((d.best_event_support_score||0)>=65)t.push("EVENT+");
+        if(d.pullback_candidate)t.push("PULLBACK");
+      }
+      _watchlistEventTagCache[code]=t;
+      if(!cancelled)setTags(t);
+    }).catch(()=>{});
+    return ()=>{cancelled=true;};
+  },[code]);
+  if(!tags||tags.length===0)return null;
+  return <span style={{fontSize:9.5,fontWeight:700,color:"var(--inkSoft)",marginLeft:4,whiteSpace:"nowrap"}} title="Market Intelligence：材料/反応/追いかけ警戒/押し目候補">
+    {tags.join(" ")}
+  </span>;
+}
+
 function NewsBadge({catalysts,code,sector}){
   const items=useMemo(()=>catalystsForCode(catalysts,code,sector),[catalysts,code,sector]);
   if(!items.length)return null;
@@ -3885,6 +3914,35 @@ function EventReactionList({eventId}){
   </div>;
 }
 
+// Market Intelligence Phase9新規（指示書8・36番）：decision_support_stateの表示メタ。
+// スコアの生数値をそのまま並べず、状態を主表示にする（詳細は展開表示に回す、指示書36番）。
+const ENTRY_EVENT_SUPPORT_LABELS = {STRONG:"Strong", NEUTRAL:"Neutral", CAUTION:"Caution", AVOID_CHASE:"⚠ Avoid Chase"};
+const DECISION_SUPPORT_STATE_META = {
+  STRONG_SUPPORT: {emoji:"🟢", label:"材料強い／反応確認"},
+  SUPPORTIVE: {emoji:"🟢", label:"支持的"},
+  NEUTRAL: {emoji:"⚪", label:"中立"},
+  CAUTION: {emoji:"🟡", label:"注意"},
+  AVOID: {emoji:"🔴", label:"弱い"},
+  AVOID_CHASE: {emoji:"⚠", label:"追いかけ注意"},
+};
+
+function EventDecisionSupportBlock({ds}){
+  const [showDetail,setShowDetail]=useState(false);
+  if(!ds)return null;
+  const meta=DECISION_SUPPORT_STATE_META[ds.decision_support_state]||{emoji:"⚪",label:ds.decision_support_state};
+  return <div style={{fontSize:10,marginTop:3,padding:"3px 5px",borderRadius:3,background:"var(--panel)"}}>
+    <div style={{fontWeight:800}} onClick={()=>setShowDetail(v=>!v)} role="button">
+      {meta.emoji} {meta.label}
+      {ds.pullback_candidate && <span style={{marginLeft:4}}>／🎯押し目候補</span>}
+      {ds.failed_reaction && <span style={{marginLeft:4,color:"var(--down)"}}>／反応失敗</span>}
+    </div>
+    {showDetail && <div style={{marginTop:2,color:"var(--inkSoft)"}}>
+      <div>材料{ds.material_quality_score}／反応{ds.reaction_quality_score}／過熱{ds.extension_score}</div>
+      {(ds.reasons||[]).map((r,i)=><div key={i}>・{r}</div>)}
+    </div>}
+  </div>;
+}
+
 function EventCard({event}){
   const [expanded,setExpanded]=useState(false);
   const [showReactions,setShowReactions]=useState(false);
@@ -3910,6 +3968,9 @@ function EventCard({event}){
       {mr.reaction_pattern && <span style={{color:"var(--inkSoft)"}}>　反応：{mr.reaction_pattern}</span>}
       {event.extended_move && <div style={{color:"var(--down)",fontWeight:700}}>⚠ EXTENDED_MOVE（既に大きく動いた後——高値掴み注意、買い材料として使わない）</div>}
     </div>}
+    {/* Market Intelligence Phase9新規（指示書36・44番）：decision_support（材料強い/反応確認/
+        追いかけ注意/押し目候補）を状態優先で表示。BUY/WAIT/SELLとは別軸の補助情報。 */}
+    <EventDecisionSupportBlock ds={event.event_decision_support}/>
     {event.age_hours!=null && event.age_hours>=24 && <div style={{fontSize:9.5,color:"var(--inkFaint)"}}>※{Math.round(event.age_hours)}時間前の情報</div>}
     {event.discovery_lead_seconds!=null && <div style={{fontSize:10,color:"var(--inkFaint)"}}>
       先行検知差：約{Math.round(Math.abs(event.discovery_lead_seconds)/60)}分（system observed official source at基準）
@@ -3927,10 +3988,20 @@ function EventCard({event}){
   </div>;
 }
 
+// Market Intelligence Phase9新規（指示書39番）：「重要」タブの簡易フィルタ。
+const EVENT_DECISION_FILTERS = [
+  {key:"strong_material", label:"強材料", test:ds=>ds&&ds.material_quality_score!=null&&ds.material_quality_score>=70},
+  {key:"reaction_confirmed", label:"反応確認", test:ds=>ds&&ds.reaction_quality_score!=null&&ds.reaction_quality_score>=60},
+  {key:"pullback_candidate", label:"押し目候補", test:ds=>ds&&ds.pullback_candidate},
+  {key:"avoid_chase", label:"追いかけ注意", test:ds=>ds&&ds.decision_support_state==="AVOID_CHASE"},
+  {key:"failed_reaction", label:"反応失敗", test:ds=>ds&&ds.failed_reaction},
+];
+
 function ImportantIntelligenceFeed(){
   const [events,setEvents]=useState(null);
   const [intel,setIntel]=useState(null);
   const [loading,setLoading]=useState(false);
+  const [activeFilter,setActiveFilter]=useState(null);
   const load=()=>{
     setLoading(true);
     Promise.all([
@@ -3943,14 +4014,23 @@ function ImportantIntelligenceFeed(){
   };
   useEffect(()=>{load();},[]); // eslint-disable-line
   if(loading&&!events)return <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:6}}>読み込み中…</div>;
-  const hasEvents=events&&events.length>0;
+  const filterDef=EVENT_DECISION_FILTERS.find(f=>f.key===activeFilter);
+  const filteredEvents=(events||[]).filter(ev=>!filterDef||filterDef.test(ev.event_decision_support));
+  const hasEvents=filteredEvents.length>0;
   const shifts=(intel&&intel.prediction_market_shifts)||[];
   const disagreements=(intel&&intel.disagreements)||[];
   const hasAny=hasEvents||shifts.length||disagreements.length;
   return <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:6}}>
-    {!hasAny && <div style={{fontSize:11,color:"var(--inkFaint)"}}>重要な情報はまだありません。</div>}
+    {events&&events.length>0 && <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+      <button className="iconbtn" style={{fontSize:9.5,padding:"0 6px",fontWeight:activeFilter?400:800}} onClick={()=>setActiveFilter(null)}>すべて</button>
+      {EVENT_DECISION_FILTERS.map(f=>
+        <button key={f.key} className="iconbtn" style={{fontSize:9.5,padding:"0 6px",fontWeight:activeFilter===f.key?800:400}}
+          onClick={()=>setActiveFilter(v=>v===f.key?null:f.key)}>{f.label}</button>
+      )}
+    </div>}
+    {!hasAny && <div style={{fontSize:11,color:"var(--inkFaint)"}}>{filterDef?"条件に合う情報はありません。":"重要な情報はまだありません。"}</div>}
     {/* 指示書23番：EVENT一覧が主表示。 */}
-    {(events||[]).map(ev=><EventCard key={ev.event_id} event={ev}/>)}
+    {filteredEvents.map(ev=><EventCard key={ev.event_id} event={ev}/>)}
     {shifts.map((p,i)=>
       <div key={`p${i}`} style={{padding:"5px 6px",borderRadius:4,background:"var(--bg)",border:"1px solid var(--rule)",fontSize:11}}>
         <div style={{fontWeight:800,color:"var(--accent)"}}>🟠 PREDICTION SHIFT</div>
@@ -4404,6 +4484,12 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                       </span>
                       <span style={{fontSize:12,fontWeight:800,color:"var(--accent)",border:"1px solid var(--accent)",borderRadius:3,padding:"1px 6px"}}>SCORE {c.entryScore}</span>
                       <span style={{fontSize:10.5,fontWeight:700,color:stMeta.color,border:`1px solid ${stMeta.color}`,borderRadius:3,padding:"1px 6px",whiteSpace:"nowrap"}}>{stMeta.label}</span>
+                      {/* Market Intelligence Phase9新規（指示書21・38番）：entry_score自体は
+                          不変、隣に並べるだけの追加専用表示。 */}
+                      {c.eventSupport && <span style={{fontSize:10,fontWeight:700,whiteSpace:"nowrap",
+                        color:c.eventSupport==="AVOID_CHASE"?"var(--down)":c.eventSupport==="STRONG"?"var(--up)":"var(--inkSoft)"}}>
+                        Event Support: {ENTRY_EVENT_SUPPORT_LABELS[c.eventSupport]||c.eventSupport}
+                      </span>}
                       {c.analysisConfidence==="LOW" && <span style={{fontSize:10,color:"var(--down)"}}>確信度LOW</span>}
                       {isException && <span style={{fontSize:10,fontWeight:700,color:"var(--accent)"}}>⚠逆行耐性例外</span>}
                       <div style={{flex:"1 1 140px",minWidth:0,fontSize:11,color:"var(--inkSoft)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>

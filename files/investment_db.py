@@ -1038,6 +1038,7 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_UNDERLYING_EVENTS_SQL)
         conn.execute(_MIGRATE_UNDERLYING_EVENTS_V2_SQL)
         conn.execute(_SCHEMA_EVENT_MARKET_REACTIONS_SQL)
+        conn.execute(_SCHEMA_EVENT_DECISION_SUPPORT_SQL)
         conn.commit()
 
 
@@ -5438,6 +5439,177 @@ def list_news_catalysts_for_backfill(database_url, user_id, since_date, limit=10
 def list_market_events_for_backfill(database_url, user_id, since_date, limit=100):
     """指示書24番：market_events backfill用。既存list_market_eventsをそのまま使い回す。"""
     return list_market_events(database_url, user_id, from_date=since_date, limit=limit)
+
+
+# ============================================================
+# Market Intelligence Phase9（2026-09-11新規）：Event Quality Calibration /
+# Decision Support Bridge。underlying_event＋event_market_reaction＋
+# event_type_performanceを組み合わせ「材料は強いか→実際に反応しているか→
+# 既に織り込まれていないか→今のポジションから見て入る価値があるか」を判定する
+# 補助レイヤー。既存のBUY/WAIT/SELL・ENTRY TOP5のentry_score・thesis score・
+# AUTO_RS・AUTO_SECTOR・損切り・ポジションサイジングは一切直接変更しない
+# （指示書21・43番、常に「隣に並べるだけ」）。
+# 履歴のあるテーブルとして設計する（UNIQUE制約は付けず評価の度にINSERTする）——
+# 「09:35 STRONG_SUPPORT→10:00 AVOID_CHASE→10:45 SUPPORTIVE」のような遷移を後から
+# 追える必要があるため（指示書28・29番）。最新1件はevaluated_at DESCで取得する。
+# ============================================================
+
+_SCHEMA_EVENT_DECISION_SUPPORT_SQL = """
+CREATE TABLE IF NOT EXISTS event_decision_support (
+    id                          SERIAL PRIMARY KEY,
+    event_id                    INTEGER NOT NULL REFERENCES underlying_events(id) ON DELETE CASCADE,
+    ticker                      TEXT NOT NULL,
+    evaluated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_data_at           TIMESTAMPTZ,   -- 指示書31番：no hindsight（事後データを混ぜていないことの記録）
+    material_quality_score      NUMERIC,
+    reaction_quality_score      NUMERIC,
+    extension_score             NUMERIC,
+    freshness_score             NUMERIC,
+    historical_edge_score       NUMERIC,
+    source_confidence_score     NUMERIC,
+    decision_support_score      NUMERIC,
+    decision_support_state      TEXT,     -- STRONG_SUPPORT|SUPPORTIVE|NEUTRAL|CAUTION|AVOID|AVOID_CHASE
+    event_direction              TEXT,     -- POSITIVE|NEGATIVE|MIXED|NEUTRAL
+    event_direction_confidence    NUMERIC,
+    persistence_class             TEXT,     -- INTRADAY|SHORT_TERM|SWING|STRUCTURAL
+    avoid_chase                   BOOLEAN NOT NULL DEFAULT false,
+    pullback_candidate            BOOLEAN NOT NULL DEFAULT false,
+    preferred_pullback_zone_json  JSONB,
+    failed_reaction               BOOLEAN NOT NULL DEFAULT false,
+    sell_the_news                 BOOLEAN NOT NULL DEFAULT false,
+    event_conflict                BOOLEAN NOT NULL DEFAULT false,
+    contradiction_flags_json      JSONB,
+    market_regime                 TEXT,     -- 指示書33番：Phase5 classify_market_regimeを再利用
+    sector_strength_at_event       NUMERIC,  -- 指示書34番
+    reasons_json                   JSONB,
+    warnings_json                   JSONB,
+    created_at                       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_event_decision_support_event ON event_decision_support(event_id, ticker, evaluated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_event_decision_support_ticker ON event_decision_support(ticker, evaluated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_event_decision_support_created ON event_decision_support(created_at);
+"""
+
+
+def create_event_decision_support(database_url, fields):
+    """指示書1番：event_decision_support行を1件INSERTする（履歴として積む、UPDATEしない）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    cols = ["event_id", "ticker", "available_data_at", "material_quality_score", "reaction_quality_score",
+            "extension_score", "freshness_score", "historical_edge_score", "source_confidence_score",
+            "decision_support_score", "decision_support_state", "event_direction", "event_direction_confidence",
+            "persistence_class", "avoid_chase", "pullback_candidate", "preferred_pullback_zone_json",
+            "failed_reaction", "sell_the_news", "event_conflict", "contradiction_flags_json",
+            "market_regime", "sector_strength_at_event", "reasons_json", "warnings_json"]
+    json_cols = {"preferred_pullback_zone_json", "contradiction_flags_json", "reasons_json", "warnings_json"}
+    values = [fields.get(c) for c in cols]
+    wrapped = [json.dumps(v, ensure_ascii=False) if (c in json_cols and v is not None) else v
+               for c, v in zip(cols, values)]
+    placeholders = [f"%s::jsonb" if c in json_cols else "%s" for c in cols]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO event_decision_support ({', '.join(cols)}) "
+                f"VALUES ({', '.join(placeholders)}) RETURNING *",
+                wrapped)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def get_latest_event_decision_support(database_url, event_id, ticker=None):
+    """指示書1・27番：最新1件（on-demand再計算のキャッシュ判定・API表示用）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    where = ["event_id = %s"]
+    params = [event_id]
+    if ticker:
+        where.append("ticker = %s")
+        params.append(ticker)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT * FROM event_decision_support WHERE {' AND '.join(where)} "
+                f"ORDER BY evaluated_at DESC LIMIT 1", params)
+            row = cur.fetchone()
+    return _row_to_json(row) if row else None
+
+
+def list_event_decision_support_history(database_url, event_id, ticker=None, limit=50):
+    """指示書28・29番：decision_supportの遷移履歴（STRONG_SUPPORT→AVOID_CHASE→…）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where = ["event_id = %s"]
+    params = [event_id]
+    if ticker:
+        where.append("ticker = %s")
+        params.append(ticker)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT * FROM event_decision_support WHERE {' AND '.join(where)} "
+                f"ORDER BY evaluated_at ASC LIMIT %s", params + [limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def list_recent_event_decision_support(database_url, since_iso, limit=200, state=None):
+    """指示書18・40番：直近の最新スナップショット一覧（GET /decision-support・
+    build_ticker_intelligence_summary向け）。ticker毎に最新1件のみを返す（DISTINCT ON）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where = ["evaluated_at >= %s"]
+    params = [since_iso]
+    if state:
+        where.append("decision_support_state = %s")
+        params.append(state)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT DISTINCT ON (event_id, ticker) * FROM event_decision_support "
+                f"WHERE {' AND '.join(where)} ORDER BY event_id, ticker, evaluated_at DESC LIMIT %s",
+                params + [limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def list_event_decision_support_for_ticker(database_url, ticker, since_iso, limit=50):
+    """指示書18番：build_ticker_intelligence_summary(ticker)向け、直近event毎の最新1件。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT DISTINCT ON (event_id) * FROM event_decision_support "
+                "WHERE ticker = %s AND evaluated_at >= %s ORDER BY event_id, evaluated_at DESC LIMIT %s",
+                [ticker, since_iso, limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def count_event_decision_support_since(database_url, since_iso, flag_col=None, state=None):
+    """指示書41番：diagnostics向け（decision_support_generated_today・avoid_chase_count等）。
+    flag_colはavoid_chase/pullback_candidate/failed_reaction/event_conflict等のBOOLEAN列名。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    _allowed_flags = {"avoid_chase", "pullback_candidate", "failed_reaction", "event_conflict", "sell_the_news"}
+    where = ["created_at >= %s"]
+    params = [since_iso]
+    if flag_col and flag_col in _allowed_flags:
+        where.append(f"{flag_col} = true")
+    if state:
+        where.append("decision_support_state = %s")
+        params.append(state)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM event_decision_support WHERE {' AND '.join(where)}", params)
+            return cur.fetchone()[0]
 
 
 # ---- investment_profile（投資プロフィール。2026-09-02新規） ----

@@ -2757,6 +2757,14 @@ def _score_entry_candidates(database_url, user_id):
         if comp["overheat"] < 0:
             risks.append("直近高値からの乖離が大きい（高値掴み注意）")
 
+        # Market Intelligence Phase9新規（指示書21・38番）：entry_score自体には一切加点も
+        # 減点もしない、隣に並べるだけの追加専用表示。例外はUI側を壊さないよう握りつぶす。
+        event_support = None
+        try:
+            event_support = build_entry_top5_event_support_label(database_url, code)
+        except Exception as e:
+            print("  entry-candidates: event support表示取得で例外（無視して続行）", code, e)
+
         candidates.append({
             "code": code, "name": w.get("name"), "sector": w.get("sector"),
             "current": row.get("current"),
@@ -2765,6 +2773,7 @@ def _score_entry_candidates(database_url, user_id):
             "entryScore": round(entry_score), "entryState": entry_state, "resilience": resilience,
             "analysisConfidence": analysis_confidence, "dataQuality": data_quality,
             "scoreBreakdown": comp, "reasons": reasons or ["総合スコア上位"], "risks": risks,
+            "eventSupport": event_support,
         })
 
     # 指示書6番「値上がり率だけでは選ばない」：ソート基準はentry_score（既に過熱ペナルティ・
@@ -6273,7 +6282,9 @@ def get_underlying_event_diagnostics(database_url):
         return {"active_underlying_events": 0, "events_created_today": 0, "merged_evidence_today": 0,
                 "duplicate_alerts_suppressed": _event_alert_suppressed_count[0], "official_confirmations_today": 0,
                 "pending_event_reactions": 0, "reactions_evaluated_today": 0, "reaction_no_data_count": 0,
-                "reaction_estimated_count": 0, "prediction_resolutions_pending": 0}
+                "reaction_estimated_count": 0, "prediction_resolutions_pending": 0,
+                "decision_support_generated_today": 0, "avoid_chase_count": 0, "pullback_candidate_count": 0,
+                "failed_reaction_count": 0, "event_conflict_count": 0}
     today_start_iso = datetime.datetime.now(_JST).replace(hour=0, minute=0, second=0, microsecond=0) \
         .astimezone(datetime.timezone.utc).isoformat()
     return {
@@ -6290,6 +6301,16 @@ def get_underlying_event_diagnostics(database_url):
         "reaction_estimated_count": investment_db.count_event_market_reactions_by_quality(
             database_url, "ESTIMATED", today_start_iso),
         "prediction_resolutions_pending": investment_db.count_pending_prediction_resolutions(database_url),
+        # Market Intelligence Phase9新規（指示書41番）。
+        "decision_support_generated_today": investment_db.count_event_decision_support_since(database_url, today_start_iso),
+        "avoid_chase_count": investment_db.count_event_decision_support_since(
+            database_url, today_start_iso, flag_col="avoid_chase"),
+        "pullback_candidate_count": investment_db.count_event_decision_support_since(
+            database_url, today_start_iso, flag_col="pullback_candidate"),
+        "failed_reaction_count": investment_db.count_event_decision_support_since(
+            database_url, today_start_iso, flag_col="failed_reaction"),
+        "event_conflict_count": investment_db.count_event_decision_support_since(
+            database_url, today_start_iso, flag_col="event_conflict"),
     }
 
 
@@ -6404,6 +6425,9 @@ def build_event_summary(database_url, event):
     if market_reaction:
         summary["market_reaction"] = market_reaction  # 指示書31番：データが無ければキー自体を省略
     summary["reaction_context"] = build_event_reaction_context(database_url, event)  # 指示書37番
+    decision_support = build_event_decision_support_payload(database_url, event["id"])  # Phase9指示書23番
+    if decision_support:
+        summary["event_decision_support"] = decision_support
     return summary
 
 
@@ -6959,6 +6983,673 @@ def track_prediction_resolution_safe(database_url, event_id, topic, probability)
     except Exception as e:
         print("  Market Intelligence: prediction resolution追跡で例外（無視して続行）", e)
         return None
+
+
+# ============================================================
+# Market Intelligence Phase9（2026-09-11新規）：Event Quality Calibration /
+# Decision Support Bridge。Phase7の underlying_event、Phase8の event_market_reaction・
+# event_type_performance・社会的合意（consensus）を組み合わせ「材料は強いか→実際に市場が
+# 反応しているか→既に織り込まれていないか→今のポジションから見て入る価値があるか」を
+# decision_support_state（STRONG_SUPPORT/SUPPORTIVE/NEUTRAL/CAUTION/AVOID/AVOID_CHASE）として
+# 判定する補助レイヤー。既存のBUY/WAIT/SELL・entry_score（ENTRY TOP5）・thesis score・
+# AUTO_RS・AUTO_SECTOR・損切り・ポジションサイジングは一切直接変更しない
+# （指示書21・43番、常に「隣に並べるだけ」）。
+# 「良い会社」「良い材料」「株価が動いた」「今から入って良い位置」は全て別物という原則
+# （指示書45番）をコード化する——特に「材料も反応も強いが、既に伸び切っている」場合は
+# AVOID_CHASEを優先する。
+# ============================================================
+
+# 指示書7番：初期重み付け。後から実データで較正できるよう1箇所に集約する
+# （コード内に散在させない）。material_quality/reaction_quality/freshness/historical_edge/
+# source_confidenceの重みの合計を分母に正規化し、extension_penaltyはスコアからの減点として
+# 別枠で引く。
+DECISION_SUPPORT_WEIGHTS = {
+    "material_quality": 0.30,
+    "reaction_quality": 0.30,
+    "freshness": 0.15,
+    "historical_edge": 0.15,
+    "source_confidence": 0.10,
+    "extension_penalty": 0.20,
+}
+
+# 指示書6・32番：event_type_performanceのsample_count閾値。5未満はhistorical_edgeをほぼ
+# 無視、5〜9はPROVISIONAL（重み弱める）、10以上でCALIBRATED（フルスコア）。
+EVENT_TYPE_HISTORICAL_MIN_SAMPLE_WEAK = 5
+EVENT_TYPE_HISTORICAL_MIN_SAMPLE_FULL = 10
+
+
+def compute_material_quality_score(event, event_type_performance=None):
+    """指示書2番：0〜100。event_type・公式確認度（confidence_level）・source独立性
+    （independent_source_count）・impact_score（既存Phase7の事前重要度）・
+    material_magnitude（規模）・event_type別過去実績から算出する。event_direction（後述）
+    とは完全に独立——弱気材料でも「材料としての強さ・明確さ」自体は高くなり得る
+    （指示書15番、material_quality=90かつevent_direction=NEGATIVEも成立する）。"""
+    if not event:
+        return 0.0
+    score = 0.0
+    score += {"OFFICIAL_CONFIRMED": 35, "MULTI_SOURCE_CONFIRMED": 25, "SINGLE_RELIABLE_SOURCE": 15,
+              "SOCIAL_ONLY": 6, "UNVERIFIED": 0}.get(event.get("confidence_level"), 0)
+    independent = event.get("independent_source_count") or 0
+    score += min(independent * 4, 12)
+    impact = event.get("impact_score")
+    if impact is not None:
+        score += min(max(impact, 0), 100) * 0.25
+    magnitude = event.get("material_magnitude")
+    if magnitude is not None:
+        score += min(abs(magnitude) * 3, 18)
+    perf = (event_type_performance or {}).get(event.get("event_type"))
+    if perf and (perf.get("sample_count") or 0) >= EVENT_TYPE_HISTORICAL_MIN_SAMPLE_WEAK:
+        positive_rate = perf.get("positive_rate")
+        if positive_rate is not None:
+            score += (positive_rate - 0.5) * 20  # 実績が良いevent_typeほど加点、悪ければ減点
+    return round(max(0.0, min(score, 100.0)), 1)
+
+
+def compute_reaction_quality_score(returns_by_window, reaction_pattern=None, breadth=None, volume_ratio=None):
+    """指示書3番：0〜100。5M/30M/1H/CLOSEの相対リターン・breadth・volume・persistenceから
+    算出する。「dead-cat pop」（5M+8%→CLOSE+0.5%でFADE）はreaction_qualityを下げる
+    （指示書3番の明示例）——直近windowの値を最重視しつつ、途中で崩れていないか
+    （最小値がプラス圏か）とpersistenceパターンで補正する。"""
+    if not returns_by_window:
+        return 0.0
+    order = ["5M", "30M", "1H", "CLOSE"]
+    vals = [returns_by_window[w] for w in order if returns_by_window.get(w) is not None]
+    if not vals:
+        return 0.0
+    score = min(max(vals[-1], 0) * 6, 40)
+    if len(vals) >= 2:
+        score += min(max(min(vals), 0) * 4, 15)
+    if breadth is not None:
+        score += breadth * 15
+    if volume_ratio is not None and volume_ratio >= 1:
+        score += min((volume_ratio - 1) * 10, 10)
+    pattern_bonus = {"PERSISTENT": 20, "DELAYED": 12, "FADE": -15, "REVERSAL": -20, "NO_REACTION": -10}
+    score += pattern_bonus.get(reaction_pattern, 0)
+    return round(max(0.0, min(score, 100.0)), 1)
+
+
+def compute_extension_score(current_price=None, event_baseline_price=None, vwap=None, ma5=None,
+                              gap_pct=None, atr=None):
+    """指示書4番：0〜100、高いほど過熱（＝追いかけ危険）。event baseline・VWAP・5分MA・
+    gap%・ATR倍率のうち使えるものだけを組み合わせる（既知の制約：全て揃わなくても算出する
+    簡易加点式）。判定材料が1つも無ければNone（0点＝過熱なし、と混同しない）。"""
+    score, used = 0.0, False
+    if current_price is not None and event_baseline_price:
+        score += min(max((current_price - event_baseline_price) / event_baseline_price * 100, 0) * 5, 50)
+        used = True
+    if current_price is not None and vwap:
+        score += min(max((current_price - vwap) / vwap * 100, 0) * 4, 25)
+        used = True
+    if current_price is not None and ma5:
+        score += min(max((current_price - ma5) / ma5 * 100, 0) * 3, 15)
+        used = True
+    if gap_pct is not None:
+        score += min(max(gap_pct, 0) * 2, 10)
+        used = True
+    if atr and current_price is not None and event_baseline_price:
+        score += min(abs(current_price - event_baseline_price) / atr * 5, 10)
+        used = True
+    if not used:
+        return None
+    return round(min(score, 100.0), 1)
+
+
+def compute_freshness_score(minutes_since_event, event_timing=None):
+    """指示書5番：<15分=100,15-30分=90,30-60分=75,1-3h=55,close後=40,翌日以降=25。
+    event_type別の細かい調整は今回省略（既知の制約、historical_edgeやpersistence_classで
+    別途カバーする方針）。"""
+    if minutes_since_event is None:
+        return None
+    if minutes_since_event < 15:
+        return 100.0
+    if minutes_since_event < 30:
+        return 90.0
+    if minutes_since_event < 60:
+        return 75.0
+    if minutes_since_event < 180:
+        return 55.0
+    if minutes_since_event < 1440:
+        return 40.0
+    return 25.0
+
+
+def compute_historical_edge_score(event_type_performance_entry):
+    """指示書6・32番：0〜100とquality（NO_DATA/INSUFFICIENT_SAMPLE/PROVISIONAL/CALIBRATED）を
+    タプルで返す。sample_count<5はhistorical_edgeをほぼ無視（0扱い）、5〜9はPROVISIONAL
+    （0.6倍に減衰）、10以上でCALIBRATED（フルスコア）。"""
+    if not event_type_performance_entry:
+        return 0.0, "NO_DATA"
+    sample = event_type_performance_entry.get("sample_count") or 0
+    positive_rate = event_type_performance_entry.get("positive_rate")
+    if sample < EVENT_TYPE_HISTORICAL_MIN_SAMPLE_WEAK or positive_rate is None:
+        return 0.0, "INSUFFICIENT_SAMPLE"
+    raw = max(0.0, min(positive_rate, 1.0)) * 100
+    if sample < EVENT_TYPE_HISTORICAL_MIN_SAMPLE_FULL:
+        return round(raw * 0.6, 1), "PROVISIONAL"
+    return round(raw, 1), "CALIBRATED"
+
+
+def compute_source_confidence_score(confidence_level):
+    """指示書7番：source confidence（既存confidence_levelの再利用）を0〜100へ写像する。"""
+    return {"OFFICIAL_CONFIRMED": 100.0, "MULTI_SOURCE_CONFIRMED": 75.0, "SINGLE_RELIABLE_SOURCE": 50.0,
+            "SOCIAL_ONLY": 25.0, "UNVERIFIED": 0.0}.get(confidence_level, 0.0)
+
+
+def compute_decision_support_score(material_quality_score, reaction_quality_score, freshness_score,
+                                     historical_edge_score, extension_score, source_confidence_score,
+                                     weights=None):
+    """指示書7番：material_quality 30%・reaction_quality 30%・freshness 15%・
+    historical_edge 15%・source_confidence 10%を加重平均で正規化し、extensionは
+    extension_penalty(20%)分をスコアから減点する。重みはDECISION_SUPPORT_WEIGHTSの1箇所に
+    集約——コード内に散在させない（指示書7番の要求通り）。"""
+    w = weights or DECISION_SUPPORT_WEIGHTS
+    mq = material_quality_score or 0
+    rq = reaction_quality_score or 0
+    fr = freshness_score if freshness_score is not None else 50.0  # データ無しは中立値
+    he = historical_edge_score or 0
+    sc = source_confidence_score or 0
+    ext = extension_score if extension_score is not None else 0.0
+    positive_weight_total = (w["material_quality"] + w["reaction_quality"] + w["freshness"]
+                              + w["historical_edge"] + w["source_confidence"])
+    positive = (mq * w["material_quality"] + rq * w["reaction_quality"] + fr * w["freshness"]
+                + he * w["historical_edge"] + sc * w["source_confidence"])
+    normalized_positive = positive / positive_weight_total if positive_weight_total else 0.0
+    penalty = ext * w["extension_penalty"]
+    return round(max(0.0, min(normalized_positive - penalty, 100.0)), 1)
+
+
+# 指示書8番：スコアだけからの素の分類。AVOID_CHASEは呼び出し側でoverrideする
+# （extension_score・現在の伸び幅からdetect_avoid_chaseが判定し、成立すればスコアに
+# 関わらずAVOID_CHASEに置き換える）。
+DECISION_SUPPORT_STATE_THRESHOLDS = [(80, "STRONG_SUPPORT"), (65, "SUPPORTIVE"), (45, "NEUTRAL"),
+                                       (30, "CAUTION"), (0, "AVOID")]
+
+
+def classify_decision_support_state(score):
+    """指示書8番：80-100=STRONG_SUPPORT,65-79=SUPPORTIVE,45-64=NEUTRAL,30-44=CAUTION,
+    0-29=AVOID。"""
+    if score is None:
+        return "NEUTRAL"
+    for threshold, state in DECISION_SUPPORT_STATE_THRESHOLDS:
+        if score >= threshold:
+            return state
+    return "AVOID"
+
+
+AVOID_CHASE_EXTENSION_THRESHOLD = 80.0
+AVOID_CHASE_RETURN_THRESHOLD_PCT = 8.0
+AVOID_CHASE_VWAP_DEVIATION_THRESHOLD_PCT = 6.0
+
+
+def detect_avoid_chase(extension_score, current_return_from_event_pct=None, vwap_deviation_pct=None):
+    """指示書9番：extension_score>=80かつcurrent_return>=+8%、またはVWAP乖離>=閾値。
+    「売買禁止」ではなく「追いかけ注意」の補助フラグ（指示書9番の注記通り）。"""
+    if extension_score is None:
+        return False
+    if extension_score >= AVOID_CHASE_EXTENSION_THRESHOLD and current_return_from_event_pct is not None \
+            and current_return_from_event_pct >= AVOID_CHASE_RETURN_THRESHOLD_PCT:
+        return True
+    if vwap_deviation_pct is not None and vwap_deviation_pct >= AVOID_CHASE_VWAP_DEVIATION_THRESHOLD_PCT:
+        return True
+    return False
+
+
+def detect_pullback_candidate(material_quality_score, reaction_quality_score, avoid_chase):
+    """指示書10番：強い材料＋強い反応＋過熱（avoid_chase）の組み合わせでは「今は追わず
+    押し目待ち」を明示する。avoid_chaseが立っていなければpullback_candidateも立てない
+    （過熱していないのに押し目を語る必要はないため）。"""
+    if not avoid_chase:
+        return False
+    return (material_quality_score or 0) >= 65 and (reaction_quality_score or 0) >= 60
+
+
+def compute_preferred_pullback_zone(vwap=None, ma5=None, recent_breakout_price=None, event_baseline_price=None):
+    """指示書11番：VWAP・5分20MA・直近ブレイク値・event baselineから候補レンジ
+    （preferred_pullback_zone）を作る。未来の株価を断定しない——disclaimerを必ず含める
+    （指示書11番「将来の株価を断定的に主張しない」）。"""
+    candidates = [v for v in (vwap, ma5, recent_breakout_price, event_baseline_price) if v is not None]
+    if not candidates:
+        return None
+    return {
+        "low": round(min(candidates), 2), "high": round(max(candidates), 2),
+        "basis": {"vwap": vwap, "ma5": ma5, "recent_breakout_price": recent_breakout_price,
+                  "event_baseline_price": event_baseline_price},
+        "disclaimer": "将来の株価を保証するものではなく、過去の参照ラインから見た押し目候補ゾーンの目安です。",
+    }
+
+
+FAILED_REACTION_MATERIAL_THRESHOLD = 70.0
+FAILED_REACTION_QUALITY_THRESHOLD = 35.0
+
+
+def detect_failed_reaction(material_quality_score, reaction_quality_score):
+    """指示書12番：材料は強いのに株価が反応しない＝弱さとして扱う重要な警告
+    （「良い材料なのに上がらない」＝弱さ）。"""
+    if material_quality_score is None or reaction_quality_score is None:
+        return False
+    return material_quality_score >= FAILED_REACTION_MATERIAL_THRESHOLD \
+        and reaction_quality_score <= FAILED_REACTION_QUALITY_THRESHOLD
+
+
+SELL_THE_NEWS_GAP_THRESHOLD_PCT = 3.0
+
+
+def detect_sell_the_news(gap_pct, reaction_pattern):
+    """指示書13番：好材料でgap upした後にFADEした場合の候補フラグ。"""
+    if gap_pct is None or reaction_pattern != "FADE":
+        return False
+    return gap_pct >= SELL_THE_NEWS_GAP_THRESHOLD_PCT
+
+
+# 指示書14・15・16番：event_type別の既定direction（テキストに手がかりが無い場合の保守的な
+# フォールバック）。material_quality_scoreとは完全に独立した軸——弱気材料でもmaterial_qualityは
+# 高くなり得る（指示書15番）。
+EVENT_TYPE_DEFAULT_DIRECTION = {
+    "BUYBACK": "POSITIVE", "DIVIDEND": "POSITIVE", "TOB_MA": "POSITIVE", "CONTRACT": "POSITIVE",
+    "PRODUCT": "POSITIVE",
+    "CAPITAL_RAISE": "NEGATIVE", "CB_BOND": "NEGATIVE", "REGULATION": "NEGATIVE",
+    "GUIDANCE_REVISION": "MIXED", "CORPORATE_NEWS": "MIXED",
+    "EARNINGS": "NEUTRAL", "GOVERNMENT_POLICY": "NEUTRAL", "ECONOMIC_INDICATOR": "NEUTRAL",
+    "CENTRAL_BANK": "NEUTRAL", "GEOPOLITICS": "NEUTRAL", "MARKET_MOVE": "NEUTRAL",
+    "PREDICTION_MARKET": "NEUTRAL", "OTHER": "NEUTRAL",
+}
+_EVENT_DIRECTION_POSITIVE_KEYWORDS = ["上方修正", "増配", "自社株買い", "受注", "黒字転換", "最高益"]
+_EVENT_DIRECTION_NEGATIVE_KEYWORDS = ["下方修正", "減配", "公募増資", "第三者割当", "行政処分",
+                                        "業務改善命令", "赤字", "希薄化"]
+
+
+def classify_event_direction(event_type, text=None):
+    """指示書14・15・16番：material_quality_scoreとは独立にPOSITIVE/NEGATIVE/MIXED/NEUTRALと
+    信頼度(0-1)を返す。material_quality_score=90でevent_direction=NEGATIVEも成立する
+    （非常に明確な悪材料、指示書15番の例）。同時に複数方向のキーワードが出た場合はMIXED
+    （指示書16番、上方修正＋増資の同時発表等）。"""
+    has_pos = bool(text) and any(kw in text for kw in _EVENT_DIRECTION_POSITIVE_KEYWORDS)
+    has_neg = bool(text) and any(kw in text for kw in _EVENT_DIRECTION_NEGATIVE_KEYWORDS)
+    if has_pos and has_neg:
+        return "MIXED", 0.5
+    if has_pos:
+        return "POSITIVE", 0.85
+    if has_neg:
+        return "NEGATIVE", 0.85
+    default = EVENT_TYPE_DEFAULT_DIRECTION.get(event_type, "NEUTRAL")
+    return default, (0.5 if default != "NEUTRAL" else 0.3)
+
+
+def detect_event_conflict(event_directions):
+    """指示書17番：同一ticker内で同時にPOSITIVEとNEGATIVEのeventがある場合にTrue。
+    event_directionsは対象tickerの直近active event群のevent_direction文字列のリスト。
+    単一材料だけで判断しない（指示書17番）。"""
+    directions = {d for d in (event_directions or []) if d}
+    return "POSITIVE" in directions and "NEGATIVE" in directions
+
+
+# 指示書20番：単純な時間減衰ではなく材料の性質から持続期間クラスを推定する
+# （大型上方修正・新中期経営計画・大型受注・政策変更は長持ちする、との指示書の例示）。
+PERSISTENCE_CLASS_BY_EVENT_TYPE = {
+    "GUIDANCE_REVISION": "SWING", "TOB_MA": "STRUCTURAL", "GOVERNMENT_POLICY": "STRUCTURAL",
+    "CONTRACT": "SWING", "BUYBACK": "SWING", "CAPITAL_RAISE": "SWING", "CB_BOND": "SHORT_TERM",
+    "DIVIDEND": "SHORT_TERM", "EARNINGS": "SHORT_TERM", "REGULATION": "SWING",
+    "ECONOMIC_INDICATOR": "INTRADAY", "CENTRAL_BANK": "SWING", "GEOPOLITICS": "SWING",
+    "PRODUCT": "SHORT_TERM", "CORPORATE_NEWS": "SHORT_TERM", "MARKET_MOVE": "INTRADAY",
+    "PREDICTION_MARKET": "SHORT_TERM", "OTHER": "SHORT_TERM",
+}
+_PERSISTENCE_CLASS_ORDER = ["INTRADAY", "SHORT_TERM", "SWING", "STRUCTURAL"]
+_PERSISTENCE_MAGNITUDE_UPGRADE_THRESHOLD = 20.0  # 大型修正・大型受注等は1段階格上げ
+
+
+def classify_persistence_class(event_type, material_magnitude=None):
+    """指示書20番：INTRADAY/SHORT_TERM/SWING/STRUCTURAL。event_type別の既定クラスに加え、
+    material_magnitudeが大きい場合は1段階格上げする（大型修正ほど長持ちする、という指示書の
+    例示に沿う簡易ヒューリスティック）。"""
+    base = PERSISTENCE_CLASS_BY_EVENT_TYPE.get(event_type, "SHORT_TERM")
+    if material_magnitude is not None and abs(material_magnitude) >= _PERSISTENCE_MAGNITUDE_UPGRADE_THRESHOLD:
+        idx = min(_PERSISTENCE_CLASS_ORDER.index(base) + 1, len(_PERSISTENCE_CLASS_ORDER) - 1)
+        return _PERSISTENCE_CLASS_ORDER[idx]
+    return base
+
+
+# 指示書19番：同日=1.0,1日=0.8,2-3日=0.6,4-7日=0.4,7日超=0.2（days_since_event<=閾値の順で判定）。
+RECENCY_WEIGHT_BY_DAYS = [(0, 1.0), (1, 0.8), (3, 0.6), (7, 0.4)]
+RECENCY_WEIGHT_FALLBACK = 0.2
+# 指示書20番：persistence_classがSWING/STRUCTURALの材料は減衰を緩める（乗数、上限1.0）。
+PERSISTENCE_RECENCY_MULTIPLIER = {"INTRADAY": 0.6, "SHORT_TERM": 1.0, "SWING": 1.4, "STRUCTURAL": 2.0}
+
+
+def compute_recency_weight(days_since_event, persistence_class=None):
+    """指示書19・20番：古いeventの影響を時間減衰させる。event_typeの持続性
+    （persistence_class）で減衰カーブを調整する（指示書20番、SWING/STRUCTURALは減衰を緩める）。"""
+    if days_since_event is None:
+        return RECENCY_WEIGHT_FALLBACK
+    base = RECENCY_WEIGHT_FALLBACK
+    for threshold, weight in RECENCY_WEIGHT_BY_DAYS:
+        if days_since_event <= threshold:
+            base = weight
+            break
+    multiplier = PERSISTENCE_RECENCY_MULTIPLIER.get(persistence_class, 1.0)
+    return round(min(base * multiplier, 1.0), 3)
+
+
+def detect_contradiction_flags(material_quality_score=None, reaction_quality_score=None,
+                                  price_move_pct=None, source_consensus_direction=None,
+                                  price_direction=None):
+    """指示書35番：GOOD_MATERIAL_BAD_REACTION・BAD_MATERIAL_STRONG_PRICE・
+    SOURCE_CONSENSUS_PRICE_DIVERGENCEを検出する。単純な閾値ベース（指示書全体の方針＝
+    AI不使用のルールベース、Phase5〜8と同じ思想）。"""
+    flags = []
+    if material_quality_score is not None and reaction_quality_score is not None:
+        if material_quality_score >= 70 and reaction_quality_score <= 30:
+            flags.append("GOOD_MATERIAL_BAD_REACTION")
+        if material_quality_score <= 30 and price_move_pct is not None and price_move_pct >= 5:
+            flags.append("BAD_MATERIAL_STRONG_PRICE")
+    if source_consensus_direction and price_direction and source_consensus_direction != "NEUTRAL" \
+            and price_direction != "NEUTRAL" and source_consensus_direction != price_direction:
+        flags.append("SOURCE_CONSENSUS_PRICE_DIVERGENCE")
+    return flags
+
+
+def generate_event_decision_support(database_url, event_id, ticker, market_context=None,
+                                      event_type_performance=None):
+    """指示書1・27番：1event×1tickerのdecision_supportを計算しDBへ1行追加する
+    （履歴として積む——UPDATEしない、指示書28・29番の遷移追跡のため）。
+    market_contextは呼び出し側が用意する現在の価格文脈（current_price/vwap/ma5/gap_pct/atr/
+    event_baseline_price/current_return_from_event_pct/vwap_deviation_pct/
+    recent_breakout_price/volume_ratio/breadth/sector_strength_at_event/
+    source_consensus_direction/market_state）。用意できないキーはNoneのまま渡してよい
+    （各スコア関数がNoneに対応する）。
+    指示書31番（no hindsight、REQUIRED）：available_data_atは常に「今」であり、事後の
+    市場反応を遡ってこの評価を良く見せることはしない。"""
+    if investment_db is None or not database_url:
+        return None
+    event = investment_db.get_underlying_event(database_url, event_id)
+    if not event:
+        return None
+    market_context = market_context or {}
+    event_type_performance = event_type_performance or {}
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+    material_quality = compute_material_quality_score(event, event_type_performance)
+
+    reactions = investment_db.list_event_market_reactions_for_event(database_url, event_id)
+    evaluated = [r for r in reactions if r.get("evaluation_status") == "EVALUATED"
+                 and r.get("ticker") == ticker and r.get("target_type") == "STOCK"]
+    returns_by_window = {r["reaction_window"]: r.get("stock_return_pct") for r in evaluated}
+    pattern = classify_reaction_pattern(returns_by_window) if returns_by_window else None
+    breadths = [r.get("breadth") for r in evaluated if r.get("breadth") is not None]
+    volume_ratios = [r.get("volume_ratio") for r in evaluated if r.get("volume_ratio") is not None]
+    reaction_quality = compute_reaction_quality_score(
+        returns_by_window, reaction_pattern=pattern,
+        breadth=(max(breadths) if breadths else market_context.get("breadth")),
+        volume_ratio=(max(volume_ratios) if volume_ratios else market_context.get("volume_ratio")))
+
+    extension = compute_extension_score(
+        current_price=market_context.get("current_price"), event_baseline_price=market_context.get("event_baseline_price"),
+        vwap=market_context.get("vwap"), ma5=market_context.get("ma5"), gap_pct=market_context.get("gap_pct"),
+        atr=market_context.get("atr"))
+    if extension is None and event.get("extended_move"):
+        extension = 85.0  # 指示書26番：Phase8のEXTENDED_MOVEフラグを補完的に利用する
+
+    market_relevant_at = None
+    minutes_since_event = None
+    try:
+        market_relevant_at = datetime.datetime.fromisoformat(
+            str(resolve_event_market_relevant_at(event)).replace("Z", "+00:00"))
+        if market_relevant_at.tzinfo is None:
+            market_relevant_at = market_relevant_at.replace(tzinfo=datetime.timezone.utc)
+        minutes_since_event = (now_utc - market_relevant_at).total_seconds() / 60
+    except Exception:
+        market_relevant_at = None
+    timing = classify_event_timing(market_relevant_at) if market_relevant_at else None
+    freshness = compute_freshness_score(minutes_since_event, event_timing=timing)
+
+    perf_entry = event_type_performance.get(event.get("event_type"))
+    historical_edge, historical_edge_quality = compute_historical_edge_score(perf_entry)
+
+    source_confidence = compute_source_confidence_score(event.get("confidence_level"))
+
+    score = compute_decision_support_score(material_quality, reaction_quality, freshness,
+                                             historical_edge, extension, source_confidence)
+    avoid_chase = detect_avoid_chase(extension, market_context.get("current_return_from_event_pct"),
+                                       market_context.get("vwap_deviation_pct"))
+    state = classify_decision_support_state(score)
+    if avoid_chase:
+        state = "AVOID_CHASE"  # 指示書8・9番：スコアに関わらずoverride
+
+    pullback_candidate = detect_pullback_candidate(material_quality, reaction_quality, avoid_chase)
+    pullback_zone = compute_preferred_pullback_zone(
+        vwap=market_context.get("vwap"), ma5=market_context.get("ma5"),
+        recent_breakout_price=market_context.get("recent_breakout_price"),
+        event_baseline_price=market_context.get("event_baseline_price")) if pullback_candidate else None
+
+    failed_reaction = detect_failed_reaction(material_quality, reaction_quality)
+    sell_the_news = detect_sell_the_news(market_context.get("gap_pct"), pattern)
+
+    direction, direction_confidence = classify_event_direction(event.get("event_type"), event.get("title"))
+
+    persistence_class = classify_persistence_class(event.get("event_type"), event.get("material_magnitude"))
+
+    market_regime = None
+    try:
+        market_state = market_context.get("market_state")
+        if market_state is None and "market_state" not in market_context:
+            market_state = capture_market_state_snapshot()
+        regimes = classify_market_regime(market_state) if market_state else []
+        market_regime = ",".join(regimes) if regimes else None
+    except Exception as e:
+        print("  Market Intelligence: decision support market_regime取得で例外（無視して続行）", e)
+        market_regime = None
+
+    current_return = market_context.get("current_return_from_event_pct")
+    price_direction = "POSITIVE" if (current_return or 0) > 0 else ("NEGATIVE" if (current_return or 0) < 0 else "NEUTRAL")
+    contradiction_flags = detect_contradiction_flags(
+        material_quality_score=material_quality, reaction_quality_score=reaction_quality,
+        price_move_pct=current_return, source_consensus_direction=market_context.get("source_consensus_direction"),
+        price_direction=price_direction if current_return is not None else None)
+
+    reasons, warnings = [], []
+    if material_quality >= 70:
+        reasons.append("材料の確度・重要度が高い")
+    if reaction_quality >= 60:
+        reasons.append("市場が実際に反応している")
+    if historical_edge_quality == "PROVISIONAL":
+        reasons.append("過去実績サンプルが少なめ（参考程度）")
+    if pullback_candidate:
+        reasons.append("押し目待ちの候補（pullback_candidate）")
+    if avoid_chase:
+        warnings.append("すでに値幅が伸びており高値掴みに注意（AVOID_CHASE）")
+    if failed_reaction:
+        warnings.append("材料は強いが株価が反応していない（FAILED_REACTION）")
+    if sell_the_news:
+        warnings.append("好材料での上昇後に失速（SELL_THE_NEWS候補）")
+    for flag in contradiction_flags:
+        warnings.append(f"矛盾フラグ：{flag}")
+
+    fields = {
+        "event_id": event_id, "ticker": ticker, "available_data_at": now_utc.isoformat(),
+        "material_quality_score": material_quality, "reaction_quality_score": reaction_quality,
+        "extension_score": extension, "freshness_score": freshness, "historical_edge_score": historical_edge,
+        "source_confidence_score": source_confidence, "decision_support_score": score,
+        "decision_support_state": state, "event_direction": direction, "event_direction_confidence": direction_confidence,
+        "persistence_class": persistence_class, "avoid_chase": avoid_chase, "pullback_candidate": pullback_candidate,
+        "preferred_pullback_zone_json": pullback_zone, "failed_reaction": failed_reaction, "sell_the_news": sell_the_news,
+        "event_conflict": False,  # event_conflictはticker横断判定（build_ticker_intelligence_summary）専任
+        "contradiction_flags_json": contradiction_flags, "market_regime": market_regime,
+        "sector_strength_at_event": market_context.get("sector_strength_at_event"),
+        "reasons_json": reasons, "warnings_json": warnings,
+    }
+    return investment_db.create_event_decision_support(database_url, fields)
+
+
+def generate_event_decision_support_safe(database_url, event_id, ticker, market_context=None,
+                                            event_type_performance=None):
+    try:
+        return generate_event_decision_support(database_url, event_id, ticker, market_context, event_type_performance)
+    except Exception as e:
+        print("  Market Intelligence: decision support生成で例外（無視して続行）", e)
+        return None
+
+
+def build_ticker_intelligence_summary(database_url, ticker, lookback_days=7):
+    """指示書18番：{"ticker":..,"active_events":N,"net_event_direction":..,
+    "best_event_support_score":..,"event_conflict":bool,"avoid_chase":bool,
+    "pullback_candidate":bool}を返す。event毎の最新decision_support行（直近lookback_days）を
+    集約する。"""
+    empty = {"ticker": ticker, "active_events": 0, "net_event_direction": "NEUTRAL",
+              "best_event_support_score": None, "event_conflict": False, "avoid_chase": False,
+              "pullback_candidate": False}
+    if investment_db is None or not database_url:
+        return empty
+    since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=lookback_days)).isoformat()
+    rows = investment_db.list_event_decision_support_for_ticker(database_url, ticker, since_iso)
+    if not rows:
+        return empty
+    directions = [r.get("event_direction") for r in rows if r.get("event_direction")]
+    conflict = detect_event_conflict(directions)
+    if conflict:
+        net_direction = "MIXED"
+    elif "POSITIVE" in directions:
+        net_direction = "POSITIVE"
+    elif "NEGATIVE" in directions:
+        net_direction = "NEGATIVE"
+    else:
+        net_direction = "NEUTRAL"
+    scores = [r.get("decision_support_score") for r in rows if r.get("decision_support_score") is not None]
+    return {
+        "ticker": ticker, "active_events": len(rows), "net_event_direction": net_direction,
+        "best_event_support_score": max(scores) if scores else None, "event_conflict": conflict,
+        "avoid_chase": any(r.get("avoid_chase") for r in rows),
+        "pullback_candidate": any(r.get("pullback_candidate") for r in rows),
+    }
+
+
+def build_entry_top5_event_support_label(database_url, ticker):
+    """指示書21・38番：ENTRY TOP5の追加専用表示——entry_score自体は変更しない。
+    "STRONG"/"NEUTRAL"/"CAUTION"/"AVOID_CHASE"のいずれか、対象event無しならNoneを返す。"""
+    summary = build_ticker_intelligence_summary(database_url, ticker)
+    if not summary.get("active_events"):
+        return None
+    if summary.get("avoid_chase"):
+        return "AVOID_CHASE"
+    score = summary.get("best_event_support_score")
+    if score is None:
+        return "NEUTRAL"
+    if score >= 65:
+        return "STRONG"
+    if score >= 45:
+        return "NEUTRAL"
+    return "CAUTION"
+
+
+def build_watchlist_event_tags(database_url, ticker):
+    """指示書22・37番：監視銘柄カード用の軽量タグ（EVENT+/EVENT⚠/PULLBACK）。UIを重くしない
+    ため最大3種類のタグのみ。"""
+    summary = build_ticker_intelligence_summary(database_url, ticker)
+    if not summary.get("active_events"):
+        return []
+    tags = []
+    if summary.get("avoid_chase"):
+        tags.append("EVENT⚠")
+    elif (summary.get("best_event_support_score") or 0) >= 65:
+        tags.append("EVENT+")
+    if summary.get("pullback_candidate"):
+        tags.append("PULLBACK")
+    return tags
+
+
+def build_event_decision_support_payload(database_url, event_id):
+    """指示書23番：ChatGPT相談payload向け。複数ticker対象の場合はdecision_support_scoreが
+    最良のものを採用する。フォーマット例：{"material_quality_score":84,
+    "reaction_quality_score":77,"extension_score":82,"decision_support_state":"AVOID_CHASE",
+    "pullback_candidate":true,"reasons":[...]}。"""
+    if investment_db is None or not database_url:
+        return None
+    rows = investment_db.list_event_decision_support_history(database_url, event_id, limit=1000) or []
+    latest_by_ticker = {}
+    for r in rows:  # historyはevaluated_at ASCなので、後に出てきた行ほど新しい
+        latest_by_ticker[r.get("ticker")] = r
+    if not latest_by_ticker:
+        return None
+    best = max(latest_by_ticker.values(), key=lambda r: r.get("decision_support_score") or 0)
+    return {
+        "material_quality_score": best.get("material_quality_score"),
+        "reaction_quality_score": best.get("reaction_quality_score"),
+        "extension_score": best.get("extension_score"),
+        "decision_support_state": best.get("decision_support_state"),
+        "pullback_candidate": bool(best.get("pullback_candidate")),
+        "failed_reaction": bool(best.get("failed_reaction")),  # UI「重要」タブのフィルタ用（指示書39番）
+        "reasons": best.get("reasons_json") or [],
+    }
+
+
+def build_intraday_event_decision_digest(database_url, lookback_hours=6):
+    """指示書24・26番：INTRADAY_REPORT（寄り30分・前場終了・後場30分・大引け）に追加する
+    「イベント支援・反応失敗・追いかけ注意・押し目候補」一覧。既存の判断は上書きしない、
+    追加専用セクション。"""
+    empty = {"supported": [], "failed_reaction": [], "avoid_chase": [], "pullback_candidate": []}
+    if investment_db is None or not database_url:
+        return empty
+    since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=lookback_hours)).isoformat()
+    rows = investment_db.list_recent_event_decision_support(database_url, since_iso, limit=200)
+
+    def _brief(r):
+        return {"ticker": r.get("ticker"), "event_id": r.get("event_id"),
+                "decision_support_state": r.get("decision_support_state"),
+                "decision_support_score": r.get("decision_support_score")}
+    return {
+        "supported": [_brief(r) for r in rows if r.get("decision_support_state") in ("STRONG_SUPPORT", "SUPPORTIVE")][:10],
+        "failed_reaction": [_brief(r) for r in rows if r.get("failed_reaction")][:10],
+        "avoid_chase": [_brief(r) for r in rows if r.get("avoid_chase")][:10],
+        "pullback_candidate": [_brief(r) for r in rows if r.get("pullback_candidate")][:10],
+    }
+
+
+def build_intraday_event_decision_digest_safe(database_url, lookback_hours=6):
+    try:
+        return build_intraday_event_decision_digest(database_url, lookback_hours)
+    except Exception as e:
+        print("  Market Intelligence: intraday event decision digest生成で例外（無視して続行）", e)
+        return {"supported": [], "failed_reaction": [], "avoid_chase": [], "pullback_candidate": []}
+
+
+def build_morning_overnight_event_digest(database_url, lookback_hours=18):
+    """指示書25番：前日引け〜当日朝までのeventからovernight catalyst・event_direction・
+    event_type別過去実績を要約する。ギャップアップ（GU）は買いサインではない、との注記を
+    必ず含める（指示書25番「GU≠buy」）。"""
+    gu_note = "ギャップアップは買いサインではありません（追いかけ注意、指示書25番）。"
+    if investment_db is None or not database_url:
+        return {"overnight_events": [], "note": gu_note}
+    since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=lookback_hours)).isoformat()
+    events = investment_db.list_active_underlying_events(database_url, since_iso=since_iso, limit=30)
+    perf_since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=90)).isoformat()
+    perf = aggregate_event_type_performance(
+        investment_db.list_evaluated_event_market_reactions_since(database_url, perf_since_iso))
+    out = []
+    for ev in events:
+        timing = None
+        try:
+            market_relevant_at = datetime.datetime.fromisoformat(
+                str(resolve_event_market_relevant_at(ev)).replace("Z", "+00:00"))
+            if market_relevant_at.tzinfo is None:
+                market_relevant_at = market_relevant_at.replace(tzinfo=datetime.timezone.utc)
+            timing = classify_event_timing(market_relevant_at)
+        except Exception:
+            timing = None
+        if timing not in ("OVERNIGHT", "AFTER_CLOSE", "PRE_MARKET"):
+            continue
+        direction, confidence = classify_event_direction(ev.get("event_type"), ev.get("title"))
+        out.append({
+            "event_id": ev.get("id"), "event_type": ev.get("event_type"), "title": ev.get("title"),
+            "tickers": ev.get("direct_tickers_json") or [], "event_direction": direction,
+            "event_direction_confidence": confidence, "historical_edge": perf.get(ev.get("event_type")),
+        })
+    return {"overnight_events": out, "note": gu_note}
+
+
+def build_morning_overnight_event_digest_safe(database_url, lookback_hours=18):
+    try:
+        return build_morning_overnight_event_digest(database_url, lookback_hours)
+    except Exception as e:
+        print("  Market Intelligence: 朝overnight event digest生成で例外（無視して続行）", e)
+        return {"overnight_events": [], "note": "ギャップアップは買いサインではありません（追いかけ注意）。"}
 
 
 def _nicosoku_morning_commentary(database_url, user_id):
@@ -12098,7 +12789,11 @@ class Handler(SimpleHTTPRequestHandler):
                           "action": "EXIT", "allow_reentry": True, "reentry_requires_new_decision": True}
             self._send_json({"rules": rules})
         # ---- 2026-09-10新規（Market Intelligence Timeline、Phase2-A） ----
-        elif self.path.startswith("/api/market-intelligence"):
+        # 不具合修正（Phase9・2026-09-11）：startswithだと同じelifチェーン内で後方に定義された
+        # /api/market-intelligence/events・/decision-support等の、より具体的なルートを
+        # 全て覆い隠して先取りしてしまっていた（本ルートの用途はレポート一覧のみ）。
+        # 完全一致に限定して修正する。
+        elif self.path.split("?")[0] == "/api/market-intelligence":
             qs = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(qs)
             reports = investment_db.list_market_intelligence_reports(DATABASE_URL, self.current_user, trade_date=params.get("date", [None])[0]) \
@@ -12376,6 +13071,63 @@ class Handler(SimpleHTTPRequestHandler):
                 investment_db.list_evaluated_event_market_reactions_since(DATABASE_URL, since_iso)) \
                 if (investment_db is not None and DATABASE_URL) else {}
             self._send_json({"event_type_performance": performance})
+        elif self.path.split("?")[0].startswith("/api/market-intelligence/events/") \
+                and self.path.split("?")[0].endswith("/decision-support"):
+            # Market Intelligence Phase9新規（指示書1・27・40番）：event単体のdecision support。
+            # on-demand再計算（~5分キャッシュ許容）。?tickerで対象を絞れる（省略時はdirect_tickers先頭）。
+            try:
+                event_id = int(self.path.split("?")[0][len("/api/market-intelligence/events/"):-len("/decision-support")].strip("/"))
+            except ValueError:
+                self._send_json({"error": "不正なevent_idです"})
+                return
+            if investment_db is None or not DATABASE_URL:
+                self._send_json({"event_id": event_id, "ticker": None, "decision_support": None, "history": []})
+                return
+            event = investment_db.get_underlying_event(DATABASE_URL, event_id)
+            if event is None:
+                self._send_json({"error": "対象のeventが見つかりません"})
+                return
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            ticker = (params.get("ticker", [None])[0]) or next(iter(event.get("direct_tickers_json") or []), None)
+            if not ticker:
+                self._send_json({"error": "対象tickerがありません"})
+                return
+            latest = investment_db.get_latest_event_decision_support(DATABASE_URL, event_id, ticker)
+            cache_fresh = False
+            if latest and latest.get("evaluated_at"):
+                try:
+                    ev_at = datetime.datetime.fromisoformat(str(latest["evaluated_at"]).replace("Z", "+00:00"))
+                    if ev_at.tzinfo is None:
+                        ev_at = ev_at.replace(tzinfo=datetime.timezone.utc)
+                    cache_fresh = (datetime.datetime.now(datetime.timezone.utc) - ev_at).total_seconds() < 300
+                except Exception:
+                    cache_fresh = False
+            if not cache_fresh:
+                perf_since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=90)).isoformat()
+                perf = aggregate_event_type_performance(
+                    investment_db.list_evaluated_event_market_reactions_since(DATABASE_URL, perf_since_iso))
+                latest = generate_event_decision_support_safe(
+                    DATABASE_URL, event_id, ticker, event_type_performance=perf) or latest
+            history = investment_db.list_event_decision_support_history(DATABASE_URL, event_id, ticker, limit=50)
+            self._send_json({"event_id": event_id, "ticker": ticker, "decision_support": latest, "history": history})
+        elif self.path.split("?")[0] == "/api/market-intelligence/decision-support":
+            # Market Intelligence Phase9新規（指示書40番）：最新スナップショット一覧
+            # （「重要」タブの各種フィルタ用）。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            lookback_hours = int(params.get("lookback_hours", ["24"])[0])
+            state = params.get("state", [None])[0]
+            since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=lookback_hours)).isoformat()
+            rows = investment_db.list_recent_event_decision_support(DATABASE_URL, since_iso, state=state) \
+                if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"decision_support": rows})
+        elif self.path.split("?")[0].startswith("/api/stocks/") and self.path.split("?")[0].endswith("/intelligence-summary"):
+            # Market Intelligence Phase9新規（指示書18・40番）：build_ticker_intelligence_summary。
+            ticker = urllib.parse.unquote(
+                self.path.split("?")[0][len("/api/stocks/"):-len("/intelligence-summary")].strip("/"))
+            summary = build_ticker_intelligence_summary(DATABASE_URL, ticker) if ticker else {}
+            self._send_json(summary)
         elif self.path.split("?")[0].startswith("/api/market-intelligence/events/"):
             # Market Intelligence Phase7新規（指示書29番）：event単体の詳細。
             try:
