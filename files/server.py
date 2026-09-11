@@ -190,6 +190,10 @@ CACHE_TTL = {  # 用途別キャッシュTTL（秒）。指示書2番の目安�
     "stock_quote": 90,   # 個別株現在値（get_stock_quotes）：60〜120秒
     "news": 420,         # ニュース/カタリスト：5〜10分（中央値7分）
     "sector": 90,        # セクター集計：60〜120秒（indices由来のため実質indexキャッシュに従属）
+    "daily_arrays": 90,  # 個別株日足履歴（RSI・短期MA・出来高倍率の元データ）：60〜120秒。
+                         # トレード分析リアルタイム自動更新（2026-09-12）でFAST UPDATEが
+                         # 10秒間隔でポーリングしても、日足履歴自体は1日1回しか動かないため
+                         # このTTLで十分——無条件に立花証券APIを叩き続けない（指示書9番）。
 }
 _CACHE_LOCK = threading.Lock()
 _CACHE_STORE = {}  # key -> {"value": ..., "ts": epoch秒}
@@ -2487,6 +2491,7 @@ def _intraday_stock_snapshot(watchlist_item):
     return {
         "current": quote.get("t") if quote else None,
         "currentChangePct": current_change_pct,
+        "vwap": regime["vwap"] if regime else None,  # トレード分析リアルタイム自動更新（2026-09-12）で使用。既存のaboveVwap判定は無変更
         "aboveVwap": regime["aboveVwap"] if regime else None,
         "fiveMinStructure": regime["pattern"] if regime else None,
         "dataStatus": "ok" if (quote and regime) else ("partial" if (quote or regime) else "failed"),
@@ -2895,6 +2900,115 @@ def compute_entry_ready_candidates(database_url, user_id):
     candidates()をそのまま返すだけで、stock_thesesへの永続化は行わない（永続化は朝TOP5＝
     generate_morning_entry_top5+persist_morning_thesesの専任、指示書22・23番）。"""
     return _score_entry_candidates(database_url, user_id)
+
+
+# ============================================================
+# トレード分析 リアルタイム自動更新（2026-09-12新規）。
+# 「今すぐ更新」ボタンを押さなくても現在値・ENTRY条件・WAIT/ENTRY READY/RISK等が自動追従する
+# ためのFAST UPDATE（軽量・5〜15秒間隔）専用エンドポイント。analyze_stock()（ニュース・
+# Expert View・ルール評価等を含む重い分析＝HEAVY ANALYSIS）は呼ばない。既存の共有Stage1
+# キャッシュ・_intraday_stock_snapshot・_volume_stage2_detail（_cached_daily_arrays経由で
+# TTLキャッシュ済み）・_entry_score_components/_classify_entry_state・Trade Experience
+# Learningのbuild_trade_experience_summary_for_symbolをそのまま再利用し、新規の重い計算・
+# 新規の外部API呼び出し経路は追加しない（指示書9番「API負荷対策」）。
+# ============================================================
+
+def _light_entry_conditions(comp):
+    """entry_score内訳（_entry_score_components()の戻り値）のうち、方向性を持つ5項目
+    （momentum/vwap/5分足構造/対市場RS/出来高）が何個「成立」しているかを簡易カウントする。
+    重いanalyze_stock()のentry_checklist（8項目・ファンダ含む）とは別物の軽量版——FAST UPDATE
+    専用であり、既存のentryConditionsMet/Totalを置き換えるものではない。"""
+    checks = [comp.get("momentum", 0) > 0, comp.get("vwap", 0) > 0, comp.get("fiveMinStructure", 0) > 0,
+              comp.get("marketRelative", 0) > 0, comp.get("volume", 0) > 0]
+    return {"passed": sum(1 for c in checks if c), "total": len(checks)}
+
+
+def _light_snapshot_fields(code, row, comp, entry_state, snapshot, rsi_val, short_ma_val, experience_score):
+    """FAST UPDATE応答の形を組み立てる純粋関数（DB/ネットワークアクセスなし、単体テスト用に
+    分離）。既存entry_score・entry_state自体は一切変更せず、そのまま乗せるだけ。"""
+    entry_conditions = _light_entry_conditions(comp)
+    risk = entry_state in ENTRY_TOP5_RISK_STATES
+    return {
+        "symbol": code,
+        "price": row.get("current"),
+        "pct": round(row["changePct"], 2) if row.get("changePct") is not None else None,
+        "vwap": (snapshot or {}).get("vwap"),
+        "rsi": round(rsi_val, 1) if rsi_val is not None else None,
+        "short_ma": round(short_ma_val, 2) if short_ma_val is not None else None,
+        "entry_state": entry_state,
+        "entry_conditions": entry_conditions,
+        "signal": entry_state,  # 簡易signal＝entry_stateそのまま（表示ラベルはフロント側ENTRY_STATE_METAで変換）
+        "risk": risk,
+        "experience_score": experience_score,
+    }
+
+
+def compute_light_trade_analysis_snapshot(database_url, user_id, code, market="JP"):
+    """FAST UPDATE用の軽量スナップショットを取得するI/Oラッパー。_score_entry_candidates()と
+    同じ共有Stage1（run_momentum_stage1、複数エンジンとプロセス内キャッシュ共有）を使うため、
+    このAPIが10秒間隔で叩かれても市場全体の再取得は増えない。対象コードがStage1（監視銘柄が
+    属する市場全体の当日値、既存のrun_momentum_stage1）に存在しない、または当日値が
+    まだ無い場合はNoneを返す（呼び出し側は404を返す）。"""
+    stage1 = run_momentum_stage1()
+    stage1_rows = stage1.get("rows", {})
+    nikkei_chg = stage1.get("nikkeiChangePct")
+    row = stage1_rows.get(code)
+    if not row or row.get("current") is None:
+        return None
+    w = {"code": code, "market": market, "sector": row.get("sector")}
+    auto_rs_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_RS_CURRENT", market="JP") \
+        if (investment_db and database_url) else set()
+    auto_sector_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_SECTOR_LEADER_CURRENT", market="JP") \
+        if (investment_db and database_url) else set()
+    stage2 = None
+    try:
+        stage2 = _volume_stage2_detail(code, row)
+    except Exception as e:
+        print("  trade-analysis/live: Stage2取得失敗", code, e)
+    snapshot = None
+    try:
+        snap = _intraday_stock_snapshot(w)
+        if snap.get("dataStatus") != "failed":
+            snapshot = snap
+    except Exception as e:
+        print("  trade-analysis/live: 5分足スナップショット失敗", code, e)
+    data_quality = "FULL" if (stage2 is not None and snapshot is not None) else (
+        "PARTIAL" if (stage2 is not None or snapshot is not None) else "DEGRADED")
+
+    catalysts = investment_db.relevant_catalysts_for(database_url, user_id, code=code, sector=row.get("sector"), limit=3) \
+        if (investment_db and database_url) else []
+    events = investment_db.upcoming_event_signals(database_url, user_id, code=code, sector=row.get("sector")) \
+        if (investment_db and database_url) else {"signals": []}
+    event_signals = events.get("signals", [])
+
+    comp = _entry_score_components(row, stage2, snapshot or {}, auto_rs_current, auto_sector_current, catalysts, event_signals)
+    neg_cat_present = bool(comp["negativeCatalysts"])
+    entry_score = comp["total"]
+    entry_state, _exception_applied = _classify_entry_state(
+        entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present, nikkei_chg)
+
+    rsi_val, short_ma_val = None, None
+    daily = _cached_daily_arrays(code, CACHE_TTL["daily_arrays"])
+    if daily:
+        closes = daily[0]
+        try:
+            if len(closes) >= 15:
+                rsi_val = _rsi(closes)
+            if len(closes) >= 5:
+                short_ma_val = _sma(closes, 5)
+        except Exception as e:
+            print("  trade-analysis/live: RSI/短期MA計算失敗", code, e)
+
+    experience_score = None
+    try:
+        exp_summary = build_trade_experience_summary_for_symbol(database_url, user_id, code)
+        experience_score = exp_summary["experience_score"]
+    except Exception as e:
+        print("  trade-analysis/live: experience score取得で例外（無視して続行）", code, e)
+
+    fields = _light_snapshot_fields(code, row, comp, entry_state, snapshot, rsi_val, short_ma_val, experience_score)
+    fields["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return fields
 
 
 def generate_morning_entry_top5(database_url, user_id):
@@ -10450,6 +10564,25 @@ def _tachibana_daily_arrays(code):
     return closes, opens, highs, lows, volumes
 
 
+def _cached_daily_arrays(code, ttl):
+    """_tachibana_daily_arrays()をCACHE_TTL["daily_arrays"]でラップする（トレード分析
+    リアルタイム自動更新・2026-09-12、指示書9番「API負荷対策」）。日足履歴は日中ほぼ変化
+    しないため、FAST UPDATEが10秒間隔でポーリングしてもこのキャッシュにより実際の
+    立花証券API呼び出しはTTLごとに1回で済む。取得失敗時、期限切れでも直近キャッシュが
+    あればそれを返す（stale fallback、既存の_cached_two_closes等と同じ方針）。"""
+    key = f"daily_arrays:{code}"
+    entry = _cache_get(key)
+    if _cache_fresh(entry, ttl):
+        return entry["value"]
+    value = _tachibana_daily_arrays(code)
+    if value is not None:
+        _cache_set(key, value)
+        return value
+    if entry is not None:
+        return entry["value"]
+    return None
+
+
 # 2026-08-21 ユーザー要望：出来高ブレイクアウト判定の高値の参照期間を「直近20営業日」から
 # 「直近3か月」に変更。1か月≒21営業日として3か月分=63営業日とする。
 BREAKOUT_LOOKBACK_DAYS = 63
@@ -10469,7 +10602,7 @@ def get_breakout_levels(watchlist):
         code = w.get("code", "")
         if not code:
             continue
-        arrays = _tachibana_daily_arrays(code)
+        arrays = _cached_daily_arrays(code, CACHE_TTL["daily_arrays"])
         if not arrays:
             continue
         _closes, _opens, highs, _lows, volumes = arrays
@@ -10844,7 +10977,7 @@ def _momentum_stage2_detail(code, stage1_row):
     追加する。1銘柄につき_tachibana_daily_arrays()（get_daily_history）を1回だけ呼ぶ
     （既存のBREAKOUT_LOOKBACK_DAYS・_tachibana_daily_arraysをそのまま再利用、新規API種別の
     追加なし）。取得失敗・データ不足時はNoneを返し、呼び出し側はStage1情報だけで暫定スコアを使う。"""
-    arrays = _tachibana_daily_arrays(code)
+    arrays = _cached_daily_arrays(code, CACHE_TTL["daily_arrays"])
     if not arrays:
         return None
     closes, opens, highs, lows, volumes = arrays
@@ -11093,7 +11226,7 @@ def _break_stage2_detail(code, stage1_row):
     （同時に複数満たす場合は最上位のtierだけを採用、加算しない）。
     breakout_lookback_high・high52wはanalyze_stock()と同じ計算（BREAKOUT_LOOKBACK_DAYS=63・
     直近252営業日）をそのまま流用し、判定基準を二重に定義しない。"""
-    arrays = _tachibana_daily_arrays(code)
+    arrays = _cached_daily_arrays(code, CACHE_TTL["daily_arrays"])
     if not arrays:
         return None
     closes, opens, highs, lows, volumes = arrays
@@ -11603,7 +11736,7 @@ def _pullback_stage2_detail(code, stage1_row):
     ように、①直近高値が何営業日前に形成されたか（daysSinceHigh、recentHighDateの代わりに
     使える同等情報。日足配列のインデックスだけで算出でき、新規API不要）、②MA25自体が上向きか
     （ma25Rising、5営業日前のMA25と比較）を追加する。"""
-    arrays = _tachibana_daily_arrays(code)
+    arrays = _cached_daily_arrays(code, CACHE_TTL["daily_arrays"])
     if not arrays:
         return None
     closes, opens, highs, lows, volumes = arrays
@@ -12204,7 +12337,7 @@ def select_volume_stage1_candidates(stage1):
 def _volume_stage2_detail(code, stage1_row):
     """日足履歴から過去20営業日平均出来高（avgVolume20）・当日出来高との倍率（生・時間帯補正後
     の両方）・売買代金倍率・直近高値からの乖離（distanceFromHigh）・break status等を算出する。"""
-    arrays = _tachibana_daily_arrays(code)
+    arrays = _cached_daily_arrays(code, CACHE_TTL["daily_arrays"])
     if not arrays:
         return None
     closes, opens, highs, lows, volumes = arrays
@@ -12484,7 +12617,7 @@ def analyze_stock(w, market_env=None):
     # 日足（移動平均・RSI・ボリンジャー等、分析の中核部分）は日本株なら立花証券APIを優先する
     # （yfinanceのレート制限リスクを避けるため。2026-08-20ユーザー要望）。取得できない場合のみ
     # yfinanceにフォールバックする。
-    arrays = _tachibana_daily_arrays(code) if w.get("market", "JP") != "US" else None
+    arrays = _cached_daily_arrays(code, CACHE_TTL["daily_arrays"]) if w.get("market", "JP") != "US" else None
     if arrays:
         closes, opens, highs, lows, volumes = arrays
     else:
@@ -14916,9 +15049,9 @@ class Handler(SimpleHTTPRequestHandler):
     def log_message(self, *a):
         pass  # アクセスログは静かに
 
-    def _send_json(self, obj):
+    def _send_json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
@@ -15302,6 +15435,24 @@ class Handler(SimpleHTTPRequestHandler):
                   f"出来高候補{result['stage2ValidCount']}件→自動登録{result['registeredCount']}件"
                   f"（降格{result['demotedToSeenCount']}件・時間進行度{result['marketTimeProgressRatio']}）")
             self._send_json(result)
+        elif self.path.startswith("/api/trade-analysis/live"):
+            # トレード分析 リアルタイム自動更新（2026-09-12新規）：FAST UPDATE用の軽量スナップ
+            # ショット。analyze_stock()は呼ばない（HEAVYは既存/api/analysisが担当）。symbol必須、
+            # marketは省略時JP。対象銘柄のStage1データがまだ無い場合は404。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            symbol = (params.get("symbol", [None])[0] or "").strip()
+            market = (params.get("market", ["JP"])[0] or "JP").strip()
+            if not symbol:
+                self._send_json({"error": "symbolは必須です"}, status=400)
+            elif investment_db is None or not DATABASE_URL:
+                self._send_json({"error": "DB未設定"}, status=503)
+            else:
+                result = compute_light_trade_analysis_snapshot(DATABASE_URL, self.current_user, symbol, market=market)
+                if result is None:
+                    self._send_json({"error": "対象銘柄の当日値が取得できません"}, status=404)
+                else:
+                    self._send_json(result)
         elif self.path.startswith("/api/entry-candidates"):
             # 2026-09-10新規（Market Intelligence Timeline Phase2-C「今買い時TOP5＋Thesis永続化」）：
             # entry_ready_top5（ENTRY_SCOREで選ばれた「今エントリー条件が整っている」候補）と

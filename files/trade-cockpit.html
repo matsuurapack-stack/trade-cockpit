@@ -468,6 +468,30 @@ const MARKET_STALE_MINUTES = 15; // 市場指標（日経・ドル円等の分�
 // 2026-09-09更新（ユーザー要望）：ニュース自動更新間隔。旧60分→20分。表示文言・setIntervalの
 // 両方がこの定数を参照するため、値を変える際はここ1箇所だけでよい（マジックナンバー化しない）。
 const NEWS_AUTO_REFRESH_MINUTES = 20;
+
+// トレード分析 リアルタイム自動更新（2026-09-12新規）：FAST UPDATE（軽量・現在値/ENTRY条件等）
+// とHEAVY ANALYSIS（重い・ニュース/Expert View/ルール評価等、既存/api/analysisがこれに相当）を
+// 分離する。既存の分析取得ロジック（fetchAnalysisFor/refreshAnalysisContext）自体は無変更、
+// FAST UPDATEは新規に追加するだけ（指示書1・2番）。
+const FAST_UPDATE_INTERVAL_MARKET_MS = 10 * 1000;    // 市場時間中：10秒
+const FAST_UPDATE_INTERVAL_OFFHOURS_MS = 90 * 1000;  // 市場時間外：60〜180秒の中央値
+const FAST_UPDATE_INTERVAL_HIDDEN_MS = 45 * 1000;    // タブ非表示時：30〜60秒の中央値
+const HEAVY_UPDATE_INTERVAL_MARKET_MS = 60 * 1000;   // 市場時間中：60秒
+const HEAVY_UPDATE_INTERVAL_OFFHOURS_MS = 150 * 1000; // 市場時間外：60〜180秒の中央値
+const LIVE_FRESH_SEC = 15;  // 0〜15秒：LIVE
+const LIVE_DELAY_SEC = 30;  // 15〜30秒：DELAY、それ以上：STALE
+// 東証の取引時間（9:00-15:00、昼休みも含めた大まかな判定。ザラ場・寄り付き/引け際の厳密判定は
+// しない——FAST/HEAVYの更新間隔を切り替えるための大雑把な目安で十分）。
+function isJstMarketHours(){
+  try{
+    const jstStr=new Date().toLocaleString("en-US",{timeZone:"Asia/Tokyo"});
+    const jst=new Date(jstStr);
+    const day=jst.getDay(); // 0=日 6=土
+    if(day===0||day===6)return false;
+    const mins=jst.getHours()*60+jst.getMinutes();
+    return mins>=9*60 && mins<=15*60;
+  }catch(e){return true;} // 判定不能時は安全側（更新頻度を落とさない）に倒す
+}
 const isStaleFetchedAt = (iso, staleMinutes) => {
   if (!iso) return true;
   const t = new Date(iso).getTime();
@@ -491,6 +515,21 @@ const FRESHNESS_COLOR = { live: "var(--up)", delayed: "var(--inkSoft)", stale: "
 function FreshnessBadge({ iso, staleMinutes, title }) {
   const info = freshnessInfo(iso, staleMinutes);
   return <span className="mono" style={{ fontSize: 10.5, color: FRESHNESS_COLOR[info.level], marginLeft: 8 }} title={title}>{info.text}</span>;
+}
+// トレード分析 リアルタイム自動更新（2026-09-12新規）：FAST UPDATEの鮮度を秒単位で表示する
+// 専用バッジ（指示書7・10番）。既存のFreshnessBadge（分単位、銘柄分析全体の鮮度）とは別物——
+// LIVE/DELAY/STALEの秒閾値（0-15s/15-30s/30s+）はFAST UPDATE専用の基準。
+function LiveStatusBadge({updatedAt}){
+  const [,forceTick]=useState(0);
+  useEffect(()=>{const id=setInterval(()=>forceTick(v=>v+1),5000);return()=>clearInterval(id);},[]);
+  if(!updatedAt)return <span style={{fontSize:10.5,color:"var(--inkFaint)"}}>—</span>;
+  const t=new Date(updatedAt).getTime();
+  if(isNaN(t))return <span style={{fontSize:10.5,color:"var(--inkFaint)"}}>—</span>;
+  const ageSec=(Date.now()-t)/1000;
+  const state=ageSec<=LIVE_FRESH_SEC?"LIVE":ageSec<=LIVE_DELAY_SEC?"DELAY":"STALE";
+  const meta={LIVE:{icon:"🟢",color:"var(--up)"},DELAY:{icon:"🟡",color:"var(--inkSoft)"},STALE:{icon:"🔴",color:"var(--down)"}}[state];
+  const hhmmss=new Date(updatedAt).toLocaleTimeString("ja-JP",{hour12:false});
+  return <span className="mono" style={{fontSize:10.5,fontWeight:700,color:meta.color,whiteSpace:"nowrap"}} title="現在値・ENTRY条件の自動更新（FAST UPDATE）の最終取得時刻">{meta.icon} {state} {hhmmss}</span>;
 }
 const WD = ["日","月","火","水","木","金","土"];
 const MAX = 300;
@@ -10001,24 +10040,88 @@ function App(){
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[s.analysisTargets,tab]);
 
-  // 2026-09-08新規：上のuseEffectは「分析タブを開いた瞬間／対象銘柄が変わった瞬間」しか
-  // 見ないため、開いたまま15分以上経過した場合は何もトリガーが無くSTALE表示のまま放置されて
-  // しまう（指示書5番「一定時間以上古ければstale扱い→再取得を試す」を機械的に満たすため）。
-  // 分析タブを開いている間だけ、1分おきに陳腐化していないか確認し、あれば自動で最新化する。
+  // トレード分析 リアルタイム自動更新（2026-09-12更新）：HEAVY ANALYSIS（ニュース・Expert
+  // View・ルール評価・類似経験検索・thesis再評価等を含む重い分析＝既存/api/analysis）を、
+  // 「分析タブを開いている間」市場時間中60秒・市場時間外60〜180秒（中央値150秒）で自動実行する
+  // （指示書3番）。以前は「ANALYSIS_STALE_MINUTES=15分を超えたら」という陳腐化ゲート付きだったが、
+  // 指示書は「HEAVY: 1〜3分ごと」を明確に要求しているため、開いている間は無条件（_refreshing中の
+  // ものだけ除く＝二重リクエスト防止）に切り替えた。表示中カード（analysisItems）のみが対象で
+  // 全56銘柄のフル再分析は行わない点は既存のまま（指示書5番）。
   useEffect(()=>{
     if(tab!=="analysis")return;
-    const id=setInterval(()=>{
+    let cancelled=false, timeoutId=null;
+    const tick=()=>{
+      if(cancelled)return;
       const ad=sRef.current.analysisData;
       const targets=sRef.current.analysisTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean).filter(w=>{
         const a=ad[w.code];
-        if(!a||a._refreshing)return false;
-        return isStaleFetchedAt(a._fetchedAtIso,ANALYSIS_STALE_MINUTES);
+        return !a||!a._refreshing;
       });
       if(targets.length)refreshAnalysisContext(targets);
-    },60*1000);
-    return ()=>clearInterval(id);
+      timeoutId=setTimeout(tick,isJstMarketHours()?HEAVY_UPDATE_INTERVAL_MARKET_MS:HEAVY_UPDATE_INTERVAL_OFFHOURS_MS);
+    };
+    timeoutId=setTimeout(tick,isJstMarketHours()?HEAVY_UPDATE_INTERVAL_MARKET_MS:HEAVY_UPDATE_INTERVAL_OFFHOURS_MS);
+    return ()=>{cancelled=true;if(timeoutId)clearTimeout(timeoutId);};
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[tab]);
+
+  // ===== トレード分析 リアルタイム自動更新：FAST UPDATE（2026-09-12新規） =====
+  // 現在値・前日比・VWAP・RSI・短期MA・ENTRY条件・WAIT/ENTRY READY/RISK・経験スコアを軽量に
+  // 追従させる（指示書1番）。ニュース取得・詳細AI分析（HEAVY、上のuseEffect）は一切呼ばない。
+  const [liveAnalysis,setLiveAnalysis]=useState({}); // code -> {price,pct,vwap,rsi,shortMa,entryState,entryConditions,signal,risk,experienceScore,updatedAt}
+  const [liveTransition,setLiveTransition]=useState({}); // code -> {text,ts}（状態変化の一時表示、指示書8番）
+  const liveInFlightRef=useRef(new Set()); // 同一symbolへの重複リクエスト防止（指示書13-9番）
+  const prevEntryStateRef=useRef({});
+  const liveFetchOne=useCallback(async(code,market)=>{
+    if(liveInFlightRef.current.has(code))return;
+    liveInFlightRef.current.add(code);
+    try{
+      const r=await fetch(`/api/trade-analysis/live?symbol=${encodeURIComponent(code)}&market=${encodeURIComponent(market||"JP")}`);
+      if(r.ok){
+        const d=await r.json();
+        if(!d.error){
+          const prevState=prevEntryStateRef.current[code];
+          if(prevState && d.entry_state && prevState!==d.entry_state){
+            const isRiskNow=d.risk||d.entry_state==="CHASE_RISK"||d.entry_state==="INVALID";
+            const becameEntryReady=d.entry_state==="ENTRY_READY"||d.entry_state==="NOW_BUYABLE";
+            const msg=isRiskNow?"RISKへ変化":becameEntryReady?"ENTRY READYに変化":`${ENTRY_STATE_META[d.entry_state]?.label||d.entry_state}に変化`;
+            setLiveTransition(t=>({...t,[code]:{text:msg,ts:Date.now()}}));
+          }
+          prevEntryStateRef.current[code]=d.entry_state;
+          setLiveAnalysis(prev=>({...prev,[code]:{price:d.price,pct:d.pct,vwap:d.vwap,rsi:d.rsi,shortMa:d.short_ma,
+            entryState:d.entry_state,entryConditions:d.entry_conditions,signal:d.signal,risk:d.risk,
+            experienceScore:d.experience_score,updatedAt:d.updated_at}}));
+        }
+      }
+    }catch(e){}
+    finally{liveInFlightRef.current.delete(code);}
+  },[]);
+  const analysisItemsRef=useRef(analysisItems);
+  useEffect(()=>{analysisItemsRef.current=analysisItems;},[analysisItems]);
+  useEffect(()=>{
+    if(tab!=="analysis")return;
+    let cancelled=false, timeoutId=null;
+    const tick=async()=>{
+      if(cancelled)return;
+      const items=analysisItemsRef.current;
+      await Promise.all(items.map(w=>liveFetchOne(w.code,w.market)));
+      if(cancelled)return;
+      const hidden=typeof document!=="undefined"&&document.visibilityState==="hidden";
+      const delay=hidden?FAST_UPDATE_INTERVAL_HIDDEN_MS:(isJstMarketHours()?FAST_UPDATE_INTERVAL_MARKET_MS:FAST_UPDATE_INTERVAL_OFFHOURS_MS);
+      timeoutId=setTimeout(tick,delay);
+    };
+    tick();
+    return ()=>{cancelled=true;if(timeoutId)clearTimeout(timeoutId);};
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[tab,liveFetchOne]);
+  // 「今すぐ更新」＝FAST+HEAVYを強制即時実行（指示書2番）。既存の🔄今すぐ最新化ボタン
+  // （refreshAnalysisContext、HEAVY）に軽量FAST取得を並行追加するだけで、ボタン自体・
+  // HEAVY側の処理は無変更。
+  const forceFullRefresh=useCallback((w)=>{
+    refreshAnalysisContext([w]);
+    liveFetchOne(w.code,w.market);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[liveFetchOne]);
 
   // ===== デスクトップ通知（セクター内逆行銘柄・出来高ブレイクアウトの監視銘柄自動追加で使用） =====
   // 2026-08-21 ユーザー要望：旧「本日優先」5分おき自動スキャン機能（priorityTargets・
@@ -11117,22 +11220,40 @@ function App(){
                 {analysisItems.map(w=>{
                   const a=s.analysisData[w.code];
                   const enr=analysisEnrichedMap.get(w.code); // v3-6 Step1：監視銘柄タブと共通のPrimary/Action Status
+                  const live=liveAnalysis[w.code]; // トレード分析 リアルタイム自動更新（FAST UPDATE）
+                  const transition=liveTransition[w.code];
+                  const showTransition=transition && (Date.now()-transition.ts)<8000; // 一時表示（指示書8番、次のFAST/HEAVY再描画で自然に消える）
                   return <div key={w.code} className="card">
                     <div className="card-hd" style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
                       <div><div className="card-t">{w.name}</div><div className="card-n mono">{w.code}</div></div>
                       <div style={{display:"flex",alignItems:"center",gap:6}}>
                         {analysisConsultMsg && <span style={{fontSize:11,color:"var(--accent)",fontWeight:700}}>{analysisConsultMsg}</span>}
+                        <LiveStatusBadge updatedAt={live?.updatedAt}/>
                         {/* 2026-09-09新規（監視銘柄・市場チャートの時間足切替、対象画面「銘柄分析画面」対応）：
                             既存の監視銘柄一覧と同じ共通ChartModalをこのカードからも開けるようにした。
                             新しいチャートロジックは作らず、setChartModalへ渡すオブジェクトの形も
                             監視銘柄一覧のonOpenChart呼び出しと完全に同じにする。 */}
                         <button className="action-btn" onClick={()=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}>📈 チャート</button>
-                        {a && <button className="action-btn" title="現在値・市場指標を取り直してから分析を再計算する" onClick={()=>refreshAnalysisContext([w])} disabled={a._refreshing}>{a._refreshing?"更新中…":"🔄 今すぐ最新化"}</button>}
+                        {/* トレード分析 リアルタイム自動更新（2026-09-12）：「今すぐ更新」＝FAST+HEAVY
+                            強制即時実行（指示書2番）。ボタン自体は削除せず、役割だけ拡張する。 */}
+                        {a && <button className="action-btn" title="FAST（現在値・ENTRY条件）+HEAVY（詳細分析）を今すぐ強制的に完全更新する" onClick={()=>forceFullRefresh(w)} disabled={a._refreshing}>{a._refreshing?"更新中…":"🔄 今すぐ更新"}</button>}
                         {a && <button className="action-btn" onClick={()=>copyAnalysisConsult(w,a)}>🤖 詳細分析を相談</button>}
                         {a && <button className="action-btn" onClick={()=>openJournalDraft(w,a)}>記録に追加</button>}
                         <button className="iconbtn" title="分析対象から外す" onClick={()=>toggleAnalysisTarget(w.code)}>×</button>
                       </div>
                     </div>
+                    {showTransition && <div style={{fontSize:11.5,fontWeight:700,color:transition.text==="RISKへ変化"?"var(--down)":"var(--up)",background:transition.text==="RISKへ変化"?"var(--downBg)":"var(--upBg)",border:`1px solid ${transition.text==="RISKへ変化"?"var(--down)":"var(--up)"}`,borderRadius:4,padding:"4px 8px",marginBottom:6}}>
+                      ⚡ {transition.text}
+                    </div>}
+                    {live && <div style={{display:"flex",flexWrap:"wrap",gap:"2px 10px",fontSize:11,color:"var(--inkSoft)",marginBottom:6}} className="mono">
+                      {live.price!=null && <span>現在値 {live.price.toLocaleString()}</span>}
+                      {live.pct!=null && <span style={{color:live.pct>0?"var(--up)":live.pct<0?"var(--down)":"var(--inkFaint)"}}>{(live.pct>0?"+":"")+live.pct.toFixed(2)}%</span>}
+                      {live.vwap!=null && <span>VWAP {live.vwap.toLocaleString()}</span>}
+                      {live.rsi!=null && <span>RSI {live.rsi}</span>}
+                      {live.entryConditions && <span>ENTRY条件 {live.entryConditions.passed}/{live.entryConditions.total}</span>}
+                      {live.entryState && <span style={{fontWeight:700,color:ENTRY_STATE_META[live.entryState]?.color||"var(--inkSoft)"}}>{ENTRY_STATE_META[live.entryState]?.label||live.entryState}</span>}
+                      {live.experienceScore!=null && <span>経験値 {live.experienceScore}/10</span>}
+                    </div>}
                     {!a
                       ? <div style={{fontSize:12.5,color:"var(--inkSoft)"}}>
                           {analyzing
