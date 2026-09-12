@@ -3007,6 +3007,40 @@ def compute_light_trade_analysis_snapshot(database_url, user_id, code, market="J
         print("  trade-analysis/live: experience score取得で例外（無視して続行）", code, e)
 
     fields = _light_snapshot_fields(code, row, comp, entry_state, snapshot, rsi_val, short_ma_val, experience_score)
+
+    # Choruco Style / ちょる子式（2026-09-12新規、指示書59番）：FAST UPDATE連携。
+    # market_mode/event_riskはキャッシュ済み（CHORUCO_MARKET_MODE_CACHE_TTL）の値を再利用する
+    # だけで重い計算は追加しない。story_statusは既存storyがある場合のみdetect_story_break()
+    # （軽量・純粋関数）で毎回再評価する。
+    try:
+        market_mode_result = compute_choruco_market_mode_cached(database_url, user_id) \
+            if (investment_db and database_url) else None
+        market_mode = (market_mode_result or {}).get("mode")
+        event_risk_level = (market_mode_result or {}).get("event_risk_level", "LOW")
+        story = investment_db.get_latest_choruco_story(database_url, user_id, code) \
+            if (investment_db and database_url) else None
+        story_status = None
+        if story and story.get("status") != "BROKEN":
+            fast_snapshot = {"price": fields.get("price"), "vwap": fields.get("vwap"),
+                               "short_ma": fields.get("short_ma"), "entry_state": entry_state,
+                               "market_mode": market_mode}
+            break_reasons = detect_story_break(story.get("story_json") or {}, fast_snapshot)
+            story_status = classify_story_status(story.get("story_score"), break_reasons)
+        elif story:
+            story_status = "BROKEN"
+        sector_flow_label = "NEUTRAL"
+        fields["market_mode"] = market_mode
+        fields["event_risk_level"] = event_risk_level
+        fields["story_status"] = story_status
+        fields["choruco_fit"] = compute_choruco_fit(market_mode, sector_flow_label, event_risk_level,
+                                                        (story or {}).get("story_score"))
+    except Exception as e:
+        print("  trade-analysis/live: choruco連携で例外（無視して続行）", code, e)
+        fields["market_mode"] = None
+        fields["event_risk_level"] = None
+        fields["story_status"] = None
+        fields["choruco_fit"] = None
+
     fields["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     return fields
 
@@ -10038,6 +10072,18 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
     result = {"trades_synced": 0, "waits_synced": 0, "experience_ids": []}
     if investment_db is None or not database_url:
         return result
+    # Choruco Style連携（2026-09-12新規、指示書38番）：market_mode/event_riskの連続的な
+    # 時系列履歴はまだ保存していないため（既知の制約）、15:30同期時点で1回だけ計算した値を
+    # その日の全トレードへ共通で使う——「エントリー時点の厳密なモード」ではなく「その日の
+    # 引け後に見た代表値」であることに注意（将来、時系列スナップショットを追加すれば
+    # 個別トレードごとの正確な値に置き換えられる設計にしてある）。
+    market_mode_today, event_risk_today = None, None
+    try:
+        mode_result = compute_choruco_market_mode(database_url, user_id)
+        market_mode_today = mode_result.get("mode")
+        event_risk_today = mode_result.get("event_risk_level")
+    except Exception as e:
+        print("  daily-review: choruco market mode取得で例外（無視して続行）", e)
     history = investment_db.list_trade_history(database_url, user_id, limit=500)
     exits_today = [t for t in history if str(t.get("closed_at") or "")[:10] == review_date]
     for t in exits_today:
@@ -10052,6 +10098,8 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
             "exit_time": t.get("closed_at"), "gross_pnl": gross_pnl, "gross_pnl_pct": gross_pnl_pct,
             "result_class": result_class,
             "trade_result_score": compute_trade_result_score(gross_pnl_pct),
+            "market_mode_at_entry": market_mode_today, "market_mode_at_exit": market_mode_today,
+            "event_risk_at_entry": event_risk_today,
             "notes": "15:30自動評価による自動登録（sync_trade_experiences_for_date）。",
         }
         try:
@@ -10266,6 +10314,18 @@ def generate_daily_review_with_learning(database_url, user_id, review_date, user
         except Exception as e:
             print("  daily-review: decision_quality/trade_result保存で例外（無視して続行）", e)
 
+    # Choruco Style / ちょる子式評価（2026-09-12新規、指示書39・40番）。既存score_total等の
+    # 5軸評価とは別軸で100点満点、daily_reviews.choruco_score/choruco_breakdown_jsonへ保存する。
+    choruco_result = None
+    try:
+        market_mode_today = compute_choruco_market_mode(database_url, user_id).get("mode")
+        choruco_result = evaluate_choruco_daily_performance(market_mode_today, today_trades)
+        if review:
+            investment_db.update_daily_review_choruco_score(database_url, user_id, review_date,
+                                                                choruco_result["total"], choruco_result)
+    except Exception as e:
+        print("  daily-review: choruco評価保存で例外（無視して続行）", e)
+
     if finalize:
         try:
             finalized_review = investment_db.mark_daily_review_finalized(database_url, user_id, review_date)
@@ -10277,6 +10337,7 @@ def generate_daily_review_with_learning(database_url, user_id, review_date, user
     return {
         "review": review, "sync": sync_result, "behaviorUpdated": behavior_updated,
         "patternCandidatesTracked": len(pattern_stats), "ruleCandidatesProposed": rule_candidates_proposed,
+        "choruco": choruco_result,
     }
 
 
@@ -10352,6 +10413,641 @@ def _daily_review_scheduler_loop():
         except Exception as e:
             print("  [DailyReview] スケジューラループで例外", e)
         time.sleep(30)
+
+
+# ============================================================
+# Choruco Style / ちょる子式（2026-09-12新規）。既存ENTRY SCORE・Rule Engine・
+# Trade Experience Learning・15:30 Daily Reviewには一切変更を加えず、その上に積む補助判断
+# レイヤーとして追加する。AIが勝手にACTIVEルールを書き換えることはない（既存
+# upsert_trade_rule_from_text/_evaluate_rule_promotionは経由しない）。既存ルールとの矛盾が
+# ある場合は既存ルールを優先——本レイヤーの各関数は「表示・提案」のみを行い、既存の
+# entry_score/entry_state/ACTIVEルールの判定結果そのものを書き換えることはない。
+# ============================================================
+
+# ---- MARKET MODE（指示書1〜5番） ----
+CHORUCO_MODE_ATTACK_THRESHOLD = 75
+CHORUCO_MODE_NORMAL_THRESHOLD = 45
+CHORUCO_MODE_SCORE_WEIGHTS = {
+    "us_market": 20, "japan_breadth": 20, "sector_rotation": 15, "volatility": 15,
+    "rates_fx": 10, "entry_quality": 10, "event_risk": 10,
+}
+
+
+def build_choruco_market_mode(us_market_score, japan_breadth_score, sector_rotation_score,
+                                volatility_score, rates_fx_score, entry_quality_score, event_risk_score,
+                                force_defense_reasons=None):
+    """指示書3・4番：CHORUCO_MODE（ATTACK/NORMAL/DEFENSE）を100点満点の加重合計から決める
+    純粋関数（各サブスコアは0-100、呼び出し側で正規化済みの値を渡す）。
+    配点：US market/futures20・Japan breadth20・sector rotation15・volatility15・rates/FX10・
+    entry candidate quality10・event risk10＝100。
+    force_defense_reasonsが非空なら、指示書5番によりスコアに関係なくDEFENSEにする。"""
+    subscores = {"us_market": us_market_score, "japan_breadth": japan_breadth_score,
+                 "sector_rotation": sector_rotation_score, "volatility": volatility_score,
+                 "rates_fx": rates_fx_score, "entry_quality": entry_quality_score,
+                 "event_risk": event_risk_score}
+    total = sum((subscores[k] or 0) * w / 100 for k, w in CHORUCO_MODE_SCORE_WEIGHTS.items())
+    total = round(max(0.0, min(100.0, total)), 1)
+    force_defense = bool(force_defense_reasons)
+    if force_defense:
+        mode = "DEFENSE"
+    elif total >= CHORUCO_MODE_ATTACK_THRESHOLD:
+        mode = "ATTACK"
+    elif total >= CHORUCO_MODE_NORMAL_THRESHOLD:
+        mode = "NORMAL"
+    else:
+        mode = "DEFENSE"
+    dist_from_boundary = min(abs(total - CHORUCO_MODE_NORMAL_THRESHOLD), abs(total - CHORUCO_MODE_ATTACK_THRESHOLD))
+    confidence = "HIGH" if (force_defense or dist_from_boundary >= 15) else ("MEDIUM" if dist_from_boundary >= 5 else "LOW")
+    # 指示書3番のpositive_factors/negative_factors：各軸が中央値(50)より高いか低いかで
+    # 機械的にラベル化する（恣意的な固定文言リストを作らない、閾値50は「平均的な地合い」の目安）。
+    axis_labels = {"us_market": "US market/futures", "japan_breadth": "Japan market breadth",
+                    "sector_rotation": "sector rotation", "volatility": "volatility (inverse)",
+                    "rates_fx": "rates/FX stability", "entry_quality": "entry candidate quality",
+                    "event_risk": "event safety"}
+    positive_factors = [axis_labels[k] for k, v in subscores.items() if (v or 0) >= 60]
+    negative_factors = [axis_labels[k] for k, v in subscores.items() if (v or 0) < 40]
+    event_penalty = round(max(0, 10 - (subscores.get("event_risk") or 10) / 10), 1)
+    risk_penalty = round(max(0, 10 - (subscores.get("entry_quality") or 10) / 10), 1)
+    return {
+        "mode": mode, "score": total, "confidence": confidence,
+        "positive_factors": positive_factors, "negative_factors": negative_factors,
+        "event_penalty": event_penalty, "risk_penalty": risk_penalty,
+        "force_defense": force_defense, "force_defense_reasons": list(force_defense_reasons or []),
+        "subscores": subscores,
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+
+def detect_choruco_force_defense(vix_value=None, vix_prev=None, nikkei_futures_chg=None, sox_chg=None,
+                                    kospi_chg=None, usdjpy_chg=None, crude_chg=None, event_risk_level=None,
+                                    failed_break_ratio=None):
+    """指示書5番：強制DEFENSE条件。該当した理由のリストを返す（空＝該当なし）。
+    スコアに関係なくDEFENSEへ強制する材料——恣意的な閾値だが、いずれも「急変」を検知する
+    ための単純な変化率しきい値であり、将来調整しやすいよう定数化はせず素直な数値のまま
+    書く（他のCHORUCO定数と異なり、この関数だけの局所的な閾値のため）。"""
+    reasons = []
+    if event_risk_level == "EXTREME":
+        reasons.append("重要イベントが極めて近い（EXTREME）")
+    if vix_value is not None and vix_prev and vix_value >= vix_prev * 1.15:
+        reasons.append("VIX急騰")
+    if nikkei_futures_chg is not None and nikkei_futures_chg <= -2.0:
+        reasons.append("日経先物急落")
+    if sox_chg is not None and sox_chg <= -3.0:
+        reasons.append("SOX急落")
+    if kospi_chg is not None and kospi_chg <= -3.0:
+        reasons.append("KOSPI急落（サーキットブレーカー級）")
+    if usdjpy_chg is not None and abs(usdjpy_chg) >= 2.0:
+        reasons.append("USDJPY急変")
+    if crude_chg is not None and crude_chg >= 5.0:
+        reasons.append("原油急騰")
+    if failed_break_ratio is not None and failed_break_ratio >= 0.5:
+        reasons.append("市場全体でFAILED BREAK急増")
+    return reasons
+
+
+def _choruco_scale_centered(value, center, spread, invert=False):
+    """変化率等の実測値を0-100スコアへ変換する共通ヘルパー。centerを50点とし、spread
+    （プラス/マイナス片側の幅）でクランプする。invert=Trueは値が大きいほど悪い指標
+    （VIX等）用。"""
+    if value is None:
+        return 50.0
+    z = (value - center) / spread if spread else 0
+    score = 50 + z * 50
+    if invert:
+        score = 100 - score
+    return round(max(0.0, min(100.0, score)), 1)
+
+
+CHORUCO_MARKET_MODE_CACHE_TTL = 20  # 指示書61番「market_mode:10〜30秒」
+
+
+def compute_choruco_market_mode_cached(database_url, user_id):
+    """compute_choruco_market_mode()をCHORUCO_MARKET_MODE_CACHE_TTL秒でラップする。
+    FAST UPDATE（10秒間隔・銘柄ごと）から呼ばれても、実際の指数取得・ENTRY候補再計算は
+    このTTLごとに1回で済む（指示書59番「重い計算は禁止」）。"""
+    key = f"choruco_mode:{user_id}"
+    entry = _cache_get(key)
+    if _cache_fresh(entry, CHORUCO_MARKET_MODE_CACHE_TTL):
+        return entry["value"]
+    value = compute_choruco_market_mode(database_url, user_id)
+    _cache_set(key, value)
+    return value
+
+
+def compute_choruco_market_mode(database_url, user_id):
+    """CHORUCO_MODEのI/Oラッパー。既存の_fetch_index_snapshot（indexキャッシュ、TTL45秒＝
+    指示書61番「market_mode:10〜30秒」相当を既存キャッシュで代用、新規の重い取得経路は
+    追加しない）・_score_entry_candidates（ENTRY READY/RISK等のカウントは.debugを再利用）・
+    upcoming_event_signalsをそのまま使う。"""
+    empty = {"mode": "NORMAL", "score": 50.0, "confidence": "LOW", "positive_factors": [],
+              "negative_factors": [], "event_penalty": 0, "risk_penalty": 0, "force_defense": False,
+              "force_defense_reasons": [], "subscores": {}, "updated_at": None}
+    idx = _fetch_index_snapshot(["nikkei", "topix_etf", "growth250_etf", "nikkei_fut", "nasdaq", "sox",
+                                    "kospi", "vix", "us10y", "usdjpy", "wti"])
+
+    def chg(key):
+        return (idx.get(key) or {}).get("changePct")
+
+    us_market_score = round((_choruco_scale_centered(chg("nasdaq"), 0, 1.5) +
+                              _choruco_scale_centered(chg("sox"), 0, 2.5)) / 2, 1)
+    japan_breadth_score = round((_choruco_scale_centered(chg("nikkei"), 0, 1.0) +
+                                  _choruco_scale_centered(chg("topix_etf"), 0, 1.0) +
+                                  _choruco_scale_centered(chg("growth250_etf"), 0, 1.5) +
+                                  _choruco_scale_centered(chg("nikkei_fut"), 0, 1.0)) / 4, 1)
+    volatility_score = _choruco_scale_centered(idx.get("vix", {}).get("value"), 18, 8, invert=True)
+    rates_fx_score = round((_choruco_scale_centered(chg("us10y"), 0, 3.0, invert=True) +
+                             _choruco_scale_centered(chg("usdjpy"), 0, 1.0)) / 2, 1)
+
+    entry_quality_score, event_risk_score = 50.0, 50.0
+    try:
+        sector_flow = compute_choruco_sector_flow(database_url, user_id)
+        sectors = sector_flow.get("sectors", [])
+        n_sectors = len(sectors) or 1
+        strong = sum(1 for s in sectors if s["flow"] == "STRONG")
+        weak = sum(1 for s in sectors if s["flow"] == "WEAKENING")
+        sector_rotation_score = round(50 + (strong - weak) / n_sectors * 50, 1)
+    except Exception as e:
+        print("  choruco: sector flow取得で例外（無視して続行）", e)
+        sector_rotation_score = 50.0
+    # 指示書59・61番「重い計算は禁止」：_score_entry_candidates()（Stage2・5分足スナップショットを
+    # 監視銘柄全件に対して取得する重い処理、TOP5表示ロジック修正で判明した通り数百銘柄規模だと
+    # 数分かかることがある）は呼ばない。市場モードは既に取得済みのStage1（共有キャッシュ）
+    # だけから安く近似する——「対象市場全体でプラス圏＆対市場優位な銘柄の比率」を
+    # entry candidate qualityの代理指標とし、「大幅安（-3%以下）の比率」をfailed_break_ratioの
+    # 代理指標とする。
+    failed_break_ratio = None
+    try:
+        stage1 = run_momentum_stage1()
+        stage1_rows = list(stage1.get("rows", {}).values())
+        watchlist_codes = {w.get("code") for w in
+                            (investment_db.list_watchlist(database_url, user_id, market="JP")
+                             if (investment_db is not None and database_url) else [])}
+        relevant_rows = [r for r in stage1_rows if r.get("code") in watchlist_codes] if watchlist_codes else stage1_rows
+        n = len(relevant_rows)
+        if n:
+            strong_candidates = sum(1 for r in relevant_rows
+                                      if (r.get("changePct") or 0) > 0 and (r.get("marketRS") or 0) > 0)
+            failed_break_count = sum(1 for r in relevant_rows if (r.get("changePct") or 0) <= -3)
+            entry_quality_score = round(min(100.0, strong_candidates / n * 300), 1)
+            failed_break_ratio = failed_break_count / n
+    except Exception as e:
+        print("  choruco: entry candidate quality簡易算出で例外（無視して続行）", e)
+
+    event_risk_level = "LOW"
+    try:
+        events_info = investment_db.upcoming_event_signals(database_url, user_id) if (investment_db and database_url) else {"events": []}
+        events_with_hours = [{"importance": e.get("importance"),
+                                "hours_to_event": e.get("business_days_until", 0) * 24}
+                               for e in events_info.get("events", [])]
+        event_risk_level = compute_event_risk_for_events(events_with_hours)
+        event_risk_score = {"LOW": 90.0, "MEDIUM": 65.0, "HIGH": 35.0, "EXTREME": 5.0}[event_risk_level]
+    except Exception as e:
+        print("  choruco: event risk取得で例外（無視して続行）", e)
+
+    force_reasons = detect_choruco_force_defense(
+        vix_value=idx.get("vix", {}).get("value"), nikkei_futures_chg=chg("nikkei_fut"),
+        sox_chg=chg("sox"), kospi_chg=chg("kospi"), usdjpy_chg=chg("usdjpy"), crude_chg=chg("wti"),
+        event_risk_level=event_risk_level, failed_break_ratio=failed_break_ratio)
+
+    result = build_choruco_market_mode(us_market_score, japan_breadth_score, sector_rotation_score,
+                                          volatility_score, rates_fx_score, entry_quality_score, event_risk_score,
+                                          force_defense_reasons=force_reasons)
+    result["event_risk_level"] = event_risk_level
+    return result
+
+
+# ---- EVENT RISK（指示書6〜8番） ----
+CHORUCO_EVENT_RISK_LOT_MULTIPLIER = {"LOW": 1.00, "MEDIUM": 0.75, "HIGH": 0.50, "EXTREME": 0.25}
+CHORUCO_CRITICAL_EVENT_KEYWORDS = ("FOMC", "日銀", "BOJ", "CPI", "雇用統計", "NFP", "ECB", "PCE")
+
+
+def classify_event_risk_level(hours_to_event, importance=None, title=None):
+    """指示書6・7番：EVENT_RISK_LEVEL（LOW/MEDIUM/HIGH/EXTREME）。>48h LOW / 24-48h MEDIUM /
+    6-24h HIGH / <6h EXTREMEが基本。FOMC/CPI/雇用統計等の重要イベント（重み付け、指示書7番
+    「ただしイベント種類により重み付け」）はcritical判定または件名一致で1段階厳しくする。"""
+    if hours_to_event is None:
+        return "LOW"
+    if hours_to_event > 48:
+        base = "LOW"
+    elif hours_to_event > 24:
+        base = "MEDIUM"
+    elif hours_to_event > 6:
+        base = "HIGH"
+    else:
+        base = "EXTREME"
+    is_critical = (importance or "").lower() == "critical" or \
+        any(kw in (title or "") for kw in CHORUCO_CRITICAL_EVENT_KEYWORDS)
+    if is_critical:
+        order = ["LOW", "MEDIUM", "HIGH", "EXTREME"]
+        base = order[min(order.index(base) + 1, len(order) - 1)]
+    return base
+
+
+def compute_event_risk_for_events(events_with_hours):
+    """複数イベントのうち最も厳しいレベルを採用する。"""
+    order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "EXTREME": 3}
+    levels = [classify_event_risk_level(e.get("hours_to_event"), e.get("importance"), e.get("title"))
+              for e in (events_with_hours or [])]
+    if not levels:
+        return "LOW"
+    return max(levels, key=lambda l: order[l])
+
+
+def event_risk_lot_multiplier(event_risk_level):
+    """指示書8番：イベント前ロット縮小。LOW1.00/MEDIUM0.75/HIGH0.50/EXTREME0.25。"""
+    return CHORUCO_EVENT_RISK_LOT_MULTIPLIER.get(event_risk_level, 1.0)
+
+
+# ---- SECTOR FLOW（指示書27〜28番） ----
+
+def classify_sector_flow_label(vs_market):
+    """指示書27番：CHORUCO_SECTOR_FLOW。セクター対市場（vsMarket、既存_compute_sector_stats
+    と同じ定義）からSTRONG/NEUTRAL/WEAKENINGを機械的にラベル化する。"""
+    if vs_market is None:
+        return "NEUTRAL"
+    if vs_market >= 1.0:
+        return "STRONG"
+    if vs_market <= -1.0:
+        return "WEAKENING"
+    return "NEUTRAL"
+
+
+def compute_choruco_sector_flow(database_url, user_id):
+    """指示書27番：CHORUCO_SECTOR_FLOW。既存_compute_sector_stats()（AUTO_SECTOR_LEADERの
+    セクター集計と共有、run_momentum_stage1のキャッシュに従属）をそのまま再利用する
+    （新規の全市場再集計はしない）。"""
+    stage1 = run_momentum_stage1()
+    nikkei_chg = stage1.get("nikkeiChangePct")
+    stats = _compute_sector_stats(stage1, nikkei_chg)
+    sectors = []
+    for sector, avg in stats["avg"].items():
+        vs_market = stats["vsMarket"].get(sector)
+        sectors.append({"sector": sector, "avgChangePct": round(avg, 2),
+                          "vsMarket": round(vs_market, 2) if vs_market is not None else None,
+                          "rank": stats["rank"].get(sector), "flow": classify_sector_flow_label(vs_market)})
+    sectors.sort(key=lambda s: s["rank"] or 999)
+    return {"sectors": sectors, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+
+
+# ---- CHORUCO FIT（指示書53・54番） ----
+CHORUCO_FIT_MODE_POINTS = {"ATTACK": 3, "NORMAL": 2, "DEFENSE": 1}
+CHORUCO_FIT_SECTOR_POINTS = {"STRONG": 2, "NEUTRAL": 1, "WEAKENING": 0}
+CHORUCO_FIT_EVENT_POINTS = {"LOW": 2, "MEDIUM": 1, "HIGH": 0.5, "EXTREME": 0}
+
+
+def compute_choruco_fit(market_mode, sector_flow_label, event_risk_level, story_score=None, price_action_ok=True):
+    """指示書53・54番：CHORUCO FIT 0-10。market_mode fit3+sector flow fit2+event safety2+
+    story quality2+price action1＝10。既存ENTRY SCOREには一切影響しない補助スコア。"""
+    mode_fit = CHORUCO_FIT_MODE_POINTS.get(market_mode, 1)
+    sector_fit = CHORUCO_FIT_SECTOR_POINTS.get(sector_flow_label, 1)
+    event_fit = CHORUCO_FIT_EVENT_POINTS.get(event_risk_level, 1)
+    story_fit = 2 if (story_score or 0) >= 60 else (1 if (story_score or 0) >= 40 else 0)
+    price_fit = 1 if price_action_ok else 0
+    return round(mode_fit + sector_fit + event_fit + story_fit + price_fit, 1)
+
+
+def compute_choruco_stock_view(database_url, user_id, symbol, sector=None):
+    """GET /api/choruco/stock/{symbol}向けの統合ビュー。市場モード・セクターフロー・
+    イベントリスク・ストーリー・CHORUCO FIT・推奨ロット倍率をまとめて返す。"""
+    market_mode_result = compute_choruco_market_mode_cached(database_url, user_id)
+    sector_flow = compute_choruco_sector_flow(database_url, user_id)
+    sector_label = next((s["flow"] for s in sector_flow.get("sectors", []) if s["sector"] == sector), "NEUTRAL") \
+        if sector else "NEUTRAL"
+    event_risk_level = market_mode_result.get("event_risk_level", "LOW")
+    if investment_db is not None and database_url:
+        try:
+            events_info = investment_db.upcoming_event_signals(database_url, user_id, code=symbol, sector=sector)
+            events_with_hours = [{"importance": e.get("importance"), "hours_to_event": e.get("business_days_until", 0) * 24,
+                                    "title": e.get("title")} for e in events_info.get("events", [])]
+            event_risk_level = compute_event_risk_for_events(events_with_hours)
+        except Exception as e:
+            print("  choruco: 銘柄別イベントリスク取得で例外（無視して続行）", symbol, e)
+    story = None
+    if investment_db is not None and database_url:
+        try:
+            story = investment_db.get_latest_choruco_story(database_url, user_id, symbol)
+        except Exception as e:
+            print("  choruco: story取得で例外（無視して続行）", symbol, e)
+    story_score = (story or {}).get("story_score")
+    choruco_fit = compute_choruco_fit(market_mode_result["mode"], sector_label, event_risk_level, story_score)
+    multiplier = compute_choruco_position_multiplier(market_mode_result["mode"], event_risk_level)
+    return {
+        "symbol": symbol, "market_mode": market_mode_result["mode"],
+        "market_mode_score": market_mode_result["score"], "sector_flow": sector_label,
+        "event_risk_level": event_risk_level, "story": story, "choruco_fit": choruco_fit,
+        "position_multiplier": multiplier,
+    }
+
+
+# ---- POSITION SIZE MULTIPLIER（指示書9〜12番） ----
+CHORUCO_MODE_BASE_MULTIPLIER = {"ATTACK": 1.00, "NORMAL": 0.70, "DEFENSE": 0.50}  # 指示書9・11番の例（DEFENSE x0.5=100株、NORMAL x0.7）に合わせる
+CHORUCO_STOCK_RISK_MULTIPLIERS = {
+    "MOMENTUM_STOCK": 0.5, "HIGH_VOLATILITY": 0.6, "LOW_LIQUIDITY": 0.5,
+    "EVENT_BEFORE_EARNINGS": 0.5, "CHASE_RISK": 0.25, "FAILED_BREAK": 0.0,
+}
+
+
+def compute_choruco_position_multiplier(market_mode, event_risk_level, stock_risk_tags=None):
+    """指示書9・10番：最終ロット倍率＝base(mode)×event_risk×個別リスク。複数の個別リスクが
+    該当する場合は最も厳しい（最小）倍率を採用する（単純な掛け算の複合による過度な
+    ペナルティを避ける——例えばMOMENTUM_STOCK(0.5)とHIGH_VOLATILITY(0.6)が両方該当しても
+    0.5×0.6=0.3ではなくmin=0.5を採用）。既存ENTRY SCOREには一切影響しない。"""
+    base = CHORUCO_MODE_BASE_MULTIPLIER.get(market_mode, 0.5)
+    event_mult = event_risk_lot_multiplier(event_risk_level)
+    applicable = [CHORUCO_STOCK_RISK_MULTIPLIERS[t] for t in (stock_risk_tags or []) if t in CHORUCO_STOCK_RISK_MULTIPLIERS]
+    stock_mult = min(applicable) if applicable else 1.0
+    return round(max(0.0, min(1.0, base * event_mult * stock_mult)), 3)
+
+
+def round_position_size_to_lot(calculated_shares, lot_size=100):
+    """指示書12番：SBI 100株単位対応。切り捨てで単元株に丸める（160→100、240→200）。"""
+    if calculated_shares is None or calculated_shares <= 0:
+        return 0
+    return int(calculated_shares // lot_size) * lot_size
+
+
+def compute_choruco_final_position_size(base_position_size, market_mode, event_risk_level,
+                                            stock_risk_tags=None, lot_size=100):
+    """指示書11番：最終ロット計算。指示書8番「EXTREME: 0.25 or NO ENTRY」は、より安全側の
+    解釈として「DEFENSEモード×EXTREMEイベント」の組み合わせのみNO ENTRY（0株）に倒し、
+    それ以外のEXTREME（ATTACK/NORMAL下でのEXTREME接近）は0.25倍数として計算する
+    （どちらの解釈も指示書の記述と矛盾しないため、より保守的な方を選択）。
+    戻り値：(final_shares, multiplier)。"""
+    multiplier = compute_choruco_position_multiplier(market_mode, event_risk_level, stock_risk_tags)
+    if event_risk_level == "EXTREME" and market_mode == "DEFENSE":
+        return 0, multiplier
+    raw = (base_position_size or 0) * multiplier
+    return round_position_size_to_lot(raw, lot_size), multiplier
+
+
+def derive_choruco_stock_risk_tags(entry_state=None, volume_type=None, days_to_earnings=None,
+                                      liquidity_low=False, volatility_score=None):
+    """既存の軽量スナップショット（compute_light_trade_analysis_snapshot等）が既に持っている
+    値だけからCHORUCO_STOCK_RISK_MULTIPLIER用のタグを導出する（新規の重い判定は追加しない）。"""
+    tags = []
+    if volume_type == "CLIMAX_UP":
+        tags.append("MOMENTUM_STOCK")
+    if entry_state == "CHASE_RISK":
+        tags.append("CHASE_RISK")
+    if volatility_score is not None and volatility_score >= 70:
+        tags.append("HIGH_VOLATILITY")
+    if liquidity_low:
+        tags.append("LOW_LIQUIDITY")
+    if days_to_earnings is not None and 0 <= days_to_earnings <= 2:
+        tags.append("EVENT_BEFORE_EARNINGS")
+    return tags
+
+
+# ---- STORY ENGINE（指示書13〜17番） ----
+CHORUCO_STORY_SCORE_WEIGHTS = {
+    "market_alignment": 15, "sector_alignment": 15, "technical_setup": 20, "volume_confirmation": 15,
+    "relative_strength": 15, "event_safety": 10, "risk_reward": 10,
+}
+
+
+def compute_story_score(components):
+    """指示書14番：STORY SCORE 0-100（componentsは各軸0-100、欠損キーは0点扱い）。"""
+    total = sum((components or {}).get(k, 0) * w / 100 for k, w in CHORUCO_STORY_SCORE_WEIGHTS.items())
+    return round(max(0.0, min(100.0, total)), 1)
+
+
+def detect_story_break(story, current_snapshot):
+    """指示書15番：ストーリー崩れの軽量検知（FAST UPDATE、5〜10秒間隔から呼ばれる想定、
+    重い計算はしない）。storyは{"support":..,"market_mode_at_entry":..}等（TRADE_STORY、
+    指示書13番）、current_snapshotはFAST UPDATEスナップショット
+    （price/vwap/short_ma/entry_state/market_mode等）。戻り値：崩れ理由のリスト（空＝崩れなし）。"""
+    story = story or {}
+    snap = current_snapshot or {}
+    reasons = []
+    price = snap.get("price")
+    support = story.get("support")
+    if support is not None and price is not None and price < support:
+        reasons.append("support割れ")
+    if snap.get("vwap") is not None and price is not None and price < snap["vwap"]:
+        reasons.append("VWAP割れ")
+    if snap.get("short_ma") is not None and price is not None and price < snap["short_ma"]:
+        reasons.append("短期MA割れ")
+    if snap.get("entry_state") == "CHASE_RISK":
+        reasons.append("breakout失敗（高値掴みリスク化）")
+    if snap.get("entry_state") in ("WEAK", "INVALID"):
+        reasons.append("RS急低下・根拠崩れ")
+    if snap.get("market_mode") == "DEFENSE" and story.get("market_mode_at_entry") != "DEFENSE":
+        reasons.append("地合いDEFENSE化")
+    return reasons
+
+
+def classify_story_status(score, break_reasons=None):
+    """指示書16番：ACTIVE/WEAKENING/BROKEN。break_reasonsが1件でもあれば、スコアが高くても
+    即BROKEN扱いにする（指示書15番の崩れ条件は「明確な条件崩れ」であり、スコアの緩やかな
+    低下とは別に即時反映すべきため）。"""
+    if break_reasons:
+        return "BROKEN"
+    if score is None:
+        return "WEAKENING"
+    if score >= 60:
+        return "ACTIVE"
+    if score >= 40:
+        return "WEAKENING"
+    return "BROKEN"
+
+
+# ---- PRICE ACTION OVERRIDE / GOOD_NEWS_WEAK_PRICE（指示書29〜31番） ----
+
+def detect_good_news_weak_price(catalyst_sentiment, relative_strength, volume_type):
+    """指示書29・31番：材料出尽くし・「良い材料なのに上がらない」検知。ポジティブ材料＋
+    相対的弱さ＋売り出来高の3条件が揃った場合のみ検知する（単独では判定しない、
+    指示書「これは重要な弱気シグナル」）。"""
+    if catalyst_sentiment != "positive":
+        return False
+    if relative_strength is None or relative_strength >= 0:
+        return False
+    if volume_type not in ("NEGATIVE_VOLUME", "CLIMAX_DOWN"):
+        return False
+    return True
+
+
+def apply_price_action_override(fundamental_signal, price_action_signal):
+    """指示書30番：PRICE_ACTION_OVERRIDE。ファンダ/材料がPOSITIVEでもprice actionがWEAKなら
+    WAITへ強制する。"""
+    if fundamental_signal == "POSITIVE" and price_action_signal == "WEAK":
+        return "WAIT"
+    return fundamental_signal
+
+
+# ---- パーフェクトオーダー / 押し目判定（指示書32〜34番） ----
+
+def classify_perfect_order(ma5, ma25, ma75, ma5_prev=None, ma25_prev=None, ma75_prev=None):
+    """指示書32番：5>25>75かつ傾きが正（比較対象が渡された場合のみ傾き判定）。
+    ENTRY理由単独にはしない——この関数はラベルを返すだけで、呼び出し側のentry_scoreには
+    一切加点しない（指示書「ただしENTRY理由単独にはしない」）。"""
+    if ma5 is None or ma25 is None or ma75 is None:
+        return False
+    if not (ma5 > ma25 > ma75):
+        return False
+    if ma5_prev is not None and ma25_prev is not None and ma75_prev is not None:
+        return ma5 > ma5_prev and ma25 > ma25_prev and ma75 > ma75_prev
+    return True
+
+
+def classify_pullback_candidate(perfect_order, price, ma5, ma25, support=None, volume_ok=None, sector_strong=None):
+    """指示書33番：パーフェクトオーダー中、5日線/25日線接近＋support＋出来高＋セクター強さの
+    押し目候補判定。"""
+    if not perfect_order or ma25 is None or ma5 is None:
+        return False
+    near_ma = abs(ma5 - ma25) / ma25 < 0.02 if ma25 else False
+    support_ok = support is None or (price is not None and price >= support)
+    return bool(near_ma and support_ok and volume_ok is not False and sector_strong is not False)
+
+
+# ---- Daily Review連携（指示書39〜44番） ----
+CHORUCO_DAILY_SCORE_MAX = {"market_mode_adaptation": 30, "event_awareness": 20, "position_sizing": 20,
+                             "story_discipline": 20, "defense_execution": 10}
+
+
+def evaluate_choruco_daily_performance(market_mode_today, trades_today, missed_opportunity=False):
+    """指示書39〜44番：ちょる子式スコア（100点満点）。「取引しなかった」を単純に失敗扱い
+    しない（指示書41・42番GOOD_DEFENSE：DEFENSE日にノートレードは満点）。ATTACK日の
+    ノートレードは指示書43番により減点は弱め（MISSED_OPPORTUNITY候補）。DEFENSE日の
+    高値追いエントリーは指示書44番RULE_VIOLATION_HIGH相当で大きく減点する。"""
+    trades_today = trades_today or []
+    breakdown, notes = {}, []
+
+    if market_mode_today == "DEFENSE":
+        chase_count = sum(1 for t in trades_today if "CHASE_RISK" in (t.get("pattern_tags_json") or []))
+        if not trades_today:
+            breakdown["market_mode_adaptation"] = 30
+            notes.append("GOOD_DEFENSE：DEFENSE日にノートレード（適切な守備、高評価）")
+        elif chase_count:
+            breakdown["market_mode_adaptation"] = max(0, 30 - chase_count * 15)
+            notes.append(f"RULE_VIOLATION_HIGH候補：DEFENSE日に高値追いエントリー{chase_count}件")
+        else:
+            breakdown["market_mode_adaptation"] = 30
+    elif market_mode_today == "ATTACK":
+        if not trades_today:
+            breakdown["market_mode_adaptation"] = 20 if missed_opportunity else 30
+            if missed_opportunity:
+                notes.append("MISSED_OPPORTUNITY候補：ATTACK日にノートレード（減点は弱め）")
+        else:
+            breakdown["market_mode_adaptation"] = 30
+    else:
+        breakdown["market_mode_adaptation"] = 25
+
+    high_risk_entries = sum(1 for t in trades_today if t.get("event_risk_at_entry") in ("HIGH", "EXTREME"))
+    breakdown["event_awareness"] = max(0, 20 - high_risk_entries * 10)
+    if high_risk_entries:
+        notes.append(f"イベントリスクHIGH/EXTREME下でのエントリー{high_risk_entries}件")
+
+    deviations = [abs((t.get("position_multiplier") or 1.0) - (t.get("recommended_multiplier") or 1.0))
+                  for t in trades_today if t.get("position_multiplier") is not None]
+    breakdown["position_sizing"] = max(0, round(20 - (sum(deviations) / len(deviations)) * 40, 1)) if deviations else 20
+
+    broken_trades = [t for t in trades_today if t.get("story_break_status") == "BROKEN"]
+    delayed = sum(1 for t in broken_trades if (t.get("post_trade_analysis_json") or {}).get("exit_delay_after_break") == "DELAYED")
+    breakdown["story_discipline"] = max(0, 20 - delayed * 10) if broken_trades else 20
+
+    if market_mode_today == "DEFENSE":
+        overnight_count = sum(1 for t in trades_today if t.get("trade_style") == "SWING")
+        breakdown["defense_execution"] = max(0, 10 - overnight_count * 5)
+    else:
+        breakdown["defense_execution"] = 10
+
+    total = round(sum(breakdown.values()), 1)
+    return {"total": total, "breakdown": breakdown, "notes": notes}
+
+
+# ---- 学習機能（指示書46〜49番） ----
+
+def aggregate_choruco_mode_performance(experiences):
+    """指示書46番：market_mode別成績（ATTACK/NORMAL/DEFENSE）。件数・勝率・平均損益。"""
+    out = {}
+    for mode in ("ATTACK", "NORMAL", "DEFENSE"):
+        group = [e for e in (experiences or []) if e.get("market_mode_at_entry") == mode]
+        n = len(group)
+        if not n:
+            out[mode] = {"trades": 0, "win_rate": None, "avg_pnl_pct": None}
+            continue
+        wins = sum(1 for e in group if e.get("result_class") == "WIN")
+        pnls = [e["gross_pnl_pct"] for e in group if e.get("gross_pnl_pct") is not None]
+        out[mode] = {"trades": n, "win_rate": round(wins / n, 3),
+                       "avg_pnl_pct": round(sum(pnls) / len(pnls), 2) if pnls else None}
+    return out
+
+
+CHORUCO_LOT_MULTIPLIER_BUCKETS = (0.25, 0.5, 0.75, 1.0)
+
+
+def aggregate_choruco_lot_multiplier_performance(experiences):
+    """指示書47番：ロット倍率別成績（0.25x/0.5x/0.75x/1.0xの最も近いバケットに丸める）。"""
+    buckets = {b: [] for b in CHORUCO_LOT_MULTIPLIER_BUCKETS}
+    for e in (experiences or []):
+        m = e.get("position_multiplier")
+        if m is None:
+            continue
+        nearest = min(CHORUCO_LOT_MULTIPLIER_BUCKETS, key=lambda b: abs(b - m))
+        buckets[nearest].append(e)
+    out = {}
+    for b, group in buckets.items():
+        n = len(group)
+        if not n:
+            out[str(b)] = {"trades": 0, "win_rate": None, "avg_pnl_pct": None, "avg_mae_pct": None, "avg_mfe_pct": None}
+            continue
+        wins = sum(1 for e in group if e.get("result_class") == "WIN")
+        pnls = [e["gross_pnl_pct"] for e in group if e.get("gross_pnl_pct") is not None]
+        maes = [e["max_adverse_excursion_pct"] for e in group if e.get("max_adverse_excursion_pct") is not None]
+        mfes = [e["max_favorable_excursion_pct"] for e in group if e.get("max_favorable_excursion_pct") is not None]
+        out[str(b)] = {"trades": n, "win_rate": round(wins / n, 3),
+                         "avg_pnl_pct": round(sum(pnls) / len(pnls), 2) if pnls else None,
+                         "avg_mae_pct": round(sum(maes) / len(maes), 2) if maes else None,
+                         "avg_mfe_pct": round(sum(mfes) / len(mfes), 2) if mfes else None}
+    return out
+
+
+def aggregate_choruco_story_score_performance(experiences):
+    """指示書48番：STORY別成績（story_score_at_entryを80+/70-79/60-69/<60で集計）。"""
+    def bucket_of(score):
+        if score is None:
+            return None
+        if score >= 80:
+            return "80+"
+        if score >= 70:
+            return "70-79"
+        if score >= 60:
+            return "60-69"
+        return "<60"
+    buckets = {"80+": [], "70-79": [], "60-69": [], "<60": []}
+    for e in (experiences or []):
+        b = bucket_of(e.get("story_score_at_entry"))
+        if b:
+            buckets[b].append(e)
+    out = {}
+    for b, group in buckets.items():
+        n = len(group)
+        wins = sum(1 for e in group if e.get("result_class") == "WIN")
+        out[b] = {"trades": n, "win_rate": round(wins / n, 3) if n else None}
+    return out
+
+
+def aggregate_choruco_story_break_response(experiences):
+    """指示書49番：STORY BREAK後の行動評価（即EXIT/遅延EXIT/HOLDの成績比較）。"""
+    out = {"immediate_exit": {"trades": 0, "avg_pnl_pct": None},
+            "delayed_exit": {"trades": 0, "avg_pnl_pct": None},
+            "held": {"trades": 0, "avg_pnl_pct": None}}
+    key_map = {"IMMEDIATE": "immediate_exit", "DELAYED": "delayed_exit", "HELD": "held"}
+    for e in (experiences or []):
+        if e.get("story_break_status") != "BROKEN":
+            continue
+        response = (e.get("post_trade_analysis_json") or {}).get("story_break_response")
+        bucket = key_map.get(response)
+        if not bucket:
+            continue
+        out[bucket]["trades"] += 1
+    for bucket_key, group_key in key_map.items():
+        group = [e for e in (experiences or [])
+                 if e.get("story_break_status") == "BROKEN"
+                 and (e.get("post_trade_analysis_json") or {}).get("story_break_response") == bucket_key]
+        pnls = [e["gross_pnl_pct"] for e in group if e.get("gross_pnl_pct") is not None]
+        out[group_key]["avg_pnl_pct"] = round(sum(pnls) / len(pnls), 2) if pnls else None
+    return out
 
 
 def _nicosoku_morning_commentary(database_url, user_id):
@@ -15633,6 +16329,47 @@ class Handler(SimpleHTTPRequestHandler):
             summary = build_learning_accumulation_summary(DATABASE_URL, self.current_user, date) \
                 if (investment_db is not None and DATABASE_URL) else {}
             self._send_json(summary)
+        # ---- Choruco Style / ちょる子式（2026-09-12新規、指示書58番）----
+        # /sector-flow・/event-risk・/market-modeは固定パス、/stock/{symbol}・/story/{symbol}は
+        # 動的パス——具体形状を先に判定する（Trade Experience Learning等と同じ徹）。
+        elif self.path.split("?")[0] == "/api/choruco/market-mode":
+            result = compute_choruco_market_mode(DATABASE_URL, self.current_user) \
+                if (investment_db is not None and DATABASE_URL) else {}
+            if result:
+                result["position_multiplier"] = compute_choruco_position_multiplier(
+                    result.get("mode"), result.get("event_risk_level"))
+            self._send_json(result)
+        elif self.path.split("?")[0] == "/api/choruco/sector-flow":
+            result = compute_choruco_sector_flow(DATABASE_URL, self.current_user) \
+                if (investment_db is not None and DATABASE_URL) else {"sectors": []}
+            self._send_json(result)
+        elif self.path.split("?")[0] == "/api/choruco/event-risk":
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            code = params.get("symbol", [None])[0]
+            sector = params.get("sector", [None])[0]
+            if investment_db is not None and DATABASE_URL:
+                events_info = investment_db.upcoming_event_signals(DATABASE_URL, self.current_user, code=code, sector=sector)
+                events_with_hours = [{"importance": e.get("importance"), "hours_to_event": e.get("business_days_until", 0) * 24,
+                                        "title": e.get("title")} for e in events_info.get("events", [])]
+                level = compute_event_risk_for_events(events_with_hours)
+                self._send_json({"event_risk_level": level, "lot_multiplier": event_risk_lot_multiplier(level),
+                                  "events": events_info.get("events", [])})
+            else:
+                self._send_json({"event_risk_level": "LOW", "lot_multiplier": 1.0, "events": []})
+        elif self.path.split("?")[0].startswith("/api/choruco/story/"):
+            symbol = self.path.split("?")[0][len("/api/choruco/story/"):]
+            story = investment_db.get_latest_choruco_story(DATABASE_URL, self.current_user, symbol) \
+                if (investment_db is not None and DATABASE_URL) else None
+            self._send_json({"symbol": symbol, "story": story})
+        elif self.path.split("?")[0].startswith("/api/choruco/stock/"):
+            symbol = self.path.split("?")[0][len("/api/choruco/stock/"):]
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            sector = params.get("sector", [None])[0]
+            result = compute_choruco_stock_view(DATABASE_URL, self.current_user, symbol, sector=sector) \
+                if (investment_db is not None and DATABASE_URL) else {"symbol": symbol}
+            self._send_json(result)
         elif self.path.split("?")[0] == "/api/trade-decision-events":
             qs = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(qs)
@@ -16658,8 +17395,17 @@ class Handler(SimpleHTTPRequestHandler):
                                                                      current_setup_tags=current_tags)
                 except Exception as e:
                     print("  knowledge-context: stock behavior要約取得で例外（無視して続行）", code, e)
+            # Choruco Style / ちょる子式（2026-09-12新規、指示書21・53番）：トレード分析カードの
+            # 「🛡 ちょる子式」表示用に同梱する（追加のfetchを増やさない）。
+            choruco = None
+            if code:
+                try:
+                    choruco = compute_choruco_stock_view(DATABASE_URL, self.current_user, code, sector=body.get("sector"))
+                except Exception as e:
+                    print("  knowledge-context: choruco要約取得で例外（無視して続行）", code, e)
             self._send_json({"context": context, "judgment": judgment, "logId": (log or {}).get("id"),
-                              "tradeExperience": trade_experience, "stockBehavior": stock_behavior})
+                              "tradeExperience": trade_experience, "stockBehavior": stock_behavior,
+                              "choruco": choruco})
         elif self.path == "/api/knowledge-context/top5-flags":
             # 指示書4番：TOP5相談向けの軽量な候補別フラグ（フルコンテキストは取得しない）。
             if not self._investment_db_ready():
@@ -16762,6 +17508,44 @@ class Handler(SimpleHTTPRequestHandler):
             if promoted is None:
                 self._send_json({"error": "対象がRULE_CANDIDATEではないか、見つかりません"}); return
             self._send_json({"rule": promoted})
+        # ---- Choruco Style / ちょる子式（2026-09-12新規、指示書58番）----
+        elif self.path.split("?")[0].startswith("/api/choruco/story/") and self.path.split("?")[0].endswith("/create"):
+            if not self._investment_db_ready():
+                return
+            symbol = self.path.split("?")[0][len("/api/choruco/story/"):-len("/create")]
+            body = self._read_json_body()
+            story_json = body.get("story") or {}
+            components = body.get("components") or {}
+            score = compute_story_score(components) if components else body.get("story_score")
+            market_mode_result = compute_choruco_market_mode(DATABASE_URL, self.current_user)
+            saved = investment_db.create_choruco_story(
+                DATABASE_URL, self.current_user, symbol, story_json, story_score=score,
+                story_score_breakdown_json=components or None, market_mode_at_entry=market_mode_result.get("mode"))
+            if saved is None:
+                self._send_json({"error": "story作成に失敗しました"}); return
+            self._send_json({"story": saved})
+        elif self.path.split("?")[0].startswith("/api/choruco/story/") and self.path.split("?")[0].endswith("/evaluate"):
+            if not self._investment_db_ready():
+                return
+            symbol = self.path.split("?")[0][len("/api/choruco/story/"):-len("/evaluate")]
+            body = self._read_json_body()
+            story_id = body.get("id")
+            existing = investment_db.get_latest_choruco_story(DATABASE_URL, self.current_user, symbol)
+            if story_id is None:
+                story_id = (existing or {}).get("id")
+            if story_id is None:
+                self._send_json({"error": "対象のstoryが見つかりません"}); return
+            snapshot = body.get("snapshot") or {}
+            break_reasons = detect_story_break((existing or {}).get("story_json") or {}, snapshot)
+            components = body.get("components")
+            score = compute_story_score(components) if components else (existing or {}).get("story_score")
+            status = classify_story_status(score, break_reasons)
+            saved = investment_db.update_choruco_story_evaluation(
+                DATABASE_URL, self.current_user, story_id, status, story_score=score,
+                story_score_breakdown_json=components, break_reasons=break_reasons)
+            if saved is None:
+                self._send_json({"error": "story評価の保存に失敗しました"}); return
+            self._send_json({"story": saved, "break_reasons": break_reasons, "status": status})
         elif self.path == "/api/morning-check/generate":
             # 指示書21番：定時以外でも現在時点の臨時レポートを作成する手動更新（MANUAL）。
             # スケジューラが呼ぶ定時生成もsnapshot_time（T0530等）を指定してこの同じ関数を

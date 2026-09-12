@@ -584,6 +584,36 @@ function DailyReviewToast({review,onOpen,onDismiss}){
     <button className="action-btn" style={{marginTop:8,width:"100%"}} onClick={onOpen}>振り返りを見る</button>
   </div>;
 }
+// Choruco Style / ちょる子式（2026-09-12新規）：MARKET MODE配色（指示書52番、既存テーマの
+// --up（赤=上昇/攻め）/--accent（黄・オレンジ系）/--down（緑=下落/守り、日本の相場慣習配色）に
+// 合わせる。CLAUDE.md「上昇/下落の配色は日本の相場慣習」と同じ考え方を流用。
+const CHORUCO_MODE_META = {
+  ATTACK: {label:"ATTACK", icon:"⚔️", color:"var(--up)"},
+  NORMAL: {label:"NORMAL", icon:"🟡", color:"var(--accent)"},
+  DEFENSE: {label:"DEFENSE", icon:"🛡", color:"var(--down)"},
+};
+const CHORUCO_EVENT_RISK_META = {
+  LOW: {label:"LOW", color:"var(--inkFaint)"}, MEDIUM: {label:"MEDIUM", color:"var(--inkSoft)"},
+  HIGH: {label:"HIGH", color:"var(--accent)"}, EXTREME: {label:"EXTREME", color:"var(--down)"},
+};
+const CHORUCO_STORY_STATUS_META = {
+  ACTIVE: {label:"ACTIVE", color:"var(--up)"}, WEAKENING: {label:"WEAKENING", color:"var(--accent)"},
+  BROKEN: {label:"BROKEN", color:"var(--down)"},
+};
+// 指示書19・20・56番：ATTACK⇄DEFENSE遷移・STORY BROKEN等の通知。既存DailyReviewToastとは
+// 別枠の汎用Toast（同じ見た目パターンを流用するだけで、日次レビュー本体には触れない）。
+function ChorucoToast({notice,onDismiss}){
+  if(!notice)return null;
+  const isAlert=notice.level==="alert";
+  return <div style={{position:"fixed",top:16,right:16,zIndex:1000,maxWidth:320,background:"var(--card)",
+    border:`1px solid ${isAlert?"var(--down)":"var(--accent)"}`,borderRadius:8,padding:"12px 14px",boxShadow:"0 4px 16px rgba(0,0,0,0.25)"}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+      <div style={{fontWeight:800,fontSize:13,color:isAlert?"var(--down)":"var(--ink)"}}>{notice.title}</div>
+      <button className="iconbtn" style={{fontSize:11}} onClick={onDismiss}>×</button>
+    </div>
+    {notice.body && <div style={{fontSize:12,marginTop:4,whiteSpace:"pre-line"}}>{notice.body}</div>}
+  </div>;
+}
 const WD = ["日","月","火","水","木","金","土"];
 const MAX = 300;
 const KEY = "trade-cockpit-v1";
@@ -3601,7 +3631,7 @@ function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[code,sector,market,tradeStyle,baseSignal]);
   if(!result)return null;
-  const{judgment,context,tradeExperience,stockBehavior}=result;
+  const{judgment,context,tradeExperience,stockBehavior,choruco}=result;
   const jm=TRADE_JUDGMENT_META[judgment.judgment]||{label:judgment.judgment,color:"var(--ink)"};
   const keyPoints=(judgment.reasons||[]).slice(0,3); // 指示書：重要ポイントは最大3件程度
   const activeRules=(context.relevant_rules||[]).filter(r=>r.status==="ACTIVE");
@@ -3611,7 +3641,16 @@ function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
   const lossExamples=(sim&&sim.examples||[]).filter(e=>e.result_class==="LOSS");
   const tagCounts=list=>{const c={};list.forEach(e=>(e.pattern_tags_json||[]).forEach(t=>c[t]=(c[t]||0)+1));
     return Object.entries(c).sort((a,b)=>b[1]-a[1]).slice(0,4).map(([t])=>t);};
+  const chorucoModeMeta=choruco?CHORUCO_MODE_META[choruco.market_mode]:null;
+  const chorucoStoryMeta=choruco?.story?CHORUCO_STORY_STATUS_META[choruco.story.status]:null;
   return <div style={{border:`1px solid ${jm.color}`,borderRadius:4,padding:"8px 10px",marginBottom:8,background:"var(--band)"}}>
+    {/* Choruco Style（2026-09-12新規、指示書21番）：カード上部のコンパクト表示。 */}
+    {chorucoModeMeta && <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:6,fontSize:11.5}}>
+      <span style={{fontWeight:800,color:chorucoModeMeta.color}}>🛡 ちょる子式　{chorucoModeMeta.icon} {chorucoModeMeta.label}</span>
+      <span style={{color:"var(--inkSoft)"}}>ロット {choruco.position_multiplier}x</span>
+      <span style={{color:"var(--inkSoft)"}}>Choruco Fit {choruco.choruco_fit}/10</span>
+      {chorucoStoryMeta && <span style={{fontWeight:700,color:chorucoStoryMeta.color}}>Story: {chorucoStoryMeta.label}</span>}
+    </div>}
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:6}}>
       <div style={{fontWeight:800,fontSize:13,color:jm.color}}>総合判断：{jm.label}</div>
       <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>確信度 {judgment.confidence}%</div>
@@ -3653,6 +3692,17 @@ function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
     })()}
     <button className="iconbtn" style={{fontSize:10.5,marginTop:4}} onClick={()=>setDetailOpen(v=>!v)}>{detailOpen?"▾":"▸"} 判断根拠の詳細</button>
     {detailOpen && <div style={{fontSize:11,color:"var(--inkSoft)",marginTop:4,display:"flex",flexDirection:"column",gap:6}}>
+      {/* Choruco Style（2026-09-12新規、指示書21番）：詳細表示。 */}
+      {choruco && <div>
+        <div style={{fontWeight:700,color:"var(--ink)"}}>🛡 ちょる子式 詳細</div>
+        <div>Market Mode：{choruco.market_mode} {choruco.market_mode_score}/100</div>
+        <div>Sector Flow：{choruco.sector_flow}</div>
+        <div>Event Risk：{choruco.event_risk_level}</div>
+        <div>Position Size：{choruco.position_multiplier}x</div>
+        {choruco.story && <div>Story：{choruco.story.status} {choruco.story.story_score!=null?`${choruco.story.story_score}/100`:""}
+          {(choruco.story.break_reasons_json||[]).length>0 && <span style={{color:"var(--down)"}}>（{choruco.story.break_reasons_json.join("・")}）</span>}
+        </div>}
+      </div>}
       {/* 指示書：詳細を開いた場合のみ、どの有識者見解・どのルール・どの市場データが影響したかを
           確認できるようにする（全文はDB/ExpertViewsPanel・トレードルール管理画面が原本）。 */}
       {context.expert_views.length>0 && <div>
@@ -9840,6 +9890,39 @@ function App(){
   // 表示上の即時反映のみ）。
   useEffect(()=>{if(tab==="dailyreview")setDailyReviewUnread(false);},[tab]);
 
+  // Choruco Style / ちょる子式（2026-09-12新規）：MARKET MODE表示（指示書51番）＋
+  // ATTACK⇄DEFENSE遷移通知（指示書20・56番）。CHORUCO_MARKET_MODE_CACHE_TTL（20秒）＋
+  // ここでの30秒ポーリングで、実際の指数取得はサーバー側キャッシュに従う（新規の重い
+  // 取得経路を増やさない）。
+  const [chorucoMode,setChorucoMode]=useState(null);
+  const [chorucoToast,setChorucoToast]=useState(null);
+  const prevChorucoModeRef=useRef(null);
+  const chorucoNoticeSuppressRef=useRef({}); // key -> 最終通知timestamp（指示書57番：5分以内再通知しない）
+  const notifyChorucoOnce=useCallback((key,title,body,level)=>{
+    const last=chorucoNoticeSuppressRef.current[key];
+    if(last && (Date.now()-last)<5*60*1000)return; // 指示書57番
+    chorucoNoticeSuppressRef.current[key]=Date.now();
+    setChorucoToast({title,body,level});
+    playDailyReviewNotifySound();
+  },[]);
+  const checkChorucoMode=useCallback(async()=>{
+    const d=await fetchJsonSafe("/api/choruco/market-mode");
+    if(!d||!d.mode)return;
+    setChorucoMode(d);
+    const prev=prevChorucoModeRef.current;
+    if(prev && prev!==d.mode){
+      if(d.mode==="DEFENSE")notifyChorucoOnce(`mode:${prev}->DEFENSE`,"🚨 DEFENSEへ移行","新規ENTRY縮小","alert");
+      else if(prev==="DEFENSE" && d.mode==="ATTACK")notifyChorucoOnce("mode:DEFENSE->ATTACK","🟢 ATTACKへ改善",null,"info");
+      else if(d.mode==="NORMAL" && prev==="ATTACK")notifyChorucoOnce("mode:ATTACK->NORMAL","⚠ 地合い悪化\nATTACK → NORMAL",null,"info");
+    }
+    prevChorucoModeRef.current=d.mode;
+  },[notifyChorucoOnce]);
+  useEffect(()=>{
+    checkChorucoMode();
+    const id=setInterval(checkChorucoMode,30*1000);
+    return ()=>clearInterval(id);
+  },[checkChorucoMode]);
+
   useEffect(()=>{
     // 今日まだ計算していなければ登録銘柄全体（日本株）で即時計算し、以後は日付が変わるまで再計算しない。
     if(s.breakoutLevelsFetchedDate!==todayISO()){
@@ -11121,6 +11204,20 @@ function App(){
         </label>
       </div>
 
+      {/* Choruco Style / ちょる子式（2026-09-12新規、指示書51・52番）：メイン画面上部の
+          MARKET MODEバナー。ATTACK=緑系/NORMAL=黄橙系/DEFENSE=赤系（既存テーマの
+          --up/--accent/--downをそのまま流用、日本の相場慣習配色とは独立した意味づけ）。 */}
+      {chorucoMode && (()=>{const meta=CHORUCO_MODE_META[chorucoMode.mode]||{label:chorucoMode.mode,icon:"🛡",color:"var(--inkSoft)"};
+        const eventMeta=CHORUCO_EVENT_RISK_META[chorucoMode.event_risk_level]||{label:"—",color:"var(--inkFaint)"};
+        const mult=chorucoMode.position_multiplier;
+        return <div className="notify-bar" style={{marginTop:8,border:`1px solid ${meta.color}`,flexWrap:"wrap",gap:10}}>
+          <span style={{fontSize:13,fontWeight:800,color:meta.color}}>🛡 Market Mode　{meta.icon} {meta.label}</span>
+          <span style={{fontSize:11.5,color:"var(--inkSoft)"}}>Score {chorucoMode.score}/100（確信度{chorucoMode.confidence}）</span>
+          <span style={{fontSize:11.5,color:eventMeta.color}}>Event Risk: {eventMeta.label}</span>
+          {mult!=null && <span style={{fontSize:11.5,color:"var(--inkSoft)"}}>推奨ロット {mult}x</span>}
+          {chorucoMode.force_defense && <span style={{fontSize:11,color:"var(--down)",fontWeight:700}}>⚠強制DEFENSE：{(chorucoMode.force_defense_reasons||[]).join("・")}</span>}
+        </div>;})()}
+
       {/* v3-4（UI/UX再設計）：タブ構成をTAB_GROUPS（本ファイル上部で定義）に基づく2階層ナビゲーション
           に変更。第1階層＝グループ（監視銘柄／市場／トレード分析／ポジション／記録／ニュース）、
           第2階層＝グループ内の既存タブ（グループ内が1つだけなら省略）。既存のtabキー・各パネルの
@@ -11988,6 +12085,8 @@ function App(){
       <DailyReviewToast review={dailyReviewToast}
         onOpen={()=>{setTab("dailyreview");setDailyReviewToast(null);}}
         onDismiss={()=>setDailyReviewToast(null)}/>
+      {/* Choruco Style（2026-09-12新規、指示書19・20・56番）：MODE変化・STORY BROKEN通知。 */}
+      <ChorucoToast notice={chorucoToast} onDismiss={()=>setChorucoToast(null)}/>
 
       {/* 5章：登録銘柄行の「チャート」ボタンで開くモーダル（タブに依存しない。6章でタブ内チャートは廃止） */}
       {chartModal && <div onClick={()=>setChartModal(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,.5)",zIndex:20,

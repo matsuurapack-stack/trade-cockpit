@@ -1206,6 +1206,7 @@ def init_schema(database_url):
         conn.execute(_MIGRATE_VALIDATION_SESSIONS_V2_SQL)
         conn.execute(_SCHEMA_PARSER_FAILURE_QUEUE_SQL)
         conn.execute(_SCHEMA_CONFIG_CHANGE_LOG_SQL)
+        conn.execute(_SCHEMA_CHORUCO_STYLE_SQL)
         conn.commit()
 
 
@@ -2112,6 +2113,8 @@ _TRADE_EXPERIENCE_COLS = (
     "max_adverse_excursion_pct", "post_exit_max_price", "post_exit_min_price", "profit_capture_ratio",
     "learning_status", "learning_weight", "score_breakdown_json", "decision_snapshot_json",
     "post_trade_analysis_json", "notes", "decision_quality_score", "trade_result_score",
+    "market_mode_at_entry", "market_mode_at_exit", "event_risk_at_entry", "position_multiplier",
+    "recommended_multiplier", "story_score_at_entry", "story_break_status", "story_break_reason",
 )
 
 
@@ -2373,6 +2376,23 @@ def update_daily_review_learning_scores(database_url, user_id, review_date, deci
                 "UPDATE daily_reviews SET decision_quality_score=%s, trade_result_score=%s, updated_at=now() "
                 "WHERE user_id=%s AND review_date=%s RETURNING *",
                 [decision_quality_score, trade_result_score, user_id, review_date])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def update_daily_review_choruco_score(database_url, user_id, review_date, choruco_score, choruco_breakdown):
+    """Choruco Style（2026-09-12新規、指示書39・40番）：ちょる子式評価（100点、既存
+    score_total等5軸とは別軸）を保存する。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE daily_reviews SET choruco_score=%s, choruco_breakdown_json=%s::jsonb, updated_at=now() "
+                "WHERE user_id=%s AND review_date=%s RETURNING *",
+                [choruco_score, json.dumps(choruco_breakdown, ensure_ascii=False), user_id, review_date])
             row = cur.fetchone()
         conn.commit()
     return _row_to_json(row) if row else None
@@ -6799,6 +6819,111 @@ def list_config_changes(database_url, limit=50):
             cur.execute("SELECT * FROM config_change_log ORDER BY changed_at DESC LIMIT %s", [limit])
             rows = cur.fetchall()
     return [_row_to_json(r) for r in rows]
+
+
+# Choruco Style / ちょる子式（2026-09-12新規）。既存ENTRY SCORE/Rule Engine/Trade Experience
+# Learning/daily_reviewsには一切変更を加えず、その上に積む補助判断レイヤー用の追加列・
+# テーブルのみ。
+_SCHEMA_CHORUCO_STYLE_SQL = """
+-- 指示書38番：トレード終了後にちょる子式の文脈を保存する（既存のTrade Experience
+-- Learningスキーマへの追加列。decision_snapshot_json/post_trade_analysis_jsonの
+-- no-hindsight分離方針はそのまま踏襲——市場モード・イベントリスクは"at_entry"/"at_exit"を
+-- 分けて保存し、事後情報を事前フィールドに混ぜない）。
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS market_mode_at_entry TEXT;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS market_mode_at_exit TEXT;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS event_risk_at_entry TEXT;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS position_multiplier NUMERIC;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS recommended_multiplier NUMERIC;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS story_score_at_entry NUMERIC;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS story_break_status TEXT;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS story_break_reason TEXT;
+
+-- 指示書39・40番：daily_reviewsへちょる子式評価（100点、既存score_totalとは別軸）を追加。
+ALTER TABLE daily_reviews ADD COLUMN IF NOT EXISTS choruco_score NUMERIC;
+ALTER TABLE daily_reviews ADD COLUMN IF NOT EXISTS choruco_breakdown_json JSONB;
+
+-- 指示書50番：stock_behavior_profilesへちょる子式関連の集計列を追加候補として反映する。
+ALTER TABLE stock_behavior_profiles ADD COLUMN IF NOT EXISTS attack_mode_win_rate NUMERIC;
+ALTER TABLE stock_behavior_profiles ADD COLUMN IF NOT EXISTS normal_mode_win_rate NUMERIC;
+ALTER TABLE stock_behavior_profiles ADD COLUMN IF NOT EXISTS defense_mode_win_rate NUMERIC;
+ALTER TABLE stock_behavior_profiles ADD COLUMN IF NOT EXISTS story_break_frequency NUMERIC;
+ALTER TABLE stock_behavior_profiles ADD COLUMN IF NOT EXISTS good_news_weak_price_rate NUMERIC;
+ALTER TABLE stock_behavior_profiles ADD COLUMN IF NOT EXISTS event_sensitive_score NUMERIC;
+
+-- 指示書13・58番：TRADE_STORY（ENTRY前から作成可能な、まだ約定していない銘柄の
+-- ストーリー定義も持てるよう、trade_experiencesとは独立したテーブルにする）。
+CREATE TABLE IF NOT EXISTS choruco_stories (
+    id                          SERIAL PRIMARY KEY,
+    user_id                     TEXT NOT NULL,
+    symbol                      TEXT NOT NULL,
+    story_json                  JSONB NOT NULL,   -- market/sector/setup/trigger/support/target/invalid_if
+    story_score                 NUMERIC,
+    story_score_breakdown_json  JSONB,
+    status                      TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE|WEAKENING|BROKEN
+    break_reasons_json          JSONB,
+    market_mode_at_entry        TEXT,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_choruco_stories_user_symbol ON choruco_stories(user_id, symbol, created_at DESC);
+"""
+
+
+def create_choruco_story(database_url, user_id, symbol, story_json, story_score=None,
+                            story_score_breakdown_json=None, market_mode_at_entry=None):
+    """指示書13・58番：POST /api/choruco/story/{symbol}/create。"""
+    pool = _get_pool(database_url)
+    if pool is None or not symbol:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "INSERT INTO choruco_stories (user_id, symbol, story_json, story_score, "
+                "story_score_breakdown_json, market_mode_at_entry) VALUES (%s,%s,%s::jsonb,%s,%s::jsonb,%s) "
+                "RETURNING *",
+                [user_id, symbol, json.dumps(story_json, ensure_ascii=False), story_score,
+                 json.dumps(story_score_breakdown_json, ensure_ascii=False) if story_score_breakdown_json else None,
+                 market_mode_at_entry])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def update_choruco_story_evaluation(database_url, user_id, story_id, status, story_score=None,
+                                        story_score_breakdown_json=None, break_reasons=None):
+    """指示書58番：POST /api/choruco/story/{symbol}/evaluate。detect_story_break()の結果を
+    保存する。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE choruco_stories SET status=%s, "
+                "story_score=COALESCE(%s, story_score), "
+                "story_score_breakdown_json=COALESCE(%s::jsonb, story_score_breakdown_json), "
+                "break_reasons_json=%s::jsonb, updated_at=now() "
+                "WHERE id=%s AND user_id=%s RETURNING *",
+                [status, story_score,
+                 json.dumps(story_score_breakdown_json, ensure_ascii=False) if story_score_breakdown_json else None,
+                 json.dumps(break_reasons or [], ensure_ascii=False), story_id, user_id])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def get_latest_choruco_story(database_url, user_id, symbol):
+    """指示書58番：GET /api/choruco/story/{symbol}。最新1件を返す。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM choruco_stories WHERE user_id=%s AND symbol=%s "
+                "ORDER BY created_at DESC LIMIT 1", [user_id, symbol])
+            row = cur.fetchone()
+    return _row_to_json(row) if row else None
 
 
 def count_underlying_events_total(database_url):
