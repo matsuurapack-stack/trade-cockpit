@@ -1208,6 +1208,7 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_CONFIG_CHANGE_LOG_SQL)
         conn.execute(_SCHEMA_CHORUCO_STYLE_SQL)
         conn.execute(_SCHEMA_CROSS_MARKET_LINK_SQL)
+        conn.execute(_SCHEMA_SECTOR_ROTATION_SQL)
         conn.commit()
 
 
@@ -2102,7 +2103,7 @@ def relevant_trade_rules_for(database_url, user_id, categories=None, limit=8):
 
 _TRADE_EXPERIENCE_JSON_COLS = ("wait_reason_json", "entry_reason_json", "exit_reason_json",
                                  "invalidation_reason_json", "pattern_tags_json", "score_breakdown_json",
-                                 "decision_snapshot_json", "post_trade_analysis_json")
+                                 "decision_snapshot_json", "post_trade_analysis_json", "rotation_context_json")
 _TRADE_EXPERIENCE_COLS = (
     "trade_date", "symbol", "stock_name", "side", "trade_style", "quantity", "entry_price", "exit_price",
     "entry_time", "exit_time", "gross_pnl", "gross_pnl_pct", "holding_minutes", "pre_entry_state",
@@ -2118,6 +2119,8 @@ _TRADE_EXPERIENCE_COLS = (
     "recommended_multiplier", "story_score_at_entry", "story_break_status", "story_break_reason",
     "primary_driver", "driver_corr_at_entry", "driver_lag_at_entry", "driver_state_at_entry",
     "driver_state_at_exit", "cross_market_score_at_entry",
+    "sector_at_entry", "sector_state_at_entry", "sector_flow_score_at_entry",
+    "sector_state_at_exit", "sector_flow_score_at_exit", "rotation_context_json",
 )
 
 
@@ -2335,7 +2338,9 @@ def upsert_stock_behavior_profile(database_url, user_id, symbol, fields):
             "overnight_gap_down_rate", "avg_mfe_pct", "avg_mae_pct", "best_entry_time_bucket",
             "worst_entry_time_bucket", "time_bucket_stats_json", "preferred_setup_json",
             "danger_patterns_json", "confidence_level",
-            "primary_driver", "primary_driver_corr", "primary_driver_lag", "cross_market_reliability"]
+            "primary_driver", "primary_driver_corr", "primary_driver_lag", "cross_market_reliability",
+            "best_sector_state_for_entry", "sector_leading_win_rate", "sector_weakening_loss_rate",
+            "rotation_sensitivity"]
     json_cols = {"time_bucket_stats_json", "preferred_setup_json", "danger_patterns_json"}
     present = [c for c in cols if c in (fields or {})]
     if not present:
@@ -6888,6 +6893,39 @@ ALTER TABLE stock_behavior_profiles ADD COLUMN IF NOT EXISTS primary_driver_lag 
 ALTER TABLE stock_behavior_profiles ADD COLUMN IF NOT EXISTS cross_market_reliability NUMERIC;
 """
 
+# Sector Rotation / Capital Flow Engine（2026-09-12新規、前提commit 9f396a1）。
+_SCHEMA_SECTOR_ROTATION_SQL = """
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS sector_at_entry TEXT;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS sector_state_at_entry TEXT;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS sector_flow_score_at_entry NUMERIC;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS sector_state_at_exit TEXT;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS sector_flow_score_at_exit NUMERIC;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS rotation_context_json JSONB;
+
+ALTER TABLE stock_behavior_profiles ADD COLUMN IF NOT EXISTS best_sector_state_for_entry TEXT;
+ALTER TABLE stock_behavior_profiles ADD COLUMN IF NOT EXISTS sector_leading_win_rate NUMERIC;
+ALTER TABLE stock_behavior_profiles ADD COLUMN IF NOT EXISTS sector_weakening_loss_rate NUMERIC;
+ALTER TABLE stock_behavior_profiles ADD COLUMN IF NOT EXISTS rotation_sensitivity NUMERIC;
+
+-- 指示書38番：sector_behavior_profiles新設。
+CREATE TABLE IF NOT EXISTS sector_behavior_profiles (
+    id                        SERIAL PRIMARY KEY,
+    user_id                   TEXT NOT NULL,
+    sector_name               TEXT NOT NULL,
+    sample_count              INTEGER NOT NULL DEFAULT 0,
+    avg_leading_duration      NUMERIC,
+    avg_flow_score            NUMERIC,
+    breakout_success_rate     NUMERIC,
+    exhaustion_failure_rate   NUMERIC,
+    best_time_bucket          TEXT,
+    time_bucket_stats_json    JSONB,
+    confidence_level          TEXT NOT NULL DEFAULT 'LOW',
+    last_updated              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, sector_name)
+);
+"""
+
 
 def create_choruco_story(database_url, user_id, symbol, story_json, story_score=None,
                             story_score_breakdown_json=None, market_mode_at_entry=None):
@@ -6944,6 +6982,58 @@ def get_latest_choruco_story(database_url, user_id, symbol):
                 "ORDER BY created_at DESC LIMIT 1", [user_id, symbol])
             row = cur.fetchone()
     return _row_to_json(row) if row else None
+
+
+def upsert_sector_behavior_profile(database_url, user_id, sector_name, fields):
+    """Sector Rotation学習（2026-09-12新規、指示書38番）：sector単位で冪等にupsertする
+    （UNIQUE(user_id,sector_name)）。"""
+    pool = _get_pool(database_url)
+    if pool is None or not sector_name:
+        return None
+    cols = ["sample_count", "avg_leading_duration", "avg_flow_score", "breakout_success_rate",
+            "exhaustion_failure_rate", "best_time_bucket", "time_bucket_stats_json", "confidence_level"]
+    json_cols = {"time_bucket_stats_json"}
+    present = [c for c in cols if c in (fields or {})]
+    if not present:
+        return get_sector_behavior_profile(database_url, user_id, sector_name)
+    values = [fields.get(c) for c in present]
+    wrapped = [json.dumps(v, ensure_ascii=False) if (c in json_cols and v is not None) else v
+               for c, v in zip(present, values)]
+    insert_placeholders = ["%s::jsonb" if c in json_cols else "%s" for c in present]
+    update_clauses = [f"{c}=EXCLUDED.{c}" for c in present] + ["last_updated=now()"]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO sector_behavior_profiles (user_id, sector_name, {', '.join(present)}) "
+                f"VALUES (%s, %s, {', '.join(insert_placeholders)}) "
+                f"ON CONFLICT (user_id, sector_name) DO UPDATE SET {', '.join(update_clauses)} "
+                f"RETURNING *", [user_id, sector_name] + wrapped)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def get_sector_behavior_profile(database_url, user_id, sector_name):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM sector_behavior_profiles WHERE user_id=%s AND sector_name=%s",
+                        [user_id, sector_name])
+            row = cur.fetchone()
+    return _row_to_json(row) if row else None
+
+
+def list_sector_behavior_profiles(database_url, user_id):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM sector_behavior_profiles WHERE user_id=%s ORDER BY sector_name", [user_id])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
 
 
 def count_underlying_events_total(database_url):

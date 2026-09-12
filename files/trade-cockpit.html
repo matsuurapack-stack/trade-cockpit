@@ -3631,7 +3631,7 @@ function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[code,sector,market,tradeStyle,baseSignal]);
   if(!result)return null;
-  const{judgment,context,tradeExperience,stockBehavior,choruco,crossMarket}=result;
+  const{judgment,context,tradeExperience,stockBehavior,choruco,crossMarket,sectorRotation,chorucoFitV2}=result;
   const jm=TRADE_JUDGMENT_META[judgment.judgment]||{label:judgment.judgment,color:"var(--ink)"};
   const keyPoints=(judgment.reasons||[]).slice(0,3); // 指示書：重要ポイントは最大3件程度
   const activeRules=(context.relevant_rules||[]).filter(r=>r.status==="ACTIVE");
@@ -3658,6 +3658,14 @@ function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
       {crossMarket.divergence!=="NONE" && <span style={{fontWeight:700,color:crossMarket.divergence==="POSITIVE_DIVERGENCE"?"var(--up)":"var(--down)"}}>{crossMarket.divergence==="POSITIVE_DIVERGENCE"?"POSITIVE":"NEGATIVE"} DIVERGENCE</span>}
       {crossMarket.leading_alert && <span style={{fontWeight:700,color:"var(--down)"}}>🚨 {crossMarket.primary_driver}先行{crossMarket.direction==="POSITIVE"?"下落":"上昇"}</span>}
       {crossMarket.catch_up_candidate && <span style={{fontWeight:700,color:"var(--up)"}}>CATCH UP候補</span>}
+    </div>}
+    {/* Sector Rotation / Capital Flow Engine（2026-09-12新規、指示書30・31番）：ちょる子式・
+        Cross Marketと並べて表示。対象テーマが無い銘柄は表示されない。 */}
+    {sectorRotation?.sector && <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:6,fontSize:11.5}}>
+      <span style={{fontWeight:800}}>🔄 {sectorRotation.sector}
+        <b style={{color:{LEADING:"var(--up)",IMPROVING:"var(--up)",NEUTRAL:"var(--inkSoft)",WEAKENING:"var(--down)",LAGGING:"var(--down)"}[sectorRotation.state]||"var(--inkSoft)"}}>{sectorRotation.state}</b>
+        {sectorRotation.score!=null && ` ${sectorRotation.score}`}
+      </span>
     </div>}
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:6}}>
       <div style={{fontWeight:800,fontSize:13,color:jm.color}}>総合判断：{jm.label}</div>
@@ -3720,6 +3728,20 @@ function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
             {d.label}　corr {d.correlation}　lag {d.best_lag_minutes>0?"+":""}{d.best_lag_minutes}m　{d.confidence}
           </div>)}
         <div style={{marginTop:2}}>現在：{crossMarket.divergence==="NONE"?"連動範囲内":(crossMarket.divergence==="POSITIVE_DIVERGENCE"?"POSITIVE DIVERGENCE（個別が強い）":"NEGATIVE DIVERGENCE（個別が弱い）")}</div>
+      </div>}
+      {/* Sector Rotation Engine（2026-09-12新規、指示書28番）：Sector Rotation詳細。 */}
+      {sectorRotation?.sector && <div>
+        <div style={{fontWeight:700,color:"var(--ink)"}}>🔄 Sector Rotation</div>
+        <div style={{marginTop:1}}>{sectorRotation.sector}　Score {sectorRotation.score}　{sectorRotation.state}</div>
+        {sectorRotation.breadth!=null && <div>Breadth {sectorRotation.breadth}%</div>}
+        {sectorRotation.volume_expansion!=null && <div>Volume {sectorRotation.volume_expansion}x</div>}
+        {(sectorRotation.rotation_pairs||[]).length>0 && <div style={{marginTop:2,color:"var(--inkSoft)"}}>
+          資金移動候補：{sectorRotation.rotation_pairs.map(p=>`${p.from_sector}→${p.to_sector}`).join("・")}
+        </div>}
+      </div>}
+      {chorucoFitV2 && <div>
+        <div style={{fontWeight:700,color:"var(--ink)"}}>Choruco Fit {chorucoFitV2.total}/10 内訳</div>
+        <div style={{marginTop:1}}>Market Mode {chorucoFitV2.market_mode}　Event {chorucoFitV2.event}　Story {chorucoFitV2.story}　Cross Market {chorucoFitV2.cross_market}　Sector Flow {chorucoFitV2.sector_flow}</div>
       </div>}
       {/* 指示書：詳細を開いた場合のみ、どの有識者見解・どのルール・どの市場データが影響したかを
           確認できるようにする（全文はDB/ExpertViewsPanel・トレードルール管理画面が原本）。 */}
@@ -8669,6 +8691,10 @@ function DailyReviewPanel(){
   const [genResult,setGenResult]=useState(null);
   const [learningSummary,setLearningSummary]=useState(null);
   const [notifySettings,setNotifySettings]=useState(loadDailyReviewNotifySettings);
+  // Cross-Market Link / Sector Rotation Engine新規（2026-09-12）：「🔗今日の市場連動学習」
+  // 「🔄今日のセクターローテーション学習」。
+  const [crossMarketLearning,setCrossMarketLearning]=useState(null);
+  const [sectorRotationLearning,setSectorRotationLearning]=useState(null);
 
   const load=async(d)=>{
     setLoading(true);
@@ -8677,6 +8703,8 @@ function DailyReviewPanel(){
     setReview(rev);
     setDecisionReview((r&&r.decisionReview)||null);
     setTradeLearning((r&&r.tradeLearning)||null);
+    setCrossMarketLearning((r&&r.crossMarketLearning)||null);
+    setSectorRotationLearning((r&&r.sectorRotationLearning)||null);
     setFeedbackDraft(rev?.user_feedback||"");
     setLoading(false);
     const ls=await fetchJsonSafe(`/api/trade-learning/summary?date=${d}`);
@@ -8801,6 +8829,23 @@ function DailyReviewPanel(){
             <span>新しいPattern Candidate　<b>{learningSummary.new_pattern_candidates}</b>件</span>
             <span>Rule Candidate　<b>{learningSummary.rule_candidates_pending}</b>件</span>
           </div>
+        </div>}
+
+        {/* Cross-Market Link Phase 2新規（2026-09-12、指示書16番）：「🔗今日の市場連動学習」。 */}
+        {crossMarketLearning?.items?.length>0 && <div className="card" style={{padding:"12px 14px",marginTop:10}}>
+          <div style={{fontWeight:800,fontSize:13}}>🔗 今日の市場連動学習</div>
+          <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:3,fontSize:11.5}}>
+            {crossMarketLearning.items.map((it,i)=><div key={i}>
+              {it.symbol} {it.stock_name}　{it.primary_driver}（corr {it.driver_corr_at_entry}・{it.driver_state_at_entry}予測）
+              {it.prediction_valid!=null && <span style={{marginLeft:4,color:it.prediction_valid?"var(--up)":"var(--down)"}}>{it.prediction_valid?"予測有効":"予測外れ"}</span>}
+            </div>)}
+          </div>
+        </div>}
+
+        {/* Sector Rotation Engine新規（2026-09-12、指示書35番）：「🔄今日のセクターローテーション学習」。 */}
+        {sectorRotationLearning?.best_rotation && <div className="card" style={{padding:"12px 14px",marginTop:10}}>
+          <div style={{fontWeight:800,fontSize:13}}>🔄 今日のセクターローテーション学習</div>
+          <div style={{marginTop:6,fontSize:11.5}}>今日のBest Rotation：<b>{sectorRotationLearning.best_rotation}</b></div>
         </div>}
 
         <div className="card" style={{padding:"10px 12px",marginTop:10}}>
@@ -9940,6 +9985,32 @@ function App(){
     const id=setInterval(checkChorucoMode,30*1000);
     return ()=>clearInterval(id);
   },[checkChorucoMode]);
+
+  // Sector Rotation / Capital Flow Engine（2026-09-12新規、指示書27・45番）：メイン画面上部の
+  // コンパクト表示。FAST〜HEAVYの中間の30秒間隔でポーリングする（サーバー側も
+  // SECTOR_ROTATION_SNAPSHOT_CACHE_TTL=30秒でキャッシュ済み）。
+  const [sectorRotationMap,setSectorRotationMap]=useState(null);
+  const [sectorRotationToastShown,setSectorRotationToastShown]=useState({}); // pair key -> ts（指示書57番相当の抑制）
+  const checkSectorRotation=useCallback(async()=>{
+    const d=await fetchJsonSafe("/api/sector-rotation/map");
+    if(!d)return;
+    setSectorRotationMap(d);
+    for(const pair of (d.rotation_pairs||[])){
+      const key=`${pair.from_sector}->${pair.to_sector}`;
+      const last=sectorRotationToastShown[key];
+      if(!last || (Date.now()-last)>5*60*1000){
+        setSectorRotationToastShown(p=>({...p,[key]:Date.now()}));
+        notifyChorucoOnce(`rotation:${key}`,"🔄 セクターローテーション",
+          `${pair.from_sector} ↓\n${pair.to_sector} ↑\n資金移動候補`,"info");
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[notifyChorucoOnce]);
+  useEffect(()=>{
+    checkSectorRotation();
+    const id=setInterval(checkSectorRotation,30*1000);
+    return ()=>clearInterval(id);
+  },[checkSectorRotation]);
 
   useEffect(()=>{
     // 今日まだ計算していなければ登録銘柄全体（日本株）で即時計算し、以後は日付が変わるまで再計算しない。
@@ -11234,6 +11305,18 @@ function App(){
           <span style={{fontSize:11.5,color:eventMeta.color}}>Event Risk: {eventMeta.label}</span>
           {mult!=null && <span style={{fontSize:11.5,color:"var(--inkSoft)"}}>推奨ロット {mult}x</span>}
           {chorucoMode.force_defense && <span style={{fontSize:11,color:"var(--down)",fontWeight:700}}>⚠強制DEFENSE：{(chorucoMode.force_defense_reasons||[]).join("・")}</span>}
+        </div>;})()}
+
+      {/* Sector Rotation / Capital Flow Engine（2026-09-12新規、指示書27番）：コンパクト表示。
+          スコアが取れているテーマのみ、上位5件を表示する（UIを肥大化させない）。 */}
+      {sectorRotationMap && sectorRotationMap.map?.some(s=>s.score!=null) && (()=>{
+        const top=[...sectorRotationMap.map].filter(s=>s.score!=null).sort((a,b)=>(b.score||0)-(a.score||0)).slice(0,5);
+        const stateColor={LEADING:"var(--up)",IMPROVING:"var(--up)",NEUTRAL:"var(--inkSoft)",WEAKENING:"var(--down)",LAGGING:"var(--down)"};
+        return <div className="notify-bar" style={{marginTop:8,flexWrap:"wrap",gap:10}}>
+          <span style={{fontSize:12.5,fontWeight:800}}>🔄 Sector Rotation</span>
+          {top.map(s=><span key={s.sector} style={{fontSize:11.5}}>
+            {s.sector}　<b style={{color:stateColor[s.state]||"var(--inkSoft)"}}>{s.state}</b>
+          </span>)}
         </div>;})()}
 
       {/* v3-4（UI/UX再設計）：タブ構成をTAB_GROUPS（本ファイル上部で定義）に基づく2階層ナビゲーション

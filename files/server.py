@@ -3030,6 +3030,18 @@ def compute_light_trade_analysis_snapshot(database_url, user_id, code, market="J
         except Exception as e:
             print("  trade-analysis/live: cross-market取得で例外（無視して続行）", code, e)
 
+        # Sector Rotation Engine新規（指示書32番）：FAST UPDATE連携。
+        # build_sector_rotation_snapshot_cached()（TTL30秒）を再利用するだけで重い再集計は
+        # しない。半導体・AI関連以外の対象外テーマの銘柄はsector_infoがNoneのまま。
+        sector_info = None
+        try:
+            themes = get_stock_themes(code)
+            if themes:
+                rotation_snapshot = build_sector_rotation_snapshot_cached(database_url, user_id)
+                sector_info = {"sector": themes[0], **(rotation_snapshot.get("sectors", {}).get(themes[0]) or {})}
+        except Exception as e:
+            print("  trade-analysis/live: sector rotation取得で例外（無視して続行）", code, e)
+
         story_status = None
         if story and story.get("status") != "BROKEN":
             fast_snapshot = {"price": fields.get("price"), "vwap": fields.get("vwap"),
@@ -3043,6 +3055,8 @@ def compute_light_trade_analysis_snapshot(database_url, user_id, code, market="J
                          if d.get("label") == cross_market.get("primary_driver")), None),
                     "direction": cross_market.get("direction"),
                 }
+            if sector_info:
+                fast_snapshot["sector_rotation"] = {"state": sector_info.get("state")}
             break_reasons = detect_story_break(story.get("story_json") or {}, fast_snapshot)
             story_status = classify_story_status(story.get("story_score"), break_reasons)
         elif story:
@@ -3059,6 +3073,10 @@ def compute_light_trade_analysis_snapshot(database_url, user_id, code, market="J
             fields["cross_market_divergence"] = cross_market.get("divergence")
             fields["cross_market_leading_alert"] = cross_market.get("leading_alert")
             fields["cross_market_score"] = cross_market.get("cross_market_score")
+        if sector_info:
+            fields["sector_rotation_sector"] = sector_info.get("sector")
+            fields["sector_rotation_state"] = sector_info.get("state")
+            fields["sector_rotation_score"] = sector_info.get("score")
     except Exception as e:
         print("  trade-analysis/live: choruco連携で例外（無視して続行）", code, e)
         fields["market_mode"] = None
@@ -10134,6 +10152,23 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
                 cross_score = cm.get("cross_market_score")
         except Exception as e:
             print("  daily-review: cross-market取得で例外（無視して続行）", t.get("code"), e)
+
+        # Sector Rotation Engine新規（指示書36番）：同期時点のsector state・flow scoreを付与
+        # する（既知の制約：market_mode/primary_driver同様「エントリー時点の厳密な値」ではなく
+        # 「15:30同期時点の代表値」）。
+        sector_at_entry = sector_state = sector_flow_score = rotation_context = None
+        try:
+            themes = get_stock_themes(t.get("code"))
+            if themes:
+                rotation_snapshot = build_sector_rotation_snapshot(database_url, user_id)
+                sector_at_entry = themes[0]
+                info = rotation_snapshot.get("sectors", {}).get(sector_at_entry) or {}
+                sector_state = info.get("state")
+                sector_flow_score = compute_sector_flow_score_for_entry(sector_state)
+                rotation_context = {"rotation_pairs": rotation_snapshot.get("rotation_pairs", [])}
+        except Exception as e:
+            print("  daily-review: sector rotation取得で例外（無視して続行）", t.get("code"), e)
+
         fields = {
             "trade_date": review_date, "symbol": t.get("code"), "stock_name": t.get("name"),
             "side": "BUY", "quantity": qty, "entry_price": entry_price, "exit_price": exit_price,
@@ -10145,6 +10180,9 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
             "primary_driver": primary_driver, "driver_corr_at_entry": driver_corr,
             "driver_lag_at_entry": driver_lag, "driver_state_at_entry": driver_state,
             "driver_state_at_exit": driver_state, "cross_market_score_at_entry": cross_score,
+            "sector_at_entry": sector_at_entry, "sector_state_at_entry": sector_state,
+            "sector_flow_score_at_entry": sector_flow_score, "sector_state_at_exit": sector_state,
+            "sector_flow_score_at_exit": sector_flow_score, "rotation_context_json": rotation_context,
             "notes": "15:30自動評価による自動登録（sync_trade_experiences_for_date）。",
         }
         try:
@@ -10909,6 +10947,13 @@ def detect_story_break(story, current_snapshot):
                       (direction == "NEGATIVE" and driver_change >= CROSS_MARKET_LEADING_ALERT_MIN_DRIVER_CHANGE)
             if adverse:
                 reasons.append(f"{primary_driver}急変（連動崩れ）")
+    # Sector Rotation Engine新規（指示書24番）：ENTRY時点のsector_stateがLEADING/IMPROVING
+    # だったのに、現在WEAKENING/LAGGINGへ悪化していれば崩れ条件へ追加する（既存の判定は無変更、
+    # 追加条件のみ）。
+    sector_state_at_entry = story.get("sector_state_at_entry")
+    current_sector_state = (snap.get("sector_rotation") or {}).get("state")
+    if sector_state_at_entry in ("LEADING", "IMPROVING") and current_sector_state in ("WEAKENING", "LAGGING"):
+        reasons.append(f"セクター弱化（{sector_state_at_entry}→{current_sector_state}）")
     return reasons
 
 
@@ -11442,6 +11487,373 @@ def build_cross_market_daily_learning(database_url, user_id, review_date):
             "prediction_valid": _cross_market_prediction_was_valid(e),
         })
     return {"items": items}
+
+
+# ============================================================
+# Sector Rotation / Capital Flow Engine（2026-09-12新規）。前提commit 9f396a1
+# （Cross-Market Link Phase 2）。既存ENTRY SCORE・Cross-Market・Choruco Styleには一切
+# 変更を加えず、その上に積む補助判断レイヤー。
+#
+# 【設計上の重要な判断・既知の制約】Cross-Market Link Phase 2で実データにより判明した通り、
+# TSE公式業種分類（watchlist.sector）には「半導体製造装置」「電線」「MLCC」「SaaS」等の
+# テーマ区分が存在しない（例：東京エレクトロンは「電気機器」）。sector文字列だけでは
+# 指示書2番のテーマ一覧を判別できないため、Cross-Market LinkのCROSS_MARKET_SEMICONDUCTOR_
+# CODESと同じ「動作確認済みの明示コードリスト」方式を採用する（SECTOR_ROTATION_THEME_
+# CODES）。網羅的なリストではなく主要銘柄のみ（指示書「既存監視銘柄で重要なものから」）。
+# ============================================================
+
+SECTOR_ROTATION_THEMES = (
+    "半導体", "半導体製造装置", "AI/データセンター", "電線", "MLCC/電子部品",
+    "重工/防衛", "海運", "エネルギー", "銀行", "保険", "SaaS", "自動車", "商社", "内需ディフェンシブ",
+)
+
+SECTOR_ROTATION_THEME_CODES = {
+    "半導体": {"6963", "3436", "4063"},  # ローム・SUMCO・信越化学
+    "半導体製造装置": {"8035", "6857", "6146", "285A", "6920", "7735"},  # 東京エレクトロン・アドバンテスト・ディスコ・キオクシア・レーザーテック・SCREEN
+    "AI/データセンター": {"6702", "6501", "6752"},  # 富士通・日立・パナソニック（データセンター関連事業を持つ主要銘柄）
+    "電線": {"5801", "5802", "5803"},  # 古河電工・住友電工・フジクラ
+    "MLCC/電子部品": {"6981", "6976", "6762"},  # 村田製作所・太陽誘電・TDK
+    "重工/防衛": {"7011", "7012", "7013"},  # 三菱重工・川崎重工・IHI
+    "海運": {"9101", "9104", "9107"},  # 日本郵船・商船三井・川崎汽船
+    "エネルギー": {"1605", "5020", "5019"},  # INPEX・ENEOS・出光興産
+    "銀行": {"8306", "8316", "8411"},  # 三菱UFJ・三井住友・みずほ
+    "保険": {"8750", "8725", "8630"},  # 第一生命・MS&AD・SOMPO
+    "SaaS": {"4478", "3994", "4382"},  # フリー・マネーフォワード・HEROZ
+    "自動車": {"7203", "7267", "7201", "7270"},  # トヨタ・ホンダ・日産・SUBARU
+    "商社": {"8058", "8031", "8001", "2768"},  # 三菱商事・三井物産・伊藤忠・双日
+    "内需ディフェンシブ": {"2914", "2502", "9983"},  # JT・アサヒ・ファーストリテイリング
+}
+
+
+def get_stock_themes(code):
+    """指示書3番：sector mapping。1銘柄が複数テーマに所属できる（例：6857はまだ半導体製造装置
+    のみ登録だが、将来AIも追加可能な設計）。"""
+    return [theme for theme, codes in SECTOR_ROTATION_THEME_CODES.items() if code in codes]
+
+
+def classify_sector_state(score):
+    """指示書9番：Sector Strength Scoreからのステート判定。80+LEADING/65-79IMPROVING/
+    45-64NEUTRAL/30-44WEAKENING/<30LAGGING。"""
+    if score is None:
+        return "NEUTRAL"
+    if score >= 80:
+        return "LEADING"
+    if score >= 65:
+        return "IMPROVING"
+    if score >= 45:
+        return "NEUTRAL"
+    if score >= 30:
+        return "WEAKENING"
+    return "LAGGING"
+
+
+def compute_sector_breadth(up_count, total_count):
+    """指示書5番：sector breadth＝上昇銘柄数/対象銘柄数（%）。"""
+    if not total_count:
+        return None
+    return round(up_count / total_count * 100, 1)
+
+
+def compute_sector_relative_strength(sector_change_pct, index_change_pct):
+    """指示書6番：指数に対するセクターの相対強度（単純な差分）。"""
+    if sector_change_pct is None or index_change_pct is None:
+        return None
+    return round(sector_change_pct - index_change_pct, 2)
+
+
+def classify_volume_expansion_score(median_volume_ratio, max_points=15):
+    """指示書7番：出来高倍率スコア。1.0未満は弱い（0点）、1.5以上で強い（満点）、間は線形。"""
+    if median_volume_ratio is None:
+        return 0.0
+    return round(_scale_score(median_volume_ratio, 1.0, 1.5, max_points), 1)
+
+
+SECTOR_STRENGTH_SCORE_WEIGHTS = {
+    "price_strength": 25, "breadth": 20, "volume_expansion": 15, "relative_strength": 15,
+    "breakout_quality": 10, "entry_ready_density": 10, "cross_market_support": 5,
+}
+
+
+def build_sector_strength_score(price_strength, breadth, volume_expansion, relative_strength,
+                                    breakout_quality, entry_ready_density, cross_market_support):
+    """指示書4番：build_sector_rotation_snapshot()が使う純粋関数。各サブスコアは0-100で
+    渡す想定（呼び出し側で正規化済み）。price_strength25/breadth20/volume_expansion15/
+    relative_strength15/breakout_quality10/entry_ready_density10/cross_market_support5＝100。"""
+    subscores = {"price_strength": price_strength, "breadth": breadth, "volume_expansion": volume_expansion,
+                 "relative_strength": relative_strength, "breakout_quality": breakout_quality,
+                 "entry_ready_density": entry_ready_density, "cross_market_support": cross_market_support}
+    total = sum((subscores[k] or 0) * w / 100 for k, w in SECTOR_STRENGTH_SCORE_WEIGHTS.items())
+    return round(max(0.0, min(100.0, total)), 1)
+
+
+CAPITAL_FLOW_SCORE_WEIGHTS = {
+    "price_acceleration": 0.3, "breadth_change": 0.2, "volume_change": 0.2,
+    "rs_change": 0.2, "breakout_density_change": 0.1,
+}
+
+
+def compute_capital_flow_score(price_acceleration, breadth_change, volume_change, rs_change, breakout_density_change):
+    """指示書11番：CAPITAL_FLOW_SCORE -100〜+100。各要素は「変化量」を-100〜+100スケールで
+    渡す想定（呼び出し側で正規化済み）。加重平均で合成する。"""
+    components = {"price_acceleration": price_acceleration, "breadth_change": breadth_change,
+                   "volume_change": volume_change, "rs_change": rs_change,
+                   "breakout_density_change": breakout_density_change}
+    total = sum((components[k] or 0) * w for k, w in CAPITAL_FLOW_SCORE_WEIGHTS.items())
+    return round(max(-100.0, min(100.0, total)), 1)
+
+
+def classify_capital_flow_direction(flow_score):
+    """指示書1番：CAPITAL_FLOW_DIRECTION。INFLOW(>=40)/ROTATING_IN(15〜40)/NEUTRAL(-15〜15)/
+    ROTATING_OUT(-40〜-15)/OUTFLOW(<=-40)。"""
+    if flow_score is None:
+        return "NEUTRAL"
+    if flow_score >= 40:
+        return "INFLOW"
+    if flow_score >= 15:
+        return "ROTATING_IN"
+    if flow_score <= -40:
+        return "OUTFLOW"
+    if flow_score <= -15:
+        return "ROTATING_OUT"
+    return "NEUTRAL"
+
+
+def detect_rotation_pairs(prev_snapshot, curr_snapshot, min_score_change=15):
+    """指示書10・12番：前回snapshotとの差から資金移動ペアを検出する。最もスコアが悪化した
+    セクター（from）と最も改善したセクター（to）の組を返す（複数ペア候補は変化量の大きい順）。
+    prev/curr_snapshotは{"sectors":{theme:{"score":...}, ...}}の形。"""
+    prev_sectors = (prev_snapshot or {}).get("sectors", {})
+    curr_sectors = (curr_snapshot or {}).get("sectors", {})
+    changes = []
+    for theme, curr in curr_sectors.items():
+        prev = prev_sectors.get(theme)
+        if not prev or curr.get("score") is None or prev.get("score") is None:
+            continue
+        changes.append((theme, curr["score"] - prev["score"]))
+    if not changes:
+        return []
+    changes.sort(key=lambda x: x[1])
+    losers = [c for c in changes if c[1] <= -min_score_change]
+    gainers = [c for c in reversed(changes) if c[1] >= min_score_change]
+    pairs = []
+    for i in range(min(len(losers), len(gainers))):
+        from_theme, from_change = losers[i]
+        to_theme, to_change = gainers[i]
+        confidence = "HIGH" if (abs(from_change) >= 25 and to_change >= 25) else "MEDIUM"
+        pairs.append({"from_sector": from_theme, "to_sector": to_theme, "confidence": confidence,
+                       "from_score_change": round(from_change, 1), "to_score_change": round(to_change, 1)})
+    return pairs
+
+
+def detect_sector_exhaustion(state_history):
+    """指示書20番：SECTOR_EXHAUSTION。LEADING状態からbreadth低下＋volume鈍化＋breakout
+    failure増加が続く場合に検知する。state_historyは時系列の
+    [{"state":...,"breadth":...,"volume_expansion":...,"breakout_failures":...}, ...]
+    （古い順、直近3件以上を想定）。"""
+    if not state_history or len(state_history) < 2:
+        return False
+    latest = state_history[-1]
+    prior = state_history[0]
+    was_leading = any(h.get("state") == "LEADING" for h in state_history[:-1])
+    if not was_leading:
+        return False
+    breadth_declining = (latest.get("breadth") or 0) < (prior.get("breadth") or 0)
+    volume_declining = (latest.get("volume_expansion") or 0) < (prior.get("volume_expansion") or 0)
+    failures_increasing = (latest.get("breakout_failures") or 0) > (prior.get("breakout_failures") or 0)
+    return bool(breadth_declining and volume_declining and failures_increasing)
+
+
+CROSS_MARKET_RELATIVE_MOVE_THRESHOLD_PCT = 1.5
+
+
+def detect_relative_weakness_alert(index_change_pct, stock_change_pct, threshold=CROSS_MARKET_RELATIVE_MOVE_THRESHOLD_PCT):
+    """指示書16番：MARKET_UP_STOCK_DOWN／RELATIVE_WEAKNESS_ALERT。指数が明確に上昇している
+    のに個別が下落している場合。"""
+    if index_change_pct is None or stock_change_pct is None:
+        return False
+    return index_change_pct >= threshold and stock_change_pct < 0
+
+
+def detect_relative_strength_alert(index_change_pct, stock_change_pct, threshold=CROSS_MARKET_RELATIVE_MOVE_THRESHOLD_PCT):
+    """指示書17番：RELATIVE_STRENGTH_ALERT。指数が明確に下落しているのに個別が上昇している
+    場合。"""
+    if index_change_pct is None or stock_change_pct is None:
+        return False
+    return index_change_pct <= -threshold and stock_change_pct > 0
+
+
+SECTOR_DIVERGENCE_THRESHOLD_PCT = 1.0
+
+
+def detect_stock_underperforming_sector(sector_change_pct, stock_change_pct, threshold=SECTOR_DIVERGENCE_THRESHOLD_PCT):
+    """指示書18番：STOCK_UNDERPERFORMING_SECTOR。セクターが明確に強いのに個別が付いてきて
+    いない場合（かなり重要、との指示）。"""
+    if sector_change_pct is None or stock_change_pct is None:
+        return False
+    if sector_change_pct < threshold:
+        return False
+    return (sector_change_pct - stock_change_pct) >= threshold
+
+
+def detect_rotation_candidate(sector_state, capital_flow_direction, volume_expansion_score, multi_stock_up_count):
+    """指示書19番：ROTATION_CANDIDATE。sector state IMPROVING/LEADING＋資金流入＋出来高増加＋
+    複数銘柄同時上昇。"""
+    if sector_state not in ("IMPROVING", "LEADING"):
+        return False
+    if capital_flow_direction not in ("INFLOW", "ROTATING_IN"):
+        return False
+    if (volume_expansion_score or 0) < 7.5:  # classify_volume_expansion_scoreの満点15の半分以上
+        return False
+    if (multi_stock_up_count or 0) < 2:
+        return False
+    return True
+
+
+SECTOR_FLOW_SCORE_FOR_STATE = {"LEADING": 8, "IMPROVING": 7, "NEUTRAL": 5, "WEAKENING": 3, "LAGGING": 2}
+
+
+def compute_sector_flow_score_for_entry(sector_state):
+    """指示書22番：ENTRY TOP5への補助SECTOR_FLOW_SCORE（0〜10）。既存ENTRY SCORE本体は
+    一切変更しない、隣に並べるだけの補助スコア。"""
+    return SECTOR_FLOW_SCORE_FOR_STATE.get(sector_state, 5)
+
+
+CHORUCO_FIT_V2_WEIGHTS = {"market_mode": 3, "event": 2, "story": 2, "cross_market": 1, "sector_flow": 2}
+
+
+def compute_choruco_fit_v2(market_mode, event_risk_level, story_score=None, cross_market_correlation=None,
+                               sector_state=None):
+    """指示書23番：既存Choruco Fit（compute_choruco_fit、指示書53・54番）は無変更のまま残し、
+    Sector Rotationを組み込んだ拡張版を並行して追加する（互換性のため別関数にする）。
+    内訳：Market Mode3+Event2+Story2+Cross Market1+Sector Flow2＝10。"""
+    mode_fit = CHORUCO_FIT_MODE_POINTS.get(market_mode, 1) * (CHORUCO_FIT_V2_WEIGHTS["market_mode"] / 3)
+    event_fit = CHORUCO_FIT_EVENT_POINTS.get(event_risk_level, 1) * (CHORUCO_FIT_V2_WEIGHTS["event"] / 2)
+    story_fit = (2 if (story_score or 0) >= 60 else (1 if (story_score or 0) >= 40 else 0)) * (CHORUCO_FIT_V2_WEIGHTS["story"] / 2)
+    cross_market_fit = (1.0 if (cross_market_correlation is not None and abs(cross_market_correlation) >= 0.65) else 0.0) \
+        * CHORUCO_FIT_V2_WEIGHTS["cross_market"]
+    sector_flow_fit = compute_sector_flow_score_for_entry(sector_state) / 10 * CHORUCO_FIT_V2_WEIGHTS["sector_flow"]
+    breakdown = {"market_mode": round(mode_fit, 1), "event": round(event_fit, 1), "story": round(story_fit, 1),
+                 "cross_market": round(cross_market_fit, 1), "sector_flow": round(sector_flow_fit, 1)}
+    breakdown["total"] = round(sum(breakdown.values()), 1)
+    return breakdown
+
+
+def _sector_rotation_prev_snapshot_key(user_id):
+    return f"sector_rotation_prev:{user_id}"
+
+
+SECTOR_ROTATION_SNAPSHOT_CACHE_TTL = 30  # 指示書45番「FAST:10〜30秒」
+
+
+def build_sector_rotation_snapshot_cached(database_url, user_id):
+    """build_sector_rotation_snapshot()をSECTOR_ROTATION_SNAPSHOT_CACHE_TTL秒でラップする。
+    FAST UPDATE（10秒間隔・銘柄ごと）から呼ばれても、実際のStage2出来高取得はこのTTLごとに
+    1回で済む（指示書32番「重い再集計はしない」）。"""
+    key = f"sector_rotation_snapshot:{user_id}"
+    entry = _cache_get(key)
+    if _cache_fresh(entry, SECTOR_ROTATION_SNAPSHOT_CACHE_TTL):
+        return entry["value"]
+    value = build_sector_rotation_snapshot(database_url, user_id)
+    _cache_set(key, value)
+    return value
+
+
+def build_sector_rotation_snapshot(database_url, user_id):
+    """指示書4番：build_sector_rotation_snapshot()。既存Stage1（run_momentum_stage1、
+    キャッシュ共有）・_volume_stage2_detail（出来高倍率）・_score_entry_candidates系の
+    ENTRY READY判定は再利用せず、Stage1だけでentry-ready密度を簡易近似する（指示書46番
+    「Stage1価格データを再利用」・重い全銘柄Stage2取得は行わない）。テーマごとの対象銘柄は
+    SECTOR_ROTATION_THEME_CODESの明示リストのみ（全銘柄フル再計算はしない、指示書46番）。
+    ローテーション検出用に直前snapshotをプロセス内キャッシュ（_CACHE_STORE、TTL無制限＝
+    次のsnapshot生成まで保持）に保存する——既知の制約：サーバー再起動をまたぐ永続履歴は
+    持たない（15:30 Daily Reviewでの日中推移は、intraday report生成時に呼ばれた場合のみ
+    その時点のsnapshotが積み上がる設計）。"""
+    stage1 = run_momentum_stage1()
+    stage1_rows = stage1.get("rows", {})
+    nikkei_chg = stage1.get("nikkeiChangePct")
+
+    sectors = {}
+    for theme in SECTOR_ROTATION_THEMES:
+        codes = SECTOR_ROTATION_THEME_CODES.get(theme, set())
+        rows = [stage1_rows[c] for c in codes if c in stage1_rows and stage1_rows[c].get("current") is not None]
+        if not rows:
+            sectors[theme] = {"score": None, "state": "NEUTRAL", "breadth": None, "volume_expansion": None,
+                                "relative_strength": None, "sample_count": 0}
+            continue
+        changes = [r.get("changePct") for r in rows if r.get("changePct") is not None]
+        avg_change = sum(changes) / len(changes) if changes else 0.0
+        up_count = sum(1 for c in changes if c > 0)
+        breadth = compute_sector_breadth(up_count, len(changes)) if changes else None
+        relative_strength = compute_sector_relative_strength(avg_change, nikkei_chg)
+        # 出来高倍率はStage2（_volume_stage2_detail）を要するため重い——このテーマ内の
+        # 銘柄数は明示リストにより少数（数銘柄）に絞られているため許容範囲内で取得する。
+        vol_ratios = []
+        for c in codes:
+            if c not in stage1_rows:
+                continue
+            try:
+                stage2 = _volume_stage2_detail(c, stage1_rows[c])
+                if stage2 and stage2.get("timeAdjustedVolumeRatio") is not None:
+                    vol_ratios.append(stage2["timeAdjustedVolumeRatio"])
+            except Exception as e:
+                print("  sector-rotation: Stage2取得で例外（無視して続行）", c, e)
+        median_vol_ratio = sorted(vol_ratios)[len(vol_ratios) // 2] if vol_ratios else None
+        volume_expansion = classify_volume_expansion_score(median_vol_ratio, max_points=100)
+        price_strength = _scale_score(avg_change, 0, 3, 100)
+        breakout_quality = _scale_score(sum(1 for r in rows if (r.get("changePct") or 0) > 0 and (r.get("marketRS") or 0) > 0), 0, len(rows), 100)
+        entry_ready_density = breakout_quality  # Stage1のみでの簡易近似（重いENTRY READY判定は再利用しない）
+        cross_market_support = 50.0  # Stage1のみでは判定不能なため中立値（既知の制約）
+        score = build_sector_strength_score(price_strength, breadth or 0, volume_expansion, _scale_score(relative_strength, 0, 2, 100),
+                                              breakout_quality, entry_ready_density, cross_market_support)
+        sectors[theme] = {"score": score, "state": classify_sector_state(score), "breadth": breadth,
+                            "volume_expansion": round(median_vol_ratio, 2) if median_vol_ratio is not None else None,
+                            "relative_strength": relative_strength, "sample_count": len(rows),
+                            "up_count": up_count}
+
+    curr_snapshot = {"sectors": sectors, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    prev_entry = _cache_get(_sector_rotation_prev_snapshot_key(user_id))
+    prev_snapshot = prev_entry["value"] if prev_entry else None
+    rotation_pairs = detect_rotation_pairs(prev_snapshot, curr_snapshot) if prev_snapshot else []
+    _cache_set(_sector_rotation_prev_snapshot_key(user_id), curr_snapshot)
+    curr_snapshot["rotation_pairs"] = rotation_pairs
+    return curr_snapshot
+
+
+def get_sector_rotation_for_theme(database_url, user_id, theme):
+    """GET /api/sector-rotation/{sector}向け。"""
+    snapshot = build_sector_rotation_snapshot(database_url, user_id)
+    return {"sector": theme, **(snapshot.get("sectors", {}).get(theme) or {"score": None, "state": "NEUTRAL"})}
+
+
+def build_sector_rotation_map(database_url, user_id):
+    """指示書29番：Rotation Map簡易表示（IN/OUT/→の3値）。"""
+    snapshot = build_sector_rotation_snapshot(database_url, user_id)
+    out = []
+    for theme, info in snapshot.get("sectors", {}).items():
+        state = info.get("state")
+        flow = "IN" if state in ("LEADING", "IMPROVING") else ("OUT" if state in ("WEAKENING", "LAGGING") else "FLAT")
+        out.append({"sector": theme, "state": state, "flow": flow, "score": info.get("score")})
+    return {"map": out, "rotation_pairs": snapshot.get("rotation_pairs", [])}
+
+
+def build_sector_rotation_daily_learning(database_url, user_id, review_date):
+    """指示書35番：「🔄今日のセクターローテーション学習」。既知の制約：intraday報告
+    （09:30/11:30/13:00/14:00等）ごとの永続的な時系列snapshot履歴はまだ保存していない
+    （指示書13・34番の完全な実装は将来の拡張候補）。ここでは15:30時点の最終snapshotと、
+    その直前snapshotとの比較（プロセス内キャッシュ、build_sector_rotation_snapshotが
+    自動保存）から検出されたrotation_pairsを「本日のBest Rotation」として報告する簡易版。"""
+    empty = {"final_snapshot": {}, "rotation_pairs": [], "best_rotation": None}
+    if investment_db is None or not database_url:
+        return empty
+    snapshot = build_sector_rotation_snapshot(database_url, user_id)
+    pairs = snapshot.get("rotation_pairs", [])
+    best_rotation = None
+    if pairs:
+        best = max(pairs, key=lambda p: abs(p.get("to_score_change", 0)) + abs(p.get("from_score_change", 0)))
+        best_rotation = f"{best['from_sector']} → {best['to_sector']}"
+    sectors_summary = {theme: {"state": info.get("state"), "score": info.get("score")}
+                         for theme, info in snapshot.get("sectors", {}).items() if info.get("score") is not None}
+    return {"final_snapshot": sectors_summary, "rotation_pairs": pairs, "best_rotation": best_rotation}
 
 
 def _nicosoku_morning_commentary(database_url, user_id):
@@ -16798,6 +17210,38 @@ class Handler(SimpleHTTPRequestHandler):
             sector = urllib.parse.parse_qs(qs).get("sector", [None])[0]
             result = build_cross_market_link(symbol, sector=sector)
             self._send_json(result)
+        # ---- Sector Rotation / Capital Flow Engine（2026-09-12新規、指示書44番）----
+        # /map・/{sector}/flow・/{sector}/historyは具体的なsuffixなので、汎用の
+        # /api/sector-rotation/{sector}より前に判定する。
+        elif self.path.split("?")[0] == "/api/sector-rotation/map":
+            result = build_sector_rotation_map(DATABASE_URL, self.current_user) \
+                if (investment_db is not None and DATABASE_URL) else {"map": [], "rotation_pairs": []}
+            self._send_json(result)
+        elif self.path.split("?")[0] == "/api/sector-rotation":
+            result = build_sector_rotation_snapshot(DATABASE_URL, self.current_user) \
+                if (investment_db is not None and DATABASE_URL) else {"sectors": {}, "rotation_pairs": []}
+            self._send_json(result)
+        elif self.path.split("?")[0].endswith("/flow") and self.path.split("?")[0].startswith("/api/sector-rotation/"):
+            theme = urllib.parse.unquote(self.path.split("?")[0][len("/api/sector-rotation/"):-len("/flow")])
+            snapshot = build_sector_rotation_snapshot(DATABASE_URL, self.current_user) \
+                if (investment_db is not None and DATABASE_URL) else {"sectors": {}}
+            info = snapshot.get("sectors", {}).get(theme) or {}
+            flow_score = compute_capital_flow_score(
+                _scale_score(info.get("relative_strength"), 0, 2, 100) - 50 if info.get("relative_strength") is not None else 0,
+                0, 0, 0, 0)  # 単発snapshotのみでは変化量が無いため簡易値（直前snapshotとの比較はrotation_pairsを参照）
+            self._send_json({"sector": theme, "state": info.get("state"),
+                              "capital_flow_direction": classify_capital_flow_direction(flow_score),
+                              "capital_flow_score": flow_score})
+        elif self.path.split("?")[0].endswith("/history") and self.path.split("?")[0].startswith("/api/sector-rotation/"):
+            theme = urllib.parse.unquote(self.path.split("?")[0][len("/api/sector-rotation/"):-len("/history")])
+            profile = investment_db.get_sector_behavior_profile(DATABASE_URL, self.current_user, theme) \
+                if (investment_db is not None and DATABASE_URL) else None
+            self._send_json({"sector": theme, "profile": profile})
+        elif self.path.split("?")[0].startswith("/api/sector-rotation/"):
+            theme = urllib.parse.unquote(self.path.split("?")[0][len("/api/sector-rotation/"):])
+            result = get_sector_rotation_for_theme(DATABASE_URL, self.current_user, theme) \
+                if (investment_db is not None and DATABASE_URL) else {"sector": theme, "score": None, "state": "NEUTRAL"}
+            self._send_json(result)
         elif self.path.split("?")[0] == "/api/trade-decision-events":
             qs = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(qs)
@@ -16853,8 +17297,17 @@ class Handler(SimpleHTTPRequestHandler):
                     cross_market_learning = build_cross_market_daily_learning(DATABASE_URL, self.current_user, date)
             except Exception as e:
                 print("  daily-review: cross-market learning生成で例外（無視して続行）", e)
+            # Sector Rotation Engine新規（2026-09-12、指示書35番）：「🔄今日のセクター
+            # ローテーション学習」。
+            sector_rotation_learning = {"final_snapshot": {}, "rotation_pairs": [], "best_rotation": None}
+            try:
+                if investment_db is not None and DATABASE_URL:
+                    sector_rotation_learning = build_sector_rotation_daily_learning(DATABASE_URL, self.current_user, date)
+            except Exception as e:
+                print("  daily-review: sector rotation learning生成で例外（無視して続行）", e)
             self._send_json({"review": review, "decisionReview": decision_review, "tradeLearning": trade_learning,
-                              "crossMarketLearning": cross_market_learning})
+                              "crossMarketLearning": cross_market_learning,
+                              "sectorRotationLearning": sector_rotation_learning})
         # ---- 2026-09-10新規（朝一マーケット自動分析システム） ----
         elif self.path.startswith("/api/morning-check/list"):
             qs = urllib.parse.urlparse(self.path).query
@@ -17847,9 +18300,35 @@ class Handler(SimpleHTTPRequestHandler):
                     cross_market = build_cross_market_link(code, sector=body.get("sector"))
                 except Exception as e:
                     print("  knowledge-context: cross-market要約取得で例外（無視して続行）", code, e)
+            # Sector Rotation / Capital Flow Engine新規（2026-09-12、指示書33番）：HEAVY側で
+            # Sector Strength Score・rotation検出をフルで返す。対象テーマが無い銘柄は
+            # sectorRotation=Noneのまま（既存銘柄クセ等と同じ「対象外は静かに空を返す」方針）。
+            sector_rotation = None
+            if code:
+                try:
+                    themes = get_stock_themes(code)
+                    if themes:
+                        snapshot = build_sector_rotation_snapshot_cached(DATABASE_URL, self.current_user)
+                        theme = themes[0]
+                        info = snapshot.get("sectors", {}).get(theme)
+                        if info:
+                            sector_rotation = {"sector": theme, **info, "rotation_pairs": snapshot.get("rotation_pairs", [])}
+                except Exception as e:
+                    print("  knowledge-context: sector rotation要約取得で例外（無視して続行）", code, e)
+            choruco_fit_v2 = None
+            if choruco:
+                try:
+                    choruco_fit_v2 = compute_choruco_fit_v2(
+                        choruco.get("market_mode"), choruco.get("event_risk_level"),
+                        story_score=(choruco.get("story") or {}).get("story_score"),
+                        cross_market_correlation=(cross_market or {}).get("correlation"),
+                        sector_state=(sector_rotation or {}).get("state"))
+                except Exception as e:
+                    print("  knowledge-context: choruco fit v2算出で例外（無視して続行）", code, e)
             self._send_json({"context": context, "judgment": judgment, "logId": (log or {}).get("id"),
                               "tradeExperience": trade_experience, "stockBehavior": stock_behavior,
-                              "choruco": choruco, "crossMarket": cross_market})
+                              "choruco": choruco, "crossMarket": cross_market,
+                              "sectorRotation": sector_rotation, "chorucoFitV2": choruco_fit_v2})
         elif self.path == "/api/knowledge-context/top5-flags":
             # 指示書4番：TOP5相談向けの軽量な候補別フラグ（フルコンテキストは取得しない）。
             if not self._investment_db_ready():
