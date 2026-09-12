@@ -10954,6 +10954,13 @@ def detect_story_break(story, current_snapshot):
     current_sector_state = (snap.get("sector_rotation") or {}).get("state")
     if sector_state_at_entry in ("LEADING", "IMPROVING") and current_sector_state in ("WEAKENING", "LAGGING"):
         reasons.append(f"セクター弱化（{sector_state_at_entry}→{current_sector_state}）")
+    # Yaaman Style新規（指示書33番）：ENTRY時点のtheme_stageがEXPANDING（またはEARLY）
+    # だったのに、現在EXHAUSTINGへ悪化していれば崩れ条件へ追加する（既存の判定は無変更、
+    # 追加条件のみ）。
+    theme_stage_at_entry = story.get("theme_stage")
+    current_theme_stage = (snap.get("theme") or {}).get("stage")
+    if theme_stage_at_entry in ("EARLY", "EXPANDING") and current_theme_stage == "EXHAUSTING":
+        reasons.append(f"テーマ失速（{theme_stage_at_entry}→EXHAUSTING）")
     return reasons
 
 
@@ -11854,6 +11861,537 @@ def build_sector_rotation_daily_learning(database_url, user_id, review_date):
     sectors_summary = {theme: {"state": info.get("state"), "score": info.get("score")}
                          for theme, info in snapshot.get("sectors", {}).items() if info.get("score") is not None}
     return {"final_snapshot": sectors_summary, "rotation_pairs": pairs, "best_rotation": best_rotation}
+
+
+# ============================================================
+# Yaaman Style / ヤーマン式 Theme Discovery（2026-09-12新規）。前提：Choruco Style・
+# Cross-Market Link・Sector Rotationは実装済み。既存ENTRY SCORE・今日の注目TOP5・
+# 今買い時TOP5には一切変更を加えず、その手前に積む「候補発掘レイヤー」として追加する。
+#
+# 【重要な既知の制約】PTS（夜間取引）はCLAUDE.md記載の通り無料で安定した自動取得APIが
+# 存在しない（既存の"ptsNote"と同じ制約）。本エンジンのPTS関連の純粋関数（classify_pts_
+# confirmation・detect_pts_fade等）はテスト可能な形で実装するが、実運用のI/Oラッパーでは
+# pts_change_pctは常にNone（未取得）として扱う——推測値は作らない。
+# ============================================================
+
+# ---- Catalyst Classification（指示書2番） ----
+LIMIT_UP_THRESHOLD_PCT = 25.0  # 東証の値幅制限は株価帯により異なるため簡易的な目安値（+25%以上）
+SURGE_THRESHOLD_PCT = 10.0
+
+CATALYST_TYPES = (
+    "EARNINGS", "UPWARD_REVISION", "ORDER", "PARTNERSHIP", "GOVERNMENT_POLICY", "REGULATION",
+    "SUBSIDY", "NEW_PRODUCT", "AI", "AUTONOMOUS_DRIVING", "SEMICONDUCTOR", "DATA_CENTER",
+    "DEFENSE", "ROBOTICS", "M_AND_A", "TOB", "BIOTECH", "OTHER",
+)
+CATALYST_KEYWORDS = {
+    "EARNINGS": ("決算", "増益", "減益", "最終利益"),
+    "UPWARD_REVISION": ("上方修正", "業績予想の修正"),
+    "ORDER": ("受注", "大型契約"),
+    "PARTNERSHIP": ("提携", "業務提携", "資本提携"),
+    "GOVERNMENT_POLICY": ("国策", "政府方針", "補正予算"),
+    "REGULATION": ("規制", "認可", "承認"),
+    "SUBSIDY": ("補助金", "助成"),
+    "NEW_PRODUCT": ("新製品", "新サービス", "発売"),
+    "AI": ("AI", "人工知能", "生成AI"),
+    "AUTONOMOUS_DRIVING": ("自動運転", "自動運転実証", "レベル4"),
+    "SEMICONDUCTOR": ("半導体", "半導体製造装置"),
+    "DATA_CENTER": ("データセンター", "データセンタ"),
+    "DEFENSE": ("防衛", "防衛費"),
+    "ROBOTICS": ("ロボット", "ロボティクス"),
+    "M_AND_A": ("M&A", "買収"),
+    "TOB": ("TOB", "株式公開買付"),
+    "BIOTECH": ("創薬", "バイオ", "治験"),
+}
+
+
+def classify_catalyst_type(text):
+    """指示書2番：CATALYST分類。キーワード一致による単純な分類（AI不使用、他のニュース
+    分類エンジンと同じルールベース方針）。複数一致時は先勝ち（CATALYST_TYPESの列挙順）。
+    一致無しはOTHER。"""
+    if not text:
+        return "OTHER"
+    for catalyst_type in CATALYST_TYPES:
+        keywords = CATALYST_KEYWORDS.get(catalyst_type)
+        if keywords and any(kw in text for kw in keywords):
+            return catalyst_type
+    return "OTHER"
+
+
+# ---- Theme抽出（指示書3・6番） ----
+THEME_KEYWORDS = {
+    "自動運転": ("自動運転", "レベル4", "LiDAR", "ライダー"),
+    "半導体": ("半導体", "半導体製造装置", "ウエハー"),
+    "AI": ("AI", "人工知能", "生成AI", "LLM"),
+    "データセンター": ("データセンター", "データセンタ", "クラウド"),
+    "防衛": ("防衛", "防衛費", "安全保障"),
+    "ロボティクス": ("ロボット", "ロボティクス", "協働ロボット"),
+    "創薬/バイオ": ("創薬", "バイオ", "治験", "新薬"),
+    "電線": ("電線", "送電"),
+    "海運": ("海運", "コンテナ船", "運賃"),
+}
+
+
+def extract_theme_from_catalyst(catalyst_type, text=None):
+    """指示書3・6番：CATALYST/材料テキストからTHEME候補を抽出する。まずtext中のTHEME_
+    KEYWORDSに一致するテーマを返し（複数一致時は最初に一致したもの）、無ければcatalyst_type
+    自体をそのままテーマ名として使う簡易フォールバック（AI/SEMICONDUCTOR/DATA_CENTER/
+    DEFENSE/ROBOTICSはCATALYST_TYPESとTHEME_KEYWORDSでほぼ同じ語彙のため）。"""
+    if text:
+        for theme, keywords in THEME_KEYWORDS.items():
+            if any(kw in text for kw in keywords):
+                return theme
+    fallback_map = {"AI": "AI", "AUTONOMOUS_DRIVING": "自動運転", "SEMICONDUCTOR": "半導体",
+                     "DATA_CENTER": "データセンター", "DEFENSE": "防衛", "ROBOTICS": "ロボティクス",
+                     "BIOTECH": "創薬/バイオ"}
+    return fallback_map.get(catalyst_type)
+
+
+# ---- Theme Stage（指示書4番） ----
+
+def classify_theme_stage(breadth, volume_expansion_ratio, days_since_trigger, upper_wick_failure=False):
+    """指示書4番：EARLY/EXPANDING/MATURE/EXHAUSTING。
+    EARLY：発生当日〜1日目、関連銘柄はまだ広く反応していない（breadth低め）。
+    EXPANDING：複数関連銘柄へ波及（breadth・volume拡大）。
+    MATURE：数日継続し主要関連銘柄が広く買われている（breadth高いが日数も経過）。
+    EXHAUSTING：上髭・出来高ピークアウト等の失速サイン。"""
+    if upper_wick_failure or (volume_expansion_ratio is not None and volume_expansion_ratio < 1.0 and (days_since_trigger or 0) >= 2):
+        return "EXHAUSTING"
+    if days_since_trigger is not None and days_since_trigger <= 1 and (breadth or 0) < 0.4:
+        return "EARLY"
+    if breadth is not None and breadth >= 0.6 and (days_since_trigger or 0) >= 3:
+        return "MATURE"
+    if breadth is not None and breadth >= 0.4:
+        return "EXPANDING"
+    return "EARLY"
+
+
+# ---- Next-Day Theme Score（指示書5番） ----
+NEXT_DAY_THEME_SCORE_WEIGHTS = {
+    "catalyst_strength": 25, "related_movers": 20, "volume_expansion": 15,
+    "pts_confirmation": 15, "theme_breadth": 15, "news_freshness": 10,
+}
+
+
+def compute_next_day_theme_score(catalyst_strength, related_movers, volume_expansion, pts_confirmation,
+                                     theme_breadth, news_freshness):
+    """指示書5番：NEXT_DAY_THEME_SCORE 0-100。各サブスコアは0-100で渡す想定
+    （呼び出し側で正規化済み）。PTS未取得（None）の場合はpts_confirmationスコアを中立の
+    50点として扱う（既知の制約：PTS自動取得非対応）。"""
+    subscores = {"catalyst_strength": catalyst_strength, "related_movers": related_movers,
+                 "volume_expansion": volume_expansion,
+                 "pts_confirmation": 50.0 if pts_confirmation is None else pts_confirmation,
+                 "theme_breadth": theme_breadth, "news_freshness": news_freshness}
+    total = sum((subscores[k] or 0) * w / 100 for k, w in NEXT_DAY_THEME_SCORE_WEIGHTS.items())
+    return round(max(0.0, min(100.0, total)), 1)
+
+
+# ---- PTS（指示書5・39番、既知の制約：自動取得非対応） ----
+PTS_STRONG_THRESHOLD_PCT = 5.0
+PTS_FADE_RATIO_THRESHOLD = 0.3
+
+
+def classify_pts_confirmation(pts_change_pct, threshold=PTS_STRONG_THRESHOLD_PCT):
+    """指示書39番：PTSが明確に強いか（純粋関数、テスト用。実運用ではpts_change_pctは
+    PTS自動取得非対応のため常にNone＝判定不能として扱われる）。"""
+    if pts_change_pct is None:
+        return None
+    return pts_change_pct >= threshold
+
+
+def detect_pts_fade(pts_change_pct, open_change_pct, ratio_threshold=PTS_FADE_RATIO_THRESHOLD):
+    """指示書39番：PTS_FADE。PTSが強かったのに寄り付きがそれに見合わない場合を検知する
+    （例：PTS+15%なのに寄り+2% → 寄りがPTSの30%未満しか反映されていない）。"""
+    if pts_change_pct is None or open_change_pct is None or pts_change_pct <= 0:
+        return False
+    return open_change_pct < pts_change_pct * ratio_threshold
+
+
+# ---- Premarket Theme Confirmation（指示書11・12番） ----
+
+def classify_theme_confirmation(trigger_gap_pct, related_gaps_pct):
+    """指示書12番：CONFIRMED/PARTIAL/FADED/INVALIDATED。発端銘柄の気配GAP率と関連銘柄群の
+    GAP率リストから判定する。related_gaps_pctは空リスト可（発端銘柄のみで判定）。"""
+    if trigger_gap_pct is None:
+        return "INVALIDATED"
+    if trigger_gap_pct < 0:
+        return "INVALIDATED"
+    related_up_count = sum(1 for g in (related_gaps_pct or []) if g is not None and g > 0)
+    related_total = len([g for g in (related_gaps_pct or []) if g is not None])
+    if trigger_gap_pct >= 3.0 and (related_total == 0 or related_up_count / related_total >= 0.5):
+        return "CONFIRMED"
+    if trigger_gap_pct >= 1.0 or (related_total and related_up_count / related_total >= 0.3):
+        return "PARTIAL"
+    return "FADED"
+
+
+# ---- テーマ本命/出遅れ（指示書23・24・25番） ----
+
+def classify_stock_theme_role(is_trigger, days_since_move, change_pct):
+    """指示書23番：LEADER/FOLLOWER/LAGGARD。"""
+    if is_trigger:
+        return "LEADER"
+    if change_pct is not None and change_pct > 0:
+        return "FOLLOWER"
+    return "LAGGARD"
+
+
+def detect_theme_catchup_candidate(theme_confirmation, sector_flow_direction, related_up_count,
+                                       stock_change_pct, cross_market_ok=True):
+    """指示書24・25番：THEME_CATCHUP_CANDIDATE。CONFIRMED＋セクター資金流入＋関連銘柄複数
+    上昇＋個別まだ未反応＋Cross-Market/RS悪くない、の全条件が揃った場合のみ（指示書25番
+    「出遅れ=無条件買いは禁止」——本関数は候補フラグを立てるだけで、ENTRY判定は別途
+    should_promote_to_entry_top5()でentry_state成立を必須にする）。"""
+    if theme_confirmation != "CONFIRMED":
+        return False
+    if sector_flow_direction not in ("INFLOW", "ROTATING_IN"):
+        return False
+    if (related_up_count or 0) < 2:
+        return False
+    if stock_change_pct is not None and abs(stock_change_pct) >= 1.0:
+        return False  # 既に反応済み
+    if not cross_market_ok:
+        return False
+    return True
+
+
+# ---- THEME_MOMENTUM_SCORE（指示書43番、既存ENTRY SCORE非破壊） ----
+
+def compute_theme_momentum_score(theme_score, confirmation, sector_state=None, cross_market_relative_ok=True):
+    """指示書43番：THEME_MOMENTUM_SCORE 0-10の補助スコア。既存ENTRY SCOREは一切変更しない。"""
+    if theme_score is None:
+        return 0.0
+    base = theme_score / 10  # 0-100 -> 0-10
+    conf_mult = {"CONFIRMED": 1.0, "PARTIAL": 0.6, "FADED": 0.2, "INVALIDATED": 0.0}.get(confirmation, 0.5)
+    score = base * conf_mult
+    if sector_state in ("LEADING", "IMPROVING"):
+        score += 0.5
+    if not cross_market_relative_ok:
+        score -= 0.5
+    return round(max(0.0, min(10.0, score)), 1)
+
+
+# ---- TOP5昇格判定（指示書14・16・17・42番、既存TOP5の役割は変更しない） ----
+YAAMAN_TOP5_ENTRY_STATES = ("NOW_BUYABLE", "ENTRY_READY", "WAIT_PULLBACK", "WAIT_BREAKOUT")
+
+
+def should_promote_to_today_top5(confirmation, relative_strength_ok, risk_high):
+    """指示書14番：LEVEL1（明日の注目テーマ）→LEVEL2（今日の注目TOP5候補）。CONFIRMED＋
+    相対的に強い＋高リスクでない、の場合のみ。"""
+    if confirmation != "CONFIRMED":
+        return False
+    if not relative_strength_ok:
+        return False
+    if risk_high:
+        return False
+    return True
+
+
+def should_promote_to_entry_top5(entry_state):
+    """指示書16番：LEVEL2→LEVEL3（今買い時TOP5）。「今日の注目になっただけでは
+    ENTRY候補にしない」——ENTRY READY/ACTIVE BREAK相当（NOW_BUYABLE/ENTRY_READY）または
+    PULLBACK READY/VWAP RECLAIM相当（WAIT_PULLBACK/WAIT_BREAKOUT、既存entry_stateの
+    語彙をそのまま再利用）が成立した場合のみ。"""
+    return entry_state in YAAMAN_TOP5_ENTRY_STATES
+
+
+# ---- I/Oラッパー（指示書1・31・46番：引け後discovery→翌朝confirmation→当日TOP5表示） ----
+YAAMAN_MAX_MOVERS = 30  # Stage2（出来高倍率）を取得する対象上限（指示書18番「重い計算は禁止」相当の安全弁）
+
+
+def discover_limit_up_and_surge_movers(database_url, user_id):
+    """指示書1番の1〜3（ストップ高・+10%以上上昇・出来高急増）。既存の共有Stage1
+    （run_momentum_stage1、東証全銘柄スキャン済み・新規APIなし）から抽出するだけで、
+    新しい全市場取得経路は追加しない。出来高倍率（Stage2）はchangePct条件を満たした
+    上位YAAMAN_MAX_MOVERS件のみ取得する（全市場4000銘柄に対するStage2取得は行わない、
+    指示書46番）。"""
+    stage1 = run_momentum_stage1()
+    stage1_rows = stage1.get("rows", {})
+    movers = [row for row in stage1_rows.values() if (row.get("changePct") or 0) >= SURGE_THRESHOLD_PCT]
+    movers.sort(key=lambda r: -(r.get("changePct") or 0))
+    movers = movers[:YAAMAN_MAX_MOVERS]
+    out = []
+    for row in movers:
+        code = row.get("code")
+        volume_ratio = None
+        try:
+            stage2 = _volume_stage2_detail(code, row)
+            if stage2:
+                volume_ratio = stage2.get("timeAdjustedVolumeRatio")
+        except Exception as e:
+            print("  yaaman: Stage2取得で例外（無視して続行）", code, e)
+        out.append({"code": code, "name": row.get("name"), "sector": row.get("sector"),
+                     "pct": row.get("changePct"), "volume": row.get("turnover"),
+                     "volume_ratio": volume_ratio,
+                     "is_limit_up": (row.get("changePct") or 0) >= LIMIT_UP_THRESHOLD_PCT})
+    return out
+
+
+def discover_next_day_themes(database_url, user_id, event_date=None):
+    """指示書1・3・5・8番：ヤーマン式パイプライン本体（引け後）。ストップ高/急騰銘柄収集→
+    上昇理由調査（既存news_catalysts DB）→CATALYST分類→THEME抽出→同テーマ関連銘柄探索→
+    Next-Day Theme Score算出→next_day_theme_candidatesへ永続化。
+    関連銘柄探索は既存SECTOR_ROTATION_THEME_CODES（Sector Rotation Engine）＋
+    THEME_KEYWORDSに一致するwatchlist銘柄を再利用する（指示書6番「既存watchlist・
+    theme mapping・sector mappingを利用」）。監視銘柄に無い銘柄も「候補」としてそのまま
+    表示し、自動登録はしない（指示書7番）。"""
+    event_date = event_date or datetime.date.today().isoformat()
+    if investment_db is None or not database_url:
+        return {"themes": []}
+    movers = discover_limit_up_and_surge_movers(database_url, user_id)
+    if not movers:
+        return {"themes": []}
+
+    # movers永続化（limit_up_events、指示書26番）＋catalyst分類＋theme抽出
+    theme_groups = {}
+    for m in movers:
+        try:
+            catalysts = investment_db.relevant_catalysts_for(database_url, user_id, code=m["code"], limit=1)
+            reason_text = catalysts[0].get("title") if catalysts else None
+        except Exception as e:
+            print("  yaaman: catalyst取得で例外（無視して続行）", m["code"], e)
+            reason_text = None
+        catalyst_type = classify_catalyst_type(reason_text)
+        theme = extract_theme_from_catalyst(catalyst_type, reason_text)
+        try:
+            investment_db.upsert_limit_up_event(database_url, user_id, event_date, m["code"], {
+                "stock_name": m.get("name"), "pct": m.get("pct"), "volume": m.get("volume"),
+                "volume_ratio": m.get("volume_ratio"), "reason": reason_text, "catalyst_type": catalyst_type,
+                "theme": theme, "sector": m.get("sector"),
+            })
+        except Exception as e:
+            print("  yaaman: limit_up_event保存で例外（無視して続行）", m["code"], e)
+        if not theme:
+            continue
+        theme_groups.setdefault(theme, {"triggers": [], "catalyst_types": set()})
+        theme_groups[theme]["triggers"].append(m)
+        theme_groups[theme]["catalyst_types"].add(catalyst_type)
+
+    results = []
+    for theme, group in theme_groups.items():
+        triggers = group["triggers"]
+        trigger_codes = {t["code"] for t in triggers}
+        # 関連銘柄探索（指示書6番）：既存のSECTOR_ROTATION_THEME_CODES（一致すれば）＋
+        # THEME_KEYWORDSでwatchlist銘柄名を照合する軽量版（新規の全文検索エンジンは作らない）。
+        related_codes = set(SECTOR_ROTATION_THEME_CODES.get(theme, set())) - trigger_codes
+        try:
+            watchlist = investment_db.list_watchlist(database_url, user_id, market="JP")
+            keywords = THEME_KEYWORDS.get(theme, ())
+            for w in watchlist:
+                if w.get("code") in trigger_codes or w.get("code") in related_codes:
+                    continue
+                name_and_theme = f"{w.get('name') or ''}{w.get('theme') or ''}"
+                if any(kw in name_and_theme for kw in keywords):
+                    related_codes.add(w["code"])
+        except Exception as e:
+            print("  yaaman: 関連銘柄探索で例外（無視して続行）", theme, e)
+        related_codes = list(related_codes)[:10]
+
+        avg_pct = sum(t.get("pct") or 0 for t in triggers) / len(triggers)
+        vol_ratios = [t.get("volume_ratio") for t in triggers if t.get("volume_ratio") is not None]
+        avg_vol_ratio = sum(vol_ratios) / len(vol_ratios) if vol_ratios else None
+        breadth = len(triggers) / max(1, len(triggers) + len(related_codes))
+        catalyst_strength = 80.0 if any(ct != "OTHER" for ct in group["catalyst_types"]) else 40.0
+        related_movers_score = _scale_score(len(related_codes), 0, 5, 100)
+        volume_expansion_score = classify_volume_expansion_score(avg_vol_ratio, max_points=100)
+        theme_breadth_score = _scale_score(breadth, 0, 1, 100)
+        news_freshness_score = 80.0  # 当日発生のためLIVE/CURRENT相当（既存freshness体系との厳密な連動は将来拡張）
+        theme_score = compute_next_day_theme_score(catalyst_strength, related_movers_score, volume_expansion_score,
+                                                       None, theme_breadth_score, news_freshness_score)
+        stage = classify_theme_stage(breadth, avg_vol_ratio, days_since_trigger=0)
+        catalyst_label = next((ct for ct in group["catalyst_types"] if ct != "OTHER"), "OTHER")
+
+        saved = None
+        try:
+            saved = investment_db.upsert_next_day_theme_candidate(database_url, user_id, theme, event_date, {
+                "theme_score": theme_score, "stage": stage,
+                "trigger_stocks_json": [t["code"] for t in triggers], "related_stocks_json": related_codes,
+                "catalyst": catalyst_label, "breadth": round(breadth, 2),
+                "volume_expansion": round(avg_vol_ratio, 2) if avg_vol_ratio is not None else None,
+                "pts_confirmation": None,  # 既知の制約：PTS自動取得非対応
+            })
+        except Exception as e:
+            print("  yaaman: next_day_theme_candidate保存で例外（無視して続行）", theme, e)
+
+        results.append(saved or {
+            "theme": theme, "theme_score": theme_score, "stage": stage,
+            "trigger_stocks_json": [t["code"] for t in triggers], "related_stocks_json": related_codes,
+            "catalyst": catalyst_label, "breadth": round(breadth, 2),
+            "volume_expansion": round(avg_vol_ratio, 2) if avg_vol_ratio is not None else None,
+        })
+
+    results.sort(key=lambda r: -(r.get("theme_score") or 0))
+    return {"themes": results, "generated_date": event_date}
+
+
+def confirm_next_day_themes(database_url, user_id, generated_date=None):
+    """指示書11・12番：翌朝8:40-8:45の気配確認。既知の制約：寄り付き前の「気配値」は
+    リアルタイム板情報でありyfinance等の遅延データでは取得できないため、Stage1（当日の
+    現在値、寄り付き後であれば当日値、寄り付き前は前日終値のまま＝gapは0扱い）を代用する
+    ——実運用では寄り付き後（9:00以降）に呼ぶ想定（既存の"気配値は証券会社アプリ等でご自身で
+    ご確認ください"という既存PTS注記と同じ精神）。"""
+    if investment_db is None or not database_url:
+        return {"themes": []}
+    generated_date = generated_date or (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+    candidates = investment_db.list_next_day_theme_candidates(database_url, user_id, generated_date=generated_date)
+    if not candidates:
+        return {"themes": []}
+    stage1 = run_momentum_stage1()
+    stage1_rows = stage1.get("rows", {})
+
+    out = []
+    for cand in candidates:
+        trigger_codes = cand.get("trigger_stocks_json") or []
+        related_codes = cand.get("related_stocks_json") or []
+        trigger_gap = None
+        if trigger_codes:
+            gaps = [stage1_rows[c]["changePct"] for c in trigger_codes if c in stage1_rows and stage1_rows[c].get("changePct") is not None]
+            trigger_gap = max(gaps) if gaps else None
+        related_gaps = [stage1_rows[c]["changePct"] for c in related_codes if c in stage1_rows and stage1_rows[c].get("changePct") is not None]
+        confirmation = classify_theme_confirmation(trigger_gap, related_gaps)
+        stage = classify_theme_stage(
+            len([g for g in related_gaps if g > 0]) / max(1, len(related_gaps)) if related_gaps else 0,
+            cand.get("volume_expansion"), days_since_trigger=1)
+        try:
+            saved = investment_db.upsert_next_day_theme_candidate(database_url, user_id, cand["theme"], generated_date, {
+                "confirmation_status": confirmation,
+                "confirmed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "confirmation_detail_json": {"trigger_gap_pct": trigger_gap, "related_gaps_pct": related_gaps},
+                "stage": stage,
+            })
+        except Exception as e:
+            print("  yaaman: theme confirmation保存で例外（無視して続行）", cand.get("theme"), e)
+            saved = {**cand, "confirmation_status": confirmation, "stage": stage}
+        out.append(saved)
+    return {"themes": out}
+
+
+def get_stock_theme_info(database_url, user_id, code):
+    """指示書35番：監視銘柄カード表示向け。当日の「今日の注目テーマ」候補のうち、この
+    codeがtrigger/relatedに含まれるものを1件返す（複数該当時は最もtheme_scoreが高いもの）。
+    LEADER/FOLLOWER/LAGGARDの役割も付与する（指示書23番）。"""
+    if investment_db is None or not database_url:
+        return None
+    today_themes = get_today_attention_themes(database_url, user_id).get("themes", [])
+    matches = []
+    for t in today_themes:
+        triggers = t.get("trigger_stocks_json") or []
+        related = t.get("related_stocks_json") or []
+        if code in triggers:
+            matches.append((t, "LEADER"))
+        elif code in related:
+            matches.append((t, "FOLLOWER"))
+    if not matches:
+        return None
+    matches.sort(key=lambda m: -(m[0].get("theme_score") or 0))
+    theme, role = matches[0]
+    momentum_score = compute_theme_momentum_score(theme.get("theme_score"), theme.get("confirmation_status"),
+                                                      sector_state=None, cross_market_relative_ok=True)
+    return {"theme": theme.get("theme"), "stage": theme.get("stage"),
+            "confirmation": theme.get("confirmation_status"), "role": role,
+            "theme_score": theme.get("theme_score"), "theme_momentum_score": momentum_score}
+
+
+def get_today_attention_themes(database_url, user_id):
+    """指示書13番：「🔥今日の注目テーマ」。前営業日生成されたnext_day_theme_candidatesのうち
+    confirmation_statusが付いているもの（confirm_next_day_themes実行後）を返す。"""
+    if investment_db is None or not database_url:
+        return {"themes": []}
+    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+    candidates = investment_db.list_next_day_theme_candidates(database_url, user_id, generated_date=yesterday)
+    return {"themes": [c for c in candidates if c.get("confirmation_status")]}
+
+
+def get_next_day_attention_themes(database_url, user_id):
+    """指示書10番：「🔥明日の注目テーマ」。当日生成分（confirmation未実施）を返す。"""
+    if investment_db is None or not database_url:
+        return {"themes": []}
+    today = datetime.date.today().isoformat()
+    return {"themes": investment_db.list_next_day_theme_candidates(database_url, user_id, generated_date=today)}
+
+
+def build_theme_daily_learning(database_url, user_id, review_date):
+    """指示書30番：「🔥テーマ学習」（15:30振り返り）。前日生成→当日confirmationまでの
+    一連の結果をtheme_momentum_historyへ記録し、その日最も強かったテーマを報告する。"""
+    empty = {"strongest_theme": None, "items": []}
+    if investment_db is None or not database_url:
+        return empty
+    candidates = investment_db.list_next_day_theme_candidates(database_url, user_id, generated_date=review_date)
+    items = []
+    for cand in candidates:
+        try:
+            investment_db.upsert_theme_momentum_history(database_url, user_id, cand["theme"], review_date, {
+                "stage": cand.get("stage"), "theme_score": cand.get("theme_score"),
+                "breadth": cand.get("breadth"),
+                "leader_count": len(cand.get("trigger_stocks_json") or []),
+                "related_movers": len(cand.get("related_stocks_json") or []),
+                "next_day_confirmation": cand.get("confirmation_status"),
+            })
+        except Exception as e:
+            print("  yaaman: theme momentum history保存で例外（無視して続行）", cand.get("theme"), e)
+        items.append({"theme": cand.get("theme"), "theme_score": cand.get("theme_score"),
+                       "confirmation_status": cand.get("confirmation_status"), "stage": cand.get("stage")})
+    strongest = max(items, key=lambda i: i.get("theme_score") or 0) if items else None
+    return {"strongest_theme": strongest.get("theme") if strongest else None, "items": items}
+
+
+def _yaaman_scheduler_users():
+    """既存_daily_review_scheduler_users()と同じ考え方（マルチユーザー対応）。"""
+    if USERS:
+        return list(USERS.keys())
+    return ["matsuura"]
+
+
+YAAMAN_DISCOVERY_HHMM = "15:35"  # 指示書46番：引け後テーマ発掘
+YAAMAN_CONFIRM_START_HHMM = "08:40"
+YAAMAN_CONFIRM_RETRY_TIMES = ("08:40", "08:42", "08:44", "08:45")  # 指示書47番
+
+
+def _yaaman_theme_scheduler_loop():
+    """ヤーマン式 daily workflow（指示書31・46・47番）のデーモンスレッド。既存
+    _daily_review_scheduler_loopと同じ設計（30秒間隔ポーリング、平日のみ、プロセス内
+    fired集合＋DBのUNIQUE制約の二重防御）。
+    15:35：discover_next_day_themes()（引け後テーマ発掘、1日1回）。
+    08:40/08:42/08:44/08:45：confirm_next_day_themes()（気配確認、指示書47番の4回リトライ。
+    寄り付き前は気配データが自動取得できない既知の制約のため、実質的には毎回Stage1の
+    最新値で再評価するだけの単純な複数回実行になる——silent failure禁止のため各回ログに残す）。"""
+    fired_discovery = set()  # {(date, user_id)}
+    fired_confirm = set()  # {(date, hhmm, user_id)}
+    JST = datetime.timezone(datetime.timedelta(hours=9))
+    while True:
+        try:
+            now_jst = datetime.datetime.now(JST)
+            hhmm = now_jst.strftime("%H:%M")
+            today_str = now_jst.date().isoformat()
+            if _is_jp_market_business_day(now_jst):
+                if hhmm == YAAMAN_DISCOVERY_HHMM:
+                    for user_id in _yaaman_scheduler_users():
+                        key = (today_str, user_id)
+                        if key in fired_discovery:
+                            continue
+                        fired_discovery.add(key)
+                        try:
+                            result = discover_next_day_themes(DATABASE_URL, user_id)
+                            print(f"  [Yaaman] {user_id} {today_str} 明日の注目テーマ生成完了（{len(result.get('themes', []))}件）")
+                        except Exception as e:
+                            print(f"  [Yaaman] {user_id} {today_str} テーマ発掘に失敗", e)
+                if hhmm in YAAMAN_CONFIRM_RETRY_TIMES:
+                    for user_id in _yaaman_scheduler_users():
+                        key = (today_str, hhmm, user_id)
+                        if key in fired_confirm:
+                            continue
+                        fired_confirm.add(key)
+                        try:
+                            result = confirm_next_day_themes(DATABASE_URL, user_id)
+                            print(f"  [Yaaman] {user_id} {hhmm} テーマ気配確認完了（{len(result.get('themes', []))}件）")
+                        except Exception as e:
+                            print(f"  [Yaaman] {user_id} {hhmm} テーマ気配確認に失敗", e)
+                if len(fired_discovery) > 200:
+                    fired_discovery = {k for k in fired_discovery if k[0] == today_str}
+                if len(fired_confirm) > 400:
+                    fired_confirm = {k for k in fired_confirm if k[0] == today_str}
+        except Exception as e:
+            print("  [Yaaman] スケジューラループで例外", e)
+        time.sleep(30)
 
 
 def _nicosoku_morning_commentary(database_url, user_id):
@@ -17242,6 +17780,30 @@ class Handler(SimpleHTTPRequestHandler):
             result = get_sector_rotation_for_theme(DATABASE_URL, self.current_user, theme) \
                 if (investment_db is not None and DATABASE_URL) else {"sector": theme, "score": None, "state": "NEUTRAL"}
             self._send_json(result)
+        # ---- Yaaman Style / ヤーマン式 Theme Discovery（2026-09-12新規、指示書45番）----
+        # /related・/historyは具体的なsuffixなので、汎用の/api/themes/{theme}より前に判定する。
+        elif self.path.split("?")[0] == "/api/themes/next-day":
+            result = get_next_day_attention_themes(DATABASE_URL, self.current_user) \
+                if (investment_db is not None and DATABASE_URL) else {"themes": []}
+            self._send_json(result)
+        elif self.path.split("?")[0] == "/api/themes/today":
+            result = get_today_attention_themes(DATABASE_URL, self.current_user) \
+                if (investment_db is not None and DATABASE_URL) else {"themes": []}
+            self._send_json(result)
+        elif self.path.split("?")[0].endswith("/related") and self.path.split("?")[0].startswith("/api/themes/"):
+            theme = urllib.parse.unquote(self.path.split("?")[0][len("/api/themes/"):-len("/related")])
+            self._send_json({"theme": theme, "related_codes": sorted(SECTOR_ROTATION_THEME_CODES.get(theme, set()))})
+        elif self.path.split("?")[0].endswith("/history") and self.path.split("?")[0].startswith("/api/themes/"):
+            theme = urllib.parse.unquote(self.path.split("?")[0][len("/api/themes/"):-len("/history")])
+            history = investment_db.list_theme_momentum_history(DATABASE_URL, self.current_user, theme=theme) \
+                if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"theme": theme, "history": history})
+        elif self.path.split("?")[0].startswith("/api/themes/"):
+            theme = urllib.parse.unquote(self.path.split("?")[0][len("/api/themes/"):])
+            today = datetime.date.today().isoformat()
+            result = investment_db.get_next_day_theme_candidate(DATABASE_URL, self.current_user, theme, today) \
+                if (investment_db is not None and DATABASE_URL) else None
+            self._send_json({"theme": theme, "candidate": result})
         elif self.path.split("?")[0] == "/api/trade-decision-events":
             qs = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(qs)
@@ -17305,9 +17867,17 @@ class Handler(SimpleHTTPRequestHandler):
                     sector_rotation_learning = build_sector_rotation_daily_learning(DATABASE_URL, self.current_user, date)
             except Exception as e:
                 print("  daily-review: sector rotation learning生成で例外（無視して続行）", e)
+            # Yaaman Style新規（2026-09-12、指示書30番）：「🔥テーマ学習」。
+            theme_learning = {"strongest_theme": None, "items": []}
+            try:
+                if investment_db is not None and DATABASE_URL:
+                    theme_learning = build_theme_daily_learning(DATABASE_URL, self.current_user, date)
+            except Exception as e:
+                print("  daily-review: theme learning生成で例外（無視して続行）", e)
             self._send_json({"review": review, "decisionReview": decision_review, "tradeLearning": trade_learning,
                               "crossMarketLearning": cross_market_learning,
-                              "sectorRotationLearning": sector_rotation_learning})
+                              "sectorRotationLearning": sector_rotation_learning,
+                              "themeLearning": theme_learning})
         # ---- 2026-09-10新規（朝一マーケット自動分析システム） ----
         elif self.path.startswith("/api/morning-check/list"):
             qs = urllib.parse.urlparse(self.path).query
@@ -18325,10 +18895,18 @@ class Handler(SimpleHTTPRequestHandler):
                         sector_state=(sector_rotation or {}).get("state"))
                 except Exception as e:
                     print("  knowledge-context: choruco fit v2算出で例外（無視して続行）", code, e)
+            # Yaaman Style新規（2026-09-12、指示書35番）：監視銘柄カード表示用。
+            theme_info = None
+            if code:
+                try:
+                    theme_info = get_stock_theme_info(DATABASE_URL, self.current_user, code)
+                except Exception as e:
+                    print("  knowledge-context: theme情報取得で例外（無視して続行）", code, e)
             self._send_json({"context": context, "judgment": judgment, "logId": (log or {}).get("id"),
                               "tradeExperience": trade_experience, "stockBehavior": stock_behavior,
                               "choruco": choruco, "crossMarket": cross_market,
-                              "sectorRotation": sector_rotation, "chorucoFitV2": choruco_fit_v2})
+                              "sectorRotation": sector_rotation, "chorucoFitV2": choruco_fit_v2,
+                              "themeInfo": theme_info})
         elif self.path == "/api/knowledge-context/top5-flags":
             # 指示書4番：TOP5相談向けの軽量な候補別フラグ（フルコンテキストは取得しない）。
             if not self._investment_db_ready():
@@ -18469,6 +19047,19 @@ class Handler(SimpleHTTPRequestHandler):
             if saved is None:
                 self._send_json({"error": "story評価の保存に失敗しました"}); return
             self._send_json({"story": saved, "break_reasons": break_reasons, "status": status})
+        # ---- Yaaman Style / ヤーマン式 Theme Discovery（2026-09-12新規、指示書45番）----
+        elif self.path == "/api/themes/generate":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            result = discover_next_day_themes(DATABASE_URL, self.current_user, event_date=body.get("date"))
+            self._send_json(result)
+        elif self.path == "/api/themes/confirm":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            result = confirm_next_day_themes(DATABASE_URL, self.current_user, generated_date=body.get("date"))
+            self._send_json(result)
         elif self.path == "/api/morning-check/generate":
             # 指示書21番：定時以外でも現在時点の臨時レポートを作成する手動更新（MANUAL）。
             # スケジューラが呼ぶ定時生成もsnapshot_time（T0530等）を指定してこの同じ関数を
@@ -19155,6 +19746,9 @@ def main():
         # 毎営業日15:30の引け後に当日評価を自動生成する独立スケジューラ。他のスケジューラと
         # 同じくサービス分離方針（指示書31番）で別スレッドにする。
         threading.Thread(target=_daily_review_scheduler_loop, daemon=True).start()
+        # Yaaman Style / ヤーマン式 Theme Discovery（2026-09-12新規、指示書46番）：
+        # 15:35引け後発掘＋08:40-08:45気配確認の独立スケジューラ。
+        threading.Thread(target=_yaaman_theme_scheduler_loop, daemon=True).start()
         # 2026-09-10新規（Market Intelligence Timeline、指示書4番）：09:30 OPENING_30Mの
         # 定時スケジューラ（Phase2-A範囲）。別スレッドに分離し、Morning Checkのスケジューラが
         # 万一詰まってもこちらは独立して動く（指示書31番のサービス分離方針）。

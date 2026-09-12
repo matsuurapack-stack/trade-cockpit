@@ -3631,7 +3631,7 @@ function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[code,sector,market,tradeStyle,baseSignal]);
   if(!result)return null;
-  const{judgment,context,tradeExperience,stockBehavior,choruco,crossMarket,sectorRotation,chorucoFitV2}=result;
+  const{judgment,context,tradeExperience,stockBehavior,choruco,crossMarket,sectorRotation,chorucoFitV2,themeInfo}=result;
   const jm=TRADE_JUDGMENT_META[judgment.judgment]||{label:judgment.judgment,color:"var(--ink)"};
   const keyPoints=(judgment.reasons||[]).slice(0,3); // 指示書：重要ポイントは最大3件程度
   const activeRules=(context.relevant_rules||[]).filter(r=>r.status==="ACTIVE");
@@ -3666,6 +3666,16 @@ function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
         <b style={{color:{LEADING:"var(--up)",IMPROVING:"var(--up)",NEUTRAL:"var(--inkSoft)",WEAKENING:"var(--down)",LAGGING:"var(--down)"}[sectorRotation.state]||"var(--inkSoft)"}}>{sectorRotation.state}</b>
         {sectorRotation.score!=null && ` ${sectorRotation.score}`}
       </span>
+    </div>}
+    {/* Yaaman Style / ヤーマン式（2026-09-12新規、指示書35番）：この銘柄が「今日の注目テーマ」の
+        発端（LEADER）または関連（FOLLOWER）に該当する場合のみコンパクト表示。THEME_MOMENTUM_SCORE
+        は既存ENTRY SCOREとは独立の補助指標（0-10）で、既存TOP5選定ロジックには一切使用しない。 */}
+    {themeInfo?.theme && <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:6,fontSize:11.5}}>
+      <span style={{fontWeight:800}}>🔥 {themeInfo.theme}
+        <b style={{marginLeft:4,color:themeInfo.role==="LEADER"?"var(--up)":"var(--inkSoft)"}}>{themeInfo.role}</b>
+      </span>
+      {themeInfo.confirmation && <span style={{fontWeight:700,color:(YAAMAN_CONFIRM_META[themeInfo.confirmation]||{}).color||"var(--inkSoft)"}}>{themeInfo.confirmation}</span>}
+      {themeInfo.theme_momentum_score!=null && <span style={{color:"var(--inkSoft)"}}>Momentum {themeInfo.theme_momentum_score}/10</span>}
     </div>}
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:6}}>
       <div style={{fontWeight:800,fontSize:13,color:jm.color}}>総合判断：{jm.label}</div>
@@ -4617,7 +4627,89 @@ function SimpleSourcePostsFeed({handle}){
   </div>;
 }
 
-function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan,newsCatalysts,entryScanning,entryResult,onEntryScan,thesisStats,todayTheses}){
+// Yaaman Style / ヤーマン式（2026-09-12新規、指示書7・9・10・18番）：LEVEL1（明日の注目テーマ
+// ＝発掘のみ・未確認）／LEVEL2（今日の注目テーマ＝翌朝気配確認済み）を表示するパネル。
+// 表示名は時刻で切り替える（15:30〜翌朝の寄り前＝「明日の注目テーマ」、寄り前以降＝
+// 「今日の注目テーマ」、指示書10番）。既存ENTRY SCORE/今日の注目TOP5/今買い時TOP5は
+// 一切参照・変更しない（このパネルは独立の「候補発掘レイヤー」、指示書は冒頭で明記）。
+const YAAMAN_STAGE_META={
+  EARLY:{label:"EARLY（初動）",color:"var(--accent)"},
+  EXPANDING:{label:"EXPANDING（拡大中）",color:"var(--up)"},
+  MATURE:{label:"MATURE（成熟）",color:"var(--inkSoft)"},
+  EXHAUSTING:{label:"EXHAUSTING（失速）",color:"var(--down)"},
+};
+const YAAMAN_CONFIRM_META={
+  CONFIRMED:{label:"CONFIRMED（気配確認済）",color:"var(--up)"},
+  PARTIAL:{label:"PARTIAL（一部確認）",color:"var(--accent)"},
+  FADED:{label:"FADED（失速）",color:"var(--down)"},
+  INVALIDATED:{label:"INVALIDATED（無効化）",color:"var(--down)"},
+};
+function YaamanThemePanel({nextDayThemes,todayThemes,watchlistAll,onAddToWatchlist,onOpenAnalysis}){
+  const [expandedTheme,setExpandedTheme]=useState(null);
+  // 指示書10番：15:30（引け後発掘直後）〜翌営業日の寄り前（9:00目安）は「明日の注目テーマ」、
+  // それ以外（寄り付き後〜引けまで）は「今日の注目テーマ」を主表示とする。
+  const now=new Date();
+  const jstHour=(()=>{try{
+    return Number(new Intl.DateTimeFormat("en-US",{timeZone:"Asia/Tokyo",hour:"numeric",hourCycle:"h23",minute:"numeric"})
+      .formatToParts(now).reduce((acc,p)=>p.type==="hour"?acc+Number(p.value):p.type==="minute"?acc+Number(p.value)/60:acc,0));
+  }catch(e){return now.getHours()+now.getMinutes()/60;}})();
+  const isEveningWindow=jstHour>=15.5||jstHour<9.0;
+  const nd=(nextDayThemes&&nextDayThemes.themes)||[];
+  const td=(todayThemes&&todayThemes.themes)||[];
+  const showNextDay=isEveningWindow&&nd.length>0;
+  const showToday=(!showNextDay)&&td.length>0;
+  const list=showNextDay?nd:showToday?td:(nd.length?nd:td); // 両方空でなければどちらか出す（時間帯が中途半端な場合のフォールバック）
+  const title=showNextDay?"🔥 明日の注目テーマ":"🔥 今日の注目テーマ";
+  const watchCodes=new Set((watchlistAll||[]).map(w=>w.code));
+  if(list.length===0)return null;
+  return <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:6,padding:"12px 14px",marginTop:12}}>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6,marginBottom:8}}>
+      <div style={{fontWeight:800,fontSize:13.5}}>{title}<span style={{fontWeight:400,fontSize:11,color:"var(--inkFaint)"}}>（ヤーマン式・候補発掘レイヤー）</span></div>
+    </div>
+    <div style={{display:"flex",flexDirection:"column",gap:6}}>
+      {list.map(t=>{
+        const stageMeta=YAAMAN_STAGE_META[t.stage]||{label:t.stage||"—",color:"var(--inkSoft)"};
+        const confMeta=t.confirmation_status?(YAAMAN_CONFIRM_META[t.confirmation_status]||{label:t.confirmation_status,color:"var(--inkSoft)"}):null;
+        const triggers=t.trigger_stocks_json||[];
+        const related=t.related_stocks_json||[];
+        const isOpen=expandedTheme===t.theme;
+        return <div key={t.theme} style={{border:"1px solid var(--rule)",borderRadius:4,background:"var(--bg)"}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,padding:"7px 10px",cursor:"pointer",flexWrap:"wrap"}}
+            onClick={()=>setExpandedTheme(isOpen?null:t.theme)}>
+            <span style={{fontSize:13,fontWeight:800}}>{t.theme}</span>
+            <span style={{fontSize:11,color:"var(--inkSoft)"}}>Score {t.theme_score!=null?Math.round(t.theme_score):"—"}</span>
+            <span style={{fontSize:10.5,fontWeight:700,color:stageMeta.color,border:`1px solid ${stageMeta.color}`,borderRadius:3,padding:"1px 6px"}}>{stageMeta.label}</span>
+            {confMeta && <span style={{fontSize:10.5,fontWeight:700,color:confMeta.color,border:`1px solid ${confMeta.color}`,borderRadius:3,padding:"1px 6px"}}>{confMeta.label}</span>}
+            {t.catalyst && <span style={{fontSize:10.5,color:"var(--inkFaint)"}}>{t.catalyst}</span>}
+            <span style={{fontSize:10.5,color:"var(--inkFaint)",marginLeft:"auto"}}>{isOpen?"▲":"▼"}</span>
+          </div>
+          {isOpen && <div style={{padding:"6px 10px 10px",borderTop:"1px solid var(--rule)"}}>
+            <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:6}}>
+              発端銘柄（LEADER）：{triggers.join("、")||"—"}
+              {t.breadth!=null && <>　breadth {t.breadth}</>}
+              {t.volume_expansion!=null && <>　出来高倍率 {t.volume_expansion}x</>}
+            </div>
+            <div style={{fontSize:11,fontWeight:700,color:"var(--inkSoft)",marginBottom:4}}>関連銘柄（FOLLOWER候補）</div>
+            <div style={{display:"flex",flexDirection:"column",gap:4}}>
+              {related.length===0 && <div style={{fontSize:11,color:"var(--inkFaint)"}}>関連銘柄なし</div>}
+              {related.map(code=>{
+                const inWatch=watchCodes.has(code);
+                return <div key={code} style={{display:"flex",alignItems:"center",gap:8,fontSize:11.5}}>
+                  <span className="mono" style={{width:56,color:"var(--inkSoft)"}}>{code}</span>
+                  {inWatch
+                    ? <button className="chip" style={{fontSize:10.5}} onClick={()=>onOpenAnalysis(code)}>分析へ</button>
+                    : <button className="chip" style={{fontSize:10.5}} onClick={()=>onAddToWatchlist({code,market:"JP"})}>[+監視] 監視銘柄に追加</button>}
+                </div>;
+              })}
+            </div>
+          </div>}
+        </div>;
+      })}
+    </div>
+  </div>;
+}
+
+function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan,newsCatalysts,entryScanning,entryResult,onEntryScan,thesisStats,todayTheses,yaamanNextDayThemes,yaamanTodayThemes,onAddToWatchlist}){
   const [expandedScoreCode,setExpandedScoreCode]=useState(null); // スコア内訳の折りたたみ展開（指示書21番）
   const [entryDebugOpen,setEntryDebugOpen]=useState(false); // TOP5表示ロジック修正指示・指示書7番：開発用デバッグ表示（既定は折りたたみ）
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
@@ -4890,6 +4982,13 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         最上部に「昨日までの反省」を表示する。監視銘柄タブは実質的な朝一チェック画面のため
         ここに置く。反省が無ければ何も表示しない。 */}
     <RecentReflectionsNote/>
+
+    {/* Yaaman Style / ヤーマン式（2026-09-12新規、指示書9番：UI表示順序 1.Market Mode
+        2.Sector Rotation 3.明日/今日の注目テーマ 4.今日の注目TOP5 5.今買い時TOP5
+        6.通常監視銘柄）。Market Mode・Sector Rotationはページ最上部に常設済み（App直下）
+        のため、この監視銘柄タブ内では3番目＝TOP5群より前に置く。 */}
+    <YaamanThemePanel nextDayThemes={yaamanNextDayThemes} todayThemes={yaamanTodayThemes}
+      watchlistAll={watchlistAll} onAddToWatchlist={onAddToWatchlist} onOpenAnalysis={onOpenAnalysis}/>
 
     {/* v3-4「今日の注目TOP5」：既存のenrichWatchRow()出力のみから軽量に順位付け（新規のサーバー
         計算・重い分析呼び出しなし）。クリックで既存のonOpenAnalysis（analysisTargetsに追加＋
@@ -10012,6 +10111,38 @@ function App(){
     return ()=>clearInterval(id);
   },[checkSectorRotation]);
 
+  // Yaaman Style / ヤーマン式（2026-09-12新規、指示書9・10・46番）：「明日の注目テーマ」
+  // （引け後15:35発掘）／「今日の注目テーマ」（翌朝8:40-8:45気配確認済み）の取得。
+  // 60秒間隔ポーリング（発掘・確認とも数分間隔のバッチ処理のため、これで十分）。
+  // 監視銘柄タブの表示名は時刻で切り替える（15:30〜翌朝寄り前＝「明日の注目テーマ」、
+  // 寄り前以降＝「今日の注目テーマ」）。データ自体は両APIを両方取得しておき、表示だけ切替える。
+  const [yaamanNextDayThemes,setYaamanNextDayThemes]=useState(null);
+  const [yaamanTodayThemes,setYaamanTodayThemes]=useState(null);
+  const prevYaamanConfirmRef=useRef({}); // theme -> confirmation_status（CONFIRMED遷移検知用）
+  const checkYaamanThemes=useCallback(async()=>{
+    const [nd,td]=await Promise.all([
+      fetchJsonSafe("/api/themes/next-day"),
+      fetchJsonSafe("/api/themes/today"),
+    ]);
+    if(nd && !nd.error)setYaamanNextDayThemes(nd);
+    if(td && !td.error){
+      setYaamanTodayThemes(td);
+      for(const th of (td.themes||[])){
+        const prev=prevYaamanConfirmRef.current[th.theme];
+        if(th.confirmation_status==="CONFIRMED" && prev!=="CONFIRMED"){
+          notifyChorucoOnce(`theme-confirm:${th.theme}:${td.generated_date||""}`,`🔥 ${th.theme} CONFIRMED`,
+            "今日の注目テーマへ昇格しました","info");
+        }
+        prevYaamanConfirmRef.current[th.theme]=th.confirmation_status;
+      }
+    }
+  },[notifyChorucoOnce]);
+  useEffect(()=>{
+    checkYaamanThemes();
+    const id=setInterval(checkYaamanThemes,60*1000);
+    return ()=>clearInterval(id);
+  },[checkYaamanThemes]);
+
   useEffect(()=>{
     // 今日まだ計算していなければ登録銘柄全体（日本株）で即時計算し、以後は日付が変わるまで再計算しない。
     if(s.breakoutLevelsFetchedDate!==todayISO()){
@@ -11425,6 +11556,7 @@ function App(){
 
       {/* ===== 監視銘柄（2026-08-21 ユーザー要望） ===== */}
       {tab==="watch" && <WatchTargetsPanel items={watchTargetItems} stockQuotes={s.stockQuotes} newsCatalysts={newsCatalysts}
+        yaamanNextDayThemes={yaamanNextDayThemes} yaamanTodayThemes={yaamanTodayThemes} onAddToWatchlist={addToWatchlistDirect}
         analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget} onOpenAnalysis={openAnalysisFor}
         earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
         onRemove={removeWatchTarget} metrics={s.metrics} watchlistAll={watchlistAll} breakoutLevels={s.breakoutLevels}

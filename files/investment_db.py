@@ -1209,6 +1209,7 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_CHORUCO_STYLE_SQL)
         conn.execute(_SCHEMA_CROSS_MARKET_LINK_SQL)
         conn.execute(_SCHEMA_SECTOR_ROTATION_SQL)
+        conn.execute(_SCHEMA_YAAMAN_THEME_SQL)
         conn.commit()
 
 
@@ -7032,6 +7033,214 @@ def list_sector_behavior_profiles(database_url, user_id):
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("SELECT * FROM sector_behavior_profiles WHERE user_id=%s ORDER BY sector_name", [user_id])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+# Yaaman Style / ヤーマン式 Theme Discovery（2026-09-12新規）。
+_SCHEMA_YAAMAN_THEME_SQL = """
+-- 指示書26番：ストップ高・急騰銘柄の履歴。
+CREATE TABLE IF NOT EXISTS limit_up_events (
+    id                SERIAL PRIMARY KEY,
+    user_id           TEXT NOT NULL,
+    event_date        DATE NOT NULL,
+    symbol            TEXT NOT NULL,
+    stock_name        TEXT,
+    pct               NUMERIC,
+    volume            NUMERIC,
+    volume_ratio      NUMERIC,
+    reason            TEXT,
+    catalyst_type     TEXT,
+    theme             TEXT,
+    sector            TEXT,
+    pts_change        NUMERIC,
+    next_day_gap      NUMERIC,
+    next_day_high     NUMERIC,
+    next_day_close    NUMERIC,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, event_date, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_limit_up_events_user_date ON limit_up_events(user_id, event_date DESC);
+
+-- 指示書27番：テーマの日次推移。
+CREATE TABLE IF NOT EXISTS theme_momentum_history (
+    id                     SERIAL PRIMARY KEY,
+    user_id                TEXT NOT NULL,
+    theme                  TEXT NOT NULL,
+    event_date             DATE NOT NULL,
+    stage                  TEXT,
+    theme_score            NUMERIC,
+    breadth                NUMERIC,
+    leader_count           INTEGER,
+    related_movers         INTEGER,
+    next_day_confirmation  TEXT,
+    day2_performance       NUMERIC,
+    day3_performance       NUMERIC,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, theme, event_date)
+);
+CREATE INDEX IF NOT EXISTS idx_theme_momentum_history_user_theme ON theme_momentum_history(user_id, theme, event_date DESC);
+
+-- 「明日の注目テーマ」（LEVEL1）を翌朝の答え合わせまで永続化する。指示書3・8・10・11番。
+CREATE TABLE IF NOT EXISTS next_day_theme_candidates (
+    id                     SERIAL PRIMARY KEY,
+    user_id                TEXT NOT NULL,
+    theme                  TEXT NOT NULL,
+    generated_date         DATE NOT NULL,   -- 生成日（引け後、15:35想定）
+    theme_score            NUMERIC,
+    stage                  TEXT,
+    trigger_stocks_json    JSONB,
+    related_stocks_json    JSONB,
+    catalyst               TEXT,
+    breadth                NUMERIC,
+    volume_expansion       NUMERIC,
+    pts_confirmation       BOOLEAN,
+    confirmation_status    TEXT,            -- NULL（未確認）|CONFIRMED|PARTIAL|FADED|INVALIDATED
+    confirmed_at           TIMESTAMPTZ,
+    confirmation_detail_json JSONB,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, theme, generated_date)
+);
+CREATE INDEX IF NOT EXISTS idx_next_day_theme_candidates_user_date ON next_day_theme_candidates(user_id, generated_date DESC);
+"""
+
+
+def upsert_limit_up_event(database_url, user_id, event_date, symbol, fields):
+    """指示書26番：limit_up_events。冪等（UNIQUE(user_id,event_date,symbol)）。"""
+    pool = _get_pool(database_url)
+    if pool is None or not symbol:
+        return None
+    cols = ["stock_name", "pct", "volume", "volume_ratio", "reason", "catalyst_type", "theme",
+            "sector", "pts_change", "next_day_gap", "next_day_high", "next_day_close"]
+    present = [c for c in cols if c in (fields or {})]
+    if not present:
+        return None
+    values = [fields.get(c) for c in present]
+    insert_placeholders = ["%s"] * len(present)
+    update_clauses = [f"{c}=EXCLUDED.{c}" for c in present]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO limit_up_events (user_id, event_date, symbol, {', '.join(present)}) "
+                f"VALUES (%s, %s, %s, {', '.join(insert_placeholders)}) "
+                f"ON CONFLICT (user_id, event_date, symbol) DO UPDATE SET {', '.join(update_clauses)} "
+                f"RETURNING *", [user_id, event_date, symbol] + values)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_limit_up_events(database_url, user_id, event_date=None, limit=200):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = ["user_id=%s"], [user_id]
+    if event_date:
+        where.append("event_date=%s")
+        params.append(event_date)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SELECT * FROM limit_up_events WHERE {' AND '.join(where)} "
+                        f"ORDER BY event_date DESC, pct DESC LIMIT %s", params + [limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def upsert_next_day_theme_candidate(database_url, user_id, theme, generated_date, fields):
+    """指示書3・8番：next_day_theme_candidates。冪等（UNIQUE(user_id,theme,generated_date)）。"""
+    pool = _get_pool(database_url)
+    if pool is None or not theme:
+        return None
+    cols = ["theme_score", "stage", "trigger_stocks_json", "related_stocks_json", "catalyst",
+            "breadth", "volume_expansion", "pts_confirmation", "confirmation_status",
+            "confirmed_at", "confirmation_detail_json"]
+    json_cols = {"trigger_stocks_json", "related_stocks_json", "confirmation_detail_json"}
+    present = [c for c in cols if c in (fields or {})]
+    if not present:
+        return get_next_day_theme_candidate(database_url, user_id, theme, generated_date)
+    values = [fields.get(c) for c in present]
+    wrapped = [json.dumps(v, ensure_ascii=False) if (c in json_cols and v is not None) else v
+               for c, v in zip(present, values)]
+    insert_placeholders = ["%s::jsonb" if c in json_cols else "%s" for c in present]
+    update_clauses = [f"{c}=EXCLUDED.{c}" for c in present] + ["updated_at=now()"]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO next_day_theme_candidates (user_id, theme, generated_date, {', '.join(present)}) "
+                f"VALUES (%s, %s, %s, {', '.join(insert_placeholders)}) "
+                f"ON CONFLICT (user_id, theme, generated_date) DO UPDATE SET {', '.join(update_clauses)} "
+                f"RETURNING *", [user_id, theme, generated_date] + wrapped)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def get_next_day_theme_candidate(database_url, user_id, theme, generated_date):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM next_day_theme_candidates WHERE user_id=%s AND theme=%s AND generated_date=%s",
+                        [user_id, theme, generated_date])
+            row = cur.fetchone()
+    return _row_to_json(row) if row else None
+
+
+def list_next_day_theme_candidates(database_url, user_id, generated_date=None, limit=50):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = ["user_id=%s"], [user_id]
+    if generated_date:
+        where.append("generated_date=%s")
+        params.append(generated_date)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SELECT * FROM next_day_theme_candidates WHERE {' AND '.join(where)} "
+                        f"ORDER BY generated_date DESC, theme_score DESC NULLS LAST LIMIT %s", params + [limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def upsert_theme_momentum_history(database_url, user_id, theme, event_date, fields):
+    """指示書27・28番：theme_momentum_history。冪等（UNIQUE(user_id,theme,event_date)）。"""
+    pool = _get_pool(database_url)
+    if pool is None or not theme:
+        return None
+    cols = ["stage", "theme_score", "breadth", "leader_count", "related_movers",
+            "next_day_confirmation", "day2_performance", "day3_performance"]
+    present = [c for c in cols if c in (fields or {})]
+    if not present:
+        return None
+    values = [fields.get(c) for c in present]
+    insert_placeholders = ["%s"] * len(present)
+    update_clauses = [f"{c}=EXCLUDED.{c}" for c in present]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO theme_momentum_history (user_id, theme, event_date, {', '.join(present)}) "
+                f"VALUES (%s, %s, %s, {', '.join(insert_placeholders)}) "
+                f"ON CONFLICT (user_id, theme, event_date) DO UPDATE SET {', '.join(update_clauses)} "
+                f"RETURNING *", [user_id, theme, event_date] + values)
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_theme_momentum_history(database_url, user_id, theme=None, limit=100):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = ["user_id=%s"], [user_id]
+    if theme:
+        where.append("theme=%s")
+        params.append(theme)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SELECT * FROM theme_momentum_history WHERE {' AND '.join(where)} "
+                        f"ORDER BY event_date DESC LIMIT %s", params + [limit])
             rows = cur.fetchall()
     return [_row_to_json(r) for r in rows]
 
