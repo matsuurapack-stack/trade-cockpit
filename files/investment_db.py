@@ -1207,6 +1207,7 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_PARSER_FAILURE_QUEUE_SQL)
         conn.execute(_SCHEMA_CONFIG_CHANGE_LOG_SQL)
         conn.execute(_SCHEMA_CHORUCO_STYLE_SQL)
+        conn.execute(_SCHEMA_CROSS_MARKET_LINK_SQL)
         conn.commit()
 
 
@@ -2115,6 +2116,8 @@ _TRADE_EXPERIENCE_COLS = (
     "post_trade_analysis_json", "notes", "decision_quality_score", "trade_result_score",
     "market_mode_at_entry", "market_mode_at_exit", "event_risk_at_entry", "position_multiplier",
     "recommended_multiplier", "story_score_at_entry", "story_break_status", "story_break_reason",
+    "primary_driver", "driver_corr_at_entry", "driver_lag_at_entry", "driver_state_at_entry",
+    "driver_state_at_exit", "cross_market_score_at_entry",
 )
 
 
@@ -2331,7 +2334,8 @@ def upsert_stock_behavior_profile(database_url, user_id, symbol, fields):
             "pullback_success_rate", "late_day_momentum_rate", "late_day_fade_rate", "overnight_win_rate",
             "overnight_gap_down_rate", "avg_mfe_pct", "avg_mae_pct", "best_entry_time_bucket",
             "worst_entry_time_bucket", "time_bucket_stats_json", "preferred_setup_json",
-            "danger_patterns_json", "confidence_level"]
+            "danger_patterns_json", "confidence_level",
+            "primary_driver", "primary_driver_corr", "primary_driver_lag", "cross_market_reliability"]
     json_cols = {"time_bucket_stats_json", "preferred_setup_json", "danger_patterns_json"}
     present = [c for c in cols if c in (fields or {})]
     if not present:
@@ -6866,6 +6870,22 @@ CREATE TABLE IF NOT EXISTS choruco_stories (
     updated_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_choruco_stories_user_symbol ON choruco_stories(user_id, symbol, created_at DESC);
+"""
+
+# Cross-Market Link Phase 2（2026-09-12新規）。既存trade_experiences/stock_behavior_profilesへの
+# 追加列のみ（新規テーブルは作らない）。
+_SCHEMA_CROSS_MARKET_LINK_SQL = """
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS primary_driver TEXT;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS driver_corr_at_entry NUMERIC;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS driver_lag_at_entry INTEGER;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS driver_state_at_entry TEXT;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS driver_state_at_exit TEXT;
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS cross_market_score_at_entry NUMERIC;
+
+ALTER TABLE stock_behavior_profiles ADD COLUMN IF NOT EXISTS primary_driver TEXT;
+ALTER TABLE stock_behavior_profiles ADD COLUMN IF NOT EXISTS primary_driver_corr NUMERIC;
+ALTER TABLE stock_behavior_profiles ADD COLUMN IF NOT EXISTS primary_driver_lag INTEGER;
+ALTER TABLE stock_behavior_profiles ADD COLUMN IF NOT EXISTS cross_market_reliability NUMERIC;
 """
 
 

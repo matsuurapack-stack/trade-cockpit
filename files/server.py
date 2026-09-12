@@ -3019,11 +3019,30 @@ def compute_light_trade_analysis_snapshot(database_url, user_id, code, market="J
         event_risk_level = (market_mode_result or {}).get("event_risk_level", "LOW")
         story = investment_db.get_latest_choruco_story(database_url, user_id, code) \
             if (investment_db and database_url) else None
+
+        # Cross-Market Link Phase 2新規（指示書10番）：FAST UPDATE連携。5分足系列はキャッシュ
+        # （_cached_5m_bars、CACHE_TTL["stock5m"]）済みのため、10秒間隔で呼ばれても相関の
+        # 再計算自体はTTLごとに1回で済む。半導体・AI関連銘柄以外はis_cross_market_eligible_
+        # sector()がFalseを返しゲートされる（重い計算は禁止、指示書18番）。
+        cross_market = None
+        try:
+            cross_market = build_cross_market_link(code, sector=row.get("sector"))
+        except Exception as e:
+            print("  trade-analysis/live: cross-market取得で例外（無視して続行）", code, e)
+
         story_status = None
         if story and story.get("status") != "BROKEN":
             fast_snapshot = {"price": fields.get("price"), "vwap": fields.get("vwap"),
                                "short_ma": fields.get("short_ma"), "entry_state": entry_state,
                                "market_mode": market_mode}
+            if cross_market and cross_market.get("primary_driver"):
+                fast_snapshot["cross_market"] = {
+                    "primary_driver": cross_market.get("primary_driver"),
+                    "driver_recent_change_pct": next(
+                        (d.get("recent_change_pct") for d in (cross_market.get("drivers") or [])
+                         if d.get("label") == cross_market.get("primary_driver")), None),
+                    "direction": cross_market.get("direction"),
+                }
             break_reasons = detect_story_break(story.get("story_json") or {}, fast_snapshot)
             story_status = classify_story_status(story.get("story_score"), break_reasons)
         elif story:
@@ -3034,6 +3053,12 @@ def compute_light_trade_analysis_snapshot(database_url, user_id, code, market="J
         fields["story_status"] = story_status
         fields["choruco_fit"] = compute_choruco_fit(market_mode, sector_flow_label, event_risk_level,
                                                         (story or {}).get("story_score"))
+        if cross_market and cross_market.get("primary_driver"):
+            fields["cross_market_primary_driver"] = cross_market.get("primary_driver")
+            fields["cross_market_correlation"] = cross_market.get("correlation")
+            fields["cross_market_divergence"] = cross_market.get("divergence")
+            fields["cross_market_leading_alert"] = cross_market.get("leading_alert")
+            fields["cross_market_score"] = cross_market.get("cross_market_score")
     except Exception as e:
         print("  trade-analysis/live: choruco連携で例外（無視して続行）", code, e)
         fields["market_mode"] = None
@@ -10092,6 +10117,23 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
         entry_price, exit_price, qty = t.get("entry_price"), t.get("exit_price"), t.get("shares")
         gross_pnl_pct = compute_trade_gross_pnl_pct(entry_price, exit_price) if entry_price else None
         result_class = classify_trade_result(gross_pnl)
+        # Cross-Market Link Phase 2新規（指示書14番）：同期時点のprimary driver情報を付与する
+        # （market_mode同様、「エントリー時点の厳密な値」ではなく「15:30同期時点の代表値」、
+        # 既知の制約）。半導体・AI関連銘柄以外はbuild_cross_market_link()がゲートしNoneに近い
+        # 値を返す。
+        primary_driver = driver_corr = driver_lag = driver_state = cross_score = None
+        try:
+            cm = build_cross_market_link(t.get("code"))
+            if cm.get("primary_driver"):
+                primary_driver = cm.get("primary_driver")
+                driver_corr = cm.get("correlation")
+                driver_lag = cm.get("best_lag_minutes")
+                primary_driver_change = next((d.get("recent_change_pct") for d in (cm.get("drivers") or [])
+                                                if d.get("label") == primary_driver), None)
+                driver_state = "UP" if (primary_driver_change or 0) > 0 else ("DOWN" if (primary_driver_change or 0) < 0 else None)
+                cross_score = cm.get("cross_market_score")
+        except Exception as e:
+            print("  daily-review: cross-market取得で例外（無視して続行）", t.get("code"), e)
         fields = {
             "trade_date": review_date, "symbol": t.get("code"), "stock_name": t.get("name"),
             "side": "BUY", "quantity": qty, "entry_price": entry_price, "exit_price": exit_price,
@@ -10100,6 +10142,9 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
             "trade_result_score": compute_trade_result_score(gross_pnl_pct),
             "market_mode_at_entry": market_mode_today, "market_mode_at_exit": market_mode_today,
             "event_risk_at_entry": event_risk_today,
+            "primary_driver": primary_driver, "driver_corr_at_entry": driver_corr,
+            "driver_lag_at_entry": driver_lag, "driver_state_at_entry": driver_state,
+            "driver_state_at_exit": driver_state, "cross_market_score_at_entry": cross_score,
             "notes": "15:30自動評価による自動登録（sync_trade_experiences_for_date）。",
         }
         try:
@@ -10221,6 +10266,23 @@ def update_stock_behavior_profile(database_url, user_id, symbol):
     stats = aggregate_stock_behavior_stats(entered)
     stock_name = next((e.get("stock_name") for e in experiences if e.get("stock_name")), None)
     fields = {**stats, "stock_name": stock_name}
+    # Cross-Market Link Phase 2新規（指示書15番）：「8035はKOSPIが平均8分先行」のように表示
+    # できるよう、蓄積済みtrade_experiencesからprimary_driver・平均相関・平均lag・信頼度
+    # （予測が当たった割合）を集計する。半導体・AI関連銘柄以外はprimary_driverが常にNoneの
+    # ためこのブロックは実質何もしない。
+    driver_rows = [e for e in entered if e.get("primary_driver")]
+    if driver_rows:
+        from collections import Counter
+        most_common_driver = Counter(e["primary_driver"] for e in driver_rows).most_common(1)[0][0]
+        same_driver_rows = [e for e in driver_rows if e["primary_driver"] == most_common_driver]
+        corrs = [e["driver_corr_at_entry"] for e in same_driver_rows if e.get("driver_corr_at_entry") is not None]
+        lags = [e["driver_lag_at_entry"] for e in same_driver_rows if e.get("driver_lag_at_entry") is not None]
+        validities = [_cross_market_prediction_was_valid(e) for e in same_driver_rows]
+        validities = [v for v in validities if v is not None]
+        fields["primary_driver"] = most_common_driver
+        fields["primary_driver_corr"] = round(sum(corrs) / len(corrs), 2) if corrs else None
+        fields["primary_driver_lag"] = round(sum(lags) / len(lags)) if lags else None
+        fields["cross_market_reliability"] = round(sum(1 for v in validities if v) / len(validities), 2) if validities else None
     return investment_db.upsert_stock_behavior_profile(database_url, user_id, symbol, fields)
 
 
@@ -10833,6 +10895,20 @@ def detect_story_break(story, current_snapshot):
         reasons.append("RS急低下・根拠崩れ")
     if snap.get("market_mode") == "DEFENSE" and story.get("market_mode_at_entry") != "DEFENSE":
         reasons.append("地合いDEFENSE化")
+    # Cross-Market Link Phase 2新規（指示書9番）：ENTRY時点のprimary driverが急落し、かつ
+    # ENTRY時点と同じ相関方向が続いている場合に崩れ条件へ追加する（既存のstory崩れ判定は
+    # 無変更、追加条件のみ）。
+    primary_driver = story.get("primary_driver")
+    driver_corr = story.get("driver_corr")
+    cm = snap.get("cross_market") or {}
+    if primary_driver and cm.get("primary_driver") == primary_driver:
+        driver_change = cm.get("driver_recent_change_pct")
+        direction = cm.get("direction") or ("POSITIVE" if (driver_corr or 0) >= 0 else "NEGATIVE")
+        if driver_change is not None:
+            adverse = (direction == "POSITIVE" and driver_change <= -CROSS_MARKET_LEADING_ALERT_MIN_DRIVER_CHANGE) or \
+                      (direction == "NEGATIVE" and driver_change >= CROSS_MARKET_LEADING_ALERT_MIN_DRIVER_CHANGE)
+            if adverse:
+                reasons.append(f"{primary_driver}急変（連動崩れ）")
     return reasons
 
 
@@ -11048,6 +11124,324 @@ def aggregate_choruco_story_break_response(experiences):
         pnls = [e["gross_pnl_pct"] for e in group if e.get("gross_pnl_pct") is not None]
         out[group_key]["avg_pnl_pct"] = round(sum(pnls) / len(pnls), 2) if pnls else None
     return out
+
+
+# ============================================================
+# Cross-Market Link Phase 2（2026-09-12新規）。既存Choruco Style（Market Mode/Event Risk/
+# Story Engine）・既存ENTRY SCORE・Rule Engineには一切変更を加えず、その上に積む補助レイヤー。
+# 対象はまず半導体・AI関連銘柄のみ（指示書1・18番、全56銘柄×全driverの総当たりは行わない）。
+# 【重要な既知の制約】NASDAQ/SOX/NVIDIA/Micronは米国市場が日本のザラ場時間中は休場のため、
+# 「同時刻の5分足」を厳密に突き合わせることはできない（日本株が動いている間、米国株は
+# 前セッションの終値のまま静止している）。本エンジンはyfinanceが返す各シンボル直近の5本足
+# 系列同士を単純にインデックス対応させて相関を計算する——KOSPI・USDJPY・日経先物は取引時間帯が
+# 重なるため実際の同時性がある一方、NASDAQ/SOX/NVIDIA/Micronは「直近に確定した値動きの
+# 方向性」程度の参考値に留まる（真の同時相関ではない）。UI文言は「連動」「先行傾向」に限定し、
+# 「原因」等の因果関係を示唆する表現は使わない（指示書17番）。
+# ============================================================
+
+CROSS_MARKET_DRIVERS = {
+    "nikkei_fut": {"symbol": "NIY=F", "label": "Nikkei Futures"},
+    "nikkei225": {"symbol": "^N225", "label": "Nikkei225"},
+    "nasdaq": {"symbol": "^IXIC", "label": "NASDAQ"},
+    "sox": {"symbol": "^SOX", "label": "SOX"},
+    "kospi": {"symbol": "^KS11", "label": "KOSPI"},
+    "nvidia": {"symbol": "NVDA", "label": "NVIDIA"},
+    "micron": {"symbol": "MU", "label": "Micron"},
+    "usdjpy": {"symbol": "JPY=X", "label": "USDJPY"},
+    # 将来拡張候補（指示書1番）：TSMC(TSM)/Samsung/SK Hynix。Samsung・SK Hynixは韓国市場上場で
+    # yfinanceの無料ティッカーが不安定なため未対応（既知の制約）。
+}
+CROSS_MARKET_ELIGIBLE_SECTOR_KEYWORDS = ("半導体",)
+# 【実データで発覚した既知の制約・修正】TSE公式業種分類には「半導体」という業種区分自体が
+# 存在せず、東京エレクトロン/アドバンテスト/キオクシアは「電気機器」、ディスコは「精密機器」に
+# 分類される（実際のwatchlistデータで確認済み）。sector文字列だけでは半導体関連銘柄を
+# 判別できないため、既存ADR_TICKER_MAP等と同じ「動作確認済みの明示コードリスト」方式を
+# 併用する。将来的にTSMC等の海外上場銘柄を追加する場合もこのリストへ追記する（指示書1番）。
+CROSS_MARKET_SEMICONDUCTOR_CODES = {
+    "8035",  # 東京エレクトロン
+    "6857",  # アドバンテスト
+    "6146",  # ディスコ
+    "285A",  # キオクシアホールディングス
+    "3436",  # SUMCO
+    "4063",  # 信越化学工業（半導体シリコンウエハー）
+    "6920",  # レーザーテック
+    "6963",  # ローム
+    "7735",  # SCREENホールディングス
+    "6526",  # ソシオネクスト
+}
+
+
+def is_cross_market_eligible_sector(sector, code=None):
+    """指示書1・18番：まず半導体・AI関連のみを対象にする。sector文字列に「半導体」を含む
+    ケースに加え、既知の半導体関連銘柄コード（CROSS_MARKET_SEMICONDUCTOR_CODES）でも判定する
+    （sector文字列だけでは実データ上判別できないため）。"""
+    if code and code in CROSS_MARKET_SEMICONDUCTOR_CODES:
+        return True
+    if not sector:
+        return False
+    return any(kw in sector for kw in CROSS_MARKET_ELIGIBLE_SECTOR_KEYWORDS)
+
+
+def compute_pct_change_series(closes):
+    """終値配列からバー毎の変化率(%)系列を作る（先頭は比較対象が無いため除外）。"""
+    out = []
+    for i in range(1, len(closes) or 0):
+        prev = closes[i - 1]
+        out.append((closes[i] - prev) / prev * 100 if prev else 0.0)
+    return out
+
+
+def pearson_correlation(xs, ys):
+    """pure-Pythonピアソン相関係数（新規の重い依存を追加しない、他の統計処理と同じ方針）。
+    長さが揃っていない場合は末尾を基準に短い方へ揃える。サンプル不足（<3）・分散ゼロは
+    Noneを返す（無理に相関ありと判定しない）。"""
+    n = min(len(xs), len(ys))
+    if n < 3:
+        return None
+    xs, ys = xs[-n:], ys[-n:]
+    mean_x, mean_y = sum(xs) / n, sum(ys) / n
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    var_y = sum((y - mean_y) ** 2 for y in ys)
+    if var_x <= 0 or var_y <= 0:
+        return None
+    return cov / ((var_x ** 0.5) * (var_y ** 0.5))
+
+
+CROSS_MARKET_MAX_LAG_BARS = 3  # 0/5/10/15分（5分足前提、指示書3番）
+
+
+def compute_lead_lag(stock_pct_series, driver_pct_series, max_lag_bars=CROSS_MARKET_MAX_LAG_BARS):
+    """指示書3番：driverがstockに対しlag本（5分刻み）先行しているとみなした場合の相関を
+    0〜3本（0/5/10/15分）で試し、絶対値が最も強いものを採用する。lag>0では
+    driver_pct_series[t-lag] と stock_pct_series[t] を対応させる（driverが過去の値＝先行）。
+    戻り値：(best_lag_minutes, best_corr, direction) または全てNone（有効な相関が無い場合）。"""
+    best_lag, best_corr, best_dir = None, 0.0, None
+    for lag in range(0, max_lag_bars + 1):
+        if lag == 0:
+            xs, ys = stock_pct_series, driver_pct_series
+        else:
+            xs, ys = stock_pct_series[lag:], driver_pct_series[:-lag]
+        corr = pearson_correlation(xs, ys)
+        if corr is None:
+            continue
+        if best_dir is None or abs(corr) > abs(best_corr):
+            best_lag, best_corr = lag * 5, corr
+            best_dir = "POSITIVE" if corr >= 0 else "NEGATIVE"
+    if best_dir is None:
+        return None, None, None
+    return best_lag, best_corr, best_dir
+
+
+def classify_cross_market_confidence(sample_count):
+    """指示書4番：sample不足時はLOW。既存classify_pattern_confidence()と同じ閾値
+    （<5 LOW/5-14 MEDIUM/15+ HIGH）をそのまま再利用する（二重の基準を作らない）。"""
+    return classify_pattern_confidence(sample_count)
+
+
+def rank_cross_market_drivers(driver_results):
+    """指示書5番：candidate driverの結果から primary/secondary を決める。|correlation|が高く
+    confidenceが高いものを優先する（stability/sector relevanceは既にdriver候補を半導体・AI
+    関連の8種に絞り込んだ時点で織り込み済みとみなし、二重の重み付けはしない）。
+    戻り値：(primary_or_None, secondary_or_None)。"""
+    _conf_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    scored = [d for d in (driver_results or []) if d.get("correlation") is not None]
+    scored.sort(key=lambda d: (-abs(d["correlation"]), _conf_order.get(d.get("confidence"), 3)))
+    primary = scored[0] if scored else None
+    secondary = scored[1] if len(scored) > 1 else None
+    return primary, secondary
+
+
+CROSS_MARKET_DIVERGENCE_THRESHOLD_PCT = 1.0
+
+
+def classify_cross_market_divergence(driver_recent_change_pct, stock_recent_change_pct, direction):
+    """指示書6番：driverの直近変化と相関の向き（direction）から期待される個別株の符号と、
+    実際の個別株の符号が食い違う場合にdivergenceとして検知する。
+    例：KOSPI-1.5%（正相関なら個別も下を期待）なのに個別+0.5% → POSITIVE_DIVERGENCE
+        （個別が予想に反して強い）。SOX+2%なのに個別-0.3% → NEGATIVE_DIVERGENCE
+        （個別が予想に反して弱い）。"""
+    if driver_recent_change_pct is None or stock_recent_change_pct is None or direction is None:
+        return "NONE"
+    if abs(driver_recent_change_pct) < CROSS_MARKET_DIVERGENCE_THRESHOLD_PCT:
+        return "NONE"
+    sign_mult = 1 if direction == "POSITIVE" else -1
+    driver_sign = 1 if driver_recent_change_pct > 0 else -1
+    expected_stock_sign = sign_mult * driver_sign
+    actual_stock_sign = 1 if stock_recent_change_pct > 0 else (-1 if stock_recent_change_pct < 0 else 0)
+    if actual_stock_sign == 0 or actual_stock_sign == expected_stock_sign:
+        return "NONE"
+    return "POSITIVE_DIVERGENCE" if actual_stock_sign > 0 else "NEGATIVE_DIVERGENCE"
+
+
+CROSS_MARKET_LEADING_ALERT_MIN_DRIVER_CHANGE = 1.0
+CROSS_MARKET_LEADING_ALERT_MIN_CORR = 0.65
+CROSS_MARKET_STOCK_REACTED_THRESHOLD_PCT = 0.3
+
+
+def detect_leading_market_alert(driver_change_pct, correlation, stock_change_pct):
+    """指示書7番：LEADING_MARKET_ALERT。driver急変（|Δ|>=1%）＋高相関（>=0.65）＋個別未反応
+    （|個別Δ|<0.3%）の3条件が揃った場合のみ検知する。"""
+    if driver_change_pct is None or correlation is None:
+        return False
+    if abs(driver_change_pct) < CROSS_MARKET_LEADING_ALERT_MIN_DRIVER_CHANGE:
+        return False
+    if abs(correlation) < CROSS_MARKET_LEADING_ALERT_MIN_CORR:
+        return False
+    if stock_change_pct is not None and abs(stock_change_pct) >= CROSS_MARKET_STOCK_REACTED_THRESHOLD_PCT:
+        return False
+    return True
+
+
+def detect_catch_up_candidate(driver_change_pct, stock_change_pct, correlation,
+                                  min_corr=CROSS_MARKET_LEADING_ALERT_MIN_CORR,
+                                  min_driver_move=CROSS_MARKET_LEADING_ALERT_MIN_DRIVER_CHANGE,
+                                  max_stock_move=CROSS_MARKET_STOCK_REACTED_THRESHOLD_PCT):
+    """指示書8番：CATCH_UP_CANDIDATE。driver上昇済み（>=+1%・正相関前提）＋個別未反応＋
+    高相関の場合のみ検知する。"""
+    if driver_change_pct is None or stock_change_pct is None or correlation is None:
+        return False
+    if correlation < min_corr:
+        return False
+    if driver_change_pct < min_driver_move:
+        return False
+    if abs(stock_change_pct) > max_stock_move:
+        return False
+    return True
+
+
+def compute_cross_market_score(leading_alert, catch_up_candidate, divergence, correlation):
+    """指示書8番：cross_market_score -5〜+5の補助スコア。既存entry_scoreには一切影響しない。
+    catch_up_candidate＝先取りの好機（+3）、leading_alert＝先行下落警告（-2）、
+    POSITIVE_DIVERGENCE＝個別が予想以上に強い（+2）、NEGATIVE_DIVERGENCE＝予想以上に弱い（-2）、
+    強い相関（|corr|>=0.8）は既存の符号をさらに強調する（+-1）。"""
+    score = 0.0
+    if catch_up_candidate:
+        score += 3
+    if leading_alert:
+        score -= 2
+    if divergence == "POSITIVE_DIVERGENCE":
+        score += 2
+    elif divergence == "NEGATIVE_DIVERGENCE":
+        score -= 2
+    if correlation is not None and abs(correlation) >= 0.8 and score != 0:
+        score += 1 if score > 0 else -1
+    return round(max(-5.0, min(5.0, score)), 1)
+
+
+def _cached_5m_bars(symbol, ttl=None):
+    """_fetch_intraday_bars()をCACHE_TTL["stock5m"]でラップする（指示書11番「5分足系列は
+    キャッシュ利用」、既存の_intraday_regime_cached等と同じstale fallback方針）。driver
+    シンボル（KOSPI・SOX・NVIDIA等）は全銘柄で共有されるキャッシュキーになるため、
+    半導体・AI関連の複数銘柄を見ても実際のyfinance呼び出しはTTLごとに1回で済む。"""
+    ttl = ttl if ttl is not None else CACHE_TTL["stock5m"]
+    key = f"5m_bars:{symbol}"
+    entry = _cache_get(key)
+    if _cache_fresh(entry, ttl):
+        return entry["value"]
+    bars = _fetch_intraday_bars(symbol, interval="5m")
+    if bars:
+        _cache_set(key, bars)
+        return bars
+    if entry is not None:
+        return entry["value"]
+    return []
+
+
+def build_cross_market_link(symbol, sector=None, market="JP"):
+    """指示書2番：build_cross_market_link(symbol)。半導体・AI関連銘柄限定
+    （is_cross_market_eligible_sector、sector文字列＋既知コードリストの両方で判定）。"""
+    empty = {"primary_driver": None, "secondary_driver": None, "correlation": None,
+              "best_lag_minutes": None, "direction": None, "confidence": "LOW",
+              "relationship_type": None, "divergence": "NONE", "drivers": [],
+              "leading_alert": False, "catch_up_candidate": False, "cross_market_score": 0.0,
+              "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    if not is_cross_market_eligible_sector(sector, code=symbol):
+        return empty
+    stock_bars = _cached_5m_bars(_yf_symbol({"code": symbol, "market": market}))
+    stock_closes = [b["close"] for b in stock_bars]
+    stock_pct = compute_pct_change_series(stock_closes)
+    if len(stock_pct) < 3:
+        return empty
+
+    driver_results = []
+    for key, meta in CROSS_MARKET_DRIVERS.items():
+        try:
+            driver_bars = _cached_5m_bars(meta["symbol"])
+            driver_closes = [b["close"] for b in driver_bars]
+            driver_pct = compute_pct_change_series(driver_closes)
+            if len(driver_pct) < 3:
+                continue
+            lag, corr, direction = compute_lead_lag(stock_pct, driver_pct)
+            if corr is None:
+                continue
+            sample_count = min(len(stock_pct), len(driver_pct))
+            driver_recent_change = driver_pct[-1] if driver_pct else None
+            driver_results.append({
+                "driver": key, "label": meta["label"], "correlation": round(corr, 2),
+                "best_lag_minutes": lag, "direction": direction,
+                "confidence": classify_cross_market_confidence(sample_count),
+                "recent_change_pct": round(driver_recent_change, 2) if driver_recent_change is not None else None,
+            })
+        except Exception as e:
+            print("  cross-market: driver取得で例外（無視して続行）", key, e)
+
+    primary, secondary = rank_cross_market_drivers(driver_results)
+    if not primary:
+        return empty
+
+    stock_recent_change = round(stock_pct[-1], 2) if stock_pct else None
+    divergence = classify_cross_market_divergence(primary.get("recent_change_pct"), stock_recent_change, primary.get("direction"))
+    leading_alert = detect_leading_market_alert(primary.get("recent_change_pct"), primary.get("correlation"), stock_recent_change)
+    catch_up = detect_catch_up_candidate(primary.get("recent_change_pct"), stock_recent_change, primary.get("correlation"))
+    cross_score = compute_cross_market_score(leading_alert, catch_up, divergence, primary.get("correlation"))
+
+    return {
+        "primary_driver": primary["label"], "secondary_driver": secondary["label"] if secondary else None,
+        "correlation": primary["correlation"], "best_lag_minutes": primary["best_lag_minutes"],
+        "direction": primary["direction"], "confidence": primary["confidence"],
+        "relationship_type": "CURRENT" if primary["best_lag_minutes"] == 0 else "LEADING",
+        "divergence": divergence, "drivers": driver_results,
+        "leading_alert": leading_alert, "catch_up_candidate": catch_up, "cross_market_score": cross_score,
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+
+def _cross_market_prediction_was_valid(experience):
+    """指示書16番「relationship confidenceを更新」の素朴な近似：driver_state_at_entry
+    （ENTRY時点でdriverが上昇/下降していたか）と実際の結果（WIN/LOSS）を突き合わせ、
+    予測が妥当だったかを機械的に判定する（厳密な因果検証ではなく参考程度の集計）。"""
+    state = experience.get("driver_state_at_entry")
+    result = experience.get("result_class")
+    if state is None or result not in ("WIN", "LOSS"):
+        return None
+    if state == "UP":
+        return result == "WIN"
+    if state == "DOWN":
+        return result == "LOSS"
+    return None
+
+
+def build_cross_market_daily_learning(database_url, user_id, review_date):
+    """指示書16番：🔗今日の市場連動学習。当日closed tradeのprimary_driver別に、
+    driver_state_at_entry（同期時点の代表値）と実際の結果を突き合わせる。UI文言は
+    「連動」「先行傾向」に限定し、因果関係を断定する表現は使わない（指示書17番）。"""
+    empty = {"items": []}
+    if investment_db is None or not database_url:
+        return empty
+    experiences = investment_db.list_trade_experiences(database_url, user_id, trade_date=review_date)
+    items = []
+    for e in experiences:
+        driver = e.get("primary_driver")
+        if not driver:
+            continue
+        items.append({
+            "symbol": e.get("symbol"), "stock_name": e.get("stock_name"), "primary_driver": driver,
+            "driver_corr_at_entry": e.get("driver_corr_at_entry"), "driver_lag_at_entry": e.get("driver_lag_at_entry"),
+            "driver_state_at_entry": e.get("driver_state_at_entry"), "result_class": e.get("result_class"),
+            "prediction_valid": _cross_market_prediction_was_valid(e),
+        })
+    return {"items": items}
 
 
 def _nicosoku_morning_commentary(database_url, user_id):
@@ -16370,6 +16764,40 @@ class Handler(SimpleHTTPRequestHandler):
             result = compute_choruco_stock_view(DATABASE_URL, self.current_user, symbol, sector=sector) \
                 if (investment_db is not None and DATABASE_URL) else {"symbol": symbol}
             self._send_json(result)
+        # ---- Cross-Market Link Phase 2（2026-09-12新規、指示書19番）----
+        # /drivers・/lead-lag・/divergenceは具体的なsuffixなので、汎用の/api/cross-market/{symbol}
+        # より前に判定する（Choruco Style/Trade Experience Learningと同じ「具体形状を先に」の徹）。
+        elif self.path.split("?")[0].endswith("/drivers") and self.path.split("?")[0].startswith("/api/cross-market/"):
+            symbol = self.path.split("?")[0][len("/api/cross-market/"):-len("/drivers")]
+            qs = urllib.parse.urlparse(self.path).query
+            sector = urllib.parse.parse_qs(qs).get("sector", [None])[0]
+            result = build_cross_market_link(symbol, sector=sector)
+            self._send_json({"symbol": symbol, "drivers": result.get("drivers", [])})
+        elif self.path.split("?")[0].endswith("/lead-lag") and self.path.split("?")[0].startswith("/api/cross-market/"):
+            symbol = self.path.split("?")[0][len("/api/cross-market/"):-len("/lead-lag")]
+            qs = urllib.parse.urlparse(self.path).query
+            sector = urllib.parse.parse_qs(qs).get("sector", [None])[0]
+            result = build_cross_market_link(symbol, sector=sector)
+            self._send_json({"symbol": symbol, "primary_driver": result.get("primary_driver"),
+                              "secondary_driver": result.get("secondary_driver"),
+                              "best_lag_minutes": result.get("best_lag_minutes"),
+                              "correlation": result.get("correlation"), "confidence": result.get("confidence"),
+                              "relationship_type": result.get("relationship_type")})
+        elif self.path.split("?")[0].endswith("/divergence") and self.path.split("?")[0].startswith("/api/cross-market/"):
+            symbol = self.path.split("?")[0][len("/api/cross-market/"):-len("/divergence")]
+            qs = urllib.parse.urlparse(self.path).query
+            sector = urllib.parse.parse_qs(qs).get("sector", [None])[0]
+            result = build_cross_market_link(symbol, sector=sector)
+            self._send_json({"symbol": symbol, "divergence": result.get("divergence"),
+                              "leading_alert": result.get("leading_alert"),
+                              "catch_up_candidate": result.get("catch_up_candidate"),
+                              "cross_market_score": result.get("cross_market_score")})
+        elif self.path.split("?")[0].startswith("/api/cross-market/"):
+            symbol = self.path.split("?")[0][len("/api/cross-market/"):]
+            qs = urllib.parse.urlparse(self.path).query
+            sector = urllib.parse.parse_qs(qs).get("sector", [None])[0]
+            result = build_cross_market_link(symbol, sector=sector)
+            self._send_json(result)
         elif self.path.split("?")[0] == "/api/trade-decision-events":
             qs = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(qs)
@@ -16418,7 +16846,15 @@ class Handler(SimpleHTTPRequestHandler):
                     trade_learning = build_daily_trade_learning_summary(day_experiences)
             except Exception as e:
                 print("  daily-review: trade learning summary生成で例外（無視して続行）", e)
-            self._send_json({"review": review, "decisionReview": decision_review, "tradeLearning": trade_learning})
+            # Cross-Market Link Phase 2新規（2026-09-12、指示書16番）：「🔗今日の市場連動学習」。
+            cross_market_learning = {"items": []}
+            try:
+                if investment_db is not None and DATABASE_URL:
+                    cross_market_learning = build_cross_market_daily_learning(DATABASE_URL, self.current_user, date)
+            except Exception as e:
+                print("  daily-review: cross-market learning生成で例外（無視して続行）", e)
+            self._send_json({"review": review, "decisionReview": decision_review, "tradeLearning": trade_learning,
+                              "crossMarketLearning": cross_market_learning})
         # ---- 2026-09-10新規（朝一マーケット自動分析システム） ----
         elif self.path.startswith("/api/morning-check/list"):
             qs = urllib.parse.urlparse(self.path).query
@@ -17403,9 +17839,17 @@ class Handler(SimpleHTTPRequestHandler):
                     choruco = compute_choruco_stock_view(DATABASE_URL, self.current_user, code, sector=body.get("sector"))
                 except Exception as e:
                     print("  knowledge-context: choruco要約取得で例外（無視して続行）", code, e)
+            # Cross-Market Link Phase 2新規（2026-09-12、指示書11・12番）：HEAVY側でcorrelation・
+            # lead-lag・driver rankingをフルで返す（FAST側は主要driverだけの軽量版）。
+            cross_market = None
+            if code:
+                try:
+                    cross_market = build_cross_market_link(code, sector=body.get("sector"))
+                except Exception as e:
+                    print("  knowledge-context: cross-market要約取得で例外（無視して続行）", code, e)
             self._send_json({"context": context, "judgment": judgment, "logId": (log or {}).get("id"),
                               "tradeExperience": trade_experience, "stockBehavior": stock_behavior,
-                              "choruco": choruco})
+                              "choruco": choruco, "crossMarket": cross_market})
         elif self.path == "/api/knowledge-context/top5-flags":
             # 指示書4番：TOP5相談向けの軽量な候補別フラグ（フルコンテキストは取得しない）。
             if not self._investment_db_ready():

@@ -3631,7 +3631,7 @@ function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[code,sector,market,tradeStyle,baseSignal]);
   if(!result)return null;
-  const{judgment,context,tradeExperience,stockBehavior,choruco}=result;
+  const{judgment,context,tradeExperience,stockBehavior,choruco,crossMarket}=result;
   const jm=TRADE_JUDGMENT_META[judgment.judgment]||{label:judgment.judgment,color:"var(--ink)"};
   const keyPoints=(judgment.reasons||[]).slice(0,3); // 指示書：重要ポイントは最大3件程度
   const activeRules=(context.relevant_rules||[]).filter(r=>r.status==="ACTIVE");
@@ -3650,6 +3650,14 @@ function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
       <span style={{color:"var(--inkSoft)"}}>ロット {choruco.position_multiplier}x</span>
       <span style={{color:"var(--inkSoft)"}}>Choruco Fit {choruco.choruco_fit}/10</span>
       {chorucoStoryMeta && <span style={{fontWeight:700,color:chorucoStoryMeta.color}}>Story: {chorucoStoryMeta.label}</span>}
+    </div>}
+    {/* Cross-Market Link Phase 2（2026-09-12新規、指示書12・13番）：ちょる子式と並べて表示。
+        半導体・AI関連銘柄以外はprimary_driverがNoneのため表示されない。 */}
+    {crossMarket?.primary_driver && <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:6,fontSize:11.5}}>
+      <span style={{fontWeight:800}}>🔗 {crossMarket.primary_driver} {crossMarket.correlation} / {crossMarket.best_lag_minutes>0?"+":""}{crossMarket.best_lag_minutes}m</span>
+      {crossMarket.divergence!=="NONE" && <span style={{fontWeight:700,color:crossMarket.divergence==="POSITIVE_DIVERGENCE"?"var(--up)":"var(--down)"}}>{crossMarket.divergence==="POSITIVE_DIVERGENCE"?"POSITIVE":"NEGATIVE"} DIVERGENCE</span>}
+      {crossMarket.leading_alert && <span style={{fontWeight:700,color:"var(--down)"}}>🚨 {crossMarket.primary_driver}先行{crossMarket.direction==="POSITIVE"?"下落":"上昇"}</span>}
+      {crossMarket.catch_up_candidate && <span style={{fontWeight:700,color:"var(--up)"}}>CATCH UP候補</span>}
     </div>}
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:6}}>
       <div style={{fontWeight:800,fontSize:13,color:jm.color}}>総合判断：{jm.label}</div>
@@ -3702,6 +3710,16 @@ function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
         {choruco.story && <div>Story：{choruco.story.status} {choruco.story.story_score!=null?`${choruco.story.story_score}/100`:""}
           {(choruco.story.break_reasons_json||[]).length>0 && <span style={{color:"var(--down)"}}>（{choruco.story.break_reasons_json.join("・")}）</span>}
         </div>}
+      </div>}
+      {/* Cross-Market Link Phase 2（2026-09-12新規、指示書12番）：Cross Market詳細。
+          「連動」「先行傾向」の表現に限定し、因果を断定しない（指示書17番）。 */}
+      {crossMarket?.primary_driver && <div>
+        <div style={{fontWeight:700,color:"var(--ink)"}}>🔗 Cross Market</div>
+        {(crossMarket.drivers||[]).filter(d=>d.correlation!=null).sort((a,b)=>Math.abs(b.correlation)-Math.abs(a.correlation)).slice(0,5).map(d=>
+          <div key={d.driver} style={{marginTop:1}}>
+            {d.label}　corr {d.correlation}　lag {d.best_lag_minutes>0?"+":""}{d.best_lag_minutes}m　{d.confidence}
+          </div>)}
+        <div style={{marginTop:2}}>現在：{crossMarket.divergence==="NONE"?"連動範囲内":(crossMarket.divergence==="POSITIVE_DIVERGENCE"?"POSITIVE DIVERGENCE（個別が強い）":"NEGATIVE DIVERGENCE（個別が弱い）")}</div>
       </div>}
       {/* 指示書：詳細を開いた場合のみ、どの有識者見解・どのルール・どの市場データが影響したかを
           確認できるようにする（全文はDB/ExpertViewsPanel・トレードルール管理画面が原本）。 */}
