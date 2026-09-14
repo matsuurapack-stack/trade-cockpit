@@ -17109,6 +17109,53 @@ _SMART_IMPORT_DATE_PATTERNS = [
     re.compile(r"\d{4}年\d{1,2}月\d{1,2}日"), re.compile(r"\d{1,2}月\d{1,2}日"),
     re.compile(r"\d{1,2}/\d{1,2}"), re.compile(r"今日|明日|明後日|今週|来週|今月|来月"),
 ]
+# 2026-09-14修正（イベント画面0件バグ）：_SMART_IMPORT_DATE_PATTERNSは「日付らしき表現が
+# あるか」の判定（has_date、confidence用）にしか使われておらず、実際のevent_date値への
+# 変換が行われていなかった。そのため「9/17 FOMC」のように日付付きで貼り付けても
+# MEDIUM confidenceでSmart Import自体は候補化されるが、draft["event_date"]は常にNoneの
+# ままimport_market_events()へ渡り、DB側のevent_date NOT NULL相当のバリデーション
+# （skipped_details reason=MISSING_EVENT_DATE）で毎回スキップされ、イベント画面が0件に
+# なっていた。以下は「本文中に明示された日付」だけをISO日付へ変換する（指示書の
+# 「不明な値を推測して埋めない」方針を維持：年省略時は当年、相対語は今日/明日/明後日の
+# 3語のみ確定変換し、今週/来週/今月/来月のような幅のある表現は変換不能としてNoneのまま
+# 残す＝has_date=Trueでconfidence自体はMEDIUMになるが、event_dateが無ければ
+# import_market_events側で従来通り安全にスキップされる）。
+_SMART_IMPORT_EXACT_DATE_RE = re.compile(r"(?:(\d{4})年)?(\d{1,2})月(\d{1,2})日")
+_SMART_IMPORT_SLASH_DATE_RE = re.compile(r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)")
+_SMART_IMPORT_RELATIVE_DATE_OFFSETS = {"今日": 0, "明日": 1, "明後日": 2}
+
+
+def _extract_event_date_from_text(chunk, today_str=None):
+    """本文中に明示された日付表現だけをISO日付（YYYY-MM-DD）へ変換する。変換できる
+    形式が無い（「今週」「来月」等の幅のある表現のみ）場合はNoneを返し、呼び出し側で
+    日付なしイベントとして扱わせる（値を推測して埋めない）。"""
+    if not chunk:
+        return None
+    today_str = today_str or _jst_today_date_str()
+    today = datetime.date.fromisoformat(today_str)
+
+    m = _SMART_IMPORT_EXACT_DATE_RE.search(chunk)
+    if m:
+        year = int(m.group(1)) if m.group(1) else today.year
+        month, day = int(m.group(2)), int(m.group(3))
+        try:
+            return datetime.date(year, month, day).isoformat()
+        except ValueError:
+            pass  # 不正な日付（例：2/30）は無視してNoneへフォールバック
+
+    m = _SMART_IMPORT_SLASH_DATE_RE.search(chunk)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+        try:
+            return datetime.date(today.year, month, day).isoformat()
+        except ValueError:
+            pass
+
+    for kw, offset in _SMART_IMPORT_RELATIVE_DATE_OFFSETS.items():
+        if kw in chunk:
+            return (today + datetime.timedelta(days=offset)).isoformat()
+
+    return None
 # 指示書8番：話者名＋意見動詞の組み合わせで有識者意見を検出する。事実の羅列（指示書22番）と
 # 区別するため、名前だけ・動詞だけでは判定しない（両方揃って初めてEXPERT_OPINION）。
 _SMART_IMPORT_EXPERT_NAME_RE = re.compile(r"([一-龠ぁ-んァ-ヶー]{2,8}(?:氏|さん|アナリスト))")
@@ -17359,8 +17406,9 @@ def _classify_text_chunk(chunk, database_url=None, user_id=None, hint_code=None,
             "title": chunk[:60], "description": chunk, "threshold": pct_match.group(1) if pct_match else None,
             "risk_rule_change_candidate": is_risk_rule_change}
     if has_event_kw:
+        event_date = _extract_event_date_from_text(chunk) if has_date else None
         return "EVENT", ("MEDIUM" if has_date else "LOW"), {
-            "title": chunk[:80], "event_date": None, "notes": chunk}
+            "title": chunk[:80], "event_date": event_date, "notes": chunk}
     if has_catalyst_kw:
         return "CATALYST", ("MEDIUM" if stock_code else "LOW"), {
             "title": chunk[:80], "summary": chunk, "ticker": stock_code.group(1) if stock_code else None}
