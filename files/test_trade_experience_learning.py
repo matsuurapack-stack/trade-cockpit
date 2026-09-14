@@ -232,5 +232,18 @@ class PatternStatisticsConfidenceTests(unittest.TestCase):
         self.assertEqual(stats["WAIT_TO_ENTRY"]["confidence_level"], "LOW")
 
 
+class UpsertTradeExperienceBySyncKeyOnConflictTests(unittest.TestCase):
+    """2026-09-14修正（不具合対応）：trade_experiencesのUNIQUE(user_id,sync_key)は
+    `WHERE sync_key IS NOT NULL`の部分インデックスのため、ON CONFLICT句にも同じWHERE述語を
+    付けないとPostgresの制約推論が一致せず「no unique or exclusion constraint matching」で
+    常に失敗する（実データで確認済み）。このテストはSQL文字列に述語が残っていることを
+    ソース検査で保証し、将来の変更でこの一致が再び崩れないようにする回帰ガード。"""
+
+    def test_on_conflict_clause_includes_partial_index_predicate(self):
+        import investment_db
+        src = get_fresh_source(investment_db.upsert_trade_experience_by_sync_key)
+        self.assertIn("ON CONFLICT (user_id, sync_key) WHERE sync_key IS NOT NULL", src)
+
+
 if __name__ == "__main__":
     unittest.main()

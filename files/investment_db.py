@@ -2684,7 +2684,13 @@ def upsert_trade_experience_by_sync_key(database_url, user_id, sync_key, fields)
             cur.execute(
                 f"INSERT INTO trade_experiences (user_id, sync_key, {', '.join(cols)}) "
                 f"VALUES (%s, %s, {', '.join(insert_placeholders)}) "
-                f"ON CONFLICT (user_id, sync_key) DO UPDATE SET {', '.join(update_clauses)} "
+                # 2026-09-14修正（不具合対応）：UNIQUE(user_id,sync_key)は
+                # `WHERE sync_key IS NOT NULL`の部分インデックスのため、ON CONFLICT句にも
+                # 同じWHERE述語を付けないとPostgresの制約推論が一致せず
+                # 「no unique or exclusion constraint matching」で常に失敗していた
+                # （この関数はsync_key必須＝呼び出し時点で常にNOT NULLのため実害はこれのみ）。
+                f"ON CONFLICT (user_id, sync_key) WHERE sync_key IS NOT NULL "
+                f"DO UPDATE SET {', '.join(update_clauses)} "
                 f"RETURNING *", [user_id, sync_key] + wrapped)
             row = cur.fetchone()
         conn.commit()
