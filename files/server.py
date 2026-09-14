@@ -2287,20 +2287,25 @@ def generate_morning_market_check(database_url, user_id, snapshot_time):
 
     strategy, strategy_text = generate_morning_strategy(market_regime, volatility_regime, market_risk_score, event_info["signals"])
 
-    risk_warnings = []
+    # Phase MU-S3C（morning_market_checks SHARED/PRIVATE分離）：市場要因由来の警告のみを
+    # market_risk_warnings_json（SHARED）に入れる。個人の保有ポジション由来の警告は
+    # position_critical_warnings_json（PRIVATE overlay行き）へ完全に分離する——SHARED側に
+    # 「保有銘柄が損切りルールに到達」のような個人情報を絶対に混ぜない。
+    market_risk_warnings = []
     vix_val = indices.get("vix", {}).get("value")
     if vix_val is not None and vix_val >= 25:
-        risk_warnings.append({"level": "WARNING" if vix_val < 35 else "CRITICAL", "message": f"VIX {vix_val}"})
+        market_risk_warnings.append({"level": "WARNING" if vix_val < 35 else "CRITICAL", "message": f"VIX {vix_val}"})
     us10y_val = indices.get("us10y", {}).get("value")
     if us10y_val is not None and us10y_val >= 4.5:
-        risk_warnings.append({"level": "WATCH", "message": f"米10年債 {us10y_val}%"})
+        market_risk_warnings.append({"level": "WATCH", "message": f"米10年債 {us10y_val}%"})
     brent_val = commodities.get("brent", {}).get("value")
     if brent_val is not None and brent_val >= 100:
-        risk_warnings.append({"level": "WATCH", "message": f"Brent {brent_val}ドル超"})
+        market_risk_warnings.append({"level": "WATCH", "message": f"Brent {brent_val}ドル超"})
     if "EVENT_RISK_HIGH" in event_info["signals"]:
-        risk_warnings.append({"level": "WARNING", "message": "重要イベントが目前"})
+        market_risk_warnings.append({"level": "WARNING", "message": "重要イベントが目前"})
+    position_critical_warnings = []
     if any(w["level"] == "CRITICAL" for w in position_risk):
-        risk_warnings.insert(0, {"level": "CRITICAL", "message": "保有銘柄が損切りルールに到達"})
+        position_critical_warnings.append({"level": "CRITICAL", "message": "保有銘柄が損切りルールに到達"})
 
     payload = {
         "market_regime": market_regime, "volatility_regime": volatility_regime, "trend_type": trend_type,
@@ -2310,8 +2315,9 @@ def generate_morning_market_check(database_url, user_id, snapshot_time):
         "commodities_json": commodities, "adr_json": adr, "data_quality_json": data_quality,
         "strong_sectors_json": strong_sectors, "weak_sectors_json": weak_sectors,
         "watchlist_top5_json": watchlist_top5_json, "avoid_stocks_json": focus["avoid"],
-        "resilience_json": focus["resilience"], "risk_warnings_json": risk_warnings[:3],
+        "resilience_json": focus["resilience"], "market_risk_warnings_json": market_risk_warnings[:3],
         "event_risk_json": event_info["events"][:5], "position_risk_json": position_risk,
+        "position_critical_warnings_json": position_critical_warnings,
         "strategy_json": strategy, "strategy_text": strategy_text,
         "raw_payload_json": {"feargreed": fear_greed, "generatedAt": now.isoformat(), "missing": vol_missing + trend_missing,
                               "external_market_commentary": _nicosoku_morning_commentary_safe(database_url, user_id)},

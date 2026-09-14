@@ -9207,13 +9207,17 @@ function MorningCheckPanel({notifyPermission,requestNotifyPermission,notifyDeskt
     // 一般の市況相談なので、個人の保有ポジション由来情報（position_risk）はSHARED payloadに
     // 含めない。自分のポジションを相談したい場合は別の「利確・損切り相談」ボタン
     // （copyPositionConsult、PRIVATE payload）を使う。
+    // Phase MU-S3C（2026-09-14・payload再監査で発見・修正）：check.risk_warnings_jsonは
+    // 表示用に合成された値（market_risk_warnings_json＋個人ポジション由来のCRITICAL警告）の
+    // ため、そのままSHARED payloadに使うと「保有銘柄が損切りルールに到達」が漏れる。
+    // 市場要因のみのcheck.market_risk_warnings_jsonを使う。
     await copyChatGPTPayload("朝一チェックを相談","morning_check_report",{
       market_regime:check.market_regime,volatility_regime:check.volatility_regime,
       market_risk_score:check.market_risk_score,
       indices:check.indices_json,fx:check.fx_json,commodities:check.commodities_json,
       strong_sectors:check.strong_sectors_json,weak_sectors:check.weak_sectors_json,
       watchlist_top5:check.watchlist_top5_json,avoid_stocks:check.avoid_stocks_json,
-      resilience_watch:check.resilience_json,risk_warnings:check.risk_warnings_json,
+      resilience_watch:check.resilience_json,risk_warnings:check.market_risk_warnings_json,
       strategy:check.strategy_json,
       data_quality:check.data_quality_json,
     },()=>{});

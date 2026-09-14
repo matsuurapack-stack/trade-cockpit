@@ -1385,6 +1385,133 @@ WHERE a.user_id <> '_shared' AND b.user_id <> '_shared' AND a.id <> b.id
 UPDATE entry_candidate_snapshots SET user_id = '_shared' WHERE user_id <> '_shared';
 """
 
+# Phase MU-S3C（2026-09-14・MIXEDテーブル分離 その1：trade_playbooks）：GLOBAL定義（setup・
+# entry/exit/stop/avoid条件・一般的evidence）と個人実践成績（user_attempt_count等、
+# record_trade_outcome_for_playbooksが個人のnet_pnl/entry_price/sharesから算出して同一行に
+# 書き込んでいた）を別テーブルへ分離する。trade_playbooks自体はtrade_rulesと同じ
+# visibility='USER'|'GLOBAL'方式のまま（MU-S2の_MIGRATE_RULE_VISIBILITY_SQLで既にvisibility列
+# 追加済み）——プレイブックも個人が自分用に作成し得るため、MU-S1のような単純な強制_shared化は
+# しない。実データ0件のタイミングで、破壊的変更（列削除）を安全に行う。
+_SCHEMA_TRADE_PLAYBOOK_USER_STATS_SQL = """
+CREATE TABLE IF NOT EXISTS trade_playbook_user_stats (
+    id                    SERIAL PRIMARY KEY,
+    user_id               TEXT NOT NULL,
+    playbook_id           INTEGER NOT NULL REFERENCES trade_playbooks(id) ON DELETE CASCADE,
+    attempt_count         INTEGER NOT NULL DEFAULT 0,
+    success_count         INTEGER NOT NULL DEFAULT 0,
+    failure_count         INTEGER NOT NULL DEFAULT 0,
+    avg_return            NUMERIC,
+    compatibility_score   NUMERIC,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, playbook_id)
+);
+CREATE INDEX IF NOT EXISTS idx_trade_playbook_user_stats_user ON trade_playbook_user_stats(user_id, playbook_id);
+"""
+
+# 既存trade_playbooks行に非デフォルトの個人成績が残っていれば新テーブルへ退避してから列を削除する
+# （現状0件のため実質no-opだが、将来この関数が別環境で実行されてもデータを失わないよう防御的に書く）。
+# 列が既に削除済み（2回目以降の起動）でも安全に再実行できるよう、SELECT文自体をDO $$ ... $$内の
+# IF分岐に閉じ込める（PL/pgSQL内の埋め込みSQLは実際にそのステートメントへ到達した時点で初めて
+# 解析されるため、列が存在しない環境ではIF条件がfalseになりparseされず落ちない）。
+_MIGRATE_TRADE_PLAYBOOK_USER_STATS_SQL = """
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name='trade_playbooks' AND column_name='user_attempt_count') THEN
+        INSERT INTO trade_playbook_user_stats (user_id, playbook_id, attempt_count, success_count,
+                                                 failure_count, avg_return, compatibility_score)
+        SELECT user_id, id, user_attempt_count, user_success_count, user_failure_count,
+               user_avg_return, user_compatibility_score
+        FROM trade_playbooks
+        WHERE (user_attempt_count > 0 OR user_success_count > 0 OR user_failure_count > 0
+               OR user_avg_return IS NOT NULL OR user_compatibility_score IS NOT NULL)
+        ON CONFLICT (user_id, playbook_id) DO NOTHING;
+    END IF;
+END $$;
+
+ALTER TABLE trade_playbooks DROP COLUMN IF EXISTS user_attempt_count;
+ALTER TABLE trade_playbooks DROP COLUMN IF EXISTS user_success_count;
+ALTER TABLE trade_playbooks DROP COLUMN IF EXISTS user_failure_count;
+ALTER TABLE trade_playbooks DROP COLUMN IF EXISTS user_avg_return;
+ALTER TABLE trade_playbooks DROP COLUMN IF EXISTS user_compatibility_score;
+"""
+
+# Phase MU-S3C（2026-09-14・MIXEDテーブル分離 その2：morning_market_checks）：SHARED MARKET CORE
+# （指数・為替・商品・ADR・データ品質・強弱セクター・朝TOP5候補・見送り銘柄・地合い耐性・
+# 市場由来のrisk警告・イベント・戦略）と、PRIVATE USER OVERLAY（個人の保有ポジション由来の
+# position_risk_json・そこから生成されるCRITICAL警告・既読状態）へ分離する。以前は
+# risk_warnings_jsonに「保有銘柄が損切りルールに到達」という個人ポジション由来の文言が
+# 混入し得ていたため、SHARED側はmarket_risk_warnings_json（市場要因のみ）に責務を絞り、
+# 個人由来の警告はPRIVATE overlay側のposition_critical_warnings_jsonへ分離する。
+_SCHEMA_MORNING_CHECK_PRIVATE_OVERLAY_SQL = """
+CREATE TABLE IF NOT EXISTS morning_market_check_private_overlay (
+    id                              SERIAL PRIMARY KEY,
+    user_id                         TEXT NOT NULL,
+    check_id                        INTEGER NOT NULL REFERENCES morning_market_checks(id) ON DELETE CASCADE,
+    check_date                      TEXT NOT NULL,
+    snapshot_time                   TEXT NOT NULL,
+    position_risk_json              JSONB,
+    position_critical_warnings_json JSONB,
+    is_read                         BOOLEAN NOT NULL DEFAULT false,
+    created_at                      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at                      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, check_id)
+);
+CREATE INDEX IF NOT EXISTS idx_morning_check_overlay_user_date
+    ON morning_market_check_private_overlay(user_id, check_date DESC);
+"""
+
+# 既存6行（実データ確認済み：position_risk_jsonは全行[]、is_readは2行True）を退避してから
+# SHARED側の列を整理する。列が既に整理済み（2回目以降の起動）でも安全に再実行できるよう、
+# 列存在チェックをDO $$ ... $$のIF内に閉じ込める（trade_playbook_user_statsと同じ手法）。
+_MIGRATE_MORNING_CHECK_PRIVATE_OVERLAY_SQL = """
+ALTER TABLE morning_market_checks ADD COLUMN IF NOT EXISTS market_risk_warnings_json JSONB;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name='morning_market_checks' AND column_name='position_risk_json') THEN
+        INSERT INTO morning_market_check_private_overlay
+            (user_id, check_id, check_date, snapshot_time, position_risk_json,
+             position_critical_warnings_json, is_read)
+        SELECT user_id, id, check_date, snapshot_time,
+               COALESCE(position_risk_json, '[]'::jsonb),
+               COALESCE((SELECT jsonb_agg(elem) FROM jsonb_array_elements(risk_warnings_json) elem
+                          WHERE elem->>'message' = '保有銘柄が損切りルールに到達'), '[]'::jsonb),
+               is_read
+        FROM morning_market_checks
+        ON CONFLICT (user_id, check_id) DO NOTHING;
+
+        UPDATE morning_market_checks
+        SET market_risk_warnings_json = COALESCE((
+            SELECT jsonb_agg(elem) FROM jsonb_array_elements(risk_warnings_json) elem
+            WHERE elem->>'message' <> '保有銘柄が損切りルールに到達'
+        ), '[]'::jsonb)
+        WHERE market_risk_warnings_json IS NULL AND risk_warnings_json IS NOT NULL;
+    END IF;
+END $$;
+
+ALTER TABLE morning_market_checks DROP COLUMN IF EXISTS risk_warnings_json;
+ALTER TABLE morning_market_checks DROP COLUMN IF EXISTS position_risk_json;
+ALTER TABLE morning_market_checks DROP COLUMN IF EXISTS is_read;
+"""
+
+# PRIVATE overlayへ退避完了後にSHARED本体のuser_idを_sharedへ一括移行する（MU-S1と同じ
+# 冪等パターン。自然キー：check_date, snapshot_time）。overlay側は退避時点のuser_idを
+# そのまま保持しているため、本体のuser_id変更はoverlayの正しさに影響しない。
+_MIGRATE_MORNING_CHECK_SHARED_SCOPE_SQL = """
+DELETE FROM morning_market_checks a USING morning_market_checks b
+WHERE a.user_id <> '_shared' AND b.user_id = '_shared'
+  AND a.check_date = b.check_date AND a.snapshot_time = b.snapshot_time;
+DELETE FROM morning_market_checks a USING morning_market_checks b
+WHERE a.user_id <> '_shared' AND b.user_id <> '_shared' AND a.id <> b.id
+  AND a.check_date = b.check_date AND a.snapshot_time = b.snapshot_time
+  AND ((b.user_id = 'matsuura' AND a.user_id <> 'matsuura')
+       OR (a.user_id <> 'matsuura' AND b.user_id <> 'matsuura' AND a.id > b.id));
+UPDATE morning_market_checks SET user_id = '_shared' WHERE user_id <> '_shared';
+"""
+
 
 def init_schema(database_url):
     """テーブルを（無ければ）作成し、マルチユーザー化・ChatGPT連携の移行SQLも実行する。
@@ -1436,6 +1563,11 @@ def init_schema(database_url):
         conn.execute(_MIGRATE_SHARED_SCOPE_SQL)
         conn.execute(_MIGRATE_CLEAR_PRIVATE_FROM_SHARED_REPORTS_SQL)
         conn.execute(_MIGRATE_MUS3B_SHARED_SCOPE_SQL)
+        conn.execute(_SCHEMA_TRADE_PLAYBOOK_USER_STATS_SQL)
+        conn.execute(_MIGRATE_TRADE_PLAYBOOK_USER_STATS_SQL)
+        conn.execute(_SCHEMA_MORNING_CHECK_PRIVATE_OVERLAY_SQL)
+        conn.execute(_MIGRATE_MORNING_CHECK_PRIVATE_OVERLAY_SQL)
+        conn.execute(_MIGRATE_MORNING_CHECK_SHARED_SCOPE_SQL)
         conn.commit()
 
 
@@ -3875,10 +4007,14 @@ def import_trade_playbooks(database_url, user_id, playbooks, created_from="chatg
 
 
 def list_trade_playbooks(database_url, user_id, status=None):
+    """Phase MU-S3C：trade_rulesと同じGLOBAL/USER可視性方式。本人が作成したUSERプレイブックに
+    加え、GLOBAL（visibility='GLOBAL'、user_id=_SHARED_SCOPE）も合わせて返す。個人実践成績
+    （旧user_attempt_count等）はtrade_playbook_user_statsへ分離済みのためここには含まれない
+    ——必要な呼び出し元はget_trade_playbook_user_statsで本人分だけ別途取得すること。"""
     pool = _get_pool(database_url)
     if pool is None:
         return []
-    where, params = ["user_id=%s"], [user_id]
+    where, params = ["user_id IN (%s, %s)"], [user_id, _SHARED_SCOPE]
     if status:
         where.append("status=%s")
         params.append(status)
@@ -3886,6 +4022,22 @@ def list_trade_playbooks(database_url, user_id, status=None):
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(f"SELECT * FROM trade_playbooks WHERE {' AND '.join(where)} ORDER BY updated_at DESC", params)
             return [_row_to_json(r) for r in cur.fetchall()]
+
+
+def get_trade_playbook_user_stats(database_url, user_id, playbook_id):
+    """Phase MU-S3C：呼び出しユーザー自身のplaybook実践成績（PRIVATE、trade_playbook_user_stats）
+    を1件返す。無ければNone（＝まだ実践経験なし）。GLOBAL/USER定義本体とは別テーブルのため、
+    他ユーザーの実践成績が混ざることは無い。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM trade_playbook_user_stats WHERE user_id=%s AND playbook_id=%s",
+                [user_id, playbook_id])
+            row = cur.fetchone()
+    return _row_to_json(row) if row else None
 
 
 def _condition_matches(cond, signals):
@@ -4468,10 +4620,14 @@ def record_trade_outcome_for_playbooks(database_url, user_id, code, trade):
     """指示書8番：売却確定後に呼ぶ（server.py側でadd_position_exit成功後にベストエフォート
     で呼ぶ想定、失敗しても売却本体には影響させない）。直近のanalysis_context_log
     （この銘柄・保有期間中に記録されたもの）からused_context.playbooksを集め、実際の
-    売買結果と紐づけてtrade_playbooksのuser_attempt/success/failure_count・
-    user_avg_return・user_compatibility_scoreを更新する。同時にplaybook自体の
-    一般的なevidence/success/failure_countも更新する（自分の結果は「一般的な再現性」の
-    証拠の一部でもあるため）。"""
+    売買結果と紐づけてtrade_playbook_user_stats（PRIVATE、本人の実践成績専用テーブル）の
+    attempt/success/failure_count・avg_return・compatibility_scoreを更新する。
+    Phase MU-S3C（不具合是正）：以前はtrade_playbooks本体（GLOBAL定義と同一行）へ
+    user_attempt_count等を書き込み、さらに個人の勝敗をevidence_count/success_count/
+    failure_countという「一般的な再現性」の指標にまで混入させていた。GLOBAL化した際に
+    他ユーザーへ個人の実績が透けて見える設計だったため、個人成績は完全に別テーブルへ分離し、
+    playbook本体の一般的evidence/success/failure_countは一切更新しない（個人の売買結果は
+    「一般的な再現性の証拠」には使わない方針に変更）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return {"updated": 0}
@@ -4498,25 +4654,37 @@ def record_trade_outcome_for_playbooks(database_url, user_id, code, trade):
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             for pid in playbook_ids:
-                cur.execute("SELECT * FROM trade_playbooks WHERE id=%s AND user_id=%s", [pid, user_id])
-                pb = cur.fetchone()
-                if not pb:
+                # GLOBAL（visibility='GLOBAL'、user_id=_SHARED_SCOPE）のplaybookで練習した場合も
+                # 対象にする（本人所有のUSERプレイブックに限定しない）。
+                cur.execute("SELECT id FROM trade_playbooks WHERE id=%s AND user_id IN (%s, %s)",
+                            [pid, user_id, _SHARED_SCOPE])
+                if cur.fetchone() is None:
                     continue
-                prev_n = pb["user_attempt_count"] or 0
+                cur.execute(
+                    "SELECT * FROM trade_playbook_user_stats WHERE user_id=%s AND playbook_id=%s",
+                    [user_id, pid])
+                stats = cur.fetchone()
+                prev_n = (stats["attempt_count"] if stats else 0) or 0
+                prev_success = (stats["success_count"] if stats else 0) or 0
+                prev_failure = (stats["failure_count"] if stats else 0) or 0
+                prev_avg = stats.get("avg_return") if stats else None
                 attempt = prev_n + 1
-                success = (pb["user_success_count"] or 0) + (1 if is_success else 0)
-                failure = (pb["user_failure_count"] or 0) + (0 if is_success else 1)
+                success = prev_success + (1 if is_success else 0)
+                failure = prev_failure + (0 if is_success else 1)
                 if return_pct is not None:
-                    new_avg = ((pb.get("user_avg_return") or 0) * prev_n + return_pct) / attempt
+                    new_avg = ((prev_avg or 0) * prev_n + return_pct) / attempt
                 else:
-                    new_avg = pb.get("user_avg_return")
+                    new_avg = prev_avg
                 compat = compute_user_compatibility_score(success, failure, attempt - success - failure, new_avg)
                 cur.execute(
-                    "UPDATE trade_playbooks SET user_attempt_count=%s, user_success_count=%s, "
-                    "user_failure_count=%s, user_avg_return=%s, user_compatibility_score=%s, "
-                    "evidence_count=evidence_count+1, success_count=success_count+%s, "
-                    "failure_count=failure_count+%s, updated_at=now() WHERE id=%s",
-                    [attempt, success, failure, new_avg, compat, 1 if is_success else 0, 0 if is_success else 1, pid])
+                    "INSERT INTO trade_playbook_user_stats (user_id, playbook_id, attempt_count, "
+                    "success_count, failure_count, avg_return, compatibility_score, updated_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,now()) "
+                    "ON CONFLICT (user_id, playbook_id) DO UPDATE SET "
+                    "attempt_count=EXCLUDED.attempt_count, success_count=EXCLUDED.success_count, "
+                    "failure_count=EXCLUDED.failure_count, avg_return=EXCLUDED.avg_return, "
+                    "compatibility_score=EXCLUDED.compatibility_score, updated_at=now()",
+                    [user_id, pid, attempt, success, failure, new_avg, compat])
                 updated += 1
         conn.commit()
     return {"updated": updated, "returnPct": return_pct}
@@ -4648,29 +4816,61 @@ def _check_playbook_discipline(database_url, user_id, exits_today):
 _MORNING_CHECK_JSON_COLS = [
     "indices_json", "fx_json", "commodities_json", "adr_json", "data_quality_json",
     "strong_sectors_json", "weak_sectors_json", "watchlist_top5_json", "avoid_stocks_json",
-    "resilience_json", "risk_warnings_json", "event_risk_json", "position_risk_json",
+    "resilience_json", "market_risk_warnings_json", "event_risk_json",
     "strategy_json", "raw_payload_json",
 ]
 _MORNING_CHECK_SCALAR_COLS = [
     "market_regime", "volatility_regime", "trend_type", "market_risk_score", "volatility_score",
     "trend_score", "macro_pressure_score", "strategy_text",
 ]
+# Phase MU-S3C：個人の保有ポジション由来のためPRIVATE overlay専用（morning_market_checks本体
+# には保存しない）。
+_MORNING_CHECK_PRIVATE_JSON_COLS = ["position_risk_json", "position_critical_warnings_json"]
+
+
+def _merge_morning_check_overlay(shared_row, overlay_row):
+    """SHARED本体1行 + PRIVATE overlay1行（無ければNone）を、呼び出し元向けに旧来と同じ
+    形（risk_warnings_json＝market_risk_warnings_json+position_critical_warnings_json、
+    position_risk_json）へ合成する。DBには保存しない、レスポンス組み立て専用。"""
+    if shared_row is None:
+        return None
+    out = dict(shared_row)
+    market_warnings = out.pop("market_risk_warnings_json", None) or []
+    if overlay_row:
+        position_risk = overlay_row.get("position_risk_json") or []
+        critical_warnings = overlay_row.get("position_critical_warnings_json") or []
+        out["is_read"] = overlay_row.get("is_read", False)
+    else:
+        position_risk, critical_warnings = [], []
+        out["is_read"] = False
+    out["position_risk_json"] = position_risk
+    out["risk_warnings_json"] = (critical_warnings + market_warnings)[:3]
+    out["market_risk_warnings_json"] = market_warnings
+    return out
 
 
 def save_morning_check(database_url, user_id, check_date, snapshot_time, data):
-    """1回分のMorningMarketCheckを保存する（(user_id, check_date, snapshot_time)で
-    UNIQUE、同一時間帯の再生成＝手動再分析はON CONFLICTで上書き更新）。dataは
-    _MORNING_CHECK_SCALAR_COLS/_MORNING_CHECK_JSON_COLSのキーを持つdict。"""
+    """1回分のMorningMarketCheckを保存する（(check_date, snapshot_time)でUNIQUE、同一時間帯の
+    再生成＝手動再分析はON CONFLICTで上書き更新）。dataは_MORNING_CHECK_SCALAR_COLS/
+    _MORNING_CHECK_JSON_COLS/_MORNING_CHECK_PRIVATE_JSON_COLSのキーを持つdict
+    （data["risk_warnings_json"]が渡された場合はmarket_risk_warnings_jsonとして扱う
+    後方互換フォールバック付き）。
+    Phase MU-S3C：SHARED MARKET CORE（morning_market_checks、_shared固定）とPRIVATE USER
+    OVERLAY（morning_market_check_private_overlay、呼び出しユーザー自身のposition_risk等）に
+    分けて保存する。戻り値は両方を合成した従来と同じ形のdict（DBには合成しない）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
+    shared_data = dict(data)
+    if "market_risk_warnings_json" not in shared_data and "risk_warnings_json" in shared_data:
+        shared_data["market_risk_warnings_json"] = shared_data["risk_warnings_json"]
     cols = _MORNING_CHECK_SCALAR_COLS + _MORNING_CHECK_JSON_COLS
     values = []
     for c in cols:
         if c in _MORNING_CHECK_JSON_COLS:
-            values.append(json.dumps(data.get(c), ensure_ascii=False))
+            values.append(json.dumps(shared_data.get(c), ensure_ascii=False))
         else:
-            values.append(data.get(c))
+            values.append(shared_data.get(c))
     placeholders = ", ".join(["%s::jsonb" if c in _MORNING_CHECK_JSON_COLS else "%s" for c in cols])
     update_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols)
     with pool.connection() as conn:
@@ -4679,17 +4879,32 @@ def save_morning_check(database_url, user_id, check_date, snapshot_time, data):
                 f"INSERT INTO morning_market_checks (user_id, check_date, snapshot_time, {', '.join(cols)}) "
                 f"VALUES (%s, %s, %s, {placeholders}) "
                 f"ON CONFLICT (user_id, check_date, snapshot_time) DO UPDATE SET "
-                f"{update_clause}, generated_at = now(), is_read = false "
+                f"{update_clause}, generated_at = now() "
                 f"RETURNING *",
-                [user_id, check_date, snapshot_time] + values,
+                [_SHARED_SCOPE, check_date, snapshot_time] + values,
             )
-            saved = cur.fetchone()
+            shared_row = cur.fetchone()
+            cur.execute(
+                "INSERT INTO morning_market_check_private_overlay "
+                "(user_id, check_id, check_date, snapshot_time, position_risk_json, "
+                "position_critical_warnings_json, is_read) "
+                "VALUES (%s,%s,%s,%s,%s::jsonb,%s::jsonb,false) "
+                "ON CONFLICT (user_id, check_id) DO UPDATE SET "
+                "position_risk_json=EXCLUDED.position_risk_json, "
+                "position_critical_warnings_json=EXCLUDED.position_critical_warnings_json, "
+                "is_read=false, updated_at=now() RETURNING *",
+                [user_id, shared_row["id"], check_date, snapshot_time,
+                 json.dumps(data.get("position_risk_json") or [], ensure_ascii=False),
+                 json.dumps(data.get("position_critical_warnings_json") or [], ensure_ascii=False)])
+            overlay_row = cur.fetchone()
         conn.commit()
-    return _row_to_json(saved)
+    return _merge_morning_check_overlay(_row_to_json(shared_row), _row_to_json(overlay_row))
 
 
 def get_latest_morning_check(database_url, user_id, check_date=None):
-    """当日（省略時は今日）分の最新MorningMarketCheckを1件返す（無ければNone）。"""
+    """当日（省略時は今日）分の最新MorningMarketCheckを1件返す（無ければNone）。
+    Phase MU-S3C：SHARED本体は全ユーザー共通、呼び出しユーザー自身のPRIVATE overlay
+    （position_risk等）をその場で合成する（他ユーザーのoverlayが混ざることは無い）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
@@ -4698,13 +4913,20 @@ def get_latest_morning_check(database_url, user_id, check_date=None):
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "SELECT * FROM morning_market_checks WHERE user_id=%s AND check_date=%s "
-                "ORDER BY generated_at DESC LIMIT 1", [user_id, check_date])
+                "ORDER BY generated_at DESC LIMIT 1", [_SHARED_SCOPE, check_date])
             row = cur.fetchone()
-    return _row_to_json(row) if row else None
+            if row is None:
+                return None
+            cur.execute(
+                "SELECT * FROM morning_market_check_private_overlay WHERE user_id=%s AND check_id=%s",
+                [user_id, row["id"]])
+            overlay = cur.fetchone()
+    return _merge_morning_check_overlay(_row_to_json(row), _row_to_json(overlay) if overlay else None)
 
 
 def list_morning_checks(database_url, user_id, check_date=None, limit=10):
-    """当日（省略時は今日）分のMorningMarketCheckを時系列（古い→新しい）で返す。"""
+    """当日（省略時は今日）分のMorningMarketCheckを時系列（古い→新しい）で返す。
+    Phase MU-S3C：呼び出しユーザー自身のPRIVATE overlayをその場で合成する。"""
     pool = _get_pool(database_url)
     if pool is None:
         return []
@@ -4713,17 +4935,34 @@ def list_morning_checks(database_url, user_id, check_date=None, limit=10):
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "SELECT * FROM morning_market_checks WHERE user_id=%s AND check_date=%s "
-                "ORDER BY generated_at ASC LIMIT %s", [user_id, check_date, limit])
+                "ORDER BY generated_at ASC LIMIT %s", [_SHARED_SCOPE, check_date, limit])
             rows = cur.fetchall()
-    return [_row_to_json(r) for r in rows]
+            if not rows:
+                return []
+            ids = [r["id"] for r in rows]
+            cur.execute(
+                "SELECT * FROM morning_market_check_private_overlay WHERE user_id=%s AND check_id = ANY(%s)",
+                [user_id, ids])
+            overlays = {o["check_id"]: o for o in cur.fetchall()}
+    return [_merge_morning_check_overlay(_row_to_json(r), _row_to_json(overlays[r["id"]]) if r["id"] in overlays else None)
+            for r in rows]
 
 
 def mark_morning_check_read(database_url, user_id, check_id):
+    """Phase MU-S3C：is_readは個人のUI既読状態のためPRIVATE overlay側で管理する
+    （overlay行が無ければ作成、他ユーザーの既読状態には一切影響しない）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return False
     with pool.connection() as conn:
-        conn.execute("UPDATE morning_market_checks SET is_read=true WHERE id=%s AND user_id=%s", [check_id, user_id])
+        conn.execute(
+            "INSERT INTO morning_market_check_private_overlay "
+            "(user_id, check_id, check_date, snapshot_time, position_risk_json, "
+            "position_critical_warnings_json, is_read) "
+            "SELECT %s, id, check_date, snapshot_time, '[]'::jsonb, '[]'::jsonb, true "
+            "FROM morning_market_checks WHERE id=%s "
+            "ON CONFLICT (user_id, check_id) DO UPDATE SET is_read=true, updated_at=now()",
+            [user_id, check_id])
         conn.commit()
     return True
 
