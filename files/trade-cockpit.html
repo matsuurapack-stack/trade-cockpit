@@ -9112,6 +9112,10 @@ function MorningCheckPanel({notifyPermission,requestNotifyPermission,notifyDeskt
 
   const copyMorningCheckConsult=async()=>{
     if(!check)return;
+    // Phase MU-S2（2026-09-14・PRIVATE情報漏洩の修正）：これは個別の相談ボタンではなく
+    // 一般の市況相談なので、個人の保有ポジション由来情報（position_risk）はSHARED payloadに
+    // 含めない。自分のポジションを相談したい場合は別の「利確・損切り相談」ボタン
+    // （copyPositionConsult、PRIVATE payload）を使う。
     await copyChatGPTPayload("朝一チェックを相談","morning_check_report",{
       market_regime:check.market_regime,volatility_regime:check.volatility_regime,
       market_risk_score:check.market_risk_score,
@@ -9119,7 +9123,7 @@ function MorningCheckPanel({notifyPermission,requestNotifyPermission,notifyDeskt
       strong_sectors:check.strong_sectors_json,weak_sectors:check.weak_sectors_json,
       watchlist_top5:check.watchlist_top5_json,avoid_stocks:check.avoid_stocks_json,
       resilience_watch:check.resilience_json,risk_warnings:check.risk_warnings_json,
-      position_risk:check.position_risk_json,strategy:check.strategy_json,
+      strategy:check.strategy_json,
       data_quality:check.data_quality_json,
     },()=>{});
   };
@@ -9280,6 +9284,10 @@ function IntradayReportCard({report,reportType,isClose}){
   const meta=INTRADAY_REPORT_META[reportType];
   const copyConsult=async()=>{
     const isDaily=isClose;
+    // Phase MU-S2（2026-09-14・PRIVATE情報漏洩の修正）：一般の市況レポート相談なので、
+    // 個人の保有ポジション由来情報（position_alerts）はSHARED payloadに含めない
+    // （report.risk_alerts_jsonはレスポンス側でその場合成される自分のCRITICAL警告を
+    // 含む場合があるが、銘柄・価格等の具体情報は無い一般メッセージのみ）。
     await copyChatGPTPayload(`${meta.short}レポートを相談`,isDaily?"daily_market_review":"market_intraday_report",{
       schema_version:"1.0",type:isDaily?"daily_market_review":"market_intraday_report",report_type:reportType,
       market_regime:report.market_regime,volatility_regime:report.volatility_regime,
@@ -9287,7 +9295,7 @@ function IntradayReportCard({report,reportType,isClose}){
       weak_sectors:report.weak_sectors_json,sector_snapshot:report.sector_snapshot_json,
       thesis_evaluation:report.morning_thesis_evaluation_json,resilience:report.resilience_stocks_json,
       momentum_or_flow:report.momentum_stocks_json,risk_alerts:report.risk_alerts_json,
-      position_alerts:report.position_alerts_json,news_changes:report.news_changes_json,
+      news_changes:report.news_changes_json,
       event_risk:report.event_risk_json,strategy_update:report.strategy_update_json,
     },()=>{});
   };
@@ -9556,10 +9564,9 @@ function MarketEnvironmentBanner({metrics,watchlistAll,stockQuotes,top5}){
     // market/semiconductor/sectorカテゴリのACTIVE/TESTINGルールを添える（全ルールは送らない）。
     const activeRulesForMorning=await fetchJsonSafe("/api/trade-rules/relevant?categories=market,semiconductor,sector,event")
       .then(d=>(d&&d.rules)||[]).catch(()=>[]);
-    // 2026-09-09新規（統合インテリジェンス機能、指示書25・26番）：直近の振り返り（昨日までの
-    // 反省点）を添える。全履歴ではなく直近3日分だけ（指示書27番：古い情報を無制限に混ぜない）。
-    const recentReflections=await fetchJsonSafe("/api/daily-review/recent?days=3")
-      .then(d=>(d&&d.reflections)||[]).catch(()=>[]);
+    // Phase MU-S2（2026-09-14・PRIVATE情報漏洩の修正）：「朝一分析」は一般の市況相談ボタン
+    // であり個別の相談ではないため、個人のdaily_reviews由来（recent_reflections）は
+    // SHARED payloadに含めない（2026-09-09新規で追加されていたが撤去）。
     // 2026-09-09新規（判断エンジン全画面統合、指示書3番）：朝一では個別銘柄よりmarket全体
     // （macro expert views・直近の重要イベント・行動警告）を優先する。stock_codeを渡さない
     // build_relevant_trading_contextを呼び、「今日やってはいけないこと」を行動警告＋
@@ -9590,7 +9597,6 @@ function MarketEnvironmentBanner({metrics,watchlistAll,stockQuotes,top5}){
         grade:lightweightGrade(w),action:lightweightAction(w),reason:lightweightReason(w),
       })),
       active_rules:activeRulesForMorning.map(r=>({rule:r.rule_text,confidence:r.confidence,action:r.action_text||null})),
-      recent_reflections:recentReflections.map(r=>({date:r.date,score:r.score,notes:(r.tomorrowNotes.length?r.tomorrowNotes:r.improvementPoints).slice(0,3)})),
       expert_views:(morningKnowledge&&!morningKnowledge.error?morningKnowledge.context.expert_views:[]).map(e=>({expert_name:e.expert_name,outlook:e.outlook,status:e.status})),
       upcoming_events:(morningKnowledge&&!morningKnowledge.error?morningKnowledge.context.upcoming_events:[]).slice(0,5).map(e=>({title:e.title||e.event,business_days_until:e.business_days_until,importance:e.importance})),
       today_avoid:avoidToday,

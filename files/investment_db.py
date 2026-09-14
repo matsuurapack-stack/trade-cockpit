@@ -630,6 +630,26 @@ CREATE TABLE IF NOT EXISTS trade_rule_history (
 CREATE INDEX IF NOT EXISTS idx_trade_rule_history_rule ON trade_rule_history(rule_id, created_at DESC);
 """
 
+# Phase MU-S2（2026-09-14・GLOBAL/USER可視性分離）：trade_rules / trade_playbooksに
+# 「誰から見えるか」の可視性列を追加する。既存の`scope`列（trade_rulesのみ）は
+# _guess_rule_scope()が判定する「対象範囲」（stock|sector|market_condition|global）という
+# 全く別の意味の列であり、意味が食い違うため絶対に再利用しない（列名は別にする）。
+#   visibility='USER'   … current_userでスコープ（デフォルト。既存行は全てこのまま）
+#   visibility='GLOBAL' … _SHARED_SCOPEでスコープ（全ユーザー共通）
+# 既存データは安全側に倒し、このmigrationでは自動でGLOBALへ移行しない（新規列追加のみ、
+# 既存23件のtrade_rulesは全てUSERのまま）。GLOBAL移行は人間が確認した候補一覧を見てから
+# 別途手動で実施する（指示書：個別銘柄・具体的な売買失敗・個人インシデント由来のルールは
+# 一般化処理を通るまでGLOBALにしない）。
+# trade_rule_historyは自身に可視性列を持たず、親trade_rules.visibility（rule_id経由）に
+# 従属する（現状の列にはPnL等の個人財務情報が無いため、この方針で十分。将来PRIVATE評価情報を
+# 追加する場合はGLOBAL定義履歴とUSER評価履歴のテーブル分離を優先すること）。
+_MIGRATE_RULE_VISIBILITY_SQL = """
+ALTER TABLE trade_rules ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'USER';
+ALTER TABLE trade_playbooks ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'USER';
+CREATE INDEX IF NOT EXISTS idx_trade_rules_visibility ON trade_rules(visibility);
+CREATE INDEX IF NOT EXISTS idx_trade_playbooks_visibility ON trade_playbooks(visibility);
+"""
+
 # ============================================================
 # Trade Experience Learning（2026-09-11新規）：日々の実トレードから、ユーザー固有の
 # 「勝ちパターン・負けパターン・WAIT条件・利確条件」を蓄積し、ENTRY TOP5・トレード分析・
@@ -1260,6 +1280,43 @@ WHERE a.user_id <> '_shared' AND b.user_id <> '_shared' AND a.id <> b.id
 UPDATE market_intelligence_reports SET user_id = '_shared' WHERE user_id <> '_shared';
 """
 
+# Phase MU-S2（2026-09-14・PRIVATE情報漏洩の修正）：MU-S1でSHARED化する前のmarket_intelligence_
+# reportsは、生成したユーザー自身の保有ポジション情報（銘柄コード・銘柄名・average_price由来の
+# 個人PnL%・position risk warning）をposition_alerts_json・risk_alerts_json・
+# strategy_update_json.major_changes/overnight_notesに書き込んでいた。SHARED化後はこれが
+# 他ユーザーにも見える状態になってしまうため、既存データからこれらを取り除く（今後の保存は
+# server.py側の修正で既に個人情報を含まない。このSQLは過去に保存済みの行の後始末のみ）。
+# 冪等：既に取り除かれていれば何も変化しない。
+_MIGRATE_CLEAR_PRIVATE_FROM_SHARED_REPORTS_SQL = """
+UPDATE market_intelligence_reports
+SET position_alerts_json = '[]'::jsonb
+WHERE position_alerts_json IS NOT NULL AND position_alerts_json <> '[]'::jsonb;
+
+UPDATE market_intelligence_reports
+SET risk_alerts_json = COALESCE((
+    SELECT jsonb_agg(elem) FROM jsonb_array_elements(risk_alerts_json) elem
+    WHERE elem->>'message' <> '保有銘柄が損切りルール（EXIT RULE）に到達'
+), '[]'::jsonb)
+WHERE risk_alerts_json @> '[{"message": "保有銘柄が損切りルール（EXIT RULE）に到達"}]'::jsonb;
+
+UPDATE market_intelligence_reports
+SET strategy_update_json = jsonb_set(
+    jsonb_set(
+        strategy_update_json,
+        '{major_changes}',
+        COALESCE((SELECT jsonb_agg(v) FROM jsonb_array_elements_text(strategy_update_json->'major_changes') v
+                   WHERE v <> 'EXIT_RULE_HIT'), '[]'::jsonb)
+    ),
+    '{overnight_notes}',
+    COALESCE((SELECT jsonb_agg(v) FROM jsonb_array_elements_text(strategy_update_json->'overnight_notes') v
+               WHERE v <> '損切りライン接近/到達中の保有銘柄あり。持ち越し判断は個別に再確認'), '[]'::jsonb)
+)
+WHERE strategy_update_json ? 'major_changes' AND strategy_update_json ? 'overnight_notes'
+  AND (strategy_update_json->'major_changes' @> '"EXIT_RULE_HIT"'::jsonb
+       OR strategy_update_json->'overnight_notes' @> '"損切りライン接近/到達中の保有銘柄あり。持ち越し判断は個別に再確認"'::jsonb);
+"""
+
+
 def init_schema(database_url):
     """テーブルを（無ければ）作成し、マルチユーザー化・ChatGPT連携の移行SQLも実行する。
     サーバー起動時に1回呼ぶ想定。失敗時は例外を投げる（起動時ログで気づけるようにするため、
@@ -1276,6 +1333,7 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_TRADE_EXPERIENCES_LEARNING_SQL)
         conn.execute(_SCHEMA_DAILY_REVIEWS_SQL)
         conn.execute(_SCHEMA_KNOWLEDGE_ENGINE_SQL)
+        conn.execute(_MIGRATE_RULE_VISIBILITY_SQL)
         conn.execute(_SCHEMA_MORNING_CHECK_SQL)
         conn.execute(_SCHEMA_POSITION_RISK_RULES_SQL)
         conn.execute(_SCHEMA_MARKET_INTELLIGENCE_SQL)
@@ -1307,6 +1365,7 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_SECTOR_ROTATION_SQL)
         conn.execute(_SCHEMA_YAAMAN_THEME_SQL)
         conn.execute(_MIGRATE_SHARED_SCOPE_SQL)
+        conn.execute(_MIGRATE_CLEAR_PRIVATE_FROM_SHARED_REPORTS_SQL)
         conn.commit()
 
 
@@ -2080,11 +2139,15 @@ def expire_temporary_trade_rules(database_url, user_id):
 
 
 def list_trade_rules(database_url, user_id, status=None, confidence=None, category=None, rule_type=None):
+    """Phase MU-S2：本人のUSERルールに加え、GLOBAL（visibility='GLOBAL'、user_id=_SHARED_SCOPE）
+    ルールも合わせて返す（全ユーザー共通で見えるべきもののため）。GLOBAL行はuser_id列自体が
+    _SHARED_SCOPEなので、user_id IN (本人, _SHARED_SCOPE)だけで両方を安全に絞り込める
+    （visibility列を独立に見なくても、この2値の組み合わせでしか発生しない設計）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return []
     expire_temporary_trade_rules(database_url, user_id)
-    where, params = ["user_id=%s"], [user_id]
+    where, params = ["user_id IN (%s, %s)"], [user_id, _SHARED_SCOPE]
     if status: where.append("status=%s"); params.append(status)
     if confidence: where.append("confidence=%s"); params.append(confidence)
     if category: where.append("category=%s"); params.append(category)
@@ -2099,18 +2162,19 @@ def list_trade_rules(database_url, user_id, status=None, confidence=None, catego
 
 
 def get_trade_rule(database_url, user_id, rule_id):
-    """ルール1件を履歴付きで返す（指示書11番：ルール詳細画面用）。"""
+    """ルール1件を履歴付きで返す（指示書11番：ルール詳細画面用）。Phase MU-S2：本人の
+    USERルールに加え、GLOBALルール（list_trade_rulesと同じ判定）も取得できる。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT * FROM trade_rules WHERE id=%s AND user_id=%s", [rule_id, user_id])
+            cur.execute("SELECT * FROM trade_rules WHERE id=%s AND user_id IN (%s, %s)", [rule_id, user_id, _SHARED_SCOPE])
             row = cur.fetchone()
             if not row:
                 return None
-            cur.execute("SELECT * FROM trade_rule_history WHERE rule_id=%s AND user_id=%s ORDER BY created_at DESC",
-                        [rule_id, user_id])
+            cur.execute("SELECT * FROM trade_rule_history WHERE rule_id=%s AND user_id IN (%s, %s) ORDER BY created_at DESC",
+                        [rule_id, user_id, _SHARED_SCOPE])
             history = [_row_to_json(h) for h in cur.fetchall()]
     result = _trade_rule_row_to_json(row)
     result["history"] = history
@@ -2125,7 +2189,9 @@ def find_similar_trade_rules(database_url, user_id, rule_text, exclude_id=None, 
     key = _normalize_rule_key(rule_text)
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT * FROM trade_rules WHERE user_id=%s AND status NOT IN ('RETIRED','EXPIRED')", [user_id])
+            # Phase MU-S2：GLOBALルールとの重複も検出対象にする（list_trade_rulesと同じ判定）。
+            cur.execute("SELECT * FROM trade_rules WHERE user_id IN (%s, %s) AND status NOT IN ('RETIRED','EXPIRED')",
+                        [user_id, _SHARED_SCOPE])
             rows = cur.fetchall()
     scored = []
     for r in rows:
@@ -2184,8 +2250,9 @@ def relevant_trade_rules_for(database_url, user_id, categories=None, limit=8):
     expire_temporary_trade_rules(database_url, user_id)
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            where = ["user_id=%s", "status IN ('ACTIVE','TESTING')", "rule_type != 'TEMPORARY'"]
-            params = [user_id]
+            # Phase MU-S2：GLOBALルール（user_id=_SHARED_SCOPE）も対象にする。
+            where = ["user_id IN (%s, %s)", "status IN ('ACTIVE','TESTING')", "rule_type != 'TEMPORARY'"]
+            params = [user_id, _SHARED_SCOPE]
             if categories:
                 where.append("(category = ANY(%s) OR scope='global')")
                 params.append(list(categories))

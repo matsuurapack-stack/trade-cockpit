@@ -12508,11 +12508,69 @@ def generate_opening_30m_report(database_url, user_id, trade_date=None):
     return generate_intraday_report(database_url, user_id, "OPENING_30M", trade_date)
 
 
+# Phase MU-S2（2026-09-14・PRIVATE情報漏洩の修正）：market_intelligence_reportsはMU-S1で
+# SHARED化済み（全ユーザー共通）のテーブルである。このテーブルの行そのものに、生成した
+# ユーザー個人の保有ポジション情報（銘柄コード・銘柄名・average_price・個人PnL%・
+# position risk warning等）を保存してはならない——SHARED行にPRIVATEデータを混ぜると、
+# 他ユーザーからも見えてしまう（実際に発生していた不具合。詳細はgenerate_intraday_report
+# 内のコメント参照）。
+#
+# 設計ルール（今後SHARED化するテーブル全てに適用すること。例：MU-S3でmorning_market_checks
+# をSHARED化する場合も同様）：
+#   SHARED market report（DB保存・全員共通） + PRIVATE position overlay（閲覧時にその場で
+#   current_userのportfolioから計算し、レスポンスに合成するだけでDBには保存しない）
+# という2層構造にする。この関数は後者のoverlay計算だけを担う。
+def _compute_personal_position_overlay(database_url, user_id):
+    """呼び出しユーザー自身の保有ポジションに関する警告を、その場で計算して返す
+    （DBへは一切保存しない）。戻り値：
+    {"position_alerts": [...], "has_critical_position_alert": bool}"""
+    if investment_db is None or not database_url:
+        return {"position_alerts": [], "has_critical_position_alert": False}
+    try:
+        watchlist_all = investment_db.list_watchlist(database_url, user_id, market="JP")
+        positions_all = investment_db.list_portfolio(database_url, user_id)
+        quote_targets = {w["code"]: w for w in watchlist_all}
+        for p in positions_all:
+            quote_targets.setdefault(p.get("code"), {"code": p.get("code"), "market": "JP"})
+        stock_quotes = get_stock_quotes(list(quote_targets.values()), cache_ttl=CACHE_TTL["stock_quote"]) if quote_targets else {}
+        alerts = evaluate_position_risk_warnings(database_url, user_id, stock_quotes)
+    except Exception as e:
+        print("  personal position overlay計算で例外", e)
+        alerts = []
+    return {"position_alerts": alerts, "has_critical_position_alert": any(a["level"] == "CRITICAL" for a in alerts)}
+
+
+_POSITION_RISK_ALERT_MESSAGE = "保有銘柄が損切りルール（EXIT RULE）に到達"
+_POSITION_OVERNIGHT_NOTE = "損切りライン接近/到達中の保有銘柄あり。持ち越し判断は個別に再確認"
+
+
+def _apply_personal_position_overlay(report, overlay):
+    """1件のmarket_intelligence_reports行（dict、SHARED・PRIVATE情報を含まない状態）に、
+    _compute_personal_position_overlayの結果をその場で合成したコピーを返す（DBへは書き込まない、
+    レスポンス表示専用）。Noneはそのまま返す。"""
+    if report is None:
+        return report
+    out = dict(report)
+    out["position_alerts_json"] = overlay["position_alerts"]
+    if overlay["has_critical_position_alert"]:
+        out["risk_alerts_json"] = list(out.get("risk_alerts_json") or []) + [
+            {"level": "CRITICAL", "message": _POSITION_RISK_ALERT_MESSAGE}]
+        su = dict(out.get("strategy_update_json") or {})
+        su["overnight_notes"] = list(su.get("overnight_notes") or [])
+        if _POSITION_OVERNIGHT_NOTE not in su["overnight_notes"]:
+            su["overnight_notes"].append(_POSITION_OVERNIGHT_NOTE)
+        out["strategy_update_json"] = su
+    return out
+
+
 def generate_intraday_report(database_url, user_id, report_type, trade_date=None):
     """Market Intelligence Timelineの共通レポートエンジン（market_report_serviceの中核）。
     report_typeはOPENING_30M/MORNING_CLOSE/AFTERNOON_30M/MARKET_CLOSEのいずれか。
     朝一予想（MorningMarketCheckのT0850）が無くても、その日の実市場スナップショットだけは
-    残す（DATA_INSUFFICIENTを使い、レポート自体は落とさない方針、指示書29番）。"""
+    残す（DATA_INSUFFICIENTを使い、レポート自体は落とさない方針、指示書29番）。
+    Phase MU-S2：戻り値はSHARED保存内容＋呼び出しユーザー自身のPRIVATE position overlayを
+    合成したものだが、実際にDBへ保存するのはSHARED部分だけ（_apply_personal_position_overlay
+    参照）。"""
     if report_type not in INTRADAY_REPORT_SNAPSHOT_TIMES:
         raise ValueError(f"未対応のreport_type: {report_type}")
     data_health = {}
@@ -12742,11 +12800,11 @@ def generate_intraday_report(database_url, user_id, report_type, trade_date=None
             print("  IntradayReport: ルール違反検出で例外", e)
             rule_violations = []
 
+    # Phase MU-S2：position_alerts由来のCRITICAL警告・major_changesはSHARED行には含めない
+    # （個人ポジションの状態が他ユーザーに見えてしまうため）。_apply_personal_position_overlay
+    # が閲覧時に呼び出しユーザー自身の分だけ合成する。
     risk_alerts = []
     major_changes = []
-    if any(a["level"] == "CRITICAL" for a in position_alerts):
-        risk_alerts.append({"level": "CRITICAL", "message": "保有銘柄が損切りルール（EXIT RULE）に到達"})
-        major_changes.append("EXIT_RULE_HIT")
     if "EVENT_RISK_HIGH" in event_info.get("signals", []):
         risk_alerts.append({"level": "WARNING", "message": "重要イベントが目前"})
     for v in rule_violations:
@@ -12764,13 +12822,12 @@ def generate_intraday_report(database_url, user_id, report_type, trade_date=None
         major_changes.append("NEW_STRONG_SECTOR")
     if report_type != "OPENING_30M" and failed_n > 0:
         major_changes.append("THESIS_FAILED")
-    # 15:30のみ：翌営業日イベントリスク・持ち越し注意（指示書3番）
+    # 15:30のみ：翌営業日イベントリスク・持ち越し注意（指示書3番）。Phase MU-S2：
+    # position_alerts由来の持ち越し注意（個人ポジション依存）はSHARED行には含めない。
     overnight_notes = []
     if report_type == "MARKET_CLOSE":
         if "NO_OVERNIGHT" in event_info.get("signals", []) or "EVENT_RISK_HIGH" in event_info.get("signals", []):
             overnight_notes.append("翌営業日に重要イベントがあるため持ち越しに注意")
-        if any(a["tier"] in ("WARNING", "EXIT") for a in position_alerts):
-            overnight_notes.append("損切りライン接近/到達中の保有銘柄あり。持ち越し判断は個別に再確認")
 
     # 指数の他のスカラーもnikkei_chgと同じフォールバック経路を通す（指示書6番）
     topix_chg = _fallback_scalar("topix_etf", "changePct", "topix_change_pct")
@@ -12822,7 +12879,9 @@ def generate_intraday_report(database_url, user_id, report_type, trade_date=None
             "previous_report_regime": previous_regime, "regime_changed_since_previous": regime_changed_since_previous,
             "stocks": thesis_stocks,
         },
-        "risk_alerts_json": risk_alerts, "position_alerts_json": position_alerts,
+        # Phase MU-S2：position_alerts_jsonは個人のポジション情報のためSHARED行には保存しない
+        # （常に空配列）。実際の値は_apply_personal_position_overlayが閲覧時に合成する。
+        "risk_alerts_json": risk_alerts, "position_alerts_json": [],
         "news_changes_json": news_changes, "event_risk_json": event_info.get("events", [])[:5],
         "strategy_update_json": {"strategy": strategy, "text": summary_text, "major_changes": major_changes,
                                   "overnight_notes": overnight_notes, "previous_report_kind": previous_kind},
@@ -12833,7 +12892,11 @@ def generate_intraday_report(database_url, user_id, report_type, trade_date=None
         "social_signals_json": _nicosoku_intraday_signals_safe(database_url, user_id),
     }
     saved = investment_db.save_market_intelligence_report(database_url, user_id, trade_date, report_type, payload) if investment_db else None
-    return saved
+    # Phase MU-S2：DBに保存するのはSHARED部分のみ（上のpayloadにPRIVATE情報は含まない）。
+    # 呼び出し元（「今すぐ分析」等の即時表示）には、この場で計算済みのposition_alertsを
+    # 合成して返す（DBには残らない）。
+    overlay = {"position_alerts": position_alerts, "has_critical_position_alert": any(a["level"] == "CRITICAL" for a in position_alerts)}
+    return _apply_personal_position_overlay(saved, overlay)
 
 
 def _intraday_report_scheduler_users():
@@ -17912,6 +17975,12 @@ class Handler(SimpleHTTPRequestHandler):
             params = urllib.parse.parse_qs(qs)
             reports = investment_db.list_market_intelligence_reports(DATABASE_URL, self.current_user, trade_date=params.get("date", [None])[0]) \
                 if (investment_db is not None and DATABASE_URL) else []
+            # Phase MU-S2：market_intelligence_reportsはSHARED（DB上にPRIVATE情報は無い）。
+            # 閲覧時にだけ呼び出しユーザー自身のposition警告をその場で合成する
+            # （他ユーザーの分は絶対に混ざらない＝self.current_userの分だけ計算）。
+            if reports and investment_db is not None and DATABASE_URL:
+                overlay = _compute_personal_position_overlay(DATABASE_URL, self.current_user)
+                reports = [_apply_personal_position_overlay(r, overlay) for r in reports]
             self._send_json({"reports": reports})
         # ---- 2026-09-09新規（判断エンジン強化：知識の実利用） ----
         elif self.path.startswith("/api/trade-playbooks"):
