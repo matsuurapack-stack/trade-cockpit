@@ -504,6 +504,129 @@ def _overlay_tachibana_prices(out, watchlist):
         out[code]["liveSource"] = "tachibana"
 
 
+# ============================================================
+# Phase QF-1（2026-09-14新規）：FAST QUOTE経路。リアルタイム表示用の現在値系データは
+# 立花証券APIを主ソースにし、yfinance（日足履歴・spark等）を一切経由しない。
+# get_stock_quotes()（既存・yfinance history＋tachibana上書き、spark付き）はSLOW
+# analytics用として無変更のまま残す——既存の呼び出し元（/api/stock-quotes、分析API、
+# 「市場」タブの残225銘柄ループ等）は一切変更しない。
+# ユーザー指示：PRICE_CHUNK（40件）はいきなり拡大しない。監視56銘柄でも2チャンクで
+# 実測2秒程度のため、まずは安定性優先。失敗したチャンクだけ再試行し、成功済みチャンクは
+# 再取得しない。
+# ============================================================
+FAST_QUOTE_CHUNK = 40  # tachibana_api.PRICE_CHUNKと同じ単位を維持（QF-1指示：一気に拡大しない）
+FAST_QUOTE_MAX_ATTEMPTS = 3  # 失敗したチャンクだけこの回数まで再試行（無限リトライ禁止）
+FAST_QUOTE_CACHE_TTL_SEC = 15  # tachibana取得失敗時のfallback①（直近キャッシュ）のTTL
+_fast_quote_cache = {}  # code -> {"value": {...FAST QUOTE dict...}, "at": epoch_sec}
+
+
+def _fetch_fast_quote_chunk_with_retry(chunk):
+    """立花証券APIから1チャンク（最大FAST_QUOTE_CHUNK件）分の時価を取得する。
+    tachibana_api.get_market_price()内部では「セッション切れ等は1回だけ再ログイン再試行」
+    までしか行わないため、それでも結果に含まれない銘柄が残る場合はここでさらに指数
+    バックオフ付きでFAST_QUOTE_MAX_ATTEMPTS回まで再試行する（成功済みの銘柄は再取得しない、
+    指示書：既存の_fetch_market_price_with_retryのリトライ設計を流用）。FAST経路のため
+    MOMENTUM_STAGE1（3秒→6秒）より短い間隔でバックオフする。
+    戻り値: {code: {...}} （最終的に取得できなかった銘柄は含まれない）"""
+    remaining = list(dict.fromkeys(chunk))
+    result = {}
+    for attempt in range(1, FAST_QUOTE_MAX_ATTEMPTS + 1):
+        if not remaining:
+            break
+        try:
+            got = tachibana_api.get_market_price(remaining)
+        except Exception as e:
+            print(f"  [FastQuote] チャンク取得失敗（{attempt}/{FAST_QUOTE_MAX_ATTEMPTS}回目、TACHIBANA_SESSION_FAILEDの可能性）", e)
+            got = {}
+        result.update(got)
+        remaining = [c for c in remaining if c not in got]
+        if remaining and attempt < FAST_QUOTE_MAX_ATTEMPTS:
+            time.sleep(attempt * 1.5)
+    if remaining:
+        print(f"  [FastQuote] TACHIBANA_SESSION_FAILED（{FAST_QUOTE_MAX_ATTEMPTS}回失敗）：{remaining}")
+    return result
+
+
+def get_fast_quotes(watchlist):
+    """FAST QUOTE経路：立花証券APIを主ソースとしたリアルタイム時価取得（指示書4番の
+    ソース優先順位＝TACHIBANA→fallback（直近キャッシュ）→yfinance→last known value）。
+    yfinanceの日足履歴取得（get_stock_quotesが行うもの）は一切呼ばない——呼ぶのは
+    fallback②として、tachibana・キャッシュのどちらでも取れなかったごく少数の銘柄だけ
+    （指示書6番：現在値pollに履歴取得を結合しない。フォールバック時の少数呼び出しのみ許容）。
+    戻り値: (quotes_dict, stats_dict)。
+    quotes_dict[code] = {t,p,change,changePct,volume,open,high,low,ask,bid,
+                          source,quote_timestamp,fetched_at,is_stale}
+    stats_dict = {"requested":N,"tachibana":N,"fallback_cache":N,"fallback_yf":N,"failed":N,"duration_ms":N}
+    最終的にどこからも値を得られなかった銘柄はquotes_dictに含めない
+    （＝フロント側は直前の値＝last known valueをそのまま保持する設計）。"""
+    t0 = time.time()
+    codes = list(dict.fromkeys(w.get("code", "") for w in watchlist if w.get("code")))
+    out = {}
+    stats = {"requested": len(codes), "tachibana": 0, "fallback_cache": 0, "fallback_yf": 0, "failed": 0, "duration_ms": 0}
+    if not codes:
+        return out, stats
+    now_iso = datetime.datetime.now(_JST).isoformat()
+
+    fetched_all = {}
+    if tachibana_api is not None:
+        for i in range(0, len(codes), FAST_QUOTE_CHUNK):
+            fetched_all.update(_fetch_fast_quote_chunk_with_retry(codes[i:i + FAST_QUOTE_CHUNK]))
+
+    still_missing = []
+    for code in codes:
+        v = fetched_all.get(code)
+        if v is not None and v.get("t") is not None:
+            out[code] = {
+                "t": v.get("t"), "p": v.get("p"), "change": v.get("change"), "changePct": v.get("changePct"),
+                "volume": v.get("volume"), "open": v.get("open"), "high": v.get("high"), "low": v.get("low"),
+                "ask": v.get("ask"), "bid": v.get("bid"),
+                "source": "tachibana", "quote_timestamp": now_iso, "fetched_at": now_iso, "is_stale": False,
+            }
+            stats["tachibana"] += 1
+            _fast_quote_cache[code] = {"value": out[code], "at": time.time()}
+        else:
+            still_missing.append(code)
+
+    # fallback①：直近キャッシュ（TTL内）
+    still_missing2 = []
+    for code in still_missing:
+        cached = _fast_quote_cache.get(code)
+        if cached is not None and (time.time() - cached["at"]) <= FAST_QUOTE_CACHE_TTL_SEC:
+            out[code] = {**cached["value"], "source": "cache", "fetched_at": now_iso, "is_stale": True}
+            stats["fallback_cache"] += 1
+        else:
+            still_missing2.append(code)
+
+    # fallback②：yfinance（tachibana・キャッシュどちらも失敗した、ごく少数のはずの銘柄のみ。
+    # 既存get_stock_quotes()をそのまま再利用するが、対象は少数のため現在値pollを
+    # ブロックするほどの遅延にはならない想定）。
+    if still_missing2:
+        yf_items = [w for w in watchlist if w.get("code") in still_missing2]
+        try:
+            yf_quotes = get_stock_quotes(yf_items)
+        except Exception as e:
+            print("  [FastQuote] yfinanceフォールバック失敗", e)
+            yf_quotes = {}
+        for code in still_missing2:
+            v = yf_quotes.get(code)
+            if v is not None and v.get("t") is not None:
+                out[code] = {
+                    "t": v.get("t"), "p": v.get("p"), "change": None, "changePct": None,
+                    "volume": v.get("volume"), "open": v.get("open"), "high": v.get("high"), "low": v.get("low"),
+                    "ask": v.get("ask"), "bid": v.get("bid"),
+                    "source": "yfinance_fallback", "quote_timestamp": now_iso, "fetched_at": now_iso, "is_stale": True,
+                }
+                stats["fallback_yf"] += 1
+                _fast_quote_cache[code] = {"value": out[code], "at": time.time()}
+            else:
+                stats["failed"] += 1
+    stats["duration_ms"] = round((time.time() - t0) * 1000)
+    print(f"  [FastQuote] requested={stats['requested']} tachibana={stats['tachibana']} "
+          f"fallback_cache={stats['fallback_cache']} fallback_yf={stats['fallback_yf']} "
+          f"failed={stats['failed']} duration={stats['duration_ms']}ms")
+    return out, stats
+
+
 def _fmt_published(entry):
     """RSS の pubDate(GMT) を日本時間 'MM/DD HH:MM' に整形。無ければ空。"""
     pp = entry.get("published_parsed")
@@ -19729,6 +19852,21 @@ class Handler(SimpleHTTPRequestHandler):
                 "stockNewsText": _stock_text(stock),
                 "macroNewsText": _macro_text(macro_all),
             })
+        elif self.path.startswith("/api/stock-quotes/fast"):
+            # Phase QF-1（2026-09-14新規）：リアルタイム表示専用のFAST QUOTE経路。
+            # 既存/api/stock-quotes（yfinance history＋tachibana上書き、spark付き）は
+            # 一切変更せずSLOW analytics用に残す。startswithの判定順は、より具体的な
+            # このルートを既存の/api/stock-quotesより先に置くことで両立させている
+            # （/api/stock-quotesはstartswithマッチのため、順序を入れ替えると壊れる）。
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b"[]"
+            try:
+                watchlist = json.loads(raw.decode("utf-8") or "[]")
+            except Exception:
+                watchlist = []
+            quotes, stats = get_fast_quotes(watchlist)
+            now = datetime.datetime.now().strftime("%H:%M:%S")
+            self._send_json({"quotes": quotes, "fetchedAt": now, "stats": stats})
         elif self.path.startswith("/api/stock-quotes"):
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length) if length else b"[]"

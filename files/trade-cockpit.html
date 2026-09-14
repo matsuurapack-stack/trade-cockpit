@@ -10075,13 +10075,24 @@ function App(){
       }
     }catch(e){}
     try{
-      const srJP=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(sRef.current.watchlist)});
+      // Phase QF-1（2026-09-14）：監視銘柄（優先56件）はFAST QUOTE経路
+      // （/api/stock-quotes/fast、立花証券API主ソース・yfinance履歴を経由しない）を使う。
+      // レスポンスにはspark（ミニチャート用7点履歴）が含まれないため、既存のspark等は
+      // 前回値からそのまま引き継ぐ（コード単位でオブジェクト全体を置き換えず、マージする）。
+      const priorityTargets=sRef.current.watchlist.filter(w=>sRef.current.watchTargets.includes(w.code));
+      const srJP=await fetch("/api/stock-quotes/fast",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(priorityTargets)});
       if(srJP.ok){
         const sdJP=await srJP.json();
         const stampedAt=new Date().toISOString();
-        const stamped=Object.fromEntries(Object.entries(sdJP.quotes||{}).map(([k,v])=>[k,{...v,quoteFetchedAt:stampedAt}]));
-        setS(p=>({...p,stockQuotes:{...p.stockQuotes,...stamped}}));
-        setJpMsg(nowHHMM()+" 自動更新");
+        setS(p=>{
+          const nq={...p.stockQuotes};
+          Object.entries(sdJP.quotes||{}).forEach(([k,v])=>{
+            nq[k]={...(nq[k]||{}),...v,quoteFetchedAt:v.fetched_at||stampedAt};
+          });
+          return {...p,stockQuotes:nq};
+        });
+        setJpMsg(nowHHMM()+" 自動更新"+(sdJP.stats?`（${sdJP.stats.tachibana}/${sdJP.stats.requested}件TACHIBANA）`:""));
+        setLastFastQuoteStats(sdJP.stats||null);
       }
     }catch(e){}
     setMonitorFetching(false);setJpFetching(false);
