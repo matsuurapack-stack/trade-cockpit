@@ -1327,6 +1327,64 @@ WHERE strategy_update_json ? 'major_changes' AND strategy_update_json ? 'overnig
        OR strategy_update_json->'overnight_notes' @> '"損切りライン接近/到達中の保有銘柄あり。持ち越し判断は個別に再確認"'::jsonb);
 """
 
+# Phase MU-S3B（2026-09-14・SHARED_SAFE 5テーブルの共有化）：MU-S3Aの調査で個人情報混入が
+# 無いと確認できた5テーブル（auto_signal_events / limit_up_events / theme_momentum_history /
+# next_day_theme_candidates / entry_candidate_snapshots）を、MU-S1と同じ_SHARED_SCOPEへ
+# 一括移行する。既存データのuser_id列は削除しない（将来のscope再設計・ロールバックに備える）。
+# 冪等：①同じ自然キーで既に"_shared"の行がある場合は旧user_idの行を削除（重複を残さない）
+# ②まだ"_shared"化されていない行同士で自然キーが重複する場合はmatsuura優先→id最小優先で
+# 1件だけ残す ③残った行のuser_idを"_shared"へ更新。
+# auto_signal_eventsとentry_candidate_snapshots(dedupe_keyがNULLの行)は自然キー（user_id込み）
+# のUNIQUE制約が無いログ/スナップショットのため、単純UPDATEのみで良い（重複が起きようがない）。
+_MIGRATE_MUS3B_SHARED_SCOPE_SQL = """
+-- auto_signal_events（自然キー無し・履歴ログのため単純UPDATEのみ）
+UPDATE auto_signal_events SET user_id = '_shared' WHERE user_id <> '_shared';
+
+-- limit_up_events（自然キー: event_date, symbol）
+DELETE FROM limit_up_events a USING limit_up_events b
+WHERE a.user_id <> '_shared' AND b.user_id = '_shared'
+  AND a.event_date = b.event_date AND a.symbol = b.symbol;
+DELETE FROM limit_up_events a USING limit_up_events b
+WHERE a.user_id <> '_shared' AND b.user_id <> '_shared' AND a.id <> b.id
+  AND a.event_date = b.event_date AND a.symbol = b.symbol
+  AND ((b.user_id = 'matsuura' AND a.user_id <> 'matsuura')
+       OR (a.user_id <> 'matsuura' AND b.user_id <> 'matsuura' AND a.id > b.id));
+UPDATE limit_up_events SET user_id = '_shared' WHERE user_id <> '_shared';
+
+-- theme_momentum_history（自然キー: theme, event_date）
+DELETE FROM theme_momentum_history a USING theme_momentum_history b
+WHERE a.user_id <> '_shared' AND b.user_id = '_shared'
+  AND a.theme = b.theme AND a.event_date = b.event_date;
+DELETE FROM theme_momentum_history a USING theme_momentum_history b
+WHERE a.user_id <> '_shared' AND b.user_id <> '_shared' AND a.id <> b.id
+  AND a.theme = b.theme AND a.event_date = b.event_date
+  AND ((b.user_id = 'matsuura' AND a.user_id <> 'matsuura')
+       OR (a.user_id <> 'matsuura' AND b.user_id <> 'matsuura' AND a.id > b.id));
+UPDATE theme_momentum_history SET user_id = '_shared' WHERE user_id <> '_shared';
+
+-- next_day_theme_candidates（自然キー: theme, generated_date）
+DELETE FROM next_day_theme_candidates a USING next_day_theme_candidates b
+WHERE a.user_id <> '_shared' AND b.user_id = '_shared'
+  AND a.theme = b.theme AND a.generated_date = b.generated_date;
+DELETE FROM next_day_theme_candidates a USING next_day_theme_candidates b
+WHERE a.user_id <> '_shared' AND b.user_id <> '_shared' AND a.id <> b.id
+  AND a.theme = b.theme AND a.generated_date = b.generated_date
+  AND ((b.user_id = 'matsuura' AND a.user_id <> 'matsuura')
+       OR (a.user_id <> 'matsuura' AND b.user_id <> 'matsuura' AND a.id > b.id));
+UPDATE next_day_theme_candidates SET user_id = '_shared' WHERE user_id <> '_shared';
+
+-- entry_candidate_snapshots（実質的な自然キーはdedupe_key、NULLはUNIQUE制約対象外）
+DELETE FROM entry_candidate_snapshots a USING entry_candidate_snapshots b
+WHERE a.user_id <> '_shared' AND b.user_id = '_shared'
+  AND a.dedupe_key IS NOT NULL AND a.dedupe_key = b.dedupe_key;
+DELETE FROM entry_candidate_snapshots a USING entry_candidate_snapshots b
+WHERE a.user_id <> '_shared' AND b.user_id <> '_shared' AND a.id <> b.id
+  AND a.dedupe_key IS NOT NULL AND a.dedupe_key = b.dedupe_key
+  AND ((b.user_id = 'matsuura' AND a.user_id <> 'matsuura')
+       OR (a.user_id <> 'matsuura' AND b.user_id <> 'matsuura' AND a.id > b.id));
+UPDATE entry_candidate_snapshots SET user_id = '_shared' WHERE user_id <> '_shared';
+"""
+
 
 def init_schema(database_url):
     """テーブルを（無ければ）作成し、マルチユーザー化・ChatGPT連携の移行SQLも実行する。
@@ -1377,6 +1435,7 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_YAAMAN_THEME_SQL)
         conn.execute(_MIGRATE_SHARED_SCOPE_SQL)
         conn.execute(_MIGRATE_CLEAR_PRIVATE_FROM_SHARED_REPORTS_SQL)
+        conn.execute(_MIGRATE_MUS3B_SHARED_SCOPE_SQL)
         conn.commit()
 
 
@@ -6767,7 +6826,12 @@ def create_entry_candidate_snapshot(database_url, user_id, fields):
     """指示書3・4・29・30番：ENTRY TOP5/WAIT/PULLBACK/AVOID_CHASE候補（買わなかったものも
     含む）のsnapshot。dedupe_keyにUNIQUE partial indexがあるためON CONFLICT DO NOTHINGで
     1日・銘柄・候補タイプ・状態ごとの重複保存を防ぐ（状態が変われば別dedupe_keyになり新規
-    snapshotとして保存される、指示書4番の「状態変化した場合は新snapshot可」に対応）。"""
+    snapshotとして保存される、指示書4番の「状態変化した場合は新snapshot可」に対応）。
+    Phase MU-S3B：entry_candidate_snapshotsはSHARED化済み（市場・銘柄条件から自動算出される
+    候補のみを保存し、個人の執行実績は保存しない設計。fields["was_taken"]は現状常にFalseで
+    未配線——将来「実際に買ったか」等の個人執行情報をここに追加してはならない。追加する場合は
+    private_execution_status等の別PRIVATEテーブルへ分離すること）。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return None
@@ -6843,7 +6907,9 @@ def list_entry_candidate_snapshots_for_code(database_url, code, since_iso, limit
 
 
 def list_entry_candidate_snapshots(database_url, user_id, since_iso, candidate_type=None, limit=1000):
-    """指示書17〜21・27・29・31番：performance集計・coverage rate算出向けの全件取得。"""
+    """指示書17〜21・27・29・31番：performance集計・coverage rate算出向けの全件取得。
+    Phase MU-S3B：entry_candidate_snapshotsはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return []
@@ -6862,6 +6928,8 @@ def list_entry_candidate_snapshots(database_url, user_id, since_iso, candidate_t
 
 
 def count_entry_candidate_snapshots_since(database_url, user_id, since_iso):
+    # Phase MU-S3B：entry_candidate_snapshotsはSHARED化済み。
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return 0
@@ -6874,6 +6942,8 @@ def count_entry_candidate_snapshots_since(database_url, user_id, since_iso):
 
 
 def count_entry_candidate_snapshots_pending(database_url, user_id):
+    # Phase MU-S3B：entry_candidate_snapshotsはSHARED化済み。
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return 0
@@ -6886,6 +6956,8 @@ def count_entry_candidate_snapshots_pending(database_url, user_id):
 
 
 def count_entry_candidate_snapshots_evaluated_since(database_url, user_id, since_iso):
+    # Phase MU-S3B：entry_candidate_snapshotsはSHARED化済み。
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return 0
@@ -7434,7 +7506,9 @@ CREATE INDEX IF NOT EXISTS idx_next_day_theme_candidates_user_date ON next_day_t
 
 
 def upsert_limit_up_event(database_url, user_id, event_date, symbol, fields):
-    """指示書26番：limit_up_events。冪等（UNIQUE(user_id,event_date,symbol)）。"""
+    """指示書26番：limit_up_events。冪等（UNIQUE(user_id,event_date,symbol)）。
+    Phase MU-S3B：limit_up_eventsはSHARED化済み（市場の事実のみ、個人の売買情報は含まない）。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None or not symbol:
         return None
@@ -7459,6 +7533,8 @@ def upsert_limit_up_event(database_url, user_id, event_date, symbol, fields):
 
 
 def list_limit_up_events(database_url, user_id, event_date=None, limit=200):
+    # Phase MU-S3B：limit_up_eventsはSHARED化済み。
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return []
@@ -7475,7 +7551,10 @@ def list_limit_up_events(database_url, user_id, event_date=None, limit=200):
 
 
 def upsert_next_day_theme_candidate(database_url, user_id, theme, generated_date, fields):
-    """指示書3・8番：next_day_theme_candidates。冪等（UNIQUE(user_id,theme,generated_date)）。"""
+    """指示書3・8番：next_day_theme_candidates。冪等（UNIQUE(user_id,theme,generated_date)）。
+    Phase MU-S3B：next_day_theme_candidatesはSHARED化済み（「市場として明日注目されるテーマ
+    候補」のみを保存し、個人の余力・ポジションは含めない）。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None or not theme:
         return None
@@ -7504,6 +7583,8 @@ def upsert_next_day_theme_candidate(database_url, user_id, theme, generated_date
 
 
 def get_next_day_theme_candidate(database_url, user_id, theme, generated_date):
+    # Phase MU-S3B：next_day_theme_candidatesはSHARED化済み。
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return None
@@ -7516,6 +7597,8 @@ def get_next_day_theme_candidate(database_url, user_id, theme, generated_date):
 
 
 def list_next_day_theme_candidates(database_url, user_id, generated_date=None, limit=50):
+    # Phase MU-S3B：next_day_theme_candidatesはSHARED化済み。
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return []
@@ -7532,7 +7615,10 @@ def list_next_day_theme_candidates(database_url, user_id, generated_date=None, l
 
 
 def upsert_theme_momentum_history(database_url, user_id, theme, event_date, fields):
-    """指示書27・28番：theme_momentum_history。冪等（UNIQUE(user_id,theme,event_date)）。"""
+    """指示書27・28番：theme_momentum_history。冪等（UNIQUE(user_id,theme,event_date)）。
+    Phase MU-S3B：theme_momentum_historyはSHARED化済み（テーマ強度・資金流入・構成銘柄等の
+    市場データのみ、個人の売買有無は含まない）。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None or not theme:
         return None
@@ -7557,6 +7643,8 @@ def upsert_theme_momentum_history(database_url, user_id, theme, event_date, fiel
 
 
 def list_theme_momentum_history(database_url, user_id, theme=None, limit=100):
+    # Phase MU-S3B：theme_momentum_historyはSHARED化済み。
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return []
@@ -7584,7 +7672,9 @@ def count_underlying_events_total(database_url):
 
 
 def count_entry_candidate_snapshots_total(database_url, user_id, candidate_type=None):
-    """指示書26・41番：累計candidate snapshot件数（type別も可）。"""
+    """指示書26・41番：累計candidate snapshot件数（type別も可）。
+    Phase MU-S3B：entry_candidate_snapshotsはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return 0
@@ -7612,7 +7702,9 @@ def count_validation_sessions(database_url):
 
 
 def count_entry_candidate_snapshots_evaluated_total(database_url, user_id):
-    """指示書26・41番：累計evaluated outcome件数（outcome_status確定済み）。"""
+    """指示書26・41番：累計evaluated outcome件数（outcome_status確定済み）。
+    Phase MU-S3B：entry_candidate_snapshotsはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return 0
@@ -8726,7 +8818,10 @@ def log_auto_signal_event(database_url, user_id, code, market, signal_type, even
                            primary_status=None, action_status=None, metadata=None):
     """auto_signal_eventsへ1件記録する。primary_status/action_statusは、サーバー側のスキャンが
     enrichWatchRow()（クライアント専用のSSoT）の結果を持たないため、現時点では意図的にNULLの
-    まま記録する（2026-09-05ユーザー判断：事後補完APIは見送り）。戻り値: True=成功。"""
+    まま記録する（2026-09-05ユーザー判断：事後補完APIは見送り）。戻り値: True=成功。
+    Phase MU-S3B：auto_signal_eventsはSHARED化済み（自動登録エンジンの市場シグナル遷移のみ、
+    MY_STOP_HIT等の個人イベントは記録しない設計）。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return False
@@ -8745,7 +8840,9 @@ def log_auto_signal_event(database_url, user_id, code, market, signal_type, even
 
 
 def list_auto_signal_events(database_url, user_id, code=None, signal_type=None, limit=200):
-    """auto_signal_eventsの履歴を新しい順に返す（検証・確認用）。codeやsignal_typeで絞り込み可能。"""
+    """auto_signal_eventsの履歴を新しい順に返す（検証・確認用）。codeやsignal_typeで絞り込み可能。
+    Phase MU-S3B：auto_signal_eventsはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return []
