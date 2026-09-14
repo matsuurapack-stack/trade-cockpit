@@ -19790,6 +19790,26 @@ class Handler(SimpleHTTPRequestHandler):
                                                        exit_price=body.get("exitPrice"))
                     except Exception:
                         pass
+                # 2026-09-14新規（持ち越し誤判定バグ対応）：15:30〜15:35に自動生成する
+                # daily_reviews（_daily_review_scheduler_loop）と、引け成売り等の手動記録
+                # タイミングは競合し得る——レビューが先に生成された時点でまだこの売却が
+                # 記録されていなければ、当日中に手仕舞った建玉でも「持ち越し」と誤判定
+                # されたまま保存されてしまう。売却が実際に記録された時点で、その決済日
+                # （closed_atのJST日付）のdaily_reviewsが既に存在するなら再生成して
+                # 誤判定を自己修復する（is_finalized済みでも中身の点数・改善点は
+                # 上書き更新される仕様＝investment_db.generate_daily_review()参照、
+                # finalize状態自体は変えず維持する）。存在しない日付（まだ生成前）は
+                # 通常のスケジューラ/手動再実行に任せるため何もしない。
+                try:
+                    review_date = investment_db._to_jst_date_str(result["trade"].get("closed_at"))
+                    if review_date:
+                        existing_review = investment_db.get_daily_review(DATABASE_URL, self.current_user, review_date)
+                        if existing_review:
+                            generate_daily_review_with_learning(
+                                DATABASE_URL, self.current_user, review_date,
+                                finalize=bool(existing_review.get("is_finalized")))
+                except Exception as e:
+                    print("  daily-review: 売却記録に伴う当日レビュー再生成で例外（無視して続行）", e)
             self._send_json(result)
         elif self.path.split("?")[0].startswith("/api/trades/") and self.path.split("?")[0].endswith("/decision-context"):
             # Market Intelligence Phase10新規（指示書3・4・5・38番）：HOLD等、明示的にsnapshotを

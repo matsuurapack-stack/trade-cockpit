@@ -563,6 +563,17 @@ ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS gross_pnl NUMERIC;
 ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS tax NUMERIC;
 ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS net_pnl NUMERIC;
 
+-- 2026-09-14新規（日次振り返りの持ち越し誤判定バグ対応）：全株売却でportfolioの行自体が
+-- 削除される（上のコメント参照）ため、これまではtrade_historyに「いつ取得したポジション
+-- だったか」「デイトレ想定だったか」が一切残らず、generate_daily_review()が review_date
+-- 大引け時点の保有状態を過去に遡って再構成できなかった（=list_portfolio()の「今この瞬間」
+-- のactiveな行だけしか見られず、その日のうちに手仕舞って既に削除済みの建玉は「持ち越して
+-- いなかった」ことを証明する手段が無かった）。売却確定時点でportfolio行からacquired_at・
+-- trade_styleを複製して残すことで、後からでも「その建玉は review_date の大引けより前に
+-- 手仕舞われていたか」を機械的に判定できるようにする。
+ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS acquired_at TIMESTAMPTZ;
+ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS trade_style TEXT;
+
 -- 2026-09-08新規（ニュース・材料連携の改善）：news_catalystsに好材料/悪材料/中立の方向性
 -- （sentiment）を追加する。既存のcategory（分類）・importance（重要度）とは別軸で、
 -- 「positive|negative|neutral」のいずれか。既存importで未指定の行はNULL（判定不能）のまま
@@ -3194,11 +3205,42 @@ def generate_daily_review(database_url, user_id, review_date, user_feedback=None
     # 過去日のreview_dateを生成する際にそのまま使うと、今日買った銘柄が過去日のレビューへ
     # 逆流してしまう（例：本日新規で買った銘柄が「9/11から持ち越していた」と誤判定される）。
     # acquired_at（無ければcreated_at）がreview_date以前のものだけを「その日時点で保有して
-    # いた可能性がある」ポジションとして扱う。既知の制約：review_date時点では保有していたが
-    # 今日までに決済されてportfolioから削除済みの銘柄は追跡できない（trade_historyに
-    # 取得日を記録する列が無いため）。
-    positions_as_of_review = [p for p in positions
-                                if _to_jst_date_str(p.get("acquired_at") or p.get("created_at")) <= review_date]
+    # いた可能性がある」ポジションとして扱う。
+    #
+    # 2026-09-14再修正（Sansan持ち越し誤判定バグ対応）：上記だけでは不十分だった。
+    # 「今この瞬間」activeな行を使う限り、review_dateの大引け後にまだ売却がこのアプリへ
+    # 記録されていない（=約定はしたが手動記録がまだの）間にレビューが生成されると、
+    # 当日中に引け成売りで手仕舞った建玉が「持ち越し」と誤判定されてしまう
+    # （15:30〜15:35に自動生成する_daily_review_scheduler_loopと、引け成売りの手動記録
+    # タイミングとの間に競合が起きるため）。正しい判定条件は
+    #   acquired_at <= review_date終了時点 AND (closed_at is NULL OR closed_at > review_date終了時点)
+    # ＝「その日の終わりまで未決済だったか」であり、「その日に取得済みだったか」だけでは
+    # 足りない。trade_history（決済済み）側にも acquired_at <= review_date かつ
+    # closed_at > review_date（＝review_date当日には手仕舞わず、後日に持ち越して決済した）の
+    # 行があれば「review_date時点で保有していた」ものとして合流させ、反対にreview_date当日
+    # またはそれ以前に決済済み（closed_at <= review_date）の行は保有扱いから除外する
+    # （同日決済＝持ち越しではない、が最優先）。
+    # 既知の制約：この再構成はtrade_history.acquired_at/trade_style（2026-09-14新設列）に
+    # 依存するため、それ以前に決済済みで列がNULLのまま残っている古いtrade_history行は
+    # 再構成できない（従来通り「追跡不可」のまま）。また、activeなportfolio行自体が
+    # 「review_dateには保有していたが今日までに手仕舞われ削除済み」のケースは、
+    # 既にtrade_history側から拾えるためlist_portfolio()の現在値と二重計上しないよう
+    # コード単位でtrade_history側を優先除外する。
+    exited_by_review_end = {
+        t["code"] for t in history
+        if _to_jst_date_str(t.get("closed_at")) and _to_jst_date_str(t.get("closed_at")) <= review_date
+    }
+    active_as_of_review = [p for p in positions
+                            if _to_jst_date_str(p.get("acquired_at") or p.get("created_at")) <= review_date
+                            and p["code"] not in exited_by_review_end]
+    carried_from_history = [
+        {**t, "acquired_at": t.get("acquired_at"), "current_stop": None, "initial_stop": None, "target_1": None}
+        for t in history
+        if t.get("acquired_at")
+        and _to_jst_date_str(t.get("acquired_at")) <= review_date
+        and _to_jst_date_str(t.get("closed_at")) > review_date
+    ]
+    positions_as_of_review = active_as_of_review + carried_from_history
 
     exits_today = [t for t in history if _to_jst_date_str(t.get("closed_at")) == review_date]
     new_positions = [p for p in positions_as_of_review
@@ -9422,9 +9464,10 @@ def add_position_exit(database_url, user_id, code, market, exit_price, shares):
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "INSERT INTO trade_history (user_id, code, name, market, entry_price, exit_price, shares, "
-                "pnl, gross_pnl, tax, net_pnl) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
-                [user_id, code, row.get("name"), market, avg_price, exit_price, shares, pnl, pnl, tax, net_pnl],
+                "pnl, gross_pnl, tax, net_pnl, acquired_at, trade_style) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
+                [user_id, code, row.get("name"), market, avg_price, exit_price, shares, pnl, pnl, tax, net_pnl,
+                 row.get("acquired_at"), row.get("trade_style")],
             )
             trade = cur.fetchone()
         new_remaining = remaining - shares
