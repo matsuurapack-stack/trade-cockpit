@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 import server
+from test_support_source_inspect import get_fresh_source
 
 
 def _iso(dt):
@@ -57,11 +58,10 @@ class ImmutableSnapshotTests(unittest.TestCase):
     """3. immutable snapshot（指示書2・3番）：呼ぶ度に新しい行をINSERTするのみ、UPDATEしない"""
 
     def test_create_trade_decision_context_never_updates(self):
-        import inspect
-        src = inspect.getsource(server.investment_db.create_trade_decision_context) \
-            if hasattr(server, "investment_db") and server.investment_db else None
+        # linecache汚染対策（Bugfix: isolate global state between test modules）：
+        # test_support_source_inspect.get_fresh_source参照。
         import investment_db
-        src = inspect.getsource(investment_db.create_trade_decision_context)
+        src = get_fresh_source(investment_db.create_trade_decision_context)
         self.assertIn("INSERT INTO trade_decision_context", src)
         self.assertNotIn("UPDATE trade_decision_context", src)
 
@@ -427,20 +427,17 @@ class ApiWiringTests(unittest.TestCase):
     """27. API（指示書38番）"""
 
     def test_new_routes_present_in_do_get(self):
-        import inspect
-        src = inspect.getsource(server.Handler.do_GET)
+        src = get_fresh_source(server.Handler.do_GET)
         for fragment in ("/decision-context", "/outcome-evaluation", "/decision-replay",
                           "/api/market-intelligence/calibration"):
             self.assertIn(fragment, src)
 
     def test_decision_context_post_route_present(self):
-        import inspect
-        src = inspect.getsource(server.Handler.do_POST)
+        src = get_fresh_source(server.Handler.do_POST)
         self.assertIn("capture_trade_decision_context_safe", src)
 
     def test_diagnostics_wired_into_market_sources_endpoint(self):
-        import inspect
-        src = inspect.getsource(server.Handler.do_GET)
+        src = get_fresh_source(server.Handler.do_GET)
         self.assertIn("trade_decision_engine", src)
 
 

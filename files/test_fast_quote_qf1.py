@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 import server
+from test_support_source_inspect import get_fresh_source
 
 
 def _watchlist(codes):
@@ -169,8 +170,9 @@ class FastQuoteEndpointRoutingTests(unittest.TestCase):
     （startswithマッチのため順序に依存する）。"""
 
     def test_fast_route_checked_before_generic_route(self):
-        import inspect
-        src = inspect.getsource(server.Handler.do_POST)
+        # linecache汚染対策（Bugfix: isolate global state between test modules）：
+        # test_support_source_inspect.get_fresh_source参照。
+        src = get_fresh_source(server.Handler.do_POST)
         fast_idx = src.find('"/api/stock-quotes/fast"')
         generic_idx = src.find('startswith("/api/stock-quotes")')
         self.assertNotEqual(fast_idx, -1)

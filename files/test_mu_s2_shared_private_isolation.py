@@ -11,6 +11,7 @@ from unittest import mock
 
 import server
 import investment_db
+from test_support_source_inspect import get_fresh_source
 
 
 class ApplyPersonalPositionOverlayTests(unittest.TestCase):
@@ -208,8 +209,9 @@ class CreateTradeExperienceRuleCandidateDefaultsToUserTests(unittest.TestCase):
     （fetchone/fetchoneの返り値をフェイクDBで正確に模倣する複雑さを避ける）。"""
 
     def test_insert_sql_does_not_set_visibility(self):
-        import inspect
-        src = inspect.getsource(investment_db.create_trade_experience_rule_candidate)
+        # linecache汚染対策（Bugfix: isolate global state between test modules）：
+        # test_support_source_inspect.get_fresh_source参照。
+        src = get_fresh_source(investment_db.create_trade_experience_rule_candidate)
         self.assertIn("INSERT INTO trade_rules", src)
         self.assertNotIn("visibility", src)  # DEFAULT 'USER'に委ねる（明示的にGLOBALを書かない）
 

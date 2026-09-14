@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 import server
+from test_support_source_inspect import get_fresh_source
 
 
 def _iso(dt):
@@ -118,9 +119,10 @@ class ActiveRuleNotAutoChangedTests(unittest.TestCase):
     """7. ACTIVEルールが自動変更されない"""
 
     def test_rule_candidate_creation_never_touches_active_status(self):
-        import inspect
+        # linecache汚染対策（Bugfix: isolate global state between test modules）：
+        # test_support_source_inspect.get_fresh_source参照。
         import investment_db
-        src = inspect.getsource(investment_db.create_trade_experience_rule_candidate)
+        src = get_fresh_source(investment_db.create_trade_experience_rule_candidate)
         self.assertIn("RULE_CANDIDATE", src)
         self.assertNotIn("'ACTIVE'", src)
 
@@ -129,9 +131,8 @@ class ActiveRuleNotAutoChangedTests(unittest.TestCase):
             mock_db.get_trade_rule.return_value = {"id": 5, "status": "ACTIVE"}
             result = server.investment_db.promote_trade_experience_rule_candidate
             # promote_trade_experience_rule_candidate自体はinvestment_db関数なので、実装を直接検証する。
-        import inspect
         import investment_db
-        src = inspect.getsource(investment_db.promote_trade_experience_rule_candidate)
+        src = get_fresh_source(investment_db.promote_trade_experience_rule_candidate)
         self.assertIn('rule.get("status") != "RULE_CANDIDATE"', src)
 
 

@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 import server
+from test_support_source_inspect import get_fresh_source
 
 
 class ValidationSessionCreationTests(unittest.TestCase):
@@ -150,9 +151,10 @@ class DeadLetterTests(unittest.TestCase):
         self.assertGreater(investment_db.PARSER_FAILURE_DEAD_LETTER_RETRY_THRESHOLD, 0)
 
     def test_record_parser_failure_sql_sets_dead_letter_on_threshold(self):
-        import inspect
+        # linecache汚染対策（Bugfix: isolate global state between test modules）：
+        # test_support_source_inspect.get_fresh_source参照。
         import investment_db
-        src = inspect.getsource(investment_db.record_parser_failure)
+        src = get_fresh_source(investment_db.record_parser_failure)
         self.assertIn("DEAD_LETTER", src)
         self.assertIn("PARSER_FAILURE_DEAD_LETTER_RETRY_THRESHOLD", src)
 

@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 import server
+from test_support_source_inspect import get_fresh_source
 
 
 def _iso(dt):
@@ -518,8 +519,9 @@ class ApiEndpointTests(unittest.TestCase):
 
     def test_market_intelligence_generic_route_is_exact_match_not_prefix(self):
         # 不具合修正の回帰確認：/api/market-intelligence/events等をstartswithで飲み込まない。
-        import inspect
-        src = inspect.getsource(server.Handler.do_GET)
+        # linecache汚染対策（Bugfix: isolate global state between test modules）：
+        # test_support_source_inspect.get_fresh_source参照。
+        src = get_fresh_source(server.Handler.do_GET)
         self.assertIn('self.path.split("?")[0] == "/api/market-intelligence"', src)
 
 
