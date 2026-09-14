@@ -68,6 +68,16 @@ def _get_pool(database_url):
 # 新規インストールでは無関係（該当行が無いのでUPDATE文は何もしない）。
 _LEGACY_OWNER = "matsuura"
 
+# Phase MU-S1（2026-09-14・SHARED/PRIVATE再分類）：市場分析系の一部テーブル
+# （watchlist / market_events / news_catalysts / expert_views / stock_theses /
+# market_intelligence_reports）は全ユーザー共有にする。2026-09-02の一律user_id分離で
+# これらも個人ごとに分断されてしまっていたための修正（指示書：ポジション/トレード等の
+# 個人情報は現状のuser_idスコープを維持し、市場分析だけを共有に戻す）。
+# 呼び出し元（server.py）から渡されるuser_idは意図的に無視し、この固定値を使う——
+# 関数シグネチャ・呼び出し側は変更しない。将来ユーザーが増えても同じ値を参照する。
+# user_id列自体は削除しない（将来のscope再設計・ロールバックに備える）。
+_SHARED_SCOPE = "_shared"
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS daily_log (
     id               SERIAL PRIMARY KEY,
@@ -1164,6 +1174,92 @@ ALTER TABLE market_sources ADD COLUMN IF NOT EXISTS last_duplicate_count INTEGER
 """
 
 
+# Phase MU-S1（2026-09-14・SHARED/PRIVATE再分類）：watchlist / market_events /
+# news_catalysts / expert_views / stock_theses / market_intelligence_reportsの
+# 既存データのuser_idを固定共有scope（_SHARED_SCOPE、"_shared"）へ一括移行する。
+# 2026-09-02の一律user_id分離でこれらも個人ごとに分断されてしまっていたための修正
+# （ポジション/トレード等の個人情報は現状のuser_idスコープを維持し、市場分析だけを
+# 共有に戻す。指示書：既存データは壊さず、user_id列自体も削除しない）。
+# サーバー起動のたびに実行しても副作用が無いよう冪等にしてある：
+#   ①同じ自然キー（例：watchlistならcode+market）で既に"_shared"の行がある場合は
+#     旧user_idの行を削除（重複を残さない）
+#   ②まだ"_shared"化されていない行同士で自然キーが重複する場合（本番matsuuraと
+#     過去の手動テスト残骸user_id等）は、matsuura優先→idが小さい方優先で1件だけ残す
+#   ③残った行のuser_idを"_shared"へ更新
+# 各テーブルの自然キーは元のUNIQUE制約と同じ（NULL同士を重複扱いしないPostgresの
+# 仕様も含めてそのまま踏襲）。定数_SHARED_SCOPEの値を変更した場合はここも合わせて
+# 変更すること（あえて直接リテラル'_shared'で書いている）。
+_MIGRATE_SHARED_SCOPE_SQL = """
+-- watchlist（自然キー: code, market）
+DELETE FROM watchlist a USING watchlist b
+WHERE a.user_id <> '_shared' AND b.user_id = '_shared'
+  AND a.code = b.code AND a.market = b.market;
+DELETE FROM watchlist a USING watchlist b
+WHERE a.user_id <> '_shared' AND b.user_id <> '_shared' AND a.id <> b.id
+  AND a.code = b.code AND a.market = b.market
+  AND ((b.user_id = 'matsuura' AND a.user_id <> 'matsuura')
+       OR (a.user_id <> 'matsuura' AND b.user_id <> 'matsuura' AND a.id > b.id));
+UPDATE watchlist SET user_id = '_shared' WHERE user_id <> '_shared';
+
+-- market_events（自然キー: event_date, title）
+DELETE FROM market_events a USING market_events b
+WHERE a.user_id <> '_shared' AND b.user_id = '_shared'
+  AND a.event_date = b.event_date AND a.title = b.title;
+DELETE FROM market_events a USING market_events b
+WHERE a.user_id <> '_shared' AND b.user_id <> '_shared' AND a.id <> b.id
+  AND a.event_date = b.event_date AND a.title = b.title
+  AND ((b.user_id = 'matsuura' AND a.user_id <> 'matsuura')
+       OR (a.user_id <> 'matsuura' AND b.user_id <> 'matsuura' AND a.id > b.id));
+UPDATE market_events SET user_id = '_shared' WHERE user_id <> '_shared';
+
+-- news_catalysts（自然キー: catalyst_date, title）
+DELETE FROM news_catalysts a USING news_catalysts b
+WHERE a.user_id <> '_shared' AND b.user_id = '_shared'
+  AND a.catalyst_date = b.catalyst_date AND a.title = b.title;
+DELETE FROM news_catalysts a USING news_catalysts b
+WHERE a.user_id <> '_shared' AND b.user_id <> '_shared' AND a.id <> b.id
+  AND a.catalyst_date = b.catalyst_date AND a.title = b.title
+  AND ((b.user_id = 'matsuura' AND a.user_id <> 'matsuura')
+       OR (a.user_id <> 'matsuura' AND b.user_id <> 'matsuura' AND a.id > b.id));
+UPDATE news_catalysts SET user_id = '_shared' WHERE user_id <> '_shared';
+
+-- expert_views（自然キー: expert_name, published_at, source_title。source_titleが
+-- NULL同士は元のUNIQUE制約と同じくPostgresの仕様上「別物」として扱い重複扱いしない）
+DELETE FROM expert_views a USING expert_views b
+WHERE a.user_id <> '_shared' AND b.user_id = '_shared'
+  AND a.expert_name = b.expert_name AND a.published_at = b.published_at
+  AND a.source_title = b.source_title;
+DELETE FROM expert_views a USING expert_views b
+WHERE a.user_id <> '_shared' AND b.user_id <> '_shared' AND a.id <> b.id
+  AND a.expert_name = b.expert_name AND a.published_at = b.published_at
+  AND a.source_title = b.source_title
+  AND ((b.user_id = 'matsuura' AND a.user_id <> 'matsuura')
+       OR (a.user_id <> 'matsuura' AND b.user_id <> 'matsuura' AND a.id > b.id));
+UPDATE expert_views SET user_id = '_shared' WHERE user_id <> '_shared';
+
+-- stock_theses（自然キー: code, market, entry_date）
+DELETE FROM stock_theses a USING stock_theses b
+WHERE a.user_id <> '_shared' AND b.user_id = '_shared'
+  AND a.code = b.code AND a.market = b.market AND a.entry_date = b.entry_date;
+DELETE FROM stock_theses a USING stock_theses b
+WHERE a.user_id <> '_shared' AND b.user_id <> '_shared' AND a.id <> b.id
+  AND a.code = b.code AND a.market = b.market AND a.entry_date = b.entry_date
+  AND ((b.user_id = 'matsuura' AND a.user_id <> 'matsuura')
+       OR (a.user_id <> 'matsuura' AND b.user_id <> 'matsuura' AND a.id > b.id));
+UPDATE stock_theses SET user_id = '_shared' WHERE user_id <> '_shared';
+
+-- market_intelligence_reports（自然キー: trade_date, report_type）
+DELETE FROM market_intelligence_reports a USING market_intelligence_reports b
+WHERE a.user_id <> '_shared' AND b.user_id = '_shared'
+  AND a.trade_date = b.trade_date AND a.report_type = b.report_type;
+DELETE FROM market_intelligence_reports a USING market_intelligence_reports b
+WHERE a.user_id <> '_shared' AND b.user_id <> '_shared' AND a.id <> b.id
+  AND a.trade_date = b.trade_date AND a.report_type = b.report_type
+  AND ((b.user_id = 'matsuura' AND a.user_id <> 'matsuura')
+       OR (a.user_id <> 'matsuura' AND b.user_id <> 'matsuura' AND a.id > b.id));
+UPDATE market_intelligence_reports SET user_id = '_shared' WHERE user_id <> '_shared';
+"""
+
 def init_schema(database_url):
     """テーブルを（無ければ）作成し、マルチユーザー化・ChatGPT連携の移行SQLも実行する。
     サーバー起動時に1回呼ぶ想定。失敗時は例外を投げる（起動時ログで気づけるようにするため、
@@ -1210,6 +1306,7 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_CROSS_MARKET_LINK_SQL)
         conn.execute(_SCHEMA_SECTOR_ROTATION_SQL)
         conn.execute(_SCHEMA_YAAMAN_THEME_SQL)
+        conn.execute(_MIGRATE_SHARED_SCOPE_SQL)
         conn.commit()
 
 
@@ -3195,7 +3292,9 @@ def evaluate_expert_view_status(view, today=None):
 
 def refresh_expert_view_statuses(database_url, user_id):
     """全有識者見解のstatusを毎回の分析時に再評価する（指示書1番「現在データと毎日照合」）。
-    期限切れ判定が主目的の軽量チェックで、新しいAPI呼び出しは発生しない。戻り値: 更新件数。"""
+    期限切れ判定が主目的の軽量チェックで、新しいAPI呼び出しは発生しない。戻り値: 更新件数。
+    Phase MU-S1：expert_viewsはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return 0
@@ -3214,7 +3313,9 @@ def refresh_expert_view_statuses(database_url, user_id):
 
 def record_expert_view_evaluation(database_url, user_id, view_id, result):
     """有識者見解1件をSUPPORTED/FAILED/NEUTRALで評価する（指示書2・28番）。
-    supported_count/failed_count/neutral_count・accuracy_score・statusを更新する。"""
+    supported_count/failed_count/neutral_count・accuracy_score・statusを更新する。
+    Phase MU-S1：expert_viewsはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None or result not in ("SUPPORTED", "FAILED", "NEUTRAL"):
         return None
@@ -4377,7 +4478,8 @@ _MARKET_INTEL_SCALAR_COLS = [
 def save_market_intelligence_report(database_url, user_id, trade_date, report_type, data):
     """1回分のMarket Intelligence Timelineレポートを保存する（(user_id, trade_date,
     report_type)でUNIQUE、手動再生成「今すぐ分析」はON CONFLICTで上書き＝重複レコードを
-    作らない、指示書4番）。"""
+    作らない、指示書4番）。Phase MU-S1：market_intelligence_reportsはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return None
@@ -4406,7 +4508,9 @@ def save_market_intelligence_report(database_url, user_id, trade_date, report_ty
 
 
 def list_market_intelligence_reports(database_url, user_id, trade_date=None):
-    """当日（省略時は今日）分のMarket Intelligence Timelineを時系列（古い→新しい）で返す。"""
+    """当日（省略時は今日）分のMarket Intelligence Timelineを時系列（古い→新しい）で返す。
+    Phase MU-S1：market_intelligence_reportsはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return []
@@ -4421,6 +4525,8 @@ def list_market_intelligence_reports(database_url, user_id, trade_date=None):
 
 
 def get_market_intelligence_report(database_url, user_id, trade_date, report_type):
+    # Phase MU-S1：market_intelligence_reportsはSHARED化済み。
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return None
@@ -4444,7 +4550,8 @@ def ensure_stock_thesis(database_url, user_id, code, market, entry_date, name, e
     一覧）は仮説を作らない設計に変更した（「朝TOP5は成績評価用として固定し、後から書き換えない」
     「Current TOP5は朝TOP5とは別物」という指示書22・23番の要件）。同じ(user_id, code, market,
     entry_date)が既にあれば何もしない（1日1仮説）。戻り値：作成したら新規行(dict)、既存行が
-    あればNone。"""
+    あればNone。Phase MU-S1：stock_thesesはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return None
@@ -4469,7 +4576,9 @@ def ensure_stock_thesis(database_url, user_id, code, market, entry_date, name, e
 
 
 def list_active_stock_theses(database_url, user_id, entry_date):
-    """当日分の、まだ最終確定（final_result未設定）していない仮説を返す（答え合わせ対象）。"""
+    """当日分の、まだ最終確定（final_result未設定）していない仮説を返す（答え合わせ対象）。
+    Phase MU-S1：stock_thesesはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return []
@@ -4487,7 +4596,8 @@ def update_stock_thesis_evaluation(database_url, user_id, code, market, entry_da
     （次回のtransition計算の入力として保存）、transition_status＝前回からの変化
     （STRENGTHENED/MAINTAINED/WEAKENED/FAILED、初回はNone）。表示用thesis_statusは
     transition_statusがあればそれ、無ければthesis_resultをそのまま使う（指示書の
-    ACTIVE→結果→変化、というライフサイクルを1列に反映）。"""
+    ACTIVE→結果→変化、というライフサイクルを1列に反映）。Phase MU-S1：stock_thesesはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return None
@@ -4509,7 +4619,9 @@ def update_stock_thesis_evaluation(database_url, user_id, code, market, entry_da
 
 
 def finalize_stock_thesis(database_url, user_id, code, market, entry_date, final_result):
-    """大引け時点の最終結果を確定する（以後、答え合わせ対象から外れる）。"""
+    """大引け時点の最終結果を確定する（以後、答え合わせ対象から外れる）。
+    Phase MU-S1：stock_thesesはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return None
@@ -4529,7 +4641,8 @@ def finalize_stock_thesis(database_url, user_id, code, market, entry_date, final
 
 
 def list_stock_theses(database_url, user_id, from_date=None, to_date=None, limit=200):
-    """成績評価画面向け：期間内の仮説を新しい順で返す。"""
+    """成績評価画面向け：期間内の仮説を新しい順で返す。Phase MU-S1：stock_thesesはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return []
@@ -4557,7 +4670,8 @@ def get_stock_thesis_stats(database_url, user_id, days=30):
     PARTIAL_SUCCESS=0.5点・FAIL=0点のsuccess_equivalentを(SUCCESS+PARTIAL+FAIL)で割る
     （PARTIAL_SUCCESSを満点扱いしていた旧実装から修正）。NO_ENTRY/DATA_INSUFFICIENTは
     「そもそもエントリー機会が無かった/判定不能」であり狙いが外れたわけではないため、
-    分母から除外する（指示書「NO_ENTRYは分母から除外」）。"""
+    分母から除外する（指示書「NO_ENTRYは分母から除外」）。Phase MU-S1：stock_thesesはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return {"totalFinalized": 0, "byResult": {}, "winRate": None}
@@ -8145,7 +8259,9 @@ def _watchlist_row_to_camel(row):
 
 def list_watchlist(database_url, user_id, market=None):
     """呼び出しユーザーのwatchlist（active=trueのみ）をadded_at昇順で返す。marketを指定すると
-    JP/USで絞り込む。フロントのwatchlist配列とほぼ同じ形（tvSymbol等camelCase）で返す。"""
+    JP/USで絞り込む。フロントのwatchlist配列とほぼ同じ形（tvSymbol等camelCase）で返す。
+    Phase MU-S1：watchlistはSHARED化済みのため、呼び出し元のuser_idは無視し全員共通のscopeを見る。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return []
@@ -8183,7 +8299,9 @@ def _upsert_watchlist_item_conn(conn, user_id, item):
 
 def upsert_watchlist_item(database_url, user_id, item):
     """itemは{code,market,name,sector,kana,tvSymbol,theme,watch,note,source,added_reason}の
-    いずれかを含むdict（code必須、marketは省略時JP）。既存なら更新、無ければ新規作成。"""
+    いずれかを含むdict（code必須、marketは省略時JP）。既存なら更新、無ければ新規作成。
+    Phase MU-S1：watchlistはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return False
@@ -8201,7 +8319,9 @@ def upsert_watchlist_master_stocks(database_url, user_id, stocks, update_mode="a
       "add"  … stocksに含まれる銘柄をadd/updateするのみ（他の既存銘柄には触れない）
       "sync" … 上記に加え、マスターに存在しなくなった既存銘柄（同一user_id・market='JP'）を
                即削除せずinactive_candidate=trueにする（指示書：即削除しない）
-    戻り値：{"added":N,"updated":N,"invalid":N,"inactive_candidates":N}。"""
+    戻り値：{"added":N,"updated":N,"invalid":N,"inactive_candidates":N}。
+    Phase MU-S1：watchlistはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return {"added": 0, "updated": 0, "invalid": 0, "inactive_candidates": 0}
@@ -8260,7 +8380,9 @@ def auto_register_or_tag_watchlist_item(database_url, user_id, code, market, rea
     （他のキー・manual_registered・name/sector等の既存値には一切触れない）。
     tag_value例: {"score": 82, "addedAt": "...", "expiresAt": "..."}
     item_fields: 新規作成時のみ使うname/sector/kana等の初期値（dict、省略可）。既存行の更新には使わない。
-    戻り値: True=成功。"""
+    戻り値: True=成功。
+    Phase MU-S1：watchlistはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return False
@@ -8296,7 +8418,9 @@ def auto_register_or_tag_watchlist_item(database_url, user_id, code, market, rea
 # 除去はremove_auto_tag_keyで行う）。
 def remove_auto_tag_key(database_url, user_id, code, market, reason_key):
     """auto_tagsから指定のreason_keyだけを取り除く（他のキー・manual_registered・name等の
-    既存値には一切触れない）。行が無い、またはそのキーを持たない場合は何もしない。"""
+    既存値には一切触れない）。行が無い、またはそのキーを持たない場合は何もしない。
+    Phase MU-S1：watchlistはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return False
@@ -8312,7 +8436,9 @@ def remove_auto_tag_key(database_url, user_id, code, market, reason_key):
 
 def get_codes_with_auto_tag(database_url, user_id, reason_key, market=None):
     """指定のauto_tagsキーを持つ銘柄コードの集合を返す。新しいスキャン結果と比較して
-    「前回CURRENTだったが今回は外れた」銘柄を特定するために使う。"""
+    「前回CURRENTだったが今回は外れた」銘柄を特定するために使う。
+    Phase MU-S1：watchlistはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return set()
@@ -8332,10 +8458,13 @@ def cleanup_expired_auto_tags(database_url, user_id):
     かつ manual_registered=false（＝自動登録のみで維持されていた銘柄）かつ保有ポジションでも
     ない銘柄は、監視銘柄から削除する。手動登録銘柄（manual_registered=true）は auto_tags が
     空になっても絶対に削除しない（タグを空にするだけ）。呼び出し側（/api/watchlist等）から
-    軽量に毎回呼べるよう、対象行が無ければ何もしない設計。"""
+    軽量に毎回呼べるよう、対象行が無ければ何もしない設計。
+    Phase MU-S1：watchlistはSHARED化済みだがportfolio（保有ポジション）はPRIVATEのまま
+    （個人のuser_idで判定する）ため、この関数だけはテーブルごとにscopeを使い分ける。"""
     pool = _get_pool(database_url)
     if pool is None:
         return {"expired": 0, "deleted": 0}
+    shared_id = _SHARED_SCOPE
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
     expired_count = 0
     deleted_count = 0
@@ -8344,7 +8473,7 @@ def cleanup_expired_auto_tags(database_url, user_id):
             cur.execute(
                 "SELECT id, code, market, manual_registered, auto_tags FROM watchlist "
                 "WHERE user_id = %s AND auto_tags IS NOT NULL AND auto_tags != '{}'::jsonb",
-                [user_id],
+                [shared_id],
             )
             rows = cur.fetchall()
         if not rows:
@@ -8559,7 +8688,9 @@ def import_market_events(database_url, user_id, events):
     UIで「原因が分からない」を防ぐため）}。
     2026-09-07更新（STEP4）：新規/更新/スキップ/エラーを分けて報告できるようにした
     （以前はimported=新規+更新の合計だった）。1件の例外で全体を失敗させないよう
-    1件ずつtry/exceptする。"""
+    1件ずつtry/exceptする。
+    Phase MU-S1：market_eventsはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     _DETAIL_LIMIT = 10
     pool = _get_pool(database_url)
     if pool is None:
@@ -8618,8 +8749,9 @@ def import_market_events(database_url, user_id, events):
 
 
 def list_market_events(database_url, user_id, from_date=None, to_date=None, limit=200):
-    """user_idのイベントをevent_date昇順で返す。from_date/to_dateはISO日付文字列（両端含む）。
-    省略時は全期間（limit件まで）。"""
+    """イベントをevent_date昇順で返す。from_date/to_dateはISO日付文字列（両端含む）。
+    省略時は全期間（limit件まで）。Phase MU-S1：market_eventsはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return []
@@ -8642,6 +8774,8 @@ def list_market_events(database_url, user_id, from_date=None, to_date=None, limi
 
 
 def delete_market_event(database_url, user_id, event_id):
+    # Phase MU-S1：market_eventsはSHARED化済み。
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return
@@ -8726,7 +8860,9 @@ def _upsert_news_catalyst_conn(conn, user_id, cat):
 
 def import_news_catalysts(database_url, user_id, catalysts):
     """catalysts（dictのリスト、JSON貼り付けのimport想定）を1件ずつupsertする。
-    戻り値: {"imported": N, "skipped": M}（catalyst_date/titleが無い行はskip）。"""
+    戻り値: {"imported": N, "skipped": M}（catalyst_date/titleが無い行はskip）。
+    Phase MU-S1：news_catalystsはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return {"imported": 0, "skipped": len(catalysts)}
@@ -8746,8 +8882,10 @@ def import_news_catalysts(database_url, user_id, catalysts):
 
 
 def list_news_catalysts(database_url, user_id, from_date=None, to_date=None, category=None, limit=300):
-    """user_idのカタリストをcatalyst_date降順（新しいもの優先）で返す。from_date/to_dateは
-    catalyst_dateへのISO日付フィルタ（両端含む）。categoryで絞り込み可能。"""
+    """カタリストをcatalyst_date降順（新しいもの優先）で返す。from_date/to_dateは
+    catalyst_dateへのISO日付フィルタ（両端含む）。categoryで絞り込み可能。
+    Phase MU-S1：news_catalystsはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return []
@@ -8773,6 +8911,8 @@ def list_news_catalysts(database_url, user_id, from_date=None, to_date=None, cat
 
 
 def delete_news_catalyst(database_url, user_id, catalyst_id):
+    # Phase MU-S1：news_catalystsはSHARED化済み。
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return
@@ -8833,7 +8973,9 @@ def _upsert_expert_view_conn(conn, user_id, ev):
 
 def import_expert_views(database_url, user_id, views):
     """views（dictのリスト、JSON貼り付けのimport想定）を1件ずつupsertする。
-    戻り値: {"imported": N, "skipped": M}（expert_name/published_atが無い行はskip）。"""
+    戻り値: {"imported": N, "skipped": M}（expert_name/published_atが無い行はskip）。
+    Phase MU-S1：expert_viewsはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return {"imported": 0, "skipped": len(views)}
@@ -8853,9 +8995,10 @@ def import_expert_views(database_url, user_id, views):
 
 
 def list_expert_views(database_url, user_id, expert=None, from_date=None, to_date=None, market=None, stock=None, limit=200):
-    """user_idの有識者見解をpublished_at降順（新しいもの優先）で返す。expert=有識者名、
+    """有識者見解をpublished_at降順（新しいもの優先）で返す。expert=有識者名、
     from_date/to_date=published_atのISO日付フィルタ（両端含む）、market=市場、
-    stock=stocks配列に含まれる銘柄コードで絞り込み可能。"""
+    stock=stocks配列に含まれる銘柄コードで絞り込み可能。Phase MU-S1：expert_viewsはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return []
@@ -8887,6 +9030,8 @@ def list_expert_views(database_url, user_id, expert=None, from_date=None, to_dat
 
 
 def delete_expert_view(database_url, user_id, view_id):
+    # Phase MU-S1：expert_viewsはSHARED化済み。
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return
@@ -8896,6 +9041,8 @@ def delete_expert_view(database_url, user_id, view_id):
 
 
 def delete_watchlist_item(database_url, user_id, code, market=None):
+    # Phase MU-S1：watchlistはSHARED化済み。
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return
@@ -8911,7 +9058,9 @@ def migrate_watchlist_from_client(database_url, user_id, items):
     """ブラウザに残っている旧localStorage watchlistをまとめてNeonへ取り込む（1回だけ呼ばれる
     想定。既存コードは上書きになるため、複数回押しても壊れない＝冪等）。戻り値: 件数。
     2026-09-03判明：300件規模だと1件ごとに新規接続していては非常に遅い（Neonへの接続確立
-    コストが件数分かかる）ため、1本の接続を使い回して処理する。"""
+    コストが件数分かかる）ため、1本の接続を使い回して処理する。
+    Phase MU-S1：watchlistはSHARED化済み。"""
+    user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return 0
