@@ -614,6 +614,74 @@ function ChorucoToast({notice,onDismiss}){
     {notice.body && <div style={{fontSize:12,marginTop:4,whiteSpace:"pre-line"}}>{notice.body}</div>}
   </div>;
 }
+
+// ============================================================
+// 2026-09-14新規（ニュース機能修正指示書E・F・G・I・J）：重要ニュース通知（ポップアップ＋音）。
+// 既存DailyReviewToast/ChorucoToastと同じ見た目パターン・Web Audio APIビープ音（既存
+// playMorningCheckChimeを流用、urgent=trueでCRITICALの二段ビープ）を再利用する。
+// サーバー側/api/news/alertsが既に「新着かつCRITICAL/HIGH、再通知済みでない」ものだけを
+// 返す設計（notification_log）のため、フロント側は受け取ったものをそのまま表示するだけで良い。
+// ============================================================
+const NEWS_ALERT_SETTINGS_KEY="newsAlertSettings";
+function loadNewsAlertSettings(){
+  try{
+    const raw=localStorage.getItem(NEWS_ALERT_SETTINGS_KEY);
+    if(raw)return {enabled:true,sound:true,threshold:"HIGH",...JSON.parse(raw)};
+  }catch(e){}
+  return {enabled:true,sound:true,threshold:"HIGH"}; // 指示書I：既定＝通知ON・音ON・HIGH以上
+}
+function saveNewsAlertSettings(settings){
+  try{localStorage.setItem(NEWS_ALERT_SETTINGS_KEY,JSON.stringify(settings));}catch(e){}
+}
+// 指示書I：ニュース画面に置く設定バー（✅重要ニュース通知／✅通知音／閾値セレクト）。
+function NewsAlertSettingsBar(){
+  const [settings,setSettings]=useState(loadNewsAlertSettings);
+  const update=(patch)=>{const next={...settings,...patch};setSettings(next);saveNewsAlertSettings(next);};
+  return <div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap",fontSize:11.5,color:"var(--inkSoft)",margin:"6px 0 10px"}}>
+    <label style={{display:"flex",alignItems:"center",gap:4,cursor:"pointer"}}>
+      <input type="checkbox" checked={settings.enabled} onChange={e=>update({enabled:e.target.checked})}/>重要ニュース通知
+    </label>
+    <label style={{display:"flex",alignItems:"center",gap:4,cursor:"pointer"}}>
+      <input type="checkbox" checked={settings.sound} onChange={e=>update({sound:e.target.checked})}/>通知音
+    </label>
+    <label style={{display:"flex",alignItems:"center",gap:4}}>
+      通知閾値：
+      <select value={settings.threshold} onChange={e=>update({threshold:e.target.value})} style={{fontSize:11.5}}>
+        <option value="CRITICAL">CRITICALのみ</option>
+        <option value="HIGH">HIGH以上</option>
+        <option value="ALL">すべて</option>
+      </select>
+    </label>
+  </div>;
+}
+// 指示書E：例）「🚨 TDnet重要開示\n1928 積水ハウス\n通期売上高を下方修正\n14:03」
+// 「🚨 MARKET ALERT\nFOMC 利下げ決定\nドル円・日経先物への影響を確認してください」
+// News Intelligence Phase 2（指示書14）更新：[source][category][code]を明示表示する形へ拡張。
+// 例）「🚨 CRITICAL [TDnet][9984] ソフトバンクG 業績予想を大幅修正 14:05」
+//     「🔥 HIGH [日経][AI/半導体] 米半導体株安、日本株にも波及 14:18」
+function NewsAlertToast({alert,onDismiss}){
+  if(!alert)return null;
+  const isCritical=alert.notificationLevel==="CRITICAL";
+  const kicker=alert.notificationLevel==="CRITICAL"?"🚨 CRITICAL":"🔥 HIGH";
+  const sourceLabel=alert.sourceLabel||alert.source;
+  const categoryTags=[...(alert.relatedSectors||[]).slice(0,1),...(alert.relatedThemes||[]).slice(0,1)];
+  return <div style={{position:"fixed",top:16,right:16,zIndex:1000,maxWidth:320,background:"var(--card)",
+    border:`1px solid ${isCritical?"var(--down)":"var(--accent)"}`,borderRadius:8,padding:"12px 14px",boxShadow:"0 4px 16px rgba(0,0,0,0.25)"}}
+    onClick={()=>alert.url&&window.open(alert.url,"_blank","noopener,noreferrer")} role={alert.url?"link":undefined}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+      <div style={{fontWeight:800,fontSize:13,color:isCritical?"var(--down)":"var(--ink)"}}>{kicker}</div>
+      <button className="iconbtn" style={{fontSize:11}} onClick={e=>{e.stopPropagation();onDismiss();}}>×</button>
+    </div>
+    <div style={{display:"flex",gap:4,flexWrap:"wrap",marginTop:5}}>
+      {sourceLabel&&<span className="chip" style={{fontSize:9.5,fontWeight:700}}>{sourceLabel}</span>}
+      {alert.code&&<span className="chip" style={{fontSize:9.5,fontWeight:700}}>{alert.code}</span>}
+      {categoryTags.map(t=><span key={t} className="chip" style={{fontSize:9.5}}>{t}</span>)}
+    </div>
+    {alert.code && <div style={{fontSize:12,marginTop:4}}>{alert.code} {alert.name}</div>}
+    <div style={{fontSize:12.5,marginTop:2,fontWeight:600}}>{alert.title}</div>
+    <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:4}}>{alert.published}</div>
+  </div>;
+}
 const WD = ["日","月","火","水","木","金","土"];
 const MAX = 300;
 const KEY = "trade-cockpit-v1";
@@ -1158,7 +1226,14 @@ function NewsList({items,showName,emptyText,priorityOf}){
   return <div className="news-list">
     {items.map((it,i)=>{
       const meta=[showName?it.name:null,it.source,it.published].filter(Boolean).join(" ・ ");
-      const important=isImportantNews(it.title);
+      // 2026-09-14追加（指示書D・J）：サーバー側importance_score（登録銘柄×TDnet重要開示・
+      // 中央銀行・地政学＋市場インパクト）による重要判定を、既存のisImportantNews
+      // （サプライズ決算・戦争・パンデミック・災害・株価暴落の見出しキーワード）に追加する
+      // （どちらか一方でも該当すれば重要表示、既存の見た目・条件は削らずOR結合）。
+      const important=isImportantNews(it.title)||it.notificationLevel==="CRITICAL"||it.notificationLevel==="HIGH";
+      // サーバーが付けたbadgesのうち、既存チップと重複するTDnet/登録銘柄/🚨重要を除いた
+      // 追加情報バッジ（重要開示／決算／中央銀行／地政学）だけを表示する。
+      const extraBadges=(it.badges||[]).filter(b=>!["TDnet","登録銘柄","🚨重要"].includes(b));
       // NQN等の速報見出し（立花証券API）は元記事URLが無いため、リンクにせずカード表示にする
       const Tag=it.url?"a":"div";
       const linkProps=it.url?{href:it.url,target:"_blank",rel:"noopener noreferrer"}:{};
@@ -1185,6 +1260,8 @@ function NewsList({items,showName,emptyText,priorityOf}){
         {showSrcBadge&&<span className="chip" style={{fontSize:9.5,marginRight:4,fontWeight:700,
           color:srcRank===0?"var(--up)":"var(--inkSoft)",borderColor:srcRank===0?"var(--up)":undefined}}>{srcLabel}</span>}
         {isIrContent&&<span className="chip" style={{fontSize:9.5,marginRight:4,color:"var(--inkSoft)"}}>IR</span>}
+        {extraBadges.map(b=><span key={b} className="chip" style={{fontSize:9.5,marginRight:4,fontWeight:700,
+          color:"var(--down)",borderColor:"var(--down)"}}>{b}</span>)}
         <span className="chip" style={{fontSize:9.5,marginRight:4,color:"var(--inkFaint)"}}>{category}</span>
         {showName&&it.code&&<span className="news-tag">{it.code}</span>}
         <span className="news-body">
@@ -10169,6 +10246,33 @@ function App(){
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
 
+  // 2026-09-14新規（ニュース機能修正指示書E・F・G・H・I）：重要ニュース通知の軽量ポーリング。
+  // 既存/api/news（20分間隔、フル取得）とは別のエンドポイント/api/news/alertsを叩く
+  // （指示書H：5分間隔目安、既存20分処理には一切手を入れない＝負荷を4倍にしない）。
+  // サーバー側で既に「監視開始後の新着かつCRITICAL/HIGH、notification_log未記録」だけに
+  // 絞られて返ってくる（指示書F・G）ため、フロントは受け取ったものをそのまま
+  // 閾値フィルタ（設定のCRITICALのみ/HIGH以上/すべて）だけ適用してtoastキューに積む。
+  const [newsAlertQueue,setNewsAlertQueue]=useState([]);
+  const checkNewsAlerts=useCallback(async()=>{
+    const settings=loadNewsAlertSettings();
+    if(!settings.enabled)return;
+    const wl=[...sRef.current.watchlist,...sRef.current.watchlistUS];
+    const r=await fetchJsonSafe("/api/news/alerts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(wl)});
+    const alerts=(r&&r.alerts)||[];
+    const passesThreshold=(lv)=>settings.threshold==="CRITICAL"?lv==="CRITICAL":true; // HIGH以上/すべては同じ集合（本エンドポイントはCRITICAL/HIGHのみ返す設計）
+    const toShow=alerts.filter(a=>passesThreshold(a.notificationLevel));
+    if(toShow.length){
+      setNewsAlertQueue(q=>[...q,...toShow]);
+      if(settings.sound)toShow.forEach((a,i)=>setTimeout(()=>playMorningCheckChime(a.notificationLevel==="CRITICAL"),i*500));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
+  useEffect(()=>{
+    checkNewsAlerts();
+    const id=setInterval(checkNewsAlerts,5*60*1000); // 指示書H：5分間隔
+    return ()=>clearInterval(id);
+  },[checkNewsAlerts]);
+
   // 「今日の振り返り」独立タブ化+15:30自動評価（2026-09-12新規、指示書8・9・10番）：
   // /api/daily-review/latestを定期ポーリングし、当日分のgenerated_atが前回確認時から
   // 進んでいれば「新しく完成した」とみなしてToast+通知音を出す。既読管理（未読dot）とは別に、
@@ -10943,7 +11047,14 @@ function App(){
   const mergeByDate=(...lists)=>{
     const seen=new Set();const out=[];
     for(const list of lists){for(const it of list){if(!it.url||seen.has(it.url))continue;seen.add(it.url);out.push(it);}}
-    return out.sort((a,b)=>(b.published||"").localeCompare(a.published||""));
+    // 2026-09-14修正（指示書A・B）：tsはサーバー側resolve_news_ts()のfallback
+    // （published_at→source_published_at→fetched_at→created_at）適用済みの数値。
+    // ts=0（未取得）の場合のみ、従来通り表示用文字列publishedの比較にフォールバックする。
+    return out.sort((a,b)=>{
+      const ta=Number(a.ts)||0, tb=Number(b.ts)||0;
+      if(ta||tb)return tb-ta;
+      return (b.published||"").localeCompare(a.published||"");
+    });
   };
   // 適時開示：日本の登録銘柄＋アメリカ市場（ダウ30社）の開示・IR・決算ニュースを、当日含む
   // 直近10日分・種類を問わず全件まとめて表示する
@@ -10953,12 +11064,17 @@ function App(){
   // 海外市況：マクロの海外市況クエリに加え、アメリカ市場登録銘柄のニュースも含める
   const overseasAll=useMemo(()=>mergeByDate(s.macroNewsOverseas,s.usStockNewsList),[s.macroNewsOverseas,s.usStockNewsList]);
 
-  // 9-1章：「サマリー」の中身の方針。2026-09-08更新（ニュース優先順位の再設計）：
-  // 従来はカテゴリ（登録銘柄IR・米国株IR・国内市況・海外市況）ごとに件数上限を決め打ちで
-  // 連結するだけだったが、指示書のranking_rulesに合わせ「①重要ニュース→②登録銘柄への
-  // 直接関連→③情報源（公式IR/TDnet＞日経＞NQN＞その他国内＞海外）→④新しさ」の順で
-  // 全件を横断ソートする方式に変更した。重複排除（URLベース）は既存のまま再利用。
-  // 表示件数の上限（旧実装のslice合計にほぼ相当する60件）だけ従来の考え方を踏襲する。
+  // 9-1章：「サマリー」の中身の方針。
+  // 2026-09-14修正（ニュース機能修正指示書A：新着順の徹底）：以前はisImportantNews(title)を
+  // 最優先キーにしていたため、キーワード一致した古い記事（例：9/12のエムスリー記事が
+  // "上方修正"等に一致）が、キーワード不一致の新しい記事（9/14）より常に上に来ていた
+  // （日付は最終タイブレークにしかならず事実上機能していなかった）。
+  // 修正後の並び順：PRIMARY=published_at(ts) DESC／SECONDARY=importanceScore DESC
+  // （同時刻付近のタイブレークにのみ効く）／TERTIARY=元の配列順（Arrayのsortは安定ソート）。
+  // 重要ニュースだからといって新着順を崩して上位固定はしない（「🚨重要ニュース」専用枠は
+  // newsImportantHighlightsで別途用意する）。published_atが無い場合のみサーバー側
+  // resolve_news_ts()のfallback（source_published_at→fetched_at→created_at）が既に
+  // 効いた値（ts）を使う。重複排除（URLベース、サーバー側でも実施済み）は既存のまま再利用。
   const newsSummary=useMemo(()=>{
     const seen=new Set();
     const pool=[];
@@ -10968,14 +11084,19 @@ function App(){
     push(s.macroNewsDomestic,false);  // 国内市況一般
     push(s.macroNewsOverseas,true);   // 海外市況一般
     push(s.stockNameNewsList,false);  // 登録銘柄の社名一致ニュース（IR以外も含む）
-    const rankOf=(it)=>[isImportantNews(it.title)?0:1, it.code?newsPriorityRank(it.code):5, newsSourceRank(it)];
     pool.sort((a,b)=>{
-      const ra=rankOf(a),rb=rankOf(b);
-      for(let i=0;i<ra.length;i++){if(ra[i]!==rb[i])return ra[i]-rb[i];}
-      return (b.published||"").localeCompare(a.published||"");
+      const ta=Number(a.ts)||0, tb=Number(b.ts)||0;
+      if(ta!==tb)return tb-ta;                                              // PRIMARY: published_at DESC
+      const ia=Number(a.importanceScore)||0, ib=Number(b.importanceScore)||0;
+      if(ia!==ib)return ib-ia;                                              // SECONDARY: importance（同時刻のみ）
+      return 0;                                                             // TERTIARY: 元の配列順（安定ソート）
     });
     return pool.slice(0,60);
   },[s.stockNewsList,s.usStockNewsList,s.macroNewsDomestic,s.macroNewsOverseas,s.stockNameNewsList,s.watchTargets,s.journal,candidateCodes,watchlistAll]);
+  // 指示書J：一覧とは別枠の「🚨重要ニュース」（最大5件）。一覧自体の並び順には一切影響しない。
+  const newsImportantHighlights=useMemo(()=>
+    newsSummary.filter(it=>it.notificationLevel==="CRITICAL"||it.notificationLevel==="HIGH").slice(0,5),
+    [newsSummary]);
 
   // 10-5章：ページ最上部の重要ニュース通知バナー用（全カテゴリを対象に件数を集計）
   const importantNewsAll=useMemo(()=>{
@@ -12495,11 +12616,15 @@ function App(){
         return <div style={{marginTop:18}}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
             <div className="sec-head">ニュース</div>
-            <span style={{fontSize:11,color:"var(--inkSoft)"}}>{newsFetching?"更新中…":newsMsg?newsMsg+`（${NEWS_AUTO_REFRESH_MINUTES}分おき自動更新）`:`${NEWS_AUTO_REFRESH_MINUTES}分おきに自動更新`}</span>
+            <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+              {!isStructured && <span style={{fontSize:10.5,color:"var(--inkFaint)",border:"1px solid var(--rule)",borderRadius:10,padding:"1px 8px"}}>新着順</span>}
+              <span style={{fontSize:11,color:"var(--inkSoft)"}}>{newsFetching?"更新中…":newsMsg?newsMsg+`（${NEWS_AUTO_REFRESH_MINUTES}分おき自動更新）`:`${NEWS_AUTO_REFRESH_MINUTES}分おきに自動更新`}</span>
+            </div>
           </div>
           <div className="subtabs">
             {NEWS_SUBTABS.map(t=><button key={t.key} className={"chip"+(newsSubTab===t.key?" on":"")} onClick={()=>{setNewsSubTab(t.key);setNewsShowCount(NEWS_PAGE_SIZE);}}>{t.label}</button>)}
           </div>
+          {!isStructured && <NewsAlertSettingsBar/>}
           {isCatalyst && <CatalystsPanel catalysts={newsCatalysts} onReload={loadNewsCatalysts} onOpenSmartImport={()=>openSmartImport("CATALYST")}/>}
           {isExpert && <ExpertViewsPanel views={expertViews} onReload={loadExpertViews} onOpenSmartImport={()=>openSmartImport("EXPERT_OPINION")}/>}
           {isSmartImport && <SmartImportPanel onReload={()=>{loadNewsCatalysts();loadExpertViews();loadMarketEvents();}}/>}
@@ -12507,6 +12632,17 @@ function App(){
                 {hasImportant && <div style={{display:"flex",alignItems:"center",gap:10,background:"var(--upBg)",border:"1px solid var(--up)",borderRadius:4,padding:"10px 14px",marginBottom:12}}>
                   <span style={{fontSize:13,fontWeight:700,color:"var(--up)"}}>⚠ 重要ニュースを含みます</span>
                   <span style={{fontSize:12,color:"var(--inkSoft)"}}>サプライズ決算・戦争紛争・パンデミック・大規模災害・株価暴落に関連する見出しに印を付けています。</span>
+                </div>}
+                {/* 指示書J：一覧の並び順（新着順）とは独立の別枠。ここに出しても一覧自体は
+                    常にpublished_at DESCのまま（重要ニュースを理由に一覧の新着順を崩さない）。 */}
+                {newsSubTab==="summary" && newsImportantHighlights.length>0 && <div className="card" style={{padding:"10px 14px",marginBottom:12,borderLeft:"3px solid var(--down)"}}>
+                  <div style={{fontSize:12.5,fontWeight:700,marginBottom:6}}>🚨 重要ニュース（最大5件・新着順とは別枠）</div>
+                  {newsImportantHighlights.map((it,i)=><a key={i} href={it.url||undefined} target="_blank" rel="noopener noreferrer"
+                      style={{display:"block",fontSize:12,padding:"3px 0",color:"inherit",textDecoration:"none"}}>
+                    <span className="chip" style={{fontSize:9,marginRight:6,fontWeight:700,color:it.notificationLevel==="CRITICAL"?"var(--down)":"var(--accent)",borderColor:it.notificationLevel==="CRITICAL"?"var(--down)":"var(--accent)"}}>{it.notificationLevel}</span>
+                    {it.code&&<span className="news-tag" style={{marginRight:4}}>{it.code}</span>}
+                    {it.title}<span style={{color:"var(--inkFaint)",marginLeft:6}}>{it.published}</span>
+                  </a>)}
                 </div>}
                 <div className="card" style={{padding:"14px 16px 6px"}}>
                   <NewsList items={listFor.slice(0,newsShowCount)} showName={showCode} priorityOf={showCode?newsPriorityRank:null}/>
@@ -12525,6 +12661,8 @@ function App(){
         onDismiss={()=>setDailyReviewToast(null)}/>
       {/* Choruco Style（2026-09-12新規、指示書19・20・56番）：MODE変化・STORY BROKEN通知。 */}
       <ChorucoToast notice={chorucoToast} onDismiss={()=>setChorucoToast(null)}/>
+      {/* 2026-09-14新規：重要ニュース通知。複数件たまっても1件ずつ表示し、閉じると次が出る。 */}
+      <NewsAlertToast alert={newsAlertQueue[0]||null} onDismiss={()=>setNewsAlertQueue(q=>q.slice(1))}/>
 
       {/* 5章：登録銘柄行の「チャート」ボタンで開くモーダル（タブに依存しない。6章でタブ内チャートは廃止） */}
       {chartModal && <div onClick={()=>setChartModal(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,.5)",zIndex:20,

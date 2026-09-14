@@ -1568,6 +1568,8 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_MORNING_CHECK_PRIVATE_OVERLAY_SQL)
         conn.execute(_MIGRATE_MORNING_CHECK_PRIVATE_OVERLAY_SQL)
         conn.execute(_MIGRATE_MORNING_CHECK_SHARED_SCOPE_SQL)
+        conn.execute(_SCHEMA_NEWS_NOTIFICATION_LOG_SQL)
+        conn.execute(_MIGRATE_MARKET_NEWS_CONTEXT_SQL)
         conn.commit()
 
 
@@ -4824,6 +4826,7 @@ _MORNING_CHECK_JSON_COLS = [
     "strong_sectors_json", "weak_sectors_json", "watchlist_top5_json", "avoid_stocks_json",
     "resilience_json", "market_risk_warnings_json", "event_risk_json",
     "strategy_json", "raw_payload_json",
+    "market_news_context_json",  # News Intelligence Phase 2（指示書12）
 ]
 _MORNING_CHECK_SCALAR_COLS = [
     "market_regime", "volatility_regime", "trend_type", "market_risk_score", "volatility_score",
@@ -4985,6 +4988,7 @@ _MARKET_INTEL_JSON_COLS = [
     "morning_thesis_evaluation_json", "risk_alerts_json", "position_alerts_json",
     "news_changes_json", "event_risk_json", "strategy_update_json", "data_health_json",
     "social_signals_json",
+    "market_news_context_json",  # News Intelligence Phase 2（指示書12）
 ]
 _MARKET_INTEL_SCALAR_COLS = [
     "scheduled_time", "morning_check_id", "market_regime", "volatility_regime", "market_summary",
@@ -7305,6 +7309,77 @@ def count_parser_failures(database_url, status=None):
         with conn.cursor() as cur:
             cur.execute(f"SELECT COUNT(*) FROM parser_failure_queue {clause}", params)
             return cur.fetchone()[0]
+
+
+# ============================================================
+# 2026-09-14新規（ニュース機能修正指示書F：再通知禁止）：同じ重要ニュースを二度通知しない
+# ためのnotification_log。title文字列だけではなくnews.pyのdedupeキー（TDnet document ID／
+# normalized URL／stock_code+normalized_title+published_at）由来のstable keyで判定する
+# （notification_key）。アプリ（サーバープロセス）再起動後も再通知しないよう、DBへ永続化する
+# （メモリ上のSetでは再起動で消えてしまうため）。
+# ============================================================
+_SCHEMA_NEWS_NOTIFICATION_LOG_SQL = """
+CREATE TABLE IF NOT EXISTS notification_log (
+    id                  SERIAL PRIMARY KEY,
+    notification_key    TEXT NOT NULL UNIQUE,
+    news_id             TEXT,
+    notification_type   TEXT,
+    importance_score     INTEGER,
+    notified_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_notification_log_notified_at ON notification_log(notified_at DESC);
+"""
+
+
+def was_already_notified(database_url, notification_key):
+    """指示書F：このnotification_keyが過去に一度でも通知済みならTrue。"""
+    pool = _get_pool(database_url)
+    if pool is None or not notification_key:
+        return False
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM notification_log WHERE notification_key=%s", [notification_key])
+            return cur.fetchone() is not None
+
+
+def record_notification(database_url, notification_key, news_id=None, notification_type=None, importance_score=None):
+    """指示書F：通知済みとして記録する。ON CONFLICT DO NOTHINGで冪等
+    （同時実行・リトライで二重挿入しない、notification_keyはUNIQUE制約）。
+    戻り値：True=新規記録、False=既に記録済み（＝二重通知の可能性があったことを示す）。"""
+    pool = _get_pool(database_url)
+    if pool is None or not notification_key:
+        return False
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO notification_log (notification_key, news_id, notification_type, importance_score) "
+                "VALUES (%s,%s,%s,%s) ON CONFLICT (notification_key) DO NOTHING RETURNING id",
+                [notification_key, news_id, notification_type, importance_score])
+            row = cur.fetchone()
+        conn.commit()
+    return row is not None
+
+
+def list_recent_notifications(database_url, limit=100):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM notification_log ORDER BY notified_at DESC LIMIT %s", [limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+# ============================================================
+# News Intelligence Phase 2（2026-09-14新規・指示書12）：朝一チェック／場中4レポートへ
+# market_news_context（構造化された「今日の市場を動かしている材料」要約）を持たせるための
+# 列追加。記事本文の長文保存・転載はしない（title/URL/短いsummary相当の構造化情報のみ）。
+# ============================================================
+_MIGRATE_MARKET_NEWS_CONTEXT_SQL = """
+ALTER TABLE morning_market_checks ADD COLUMN IF NOT EXISTS market_news_context_json JSONB;
+ALTER TABLE market_intelligence_reports ADD COLUMN IF NOT EXISTS market_news_context_json JSONB;
+"""
 
 
 # ---- 指示書15・16番：duplicate audit / orphan audit（自動削除はしない、報告のみ） ----

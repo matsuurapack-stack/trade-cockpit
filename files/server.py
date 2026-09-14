@@ -749,10 +749,387 @@ def _title_mentions_name(name, title):
     return False
 
 
-def _sort_and_strip(items):
-    """複数クエリの結果を連結したリストを公開日時の降順に並べ替え、ソート用の内部フィールドを除く。"""
-    items = sorted(items, key=lambda it: it.get("_ts", 0), reverse=True)
-    return [{k: v for k, v in it.items() if k != "_ts"} for it in items]
+# ============================================================
+# 2026-09-14新規（ニュース機能修正指示書）：ニュース一覧のソート・重要度判定・重複排除・
+# 通知の基盤。既存の各build_*_news()が返すitem（code/name/title/url/source/published/_ts）
+# に importanceScore（0-100）／notificationLevel（CRITICAL|HIGH|NORMAL）／badges（表示用）
+# ／ts（_tsの公開名、JS側は数値のUNIX秒として扱う）を付与する。
+#
+# 根本原因（指示書A）：newsSummary（trade-cockpit.html）の並べ替えが
+# [isImportantNews(title)?0:1, priority, source] を最優先キーにしていたため、キーワード一致
+# した古い記事（例：エムスリー 9/12、"上方修正"等に一致）が新しい記事（9/14、キーワード
+# 不一致）より常に上に来ていた（日付は最終タイブレークにしかならず、事実上機能していなかった）。
+# 修正方針：一覧の並び順はpublished_at（_ts）を必ず主キーにする。重要度は「新着順」を崩す
+# ためではなく、①通知の要否判定②別枠「🚨重要ニュース」パネル③一覧内バッジ表示、の3用途に限定する。
+# ============================================================
+
+def _clamp_future_ts(ts, now=None, max_skew_sec=6 * 3600):
+    """指示書B（異常日時検出）：未来日時（now+6時間超）はソース側のタイムゾーン誤解釈等の
+    異常値とみなし0（=末尾扱い）にする。過去日時はそのまま通す（正規のニュースは全て過去）。"""
+    if not ts or ts <= 0:
+        return 0
+    now = now if now is not None else time.time()
+    if ts > now + max_skew_sec:
+        return 0
+    return ts
+
+
+def resolve_news_ts(item):
+    """指示書B（日時正規化フォールバック）：published_at(_ts) → source_published_at(_source_ts)
+    → fetched_at(_fetched_ts) → created_at(_created_ts) の順にフォールバックする。
+    このリポジトリの各build_*_news()は基本的に_tsだけを持つが、将来ソースごとに複数の時刻
+    候補を持たせる場合に備えて汎用にしておく。戻り値：UNIX秒（int/float）、全て無ければ0。"""
+    for key in ("_ts", "_source_ts", "_fetched_ts", "_created_ts"):
+        ts = item.get(key)
+        if ts:
+            return _clamp_future_ts(ts)
+    return 0
+
+
+# ---- 指示書D：重要ニュース判定（0〜100） ----
+
+# 登録銘柄×TDnet適時開示：CRITICAL/HIGH候補キーワード。
+TDNET_CRITICAL_KEYWORDS = [
+    "上方修正", "下方修正", "決算", "増配", "減配", "無配", "配当予想の修正",
+    "自己株式", "自社株買い", "TOB", "公開買付", "M&A", "買収", "合併",
+    "増資", "第三者割当", "株式売出", "売出し", "大型受注", "業務提携", "資本提携",
+    "事業撤退", "事業縮小", "不正", "粉飾", "行政処分", "上場廃止", "監理銘柄",
+    "代表取締役", "社長交代", "株式分割", "株式併合",
+]
+# 上記の中でも特に単独でCRITICAL（他条件を待たず即CRITICAL）とするもの。
+TDNET_CRITICAL_ALWAYS = [
+    "上方修正", "下方修正", "TOB", "公開買付", "不正", "粉飾", "行政処分",
+    "上場廃止", "監理銘柄", "無配", "代表取締役", "社長交代",
+]
+
+IMPORTANCE_KEYWORDS_CENTRAL_BANK_US = [
+    "FOMC", "Federal Reserve", "FRB", "パウエル", "Powell", "利上げ", "利下げ",
+    "金利据え置き", "QT", "QE", "量的引き締め", "量的緩和",
+]
+IMPORTANCE_KEYWORDS_BOJ = [
+    "BOJ", "日本銀行", "日銀", "植田総裁", "金融政策決定会合", "国債買入れ", "YCC",
+    "イールドカーブコントロール", "マイナス金利",
+]
+IMPORTANCE_KEYWORDS_ECB = ["ECB", "ラガルド", "Lagarde", "欧州中央銀行", "欧州金利"]
+IMPORTANCE_KEYWORDS_FX = ["ドル円急変", "円高", "円安", "為替介入", "財務省介入", "覆面介入"]
+IMPORTANCE_KEYWORDS_US_STATS = ["CPI", "PCE", "雇用統計", "ISM", "GDP", "非農業部門雇用者数"]
+IMPORTANCE_KEYWORDS_CENTRAL_BANK = (
+    IMPORTANCE_KEYWORDS_CENTRAL_BANK_US + IMPORTANCE_KEYWORDS_BOJ + IMPORTANCE_KEYWORDS_ECB
+    + IMPORTANCE_KEYWORDS_FX + IMPORTANCE_KEYWORDS_US_STATS
+)
+
+IMPORTANCE_KEYWORDS_GEOPOLITICAL = [
+    "戦争", "攻撃", "空爆", "ミサイル", "停戦", "制裁", "海峡封鎖", "原油供給障害",
+    "ホルムズ海峡", "紅海", "台湾海峡", "ウクライナ", "ロシア", "中東", "台湾有事", "米中関係",
+]
+# 指示書D：「単に戦争関連記事だから通知するのではなく、市場インパクトが大きいものだけ」
+# ＝地政学キーワードに加え、以下のいずれかを含む場合のみ地政学ニュースを重要ニュース対象にする。
+IMPORTANCE_KEYWORDS_MARKET_IMPACT = [
+    "日本株", "日経平均", "ドル円", "為替", "原油", "原油価格", "海運", "半導体", "防衛", "金利",
+    "株式市場", "株安", "株高",
+]
+
+
+def _kw_hit(norm_title, keywords):
+    return [k for k in keywords if unicodedata.normalize("NFKC", k) in norm_title]
+
+
+def compute_news_importance(title, code=None, source=None, is_tdnet=False, is_registered_stock=False, source_tier=None):
+    """指示書D・Phase2指示書7・8：見出し（と付随情報）からimportance_score（0-100）・
+    notificationLevel（CRITICAL|HIGH|NORMAL）・badges（UI表示用の短いラベル）を計算する。
+    優先順位：①登録銘柄×TDnet適時開示（最優先）②中央銀行・為替・米統計・サプライチェーン
+    規制・日本市場急変マクロ③地政学（市場インパクトの語を伴う場合のみ）。いずれにも該当
+    しなければNORMAL・0点。
+    Phase2追加：source_tier（1=一次情報〜4=集約）による信頼度ボーナスを補助的に加える。
+    ただしsource_tierだけではCRITICAL/HIGHにしない——スコアが既に内容面で0より大きい
+    （＝何らかの重要キーワードに一致した）場合のみ、Tier1は+5・Tier2（日経）は+3を上乗せする
+    （指示書7番「日経記事という理由だけでHIGHにしない」を厳守）。
+    戻り値：{"score":int, "level":"CRITICAL"|"HIGH"|"NORMAL", "badges":[...]}"""
+    if not title:
+        return {"score": 0, "level": "NORMAL", "badges": []}
+    norm_title = unicodedata.normalize("NFKC", title)
+    score = 0
+    badges = []
+
+    if is_tdnet:
+        badges.append("TDnet")
+    if is_registered_stock:
+        badges.append("登録銘柄")
+
+    tdnet_hits = _kw_hit(norm_title, TDNET_CRITICAL_KEYWORDS) if (is_tdnet or is_registered_stock) else []
+    if tdnet_hits:
+        always_hit = _kw_hit(norm_title, TDNET_CRITICAL_ALWAYS)
+        score = max(score, 95 if always_hit else 75)
+        if any(k in ("決算",) for k in tdnet_hits):
+            badges.append("決算")
+        badges.append("重要開示")
+
+    cb_hits = _kw_hit(norm_title, IMPORTANCE_KEYWORDS_CENTRAL_BANK)
+    if cb_hits:
+        score = max(score, 80)
+        badges.append("中央銀行")
+
+    # Phase2指示書8：半導体輸出規制・米中関税等のサプライチェーン規制、日経先物急変等の
+    # 日本市場急変ワードもHIGH候補にする（単純キーワード一致だが、既存カテゴリと同じ
+    # 「明確に市場を動かす政策・イベント」の語彙に限定している）。
+    supply_hits = _kw_hit(norm_title, IMPORTANCE_KEYWORDS_SUPPLY_CHAIN)
+    if supply_hits:
+        score = max(score, 80)
+        badges.append("サプライチェーン")
+    shock_hits = _kw_hit(norm_title, IMPORTANCE_KEYWORDS_JP_MARKET_SHOCK)
+    if shock_hits:
+        score = max(score, 80)
+        badges.append("日本市場急変")
+
+    geo_hits = _kw_hit(norm_title, IMPORTANCE_KEYWORDS_GEOPOLITICAL)
+    impact_hits = _kw_hit(norm_title, IMPORTANCE_KEYWORDS_MARKET_IMPACT)
+    if geo_hits and impact_hits:
+        score = max(score, 70)
+        badges.append("地政学")
+
+    # Phase2指示書7：source reliabilityは補助要素。内容面で既に0点超のときだけ小さく加点する
+    # （0点のまま＝内容的に無関係な記事は、日経・TDnet等どれだけ信頼度の高いソースでも
+    # HIGH/CRITICALへは上がらない）。
+    if score > 0 and source_tier is not None:
+        score = min(100, score + {1: 5, 2: 3}.get(source_tier, 0))
+
+    if score >= 90:
+        level = "CRITICAL"
+    elif score >= 60:
+        level = "HIGH"
+    else:
+        level = "NORMAL"
+    if level != "NORMAL" and "🚨重要" not in badges:
+        badges.insert(0, "🚨重要")
+    return {"score": score, "level": level, "badges": badges}
+
+
+def _normalize_news_title_for_dedupe(title):
+    """指示書C（重複排除）：媒体名サフィックス・記号・空白差を吸収した正規化タイトル。"""
+    if not title:
+        return ""
+    t = unicodedata.normalize("NFKC", title)
+    t = _clean_title(t)
+    t = re.sub(r"[\s　]+", "", t)
+    t = re.sub(r"[【】\[\]（）()「」『』｜|・、。,.!！?？:：;；\-─―]", "", t)
+    return t.lower()
+
+
+def _normalize_news_url_for_dedupe(url):
+    """クエリパラメータ・末尾スラッシュの差異を吸収した正規化URL。"""
+    if not url:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+    except Exception:
+        return url
+
+
+_TDNET_DOC_ID_RE = re.compile(r"(\d{14,})")
+
+
+def _news_dedupe_key(item):
+    """指示書C：normalized_url／TDnet document ID／stock_code／normalized_title／
+    published_at(日付部分)の組み合わせで同一記事・同一開示を判定するキーを作る。
+    TDnetのURLは配信ごとにdocument ID（長い数字列）を含むため、そのIDが取れれば
+    URL全体より安定したキーとして優先する。"""
+    url = item.get("url") or ""
+    m = _TDNET_DOC_ID_RE.search(url)
+    tdnet_doc_id = m.group(1) if m else None
+    norm_title = _normalize_news_title_for_dedupe(item.get("title"))
+    code = item.get("code") or ""
+    published_date = str(item.get("published") or "")[:5]  # "MM/DD"部分（年またぎは別記事として扱う）
+    if tdnet_doc_id:
+        return f"tdnet:{tdnet_doc_id}"
+    norm_url = _normalize_news_url_for_dedupe(url)
+    if norm_url:
+        return f"url:{norm_url}"
+    return f"title:{code}:{norm_title}:{published_date}"
+
+
+def dedupe_news_items(items):
+    """指示書C：_news_dedupe_key()が示す同一記事・同一開示を1件に集約する
+    （最初に出てきたものを残す＝呼び出し元で優先度順に並べてから渡すこと）。"""
+    seen = set()
+    out = []
+    for it in items:
+        key = _news_dedupe_key(it)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
+
+# ============================================================
+# News Intelligence Phase 2（2026-09-14新規）：国内市場ニュース「日経中心化」＋分析エンジン
+# 連携。Phase1（新着順ソート・importance・dedupe・notification_log・5分アラート）は無変更、
+# 差分追加のみ。DBスキーマへの永続化は行わない（このニュース基盤は現状どのソースも記事を
+# DBへ保存しておらず、APIレスポンスその場限りの付加情報として計算する既存方式を踏襲する
+# ——importanceScore/badges等、既存Phase1のannotationと同じ扱い）。
+# ============================================================
+
+# 指示書1・3：ソースのTier（1=一次情報〜4=検索/一般）。sortには使わない
+# （最重要原則：SOURCE PRIORITYとSORTを混同しない）——重複記事の代表選択・信頼度評価・
+# AI分析時の根拠優先順位にのみ使う。
+SOURCE_TIER_PRIMARY_DISCLOSURE = 1  # TDnet
+SOURCE_TIER_PRIMARY_IR = 1          # 企業公式IR
+SOURCE_TIER_OFFICIAL = 1            # 日銀・財務省・金融庁・経産省等
+SOURCE_TIER_MARKET_MEDIA = 2        # 日経
+SOURCE_TIER_GLOBAL_MEDIA = 3        # Reuters・Bloomberg等
+SOURCE_TIER_AGGREGATOR = 4          # Yahoo!・Google News等
+
+_OFFICIAL_SOURCE_NAMES = ["日本銀行", "日銀", "財務省", "金融庁", "経済産業省", "経産省"]
+_GLOBAL_MEDIA_SOURCE_NAMES = ["Reuters", "ロイター", "Bloomberg", "ブルームバーグ"]
+
+
+def classify_source_tier(source, url=None, is_tdnet=False, is_ir=False):
+    """指示書1・3：(source_tier:int, source_type:str)を返す。
+    Tier1: TDnet／企業IR／公的機関、Tier2: 日経、Tier3: Reuters/Bloomberg等、
+    Tier4: それ以外（Yahoo!・Google News等の集約/検索）。"""
+    source = source or ""
+    if is_tdnet or source == "TDnet":
+        return SOURCE_TIER_PRIMARY_DISCLOSURE, "PRIMARY_DISCLOSURE"
+    if is_ir:
+        return SOURCE_TIER_PRIMARY_IR, "PRIMARY_IR"
+    if any(n in source for n in _OFFICIAL_SOURCE_NAMES):
+        return SOURCE_TIER_OFFICIAL, "OFFICIAL"
+    if "日本経済新聞" in source or "日経" in source or "nikkei.com" in (url or ""):
+        return SOURCE_TIER_MARKET_MEDIA, "MARKET_MEDIA"
+    if any(n in source for n in _GLOBAL_MEDIA_SOURCE_NAMES):
+        return SOURCE_TIER_GLOBAL_MEDIA, "GLOBAL_MEDIA"
+    return SOURCE_TIER_AGGREGATOR, "AGGREGATOR"
+
+
+SOURCE_TIER_SHORT_LABEL = {
+    "PRIMARY_DISCLOSURE": "TDnet", "PRIMARY_IR": "IR", "OFFICIAL": "公的機関",
+    "MARKET_MEDIA": "日経", "GLOBAL_MEDIA": "海外通信社", "AGGREGATOR": "その他",
+}
+
+# 指示書8：日経記事でも重要通知候補になる分野（既存IMPORTANCE_KEYWORDS_*に無いもの追加）。
+IMPORTANCE_KEYWORDS_SUPPLY_CHAIN = ["半導体輸出規制", "輸出規制", "米中関税", "対中関税", "関税措置"]
+IMPORTANCE_KEYWORDS_JP_MARKET_SHOCK = [
+    "日経先物急変", "日経平均急落", "日経平均急伸", "日経平均急変", "国債金利急変", "長期金利急上昇",
+    "植田総裁",
+]
+
+# 指示書4・5：related_sectors／related_themes抽出用キーワード（SECTOR_ROTATION_THEME_CODESの
+# テーマ名＋THEME_KEYWORDSに、指示書4番の主要テーマ（銀行・保険・商社・自動車・エネルギー・
+# SaaS・電力設備・フィジカルAI等）を補って統合したニュース専用マッピング。sector_rotationの
+# 対象銘柄コードとは独立に、見出しのテキストだけで判定する軽量な近似）。
+NEWS_SECTOR_KEYWORDS = {
+    "半導体": ("半導体", "ウエハー", "ファウンドリ"),
+    "半導体製造装置": ("半導体製造装置", "露光装置", "エッチング"),
+    "AI/データセンター": ("データセンター", "データセンタ", "クラウド", "GPU", "生成AI", "フィジカルAI"),
+    "電線": ("電線", "送電", "銅線"),
+    "電力設備": ("電力設備", "変圧器", "電力インフラ", "送配電"),
+    "海運": ("海運", "コンテナ船", "運賃", "タンカー"),
+    "エネルギー": ("原油", "エネルギー", "LNG", "天然ガス"),
+    "銀行": ("銀行", "メガバンク", "地銀"),
+    "保険": ("保険", "損保", "生保"),
+    "商社": ("商社", "総合商社"),
+    "自動車": ("自動車", "EV", "電気自動車"),
+    "SaaS": ("SaaS", "クラウドサービス"),
+    "防衛": ("防衛", "防衛費", "安全保障"),
+    "ロボティクス": ("ロボット", "ロボティクス"),
+}
+# 注：THEME_KEYWORDS（catalyst由来のテーマ抽出、本ファイル後方で定義）とは別に、ニュース見出し
+# 用の独立した辞書として持つ（THEME_KEYWORDSは本関数より後方で定義されるため、モジュール
+# ロード順に依存しないようここでは重複を許容して独立定義する。語彙はTHEME_KEYWORDSと大部分
+# 重複している）。
+NEWS_THEME_KEYWORDS = {
+    "自動運転": ("自動運転", "レベル4", "LiDAR", "ライダー"),
+    "半導体": ("半導体", "半導体製造装置", "ウエハー"),
+    "AI": ("AI", "人工知能", "生成AI", "LLM", "フィジカルAI"),
+    "データセンター": ("データセンター", "データセンタ", "クラウド", "GPU"),
+    "防衛": ("防衛", "防衛費", "安全保障"),
+    "ロボティクス": ("ロボット", "ロボティクス", "協働ロボット"),
+    "創薬/バイオ": ("創薬", "バイオ", "治験", "新薬"),
+    "電線": ("電線", "送電"),
+    "海運": ("海運", "コンテナ船", "運賃"),
+    "SaaS": ("SaaS", "クラウドサービス"),
+    "金融政策": ("日銀", "金融政策決定会合", "利上げ", "利下げ", "YCC"),
+}
+
+
+def extract_related_tags(title, code=None):
+    """指示書4・5：見出しからrelated_sectors／related_themesを抽出する
+    （テーマ発掘等の重い処理は使わず、キーワード一致による軽量な近似）。
+    watchlist_relatedは呼び出し元がcode（登録銘柄一致）を渡した場合のみTrueにする
+    （名前の曖昧一致による誤タグ付けを避けるため、既存build_stock_news等が既にcodeを
+    確実に付与している経路だけを対象にする）。"""
+    norm_title = unicodedata.normalize("NFKC", title or "")
+    related_sectors = [s for s, kws in NEWS_SECTOR_KEYWORDS.items() if any(k in norm_title for k in kws)]
+    related_themes = [t for t, kws in NEWS_THEME_KEYWORDS.items() if any(k in norm_title for k in kws)]
+    return {
+        "watchlistRelated": bool(code),
+        "relatedStockCodes": [code] if code else [],
+        "relatedSectors": related_sectors,
+        "relatedThemes": related_themes,
+    }
+
+
+def assign_event_keys(items):
+    """指示書6：TDnet（FACT）と日経等（MARKET_REACTION）を「同一イベント」として関連付ける。
+    単純dedupeはしない（同一記事の完全一致のみdedupe_news_itemsが担当）——同じ銘柄コードに
+    ついて同日中に複数ソースの記事がある場合、最も古い（＝一次情報である可能性が高い）ものを
+    FACT、それ以外をMARKET_REACTIONとしてevent_keyで束ねる。codeが無い記事は対象外。"""
+    by_code_date = {}
+    for it in items:
+        code = it.get("code")
+        if not code:
+            continue
+        date_bucket = str(it.get("published") or "")[:5]  # "MM/DD"
+        by_code_date.setdefault((code, date_bucket), []).append(it)
+    for (code, date_bucket), group in by_code_date.items():
+        if len(group) < 2:
+            continue
+        group.sort(key=lambda it: resolve_news_ts(it))  # 古い順＝一次情報らしいものを先頭に
+        event_key = f"event:{code}:{date_bucket}"
+        for idx, it in enumerate(group):
+            it["eventKey"] = event_key
+            tier = it.get("sourceTier")
+            it["eventRole"] = "FACT" if (tier == 1 or idx == 0) else "MARKET_REACTION"
+    return items
+
+
+def _annotate_news_importance(items, is_tdnet=False, is_registered_stock=False):
+    """items各要素にimportanceScore/notificationLevel/badges、および指示書1〜6の
+    sourceTier/sourceType/related*/eventKeyを付与する（既存フィールドはそのまま、追加のみ
+    ＝既存機能を壊さない）。"""
+    for it in items:
+        item_is_tdnet = is_tdnet or (it.get("source") == "TDnet")
+        item_is_registered = is_registered_stock or bool(it.get("code"))
+        tier, source_type = classify_source_tier(it.get("source"), it.get("url"), is_tdnet=item_is_tdnet)
+        result = compute_news_importance(
+            it.get("title"), code=it.get("code"), source=it.get("source"),
+            is_tdnet=item_is_tdnet, is_registered_stock=item_is_registered, source_tier=tier)
+        it["importanceScore"] = result["score"]
+        it["notificationLevel"] = result["level"]
+        it["badges"] = result["badges"]
+        it["sourceTier"] = tier
+        it["sourceType"] = source_type
+        it["sourceLabel"] = SOURCE_TIER_SHORT_LABEL.get(source_type, it.get("source") or "")
+        it.update(extract_related_tags(it.get("title"), code=it.get("code") if item_is_registered else None))
+    assign_event_keys(items)
+    return items
+
+
+def _sort_and_strip(items, is_tdnet=False, is_registered_stock=False):
+    """複数クエリの結果を連結したリストを公開日時の降順に並べ替える（指示書A：PRIMARYは
+    常にpublished_at/_ts、重要度は同時刻付近のタイブレークにのみ使う——重要ニュースだから
+    といって日付を無視して上位固定はしない）。あわせて重複排除（指示書C）・重要度付与
+    （指示書D）を行い、ソート用の内部フィールド（_ts）だけ外して返す（`ts`として公開する）。"""
+    # 完全重複（同一記事・同一開示）のdedupeを先に行い、残った異なる記事同士だけを
+    # イベント関連付け（event_key、指示書6）の対象にする。
+    items = dedupe_news_items(items)
+    items = _annotate_news_importance(items, is_tdnet=is_tdnet, is_registered_stock=is_registered_stock)
+    # PRIMARY: published_at(_ts) DESC / SECONDARY: importanceScore DESC（_tsが数秒〜数分差の
+    # 同時刻帯でのみ効く程度の重み）/ TERTIARY: 元の並び順（Pythonのsortは安定ソートのため
+    # 明示キー無しで自然に維持される）。
+    items = sorted(items, key=lambda it: (-resolve_news_ts(it), -it.get("importanceScore", 0)))
+    return [{**{k: v for k, v in it.items() if k != "_ts"}, "ts": resolve_news_ts(it)} for it in items]
 
 
 # 適時開示は本来Googleニュースの近似ではなく、TDnet（適時開示情報閲覧サービス）の公開一覧ページ
@@ -1581,6 +1958,30 @@ def build_stock_name_news(watchlist):
 MACRO_QUERIES_DOMESTIC = ["日経平均 見通し", "日銀 金融政策 決定", "ドル円 相場", "site:nikkei.com 株式市場"]
 MACRO_QUERIES_OVERSEAS = ["FRB 利上げ 金利", "米国株式市場 ダウ"]
 
+# News Intelligence Phase 2（2026-09-14新規・指示書1・4：国内市場ニュース「日経中心化」）：
+# 既存MACRO_QUERIES_DOMESTIC（4クエリ）は無変更のまま、指示書4番の重点分野
+# （市場全体／金融政策／主要テーマ／海外→日本株）をsite:nikkei.com検索で追加取得する
+# 専用クエリ。既存の国内市況タブ・サマリー表示ロジックには一切手を入れず、
+# build_nikkei_focus_news()という新規関数として追加し、呼び出し元（/api/news）側で
+# 既存macroNewsDomesticへ合流させる（差分実装、既存関数は書き換えない）。
+NIKKEI_FOCUS_QUERIES = [
+    "site:nikkei.com 日経平均 TOPIX 需給",
+    "site:nikkei.com 日銀 金融政策決定会合",
+    "site:nikkei.com 為替介入 円安 円高",
+    "site:nikkei.com 半導体 AI データセンター",
+    "site:nikkei.com 米国 FOMC 日本株",
+    "site:nikkei.com 米中 関税 半導体輸出規制",
+]
+
+
+def build_nikkei_focus_news():
+    """指示書1・4：日経中心化のための追加取得。既存build_macro_news()のdomestic結果とは
+    別に計算し、呼び出し元でmacroNewsDomesticへ合流させる（既存関数・既存件数は無変更）。"""
+    items = []
+    for q in NIKKEI_FOCUS_QUERIES:
+        items.extend(google_news(q, 4))
+    return _sort_and_strip(items)
+
 
 def build_macro_news():
     """マクロニュースを国内・海外に分けて返す（国内タプル, 海外タプル）。
@@ -1592,6 +1993,112 @@ def build_macro_news():
     for q in MACRO_QUERIES_OVERSEAS:
         overseas.extend(google_news(q, 6))
     return _sort_and_strip(domestic), _sort_and_strip(overseas)
+
+
+# ============================================================
+# 2026-09-14新規（ニュース機能修正指示書E・F・G・H）：重要ニュース通知の軽量パイプライン。
+# 既存の/api/news（20分間隔、登録銘柄IR＋市況一般をフル取得）とは別に、通知判定専用の
+# 軽量チェック（指示書H：5分間隔目安）を用意する。既存20分処理は一切変更しない
+# （呼び出し頻度・件数とも既存のまま＝負荷を4倍にしない）。
+# ============================================================
+
+# 指示書H：中央銀行・地政学の専用クエリ（既存MACRO_QUERIES_*とは別に用意し、既存の
+# 市況タブ表示件数・頻度には影響させない）。件数は少なめに抑え、API負荷を抑制する。
+NEWS_ALERT_MACRO_QUERIES = [
+    "FOMC 利上げ 利下げ", "日銀 金融政策決定会合", "ECB 欧州中央銀行 金利",
+    "ドル円 為替介入", "地政学リスク 原油 市場",
+]
+NEWS_ALERT_CACHE_TTL_SEC = 240  # 5分間隔運用の想定（バックオフ込みで4分キャッシュ）
+_news_alert_cache = {"built_at": 0, "watchlist_key": None, "candidates": []}
+
+
+def _fetch_news_alert_candidates(watchlist):
+    """通知判定対象となりうる候補ニュースだけを軽量に集める：
+    ①登録銘柄×TDnet当日開示（既存_tdnet_today_disclosuresを再利用、追加スクレイピング無し）
+    ②中央銀行・地政学の専用クエリ（少数・6件/クエリ）。
+    既存の/api/news（build_stock_news等）のフル処理は呼ばない＝重複取得・負荷増を避ける。
+    NEWS_ALERT_CACHE_TTL_SEC以内の再呼び出しはキャッシュを返す（指示書H：5分間隔での
+    連続呼び出しでAPI負荷・スクレイピング頻度が増えすぎないようにする）。"""
+    watchlist_key = tuple(sorted((w.get("code", ""), w.get("market", "JP")) for w in (watchlist or [])
+                                   if w.get("market", "JP") != "US"))
+    now = time.time()
+    if (now - _news_alert_cache["built_at"] < NEWS_ALERT_CACHE_TTL_SEC
+            and _news_alert_cache["watchlist_key"] == watchlist_key):
+        return _news_alert_cache["candidates"]
+
+    candidates = []
+    jp_items = [w for w in (watchlist or []) if w.get("market", "JP") != "US"]
+    if jp_items:
+        jst = datetime.timezone(datetime.timedelta(hours=9))
+        today_str = datetime.datetime.now(jst).strftime("%m/%d")
+        try:
+            tdnet = _tdnet_today_disclosures()
+        except Exception as e:
+            print("  ニュースアラート: TDnet取得で例外（無視して続行）", e)
+            tdnet = {}
+        for w in jp_items:
+            code, name = w.get("code", ""), w.get("name", "")
+            if not code or not name:
+                continue
+            for e in tdnet.get(code, []):
+                candidates.append({
+                    "code": code, "name": name, "title": e["title"], "url": e["url"],
+                    "source": "TDnet", "published": f"{today_str} {e['time']}",
+                    "_ts": _tdnet_sort_key(e["time"]),
+                })
+    for q in NEWS_ALERT_MACRO_QUERIES:
+        try:
+            candidates.extend(google_news(q, 4))
+        except Exception as e:
+            print("  ニュースアラート: マクロ取得で例外（無視して続行）", q, e)
+
+    candidates = _sort_and_strip(candidates)
+    _news_alert_cache["built_at"] = now
+    _news_alert_cache["watchlist_key"] = watchlist_key
+    _news_alert_cache["candidates"] = candidates
+    return candidates
+
+
+# 指示書I：通知閾値の既定値（フロント側のlocalStorage設定が無い初回のみ使うサーバー側既定、
+# 実際の閾値判定自体はフロント側のフィルタと二重にせず、ここではCRITICAL/HIGHの候補だけを
+# 返しNORMALはそもそも候補に出さない——「HIGH以上のみ通知」がアプリの既定方針のため）。
+NEWS_ALERT_NOTIFY_LEVELS = ("CRITICAL", "HIGH")
+# 指示書G：起動直後の静穏期間の例外——直近この秒数以内のCRITICALだけは初回チェックでも通知可。
+NEWS_ALERT_STARTUP_CRITICAL_WINDOW_SEC = 5 * 60
+# サーバープロセスが起動し「ニュース監視」を開始した時刻（モジュールロード時に1回だけ確定）。
+# 指示書G：この時刻より前に公開されたニュースは、起動直後の一括通知を避けるため通知対象外
+# （CRITICALかつ直近NEWS_ALERT_STARTUP_CRITICAL_WINDOW_SEC以内は例外で通知可）。
+NEWS_WATCHER_STARTED_AT = time.time()
+
+
+def select_news_alerts(database_url, candidates, watcher_started_at=None, now=None):
+    """指示書E・F・G：通知すべき新着重要ニュースだけを選び、notification_logへ記録する
+    （記録済みのものは戻り値・DB両方から自然に除外される＝再通知禁止）。
+    戻り値：新規に通知すべきitemのリスト（importanceScore/notificationLevel付き、
+    notification_key追加）。DBが無い環境（investment_db未設定）では、この呼び出し限りの
+    重複排除だけ行い常に通知可とする（既存の単体テスト・オフライン環境向けのフォールバック）。"""
+    watcher_started_at = NEWS_WATCHER_STARTED_AT if watcher_started_at is None else watcher_started_at
+    now = time.time() if now is None else now
+    alerts = []
+    for it in candidates:
+        level = it.get("notificationLevel", "NORMAL")
+        if level not in NEWS_ALERT_NOTIFY_LEVELS:
+            continue
+        ts = it.get("ts") or resolve_news_ts(it)
+        is_recent_critical = level == "CRITICAL" and ts and (now - ts) <= NEWS_ALERT_STARTUP_CRITICAL_WINDOW_SEC
+        if ts and ts < watcher_started_at and not is_recent_critical:
+            continue  # 指示書G：監視開始前の過去ニュースは（直近CRITICAL以外）一斉通知しない
+        key = _news_dedupe_key(it)
+        if database_url and investment_db is not None:
+            if investment_db.was_already_notified(database_url, key):
+                continue
+            recorded = investment_db.record_notification(
+                database_url, key, news_id=it.get("url") or key,
+                notification_type=level, importance_score=it.get("importanceScore"))
+            if not recorded:
+                continue  # 他プロセス/リクエストと競合して同時に記録された（二重通知防止）
+        alerts.append({**it, "notificationKey": key})
+    return alerts
 
 
 # 12-1章：分析タブのテクニカル指標計算。外部ライブラリ(ta-lib等)を追加せず、
@@ -2258,6 +2765,11 @@ def generate_morning_market_check(database_url, user_id, snapshot_time):
         print("  MorningCheck: entry_score版TOP5算出で例外", e)
         entry_ready_top5 = []
         data_quality["entry_top5"] = "failed"
+    # News Intelligence Phase 2（指示書11）：既存ENTRY TOP5選考には一切影響させず、
+    # 表示用の参考情報としてニュース材料の有無だけを添える（新規取得はせず、キャッシュ済みの
+    # ニュース候補を再利用する）。
+    news_catalyst_map = attach_news_catalyst_flags(
+        {c["code"] for c in entry_ready_top5}, _news_alert_cache.get("candidates") or [])
     watchlist_top5_json = [{
         "code": c["code"], "name": c["name"], "rank": c["rank"],
         "entryScore": c["entryScore"], "score": c["entryScore"], "entryState": c["entryState"],
@@ -2266,6 +2778,7 @@ def generate_morning_market_check(database_url, user_id, snapshot_time):
         "analysisConfidence": c["analysisConfidence"], "dataQuality": c["dataQuality"],
         "trigger": "寄り後VWAP維持＋5分足安値切り上げを確認してからのエントリーを推奨",
         "avoidCondition": "寄り天・出来高を伴わない上昇・悪材料の追加",
+        "newsCatalyst": news_catalyst_map.get(c["code"]),
     } for c in entry_ready_top5]
 
     try:
@@ -2321,6 +2834,9 @@ def generate_morning_market_check(database_url, user_id, snapshot_time):
         "strategy_json": strategy, "strategy_text": strategy_text,
         "raw_payload_json": {"feargreed": fear_greed, "generatedAt": now.isoformat(), "missing": vol_missing + trend_missing,
                               "external_market_commentary": _nicosoku_morning_commentary_safe(database_url, user_id)},
+        # News Intelligence Phase 2（指示書12）：既にキャッシュ済みのニュース候補（新規取得
+        # なし、_fetch_news_alert_candidatesの5分キャッシュを再利用）から構造化要約のみ生成。
+        "market_news_context_json": build_market_news_context(_news_alert_cache.get("candidates") or []),
     }
     saved = investment_db.save_morning_check(database_url, user_id, check_date, snapshot_time, payload) if investment_db else None
     # 朝TOP5をstock_thesesへ永続化（source='MORNING'固定、以後書き換えない成績評価用スナップ
@@ -11863,6 +12379,69 @@ def compute_sector_flow_score_for_entry(sector_state):
     return SECTOR_FLOW_SCORE_FOR_STATE.get(sector_state, 5)
 
 
+def attach_news_catalyst_flags(candidate_codes, news_items):
+    """News Intelligence Phase 2（指示書11）：ENTRY TOP5候補へニュース材料の有無を注記する
+    読み取り専用のヘルパー。既存のENTRY SCORE・ランキング自体には一切触れない
+    （指示書「ニュースだけで強制昇格させない、NEWS+PRICE+VOLUME+RSの一致を重視」を、
+    スコアを書き換えるのではなく「参考情報を隣に添えるだけ」という設計で満たす——
+    実際にPRICE/VOLUME/RSと一致するかの最終判断は既存のENTRY SCORE側に委ねる）。
+    戻り値：{code: {"matched":bool, "title":..., "relatedThemes":[...], "importanceScore":int}}
+    （該当ニュースが無いcodeはキー自体を含まない＝呼び出し側は.get(code)でNone許容）。"""
+    by_code = {}
+    for it in news_items or []:
+        code = it.get("code")
+        if not code or code not in candidate_codes:
+            continue
+        score = it.get("importanceScore") or 0
+        existing = by_code.get(code)
+        if existing is None or score > existing["importanceScore"]:
+            by_code[code] = {"matched": True, "title": it.get("title"),
+                              "relatedThemes": it.get("relatedThemes") or [],
+                              "importanceScore": score}
+    return by_code
+
+
+def build_market_news_context(news_items):
+    """News Intelligence Phase 2（指示書12）：朝一チェック／場中4レポート向けの構造化
+    ニュース要約。記事本文は保存せず、最重要記事1件からmain_driver（見出しそのまま）・
+    source・affected_sectors・confidence（importanceScoreを0-1へ正規化した簡易値）
+    だけを抜き出す。newsが無ければNone（「まだ材料無し」と「取得失敗」を区別しない簡易設計、
+    既知の制約）。"""
+    if not news_items:
+        return None
+    candidates = [it for it in news_items if (it.get("importanceScore") or 0) > 0]
+    if not candidates:
+        return None
+    top = max(candidates, key=lambda it: (it.get("importanceScore") or 0, resolve_news_ts(it)))
+    return {
+        "main_driver": top.get("title"),
+        "source": top.get("sourceLabel") or top.get("source"),
+        "affected_sectors": top.get("relatedSectors") or [],
+        "confidence": round(min(1.0, (top.get("importanceScore") or 0) / 100), 2),
+        "published_at": top.get("published"),
+        "url": top.get("url"),
+    }
+
+
+def compute_sector_news_score(theme, news_items):
+    """News Intelligence Phase 2（指示書10）：直近ニュース（relatedSectors付き、
+    _annotate_news_importance済み）からテーマ関連の話題性を0-100の補助スコアで返す。
+    PRICE/出来高/相対強度による既存のsector state判定（classify_sector_state）には
+    一切混ぜない——build_sector_rotation_snapshot()の戻り値に並べて追加する補助フィールド
+    としてのみ使う（指示書「ニュースだけでLEADINGへ昇格させない」）。
+    news_itemsが空（アラートキャッシュ未ウォームアップ等）の場合はNoneを返す
+    （0点＝ニュース無し、と「まだ計測していない」を区別するため）。"""
+    if not news_items:
+        return None
+    hits = [it for it in news_items if theme in (it.get("relatedSectors") or [])]
+    if not hits:
+        return 0
+    score = 0
+    for it in hits:
+        score += 15 + (it.get("importanceScore") or 0) * 0.3
+    return round(min(100, score))
+
+
 CHORUCO_FIT_V2_WEIGHTS = {"market_mode": 3, "event": 2, "story": 2, "cross_market": 1, "sector_flow": 2}
 
 
@@ -11916,6 +12495,10 @@ def build_sector_rotation_snapshot(database_url, user_id):
     stage1 = run_momentum_stage1()
     stage1_rows = stage1.get("rows", {})
     nikkei_chg = stage1.get("nikkeiChangePct")
+    # News Intelligence Phase 2（指示書10）：直近の重要ニュース候補（既にannotate済みの
+    # アラートキャッシュ、無ければ空）からテーマ別のsector_news_scoreを補助情報として計算する。
+    # 新規のニュース取得は行わない（このsnapshot生成自体を遅くしないため）。
+    _news_candidates_for_sectors = _news_alert_cache.get("candidates") or []
 
     sectors = {}
     for theme in SECTOR_ROTATION_THEMES:
@@ -11923,7 +12506,8 @@ def build_sector_rotation_snapshot(database_url, user_id):
         rows = [stage1_rows[c] for c in codes if c in stage1_rows and stage1_rows[c].get("current") is not None]
         if not rows:
             sectors[theme] = {"score": None, "state": "NEUTRAL", "breadth": None, "volume_expansion": None,
-                                "relative_strength": None, "sample_count": 0}
+                                "relative_strength": None, "sample_count": 0,
+                                "sector_news_score": compute_sector_news_score(theme, _news_candidates_for_sectors)}
             continue
         changes = [r.get("changePct") for r in rows if r.get("changePct") is not None]
         avg_change = sum(changes) / len(changes) if changes else 0.0
@@ -11953,7 +12537,10 @@ def build_sector_rotation_snapshot(database_url, user_id):
         sectors[theme] = {"score": score, "state": classify_sector_state(score), "breadth": breadth,
                             "volume_expansion": round(median_vol_ratio, 2) if median_vol_ratio is not None else None,
                             "relative_strength": relative_strength, "sample_count": len(rows),
-                            "up_count": up_count}
+                            "up_count": up_count,
+                            # 指示書10：PRICE/RELATIVE STRENGTHによるscore/state（上記）とは
+                            # 独立の補助フィールド。既存のclassify_sector_state()の入力には含めない。
+                            "sector_news_score": compute_sector_news_score(theme, _news_candidates_for_sectors)}
 
     curr_snapshot = {"sectors": sectors, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
     prev_entry = _cache_get(_sector_rotation_prev_snapshot_key(user_id))
@@ -13028,6 +13615,9 @@ def generate_intraday_report(database_url, user_id, report_type, trade_date=None
         # CRITICALの投稿のみ参照する追加専用フィールド。既存のレポート生成・エントリー判定
         # ロジックには一切影響しない（例外は握りつぶし、失敗しても空配列のまま）。
         "social_signals_json": _nicosoku_intraday_signals_safe(database_url, user_id),
+        # News Intelligence Phase 2（指示書12）：朝一チェックと同じキャッシュ済みニュース候補
+        # から構造化要約を生成（新規取得なし）。
+        "market_news_context_json": build_market_news_context(_news_alert_cache.get("candidates") or []),
     }
     saved = investment_db.save_market_intelligence_report(database_url, user_id, trade_date, report_type, payload) if investment_db else None
     # Phase MU-S2：DBに保存するのはSHARED部分のみ（上のpayloadにPRIVATE情報は含まない）。
@@ -19854,6 +20444,21 @@ class Handler(SimpleHTTPRequestHandler):
             print(f"[投資判断ログ] 旧データ移行（{self.current_user}・journal {len(body.get('journal', []))}件・rules {len(body.get('rules', []))}件）…")
             result = investment_db.migrate_legacy(DATABASE_URL, self.current_user, body.get("journal", []), body.get("rules", []))
             self._send_json(result)
+        elif self.path.startswith("/api/news/alerts"):
+            # 2026-09-14新規（ニュース機能修正指示書E・F・G・H）：重要ニュース通知専用の
+            # 軽量エンドポイント。既存の/api/news（フル取得、20分間隔想定）とは別に、
+            # フロント側が短い間隔（目安5分）でポーリングする。startswithマッチのため
+            # より具体的なこのルートを既存/api/newsより先に判定させている
+            # （/api/newsはstartswithマッチのため、順序を入れ替えると壊れる）。
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b"[]"
+            try:
+                watchlist = json.loads(raw.decode("utf-8") or "[]")
+            except Exception:
+                watchlist = []
+            candidates = _fetch_news_alert_candidates(watchlist)
+            alerts = select_news_alerts(DATABASE_URL if investment_db is not None else None, candidates)
+            self._send_json({"alerts": alerts, "checkedAt": datetime.datetime.now().strftime("%H:%M:%S")})
         elif self.path.startswith("/api/news"):
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length) if length else b"[]"
@@ -19866,6 +20471,13 @@ class Handler(SimpleHTTPRequestHandler):
             stock_name_news = build_stock_name_news(watchlist)
             disclosure_news = build_disclosure_news(watchlist)
             macro_domestic, macro_overseas = build_macro_news()
+            # News Intelligence Phase 2（指示書1・4）：日経中心化のための追加取得を
+            # macroNewsDomesticへ合流させる（既存build_macro_news()自体は無変更・追加のみ）。
+            try:
+                macro_domestic = dedupe_news_items(build_nikkei_focus_news() + macro_domestic)
+                macro_domestic = sorted(macro_domestic, key=lambda it: (-(it.get("ts") or 0), -(it.get("importanceScore") or 0)))
+            except Exception as e:
+                print("  ニュース: 日経中心化の追加取得で例外（無視して既存結果のみ使用）", e)
             macro_all = macro_domestic + macro_overseas
             self._send_json({
                 "stockNews": stock,  # 9章：決算・IR・適時開示のみに絞り込み済み
