@@ -3056,19 +3056,78 @@ def _check_exit_quality(exits_today, reflection_tags):
     return max(0, round(score)), good, bad
 
 
-def _check_market_fit(new_positions, market_condition):
+def _check_market_fit(new_positions, market_condition, is_business_day=True):
     """地合い適応（15点満点）：地合いが軟調（リスクオフ等）な日に新規エントリーを増やして
-    いないかを見る。market_conditionはdaily_log保存時の自由記述テキストのため、キーワードで
-    軽く判定する（厳密な数値判定はしない）。"""
+    いないかを見る。market_conditionはdaily_log（PRIVATE）またはSHARED market_intelligence_
+    reportsから解決済みの自由記述テキスト（_resolve_market_condition_for_review参照）で、
+    キーワードで軽く判定する（厳密な数値判定はしない）。
+    2026-09-14修正（不具合対応）：データ不足を満点扱いしていた旧仕様（「地合い情報が未記録の
+    ため判定不能（満点扱い）」）を廃止。市場休場日・データ不足はともに満点を与えず、戻り値の
+    4つ目（applicable_max）を0にして生成元（generate_daily_review）の分母から除外させる。
+    戻り値: (score, good_points, improvement_points, applicable_max)"""
+    if not is_business_day:
+        return 0, [], ["市場休場日のため評価対象外"], 0
     if not market_condition:
-        return MARKET_FIT_MAX, [], ["地合い情報が未記録のため判定不能（満点扱い）"]
-    risk_off = any(k in market_condition for k in ["リスクオフ", "軟調", "弱い", "急落", "下落"])
+        return 0, [], ["地合い評価：データ不足のため未評価"], 0
+    # 2026-09-14修正（SHARED market_intelligence_reportsフォールバック対応）：daily_log自由記述の
+    # 日本語表現に加え、market_intelligence_reports.market_regime（RISK_OFF|MILD_RISK_OFF|
+    # HIGH_VOLATILITY等の英語enum、server.pyのgenerate_morning_strategy参照）もリスクオフ判定
+    # できるようにする（旧実装は日本語キーワードしか見ておらず、SHARED経由の地合いを
+    # 常に「良好」と誤判定していた）。
+    risk_off = any(k in market_condition for k in
+                    ["リスクオフ", "軟調", "弱い", "急落", "下落", "RISK_OFF", "HIGH_VOLATILITY"])
     if not risk_off:
-        return MARKET_FIT_MAX, [f"地合い「{market_condition}」の下で通常運用"], []
+        return MARKET_FIT_MAX, [f"地合い評価：良好（{market_condition}の下で通常運用）"], [], MARKET_FIT_MAX
     if not new_positions:
-        return MARKET_FIT_MAX, [f"地合い軟調（{market_condition}）の中、新規エントリーを抑制"], []
+        return MARKET_FIT_MAX, [f"地合い評価：警戒（{market_condition}軟調の中、新規エントリーを抑制）"], [], MARKET_FIT_MAX
     deduct = min(MARKET_FIT_MAX, len(new_positions) * 5)
-    return max(0, MARKET_FIT_MAX - deduct), [], [f"地合い軟調（{market_condition}）にも関わらず新規{len(new_positions)}件エントリー"]
+    return (max(0, MARKET_FIT_MAX - deduct), [],
+            [f"地合い評価：不一致（{market_condition}軟調にも関わらず新規{len(new_positions)}件エントリー）"], MARKET_FIT_MAX)
+
+
+# Phase MU-S2続き（2026-09-14・不具合対応）：market_intelligence_reportsはMU-S1でSHARED化
+# 済みのため、report_type優先順位で「その日の最終的な地合い」を1件だけ選ぶ。daily_review
+# （PRIVATE）とはuser_idでJOINしない——date（trade_date=review_date）だけで関連付ける
+# （指示書：PRIVATEとSHAREDはuser_idでJOINしてはいけない。list_market_intelligence_reports
+# 自体がMU-S1でuser_id引数を無視し常に_SHARED_SCOPEを見る設計のため、ここで渡すuser_idの
+# 値は実質無視される＝安全）。
+_MARKET_CONDITION_REPORT_PRIORITY = ("MARKET_CLOSE", "AFTERNOON_30M", "MORNING_CLOSE", "OPENING_30M")
+
+
+def _resolve_market_condition_for_review(database_url, user_id, review_date):
+    """その日の地合い判定材料を1つに解決する。優先順位：
+    1) daily_log.market_env（PRIVATE、ユーザーが自分で書いた自由記述）
+    2) market_intelligence_reports（SHARED）を優先度の高いreport_type順に見る
+    見つからなければNone（=データ不足、呼び出し側で「データ不足のため未評価」扱い）。
+    戻り値: market_condition文字列 または None。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT market_env FROM daily_log WHERE user_id=%s AND date=%s ORDER BY id DESC LIMIT 1",
+                        [user_id, review_date])
+            row = cur.fetchone()
+            if row and row.get("market_env"):
+                return row["market_env"]
+    reports = list_market_intelligence_reports(database_url, user_id, trade_date=review_date)
+    if not reports:
+        return None
+    by_type = {r.get("report_type"): r for r in reports}
+    chosen = None
+    for rt in _MARKET_CONDITION_REPORT_PRIORITY:
+        if rt in by_type:
+            chosen = by_type[rt]
+            break
+    if chosen is None:
+        chosen = reports[-1]  # 優先順位に無いreport_typeでも、当日分があれば無いよりまし
+    regime = chosen.get("market_regime")
+    summary = chosen.get("market_summary")
+    if not regime and not summary:
+        return None
+    if regime and summary:
+        return f"{regime}：{summary}"
+    return regime or summary
 
 
 def _check_risk_management(database_url, user_id, review_date):
@@ -3090,30 +3149,67 @@ def _check_risk_management(database_url, user_id, review_date):
     return max(0, RISK_MGMT_MAX - deduct), [], [f"リスク関連ルール『{f['rule_text'][:30]}…』がFAILED評価" for f in fails]
 
 
-def generate_daily_review(database_url, user_id, review_date, user_feedback=None):
+_JST = datetime.timezone(datetime.timedelta(hours=9))
+
+
+def _to_jst_date_str(ts):
+    """timestamp文字列（TIMESTAMPTZ由来、UTC想定）をJSTの日付（YYYY-MM-DD）文字列にして返す。
+    2026-09-14修正（不具合対応）：単純に文字列の先頭10文字を取るとUTC日付になってしまい、
+    JST 00:00〜08:59（=UTC前日15:00〜23:59）に約定した取引がJSTでの実際の日付より1日
+    前の日として扱われてしまう（例：JST 2026-09-14 00:55の取得がUTCでは2026-09-13 15:55と
+    なり、[:10]切り出しだとreview_date="2026-09-13"の持ち越し判定に誤って含まれ得る）。
+    パース失敗時・空文字時は空文字を返す（呼び出し側で「日付不明」として扱われる）。"""
+    if not ts:
+        return ""
+    try:
+        dt = datetime.datetime.fromisoformat(str(ts))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(_JST).date().isoformat()
+    except (ValueError, TypeError):
+        return str(ts)[:10]
+
+
+def generate_daily_review(database_url, user_id, review_date, user_feedback=None, is_business_day=None):
     """指示書13〜17番：1日の投資振り返りを自動生成し、1〜100点で評価する。既存の
     ChatGPT取込・trade_rules・portfolio・trade_historyのデータだけを使い、新しい判定
     ロジックを勝手に「賢く」しすぎない（機械的に検証できる項目だけを積み上げる設計）。
+    is_business_day：呼び出し元（server.py）がJP祝日カレンダー込みのis_jp_trading_day()で
+    正確に判定できるならその結果を渡す。省略時（None）はinvestment_db側で土日だけの簡易判定
+    にフォールバックする（祝日カレンダーはserver.py側にしか無いため）。
     戻り値: 保存済みdaily_reviewsの1行（camelCase変換済み）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
+    if is_business_day is None:
+        try:
+            is_business_day = datetime.date.fromisoformat(review_date).weekday() < 5
+        except (ValueError, TypeError):
+            is_business_day = True
     positions = list_portfolio(database_url, user_id)
     history = list_trade_history(database_url, user_id, limit=500)
     rules = list_trade_rules(database_url, user_id)
 
-    exits_today = [t for t in history if str(t.get("closed_at") or "")[:10] == review_date]
-    new_positions = [p for p in positions if str(p.get("acquired_at") or p.get("created_at") or "")[:10] == review_date]
+    # 2026-09-14修正（不具合対応）：list_portfolio()は「今この瞬間」のポジションを返すため、
+    # 過去日のreview_dateを生成する際にそのまま使うと、今日買った銘柄が過去日のレビューへ
+    # 逆流してしまう（例：本日新規で買った銘柄が「9/11から持ち越していた」と誤判定される）。
+    # acquired_at（無ければcreated_at）がreview_date以前のものだけを「その日時点で保有して
+    # いた可能性がある」ポジションとして扱う。既知の制約：review_date時点では保有していたが
+    # 今日までに決済されてportfolioから削除済みの銘柄は追跡できない（trade_historyに
+    # 取得日を記録する列が無いため）。
+    positions_as_of_review = [p for p in positions
+                                if _to_jst_date_str(p.get("acquired_at") or p.get("created_at")) <= review_date]
 
-    # market_condition: その日のdaily_logがあれば使う（無くても判定不能として満点扱いにするだけ）
-    market_condition = None
+    exits_today = [t for t in history if _to_jst_date_str(t.get("closed_at")) == review_date]
+    new_positions = [p for p in positions_as_of_review
+                      if _to_jst_date_str(p.get("acquired_at") or p.get("created_at")) == review_date]
+
+    # 2026-09-14修正（不具合対応）：market_conditionはPRIVATE daily_logで見つからなければ
+    # SHARED market_intelligence_reportsへフォールバックする（_resolve_market_condition_for_review
+    # 参照。date一致だけで関連付け、user_idではJOINしない）。
+    market_condition = _resolve_market_condition_for_review(database_url, user_id, review_date)
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT market_env FROM daily_log WHERE user_id=%s AND date=%s ORDER BY id DESC LIMIT 1",
-                        [user_id, review_date])
-            row = cur.fetchone()
-            if row:
-                market_condition = row.get("market_env")
             # 既存のuser_feedback（同日、まだ無ければNone）
             cur.execute("SELECT user_feedback FROM daily_reviews WHERE user_id=%s AND review_date=%s",
                         [user_id, review_date])
@@ -3121,10 +3217,11 @@ def generate_daily_review(database_url, user_id, review_date, user_feedback=None
     effective_feedback = user_feedback if user_feedback is not None else (existing.get("user_feedback") if existing else None)
     reflection_tags = extract_reflection_tags(effective_feedback)
 
-    score_rule, good_rule, bad_rule = _check_rule_adherence(database_url, user_id, review_date, positions, rules)
+    score_rule, good_rule, bad_rule = _check_rule_adherence(database_url, user_id, review_date, positions_as_of_review, rules)
     score_entry, good_entry, bad_entry = _check_entry_quality(new_positions)
     score_exit, good_exit, bad_exit = _check_exit_quality(exits_today, reflection_tags)
-    score_market, good_market, bad_market = _check_market_fit(new_positions, market_condition)
+    score_market, good_market, bad_market, market_applicable_max = _check_market_fit(
+        new_positions, market_condition, is_business_day=is_business_day)
     score_risk, good_risk, bad_risk = _check_risk_management(database_url, user_id, review_date)
     score_reflection = REFLECTION_MAX if (effective_feedback or "").strip() else 4
 
@@ -3132,7 +3229,7 @@ def generate_daily_review(database_url, user_id, review_date, user_feedback=None
     # NO_OVERNIGHT等の警告が出ていたのに実際に持ち越した銘柄を検出し、「知っていたのに
     # 無視した」としてルール遵守点をさらに減点する（結果論ではなく、その時点で警告が
     # 出ていたかどうかで判定、指示書27番）。
-    known_risk_ignored = _check_known_risk_ignored(database_url, user_id, review_date, positions, new_positions=new_positions)
+    known_risk_ignored = _check_known_risk_ignored(database_url, user_id, review_date, positions_as_of_review, new_positions=new_positions)
     if known_risk_ignored:
         score_rule = max(0, score_rule - DEDUCTION_RULE_VIOLATION * len(known_risk_ignored))
         bad_rule = bad_rule + [f"{k['code']}：{k['reason']}（知っていたのに無視）" for k in known_risk_ignored]
@@ -3143,7 +3240,13 @@ def generate_daily_review(database_url, user_id, review_date, user_feedback=None
     good_entry = good_entry + good_pb
     bad_rule = bad_rule + bad_pb
 
-    score_total = score_rule + score_entry + score_exit + score_market + score_risk + score_reflection
+    # 2026-09-14修正（不具合対応）：地合い適応がデータ不足/休場日で評価対象外
+    # （market_applicable_max=0）の場合、100点満点の分母からも除外し、残りの項目だけで
+    # 100点相当に比例配分する（「データ不足を満点扱いしない」＝分子にも分母にも入れない）。
+    raw_total = score_rule + score_entry + score_exit + score_market + score_risk + score_reflection
+    applicable_max = (RULE_ADHERENCE_MAX + ENTRY_QUALITY_MAX + EXIT_QUALITY_MAX + market_applicable_max
+                       + RISK_MGMT_MAX + REFLECTION_MAX)
+    score_total = round(raw_total / applicable_max * 100) if applicable_max > 0 else 0
     good_points = good_rule + good_entry + good_exit + good_market + good_risk
     improvement_points = bad_rule + bad_entry + bad_exit + bad_market + bad_risk
 
@@ -3157,9 +3260,10 @@ def generate_daily_review(database_url, user_id, review_date, user_feedback=None
     if "高値追い" in reflection_tags or "FOMO" in reflection_tags:
         tomorrow_notes.append("急騰銘柄への飛び乗りエントリーを控える")
 
+    market_fit_label = f"{score_market}/{market_applicable_max}" if market_applicable_max > 0 else "評価対象外"
     auto_summary = f"今日の投資スコア：{score_total}/100（ルール遵守{score_rule}/{RULE_ADHERENCE_MAX}・" \
         f"エントリー{score_entry}/{ENTRY_QUALITY_MAX}・利確損切り{score_exit}/{EXIT_QUALITY_MAX}・" \
-        f"地合い適応{score_market}/{MARKET_FIT_MAX}・リスク管理{score_risk}/{RISK_MGMT_MAX}・" \
+        f"地合い適応{market_fit_label}・リスク管理{score_risk}/{RISK_MGMT_MAX}・" \
         f"振り返り{score_reflection}/{REFLECTION_MAX}）"
 
     with pool.connection() as conn:

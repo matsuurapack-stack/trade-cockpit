@@ -10379,7 +10379,16 @@ def generate_daily_review_with_learning(database_url, user_id, review_date, user
              "ruleCandidatesProposed":[...]}。"""
     if investment_db is None or not database_url:
         return None
-    review = investment_db.generate_daily_review(database_url, user_id, review_date, user_feedback=user_feedback)
+    # 2026-09-14修正（不具合対応）：土日・祝日・年末年始は「地合い情報が未記録」ではなく
+    # 「市場休場日のため評価対象外」として扱うため、JP祝日カレンダー込みの正確な判定
+    # （is_jp_trading_day）をここから渡す（investment_db側は祝日カレンダーを持たないため
+    # 土日だけの簡易フォールバックしかできない）。
+    try:
+        is_business_day = is_jp_trading_day(datetime.date.fromisoformat(review_date))
+    except (ValueError, TypeError):
+        is_business_day = True
+    review = investment_db.generate_daily_review(database_url, user_id, review_date, user_feedback=user_feedback,
+                                                   is_business_day=is_business_day)
 
     sync_result = sync_trade_experiences_for_date(database_url, user_id, review_date)
 
@@ -19728,8 +19737,13 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception:
                 watchlist = []
             print(f"[取得] 登録銘柄の現在値（{len(watchlist)} 件）…")
+            # 2026-09-14新規（監視銘柄「動いていない」不具合調査）：毎pollで実際に何件取得できたか・
+            # 何秒かかったかをサーバーログに残す（フロントの「更新デバッグ」表示と突き合わせるため）。
+            _sq_t0 = time.time()
             quotes = get_stock_quotes(watchlist)
+            _sq_elapsed = time.time() - _sq_t0
             now = datetime.datetime.now().strftime("%H:%M:%S")
+            print(f"  [StockQuotes] {now} {len(watchlist)}銘柄要求 → {len(quotes)}銘柄取得（{_sq_elapsed:.1f}秒）")
             self._send_json({"quotes": quotes, "fetchedAt": now})
         elif self.path.startswith("/api/breakout-levels"):
             length = int(self.headers.get("Content-Length", 0))

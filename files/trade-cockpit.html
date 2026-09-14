@@ -1011,6 +1011,11 @@ const emptyState=()=>({
   stockNameNewsList:[], usStockNameNewsList:[], // ニュースタブ「登録銘柄」サブタブ：IR以外も含む社名一致ニュース
   disclosureNewsList:[], usDisclosureNewsList:[], // ニュースタブ「適時開示」サブタブ：当日含む直近10日分・種類問わず全件
   analysisTargets:[], // analysisTargets: 5章「分析」ボタンで追加した銘柄コード一覧（12章の分析タブで使用）
+  // 2026-09-14新規（トレード分析STALE不具合修正）：分析対象に追加した時点のmarketを覚えておく
+  // （{code: "JP"|"US"}）。後で監視銘柄からその銘柄が削除・非表示化されても、
+  // allWatch.find()に失敗して自動更新の対象から静かに脱落しないようにするため
+  // （3日以上STALEのまま放置されていた不具合の原因）。
+  analysisTargetMarkets:{},
   analysisData:{}, // analysisData: 12-1章の分析結果（購入/損切り/利確の目安・算出根拠）をコードごとに保持
   earningsTargets:[], // earningsTargets: 登録銘柄テーブルの「決算」ボタンで追加した銘柄コード一覧（決算分析タブで使用）
   earningsDetail:{}, // earningsDetail: 直近の決算短信（TDnet）のタイトル・URL・数値要約をコードごとに保持
@@ -1525,7 +1530,7 @@ function SectorWatchlist({market,watchlist,setWatchlist,candidates,max,stockQuot
                     <button className="watch-menu-btn" onClick={e=>{e.stopPropagation();setOpenMenuFor(v=>v===w.code?null:w.code);}}>⋮</button>
                     {openMenuFor===w.code && <div className="watch-menu" onClick={e=>e.stopPropagation()}>
                       <button onClick={()=>{onOpenChart(w);setOpenMenuFor(null);}}>チャート</button>
-                      <button className={inAnalysis?"on":""} onClick={()=>{onToggleAnalysis(w.code);setOpenMenuFor(null);}}>{inAnalysis?"✓ 分析中":"分析"}</button>
+                      <button className={inAnalysis?"on":""} onClick={()=>{onToggleAnalysis(w.code,w.market);setOpenMenuFor(null);}}>{inAnalysis?"✓ 分析中":"分析"}</button>
                       {market==="JP" && <button className={inWatch?"on":""} onClick={()=>{onToggleWatch(w.code);setOpenMenuFor(null);}}>{inWatch?"✓ 監視銘柄":"監視銘柄に追加"}</button>}
                       {market==="JP" && <button className={inEarnings?"on":""} onClick={()=>{onToggleEarnings(w.code);setOpenMenuFor(null);}}>{inEarnings?"✓ 決算":"決算"}</button>}
                       {/* 2026-09-08新規：監視銘柄（watchTargets）登録の有無に関わらず、登録銘柄
@@ -4712,6 +4717,60 @@ function YaamanThemePanel({nextDayThemes,todayThemes,watchlistAll,onAddToWatchli
 function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan,newsCatalysts,entryScanning,entryResult,onEntryScan,thesisStats,todayTheses,yaamanNextDayThemes,yaamanTodayThemes,onAddToWatchlist}){
   const [expandedScoreCode,setExpandedScoreCode]=useState(null); // スコア内訳の折りたたみ展開（指示書21番）
   const [entryDebugOpen,setEntryDebugOpen]=useState(false); // TOP5表示ロジック修正指示・指示書7番：開発用デバッグ表示（既定は折りたたみ）
+
+  // 2026-09-14新規（監視銘柄「動いていない」不具合調査・可視化）：/api/stock-quotesの
+  // 自動更新（fetchMonitorAndJP、30秒おき）が実際にこのタブの銘柄まで届いているかを
+  // ユーザー自身の画面上で確認できるようにする。stockQuotes[code].quoteFetchedAtは
+  // 各銘柄が最後に新しい値を受け取った時刻（fetchMonitorAndJP側で毎回スタンプ済み）。
+  const [debugUpdatesOpen,setDebugUpdatesOpen]=useState(false);
+  const [nowTick,setNowTick]=useState(Date.now());
+  useEffect(()=>{const id=setInterval(()=>setNowTick(Date.now()),1000);return()=>clearInterval(id);},[]);
+  const prevQuoteFetchedAtRef=useRef({});
+  const [lastPollStats,setLastPollStats]=useState(null); // {at, updated, total}
+  useEffect(()=>{
+    if(!items.length)return;
+    const prev=prevQuoteFetchedAtRef.current;
+    let updated=0;
+    const next={};
+    items.forEach(it=>{
+      const fa=stockQuotes[it.code]?.quoteFetchedAt||null;
+      next[it.code]=fa;
+      if(fa&&fa!==prev[it.code])updated++;
+    });
+    prevQuoteFetchedAtRef.current=next;
+    // 初回マウント直後（prevが空）は「全件が新規」になり無意味なので記録しない
+    if(Object.keys(prev).length>0){
+      const stat={at:Date.now(),updated,total:items.length};
+      setLastPollStats(stat);
+      console.log(`[監視銘柄更新] ${new Date(stat.at).toLocaleTimeString("ja-JP")} updated ${updated}/${items.length}`);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[stockQuotes,items.length]);
+  const DEBUG_WATCH_CODES=["6753","8001","9532","9432","9434"];
+  const lastAnyQuoteAt=useMemo(()=>{
+    let max=null;
+    items.forEach(it=>{
+      const fa=stockQuotes[it.code]?.quoteFetchedAt;
+      if(!fa)return;
+      const t=new Date(fa).getTime();
+      if(!max||t>max)max=t;
+    });
+    return max;
+  },[items,stockQuotes]);
+  const secondsSinceLastQuote=lastAnyQuoteAt?Math.round((nowTick-lastAnyQuoteAt)/1000):null;
+  // Phase QF-1（2026-09-14）指示書11番：LIVE(0-45秒)/DELAYED(46-90秒)/STALE(91秒以上)の
+  // 初期基準。市場時間外は「昼休み・引け後で約定が動かないだけ」を更新停止と誤判定しないよう、
+  // STALE扱いにしない（データ遅延の注記のみに留める）。
+  const updateStatusLabel=(()=>{
+    if(secondsSinceLastQuote==null)return {text:"取得中…",color:"var(--inkSoft)"};
+    const hhmmss=new Date(lastAnyQuoteAt).toLocaleTimeString("ja-JP");
+    if(secondsSinceLastQuote<45)return {text:`最終更新 ${hhmmss} LIVE`,color:"var(--inkSoft)"};
+    if(secondsSinceLastQuote<90)return {text:`最終更新 ${hhmmss}（DELAYED・${secondsSinceLastQuote}秒前）`,color:"var(--warn)"};
+    if(!isJstMarketHours())return {text:`最終更新 ${hhmmss}（市場時間外・${secondsSinceLastQuote}秒前）`,color:"var(--inkSoft)"};
+    // 注：ここは値の上昇/下落ではなく「更新が止まっている」という警告色のため、
+    // 日本の相場慣習配色（--up=赤/--down=緑）ではなく固定の赤を使う（混同防止）。
+    return {text:`⚠ STALE：最終更新 ${hhmmss}（${secondsSinceLastQuote}秒前）`,color:"#c62828"};
+  })();
   const pctOf=(code)=>{const qt=stockQuotes[code]||{};const t=num(qt.t),p=num(qt.p);
     return (t!=null&&p!=null&&p)?(t-p)/p*100:null;};
 
@@ -4976,7 +5035,39 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         title="「日本市場」タブの「監視銘柄」ボタン、または出来高ブレイクアウト条件（直近3か月高値を出来高1.5倍以上で上抜け）への自動該当で追加されます（日本市場のみ対象）。Status・RS Scoreは日経平均・所属セクター平均との当日騰落率の差から簡易算出（詳しい分析は「分析」ボタンから）。">？</span>
       {consultMsg && <span style={{fontSize:12,color:"var(--accent)",fontWeight:700}}>{consultMsg}</span>}
       {recordMsg && <span style={{fontSize:12,color:"var(--accent)",fontWeight:700}}>{recordMsg}</span>}
+      {/* 2026-09-14新規：この一覧が実際に更新され続けているかをその場で確認できる表示
+          （調査依頼：バックエンドが動いていることではなく、ユーザーが見る画面に表示されること）。 */}
+      <span style={{fontSize:11,color:updateStatusLabel.color}}>{updateStatusLabel.text}</span>
+      {lastPollStats && <span style={{fontSize:11,color:"var(--inkFaint)"}}>（前回poll：{lastPollStats.updated}/{lastPollStats.total}件更新）</span>}
+      <button className="ghost" style={{fontSize:10,padding:"1px 6px"}} onClick={()=>setDebugUpdatesOpen(v=>!v)}>🔧 更新デバッグ {debugUpdatesOpen?"▲":"▼"}</button>
     </div>
+
+    {debugUpdatesOpen && <div style={{fontSize:11,background:"var(--panelAlt,#f5f5f5)",border:"1px solid var(--rule)",borderRadius:6,padding:"6px 10px",marginTop:4,marginBottom:8}}>
+      <div style={{fontWeight:700,marginBottom:4}}>指定5銘柄の更新状況（quoteFetchedAt＝frontend stateが最後に新しい値を受け取った時刻）</div>
+      {lastFastQuoteStats && <div style={{marginBottom:4,color:"var(--inkSoft)"}}>
+        前回FAST poll：requested={lastFastQuoteStats.requested} tachibana={lastFastQuoteStats.tachibana} fallback_cache={lastFastQuoteStats.fallback_cache} fallback_yf={lastFastQuoteStats.fallback_yf} failed={lastFastQuoteStats.failed} ({lastFastQuoteStats.duration_ms}ms)
+      </div>}
+      <table style={{width:"100%",borderCollapse:"collapse"}}><tbody>
+        {DEBUG_WATCH_CODES.map(code=>{
+          const it=items.find(w=>w.code===code);
+          const q=stockQuotes[code];
+          const fa=q?.quoteFetchedAt?new Date(q.quoteFetchedAt):null;
+          const ago=fa?Math.round((nowTick-fa.getTime())/1000):null;
+          return <tr key={code} style={{borderTop:"1px solid var(--rule)"}}>
+            <td style={{padding:"2px 6px"}}>{code}</td>
+            <td style={{padding:"2px 6px"}}>{it?.name||"(監視対象外)"}</td>
+            <td style={{padding:"2px 6px"}}>{q?.t??"—"}</td>
+            {/* Phase QF-1新規：source（TACHIBANA/cache/yfinance_fallback）をデバッグ表示 */}
+            <td style={{padding:"2px 6px",fontWeight:700,color:q?.source==="tachibana"?"#2e7d32":q?.source?"var(--warn)":undefined}}>
+              {q?.source?q.source.toUpperCase():"—"}</td>
+            <td style={{padding:"2px 6px"}}>{fa?fa.toLocaleTimeString("ja-JP"):"未取得"}</td>
+            {/* 注：これは値の上昇/下落ではなく「新鮮さ」の表示のため、相場配色（--up/--down）は使わない */}
+            <td style={{padding:"2px 6px",color:ago==null?undefined:ago<45?"#2e7d32":ago<90?"var(--warn)":(isJstMarketHours()?"#c62828":"var(--inkSoft)")}}>
+              {ago==null?"—":`${ago}秒前`}</td>
+          </tr>;
+        })}
+      </tbody></table>
+    </div>}
 
     {/* 2026-09-09新規（日次投資レビュー、指示書21番）：朝一チェックの入口となるこのタブの
         最上部に「昨日までの反省」を表示する。監視銘柄タブは実質的な朝一チェック画面のため
@@ -5022,7 +5113,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
               {/* v3-9続き（PHASE 7 MOBILE/PWA・STEP1監査で発見）：flex:1のreason要素は
                   デフォルトのmin-width:autoにより、狭い画面で他の固定幅要素を押しのけて
                   横スクロールを発生させていた。flexWrap+minWidth:0で折り返し・省略を機能させる。 */}
-              return <div key={w.code} onClick={()=>onOpenAnalysis(w.code)}
+              return <div key={w.code} onClick={()=>onOpenAnalysis(w.code,w.market)}
                 style={{display:"flex",alignItems:"center",gap:10,padding:"7px 8px",borderRadius:4,cursor:"pointer",
                   background:"var(--bg)",border:w.isResilienceException?"1px solid var(--accent)":"1px solid var(--rule)",flexWrap:"wrap"}}
                 title="クリックでトレード分析へ">
@@ -5478,7 +5569,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                 <button className="watch-menu-btn" onClick={e=>{e.stopPropagation();setOpenMenuFor(v=>v===w.code?null:w.code);}}>⋮</button>
                 {openMenuFor===w.code && <div className="watch-menu" onClick={e=>e.stopPropagation()}>
                   <button onClick={()=>{onOpenChart(w);setOpenMenuFor(null);}}>チャート</button>
-                  <button className={inAnalysis?"on":""} onClick={()=>{onToggleAnalysis(w.code);setOpenMenuFor(null);}}>{inAnalysis?"✓ 分析中":"分析"}</button>
+                  <button className={inAnalysis?"on":""} onClick={()=>{onToggleAnalysis(w.code,w.market);setOpenMenuFor(null);}}>{inAnalysis?"✓ 分析中":"分析"}</button>
                   {w.market==="JP" && <button className={inEarnings?"on":""} onClick={()=>{onToggleEarnings(w.code);setOpenMenuFor(null);}}>{inEarnings?"✓ 決算":"決算"}</button>}
                   <div style={{padding:"6px 12px",display:"flex",gap:4,alignItems:"center"}}>
                     <select value={candidateStatusPick[w.code]||"WATCH"} onChange={e=>setCandidateStatusPick(p=>({...p,[w.code]:e.target.value}))}
@@ -5550,7 +5641,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                 {reasonList.length>0 && <div>{actionMeta.label}理由：{reasonList.filter(Boolean).join("・")}</div>}
                 <div style={{display:"flex",gap:10,flexWrap:"wrap",marginTop:4}}>
                   <button className="action-btn" onClick={()=>onOpenChart(w)}>チャート</button>
-                  <button className={"action-btn"+(inAnalysis?" on":"")} onClick={()=>onToggleAnalysis(w.code)}>{inAnalysis?"✓ 分析中":"分析"}</button>
+                  <button className={"action-btn"+(inAnalysis?" on":"")} onClick={()=>onToggleAnalysis(w.code,w.market)}>{inAnalysis?"✓ 分析中":"分析"}</button>
                   <button className="action-btn" onClick={()=>onRemove(w.code)}>監視解除</button>
                 </div>
               </div>}
@@ -9896,6 +9987,9 @@ function App(){
   const [monitorMsg,setMonitorMsg]=useState("");
   const [jpFetching,setJpFetching]=useState(false);
   const [jpMsg,setJpMsg]=useState("");
+  // Phase QF-1新規：FAST QUOTE経路の直近poll統計（requested/tachibana/fallback_cache/
+  // fallback_yf/failed/duration_ms）。デバッグ表示用。
+  const [lastFastQuoteStats,setLastFastQuoteStats]=useState(null);
   const [usFetching,setUsFetching]=useState(false);
   const [usMsg,setUsMsg]=useState("");
 
@@ -9953,6 +10047,14 @@ function App(){
   // 前回の取得が終わる前に次の取得が二重・三重に走ってメモリを食い潰していたのが主因と判明。
   // 実行中フラグで多重起動を防ぐ（ローカル/LANでも無駄なリクエスト重複を避けられるため常時有効）。
   const monitorFetchingRef=useRef(false);
+  // 2026-09-14修正（監視銘柄pollの実効間隔改善）：以前はここで登録銘柄281件（JP全体）を
+  // 毎回まとめて取得しており、立花証券API上書き込みまで含め1回あたり約17秒かかっていた。
+  // 30秒間隔のsetIntervalに対し、前回取得が終わる前に次が来ると多重起動防止ガード
+  // （monitorFetchingRef）でスキップされるため、実効更新間隔が76〜147秒まで伸びる
+  // 不具合の原因だった。「監視銘柄」タブで実際に見る56銘柄（s.watchTargets、TOP5/
+  // ENTRY READYもこの中から算出される）だけを優先して毎30秒取得するよう分離し、
+  // 残り約225銘柄（「市場」タブの全銘柄一覧表示用）はfetchRestOfWatchlist（下記、
+  // 90秒間隔の別ループ）に任せる。
   const fetchMonitorAndJP=async()=>{
     if(monitorFetchingRef.current)return;
     monitorFetchingRef.current=true;
@@ -9984,6 +10086,27 @@ function App(){
     }catch(e){}
     setMonitorFetching(false);setJpFetching(false);
     monitorFetchingRef.current=false;
+  };
+  // 2026-09-14新規：監視銘柄（優先）以外の登録銘柄（「市場」タブの一覧表示用）を
+  // 90秒間隔で別途更新する。監視銘柄の更新とAPI呼び出しが重ならないよう独立したガードを持つ
+  // （rate limit悪化を避けるため、対象範囲を分けるだけで呼び出し頻度・並列数は増やさない）。
+  const restFetchingRef=useRef(false);
+  const fetchRestOfWatchlist=async()=>{
+    if(restFetchingRef.current||monitorFetchingRef.current)return;
+    restFetchingRef.current=true;
+    try{
+      const rest=sRef.current.watchlist.filter(w=>!sRef.current.watchTargets.includes(w.code));
+      if(rest.length){
+        const r=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(rest)});
+        if(r.ok){
+          const d=await r.json();
+          const stampedAt=new Date().toISOString();
+          const stamped=Object.fromEntries(Object.entries(d.quotes||{}).map(([k,v])=>[k,{...v,quoteFetchedAt:stampedAt}]));
+          setS(p=>({...p,stockQuotes:{...p.stockQuotes,...stamped}}));
+        }
+      }
+    }catch(e){}
+    restFetchingRef.current=false;
   };
 
   // アメリカ市場（登録銘柄の現在値）は朝6時（日本時間・端末時刻基準）に1日1回だけ自動更新する。
@@ -10020,6 +10143,14 @@ function App(){
     fetchMonitorAndJP();
     const id=setInterval(fetchMonitorAndJP,30*1000);
     return ()=>clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
+  // 2026-09-14新規：残り銘柄（監視銘柄以外）の低頻度ループ。優先ループの初回取得と
+  // 重ならないよう少し遅らせて開始する。
+  useEffect(()=>{
+    const startId=setTimeout(fetchRestOfWatchlist,15*1000);
+    const id=setInterval(fetchRestOfWatchlist,90*1000);
+    return ()=>{clearTimeout(startId);clearInterval(id);};
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
 
@@ -10369,7 +10500,47 @@ function App(){
 
   // 12章：分析タブの対象銘柄（日本市場・アメリカ市場どちらの登録銘柄からも追加され得る）
   const allWatch=useMemo(()=>[...s.watchlist,...s.watchlistUS],[s.watchlist,s.watchlistUS]);
-  const analysisItems=useMemo(()=>s.analysisTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean),[s.analysisTargets,allWatch]);
+  // 2026-09-14新規（トレード分析STALE不具合修正）：分析対象の銘柄が監視銘柄一覧から
+  // 削除・非表示化された後もallWatch.find()に失敗して自動更新の対象から静かに脱落しない
+  // ようにする（3日以上STALEのまま放置されていた不具合の直接原因）。allWatchに見つかれば
+  // それを優先し（最新のname/sector等を反映できるため）、無ければanalysisTargetMarkets
+  // （追加時に記録したmarket）またはanalysisData（前回分析結果のname）でフォールバックする。
+  const resolveAnalysisItem=useCallback((code)=>{
+    const found=allWatch.find(w=>w.code===code);
+    if(found)return found;
+    return {code,market:s.analysisTargetMarkets[code]||"JP",name:s.analysisData[code]?.name||code};
+  },[allWatch,s.analysisTargetMarkets,s.analysisData]);
+  const analysisItems=useMemo(()=>s.analysisTargets.map(resolveAnalysisItem),[s.analysisTargets,resolveAnalysisItem]);
+  // 2026-09-14新規（トレード分析STALE不具合修正・可視化）：分析タブ上部に「取得時刻・鮮度・
+  // 更新状態」を表示するための集計。個別カードのFreshnessBadge（1件ずつ）とは別に、
+  // タブ全体としてひと目で分かるサマリーを出す。
+  const [analysisNowTick,setAnalysisNowTick]=useState(Date.now());
+  useEffect(()=>{if(tab!=="analysis")return;const id=setInterval(()=>setAnalysisNowTick(Date.now()),1000);return()=>clearInterval(id);},[tab]);
+  const analysisFreshnessSummary=useMemo(()=>{
+    if(!analysisItems.length)return null;
+    let oldestIso=null,failedCount=0,refreshingCount=0;
+    analysisItems.forEach(w=>{
+      const a=s.analysisData[w.code];
+      if(!a){failedCount++;return;}
+      if(a._refreshFailed)failedCount++;
+      if(a._refreshing)refreshingCount++;
+      if(a._fetchedAtIso){
+        if(!oldestIso||a._fetchedAtIso<oldestIso)oldestIso=a._fetchedAtIso;
+      }else failedCount++;
+    });
+    return {oldestIso,failedCount,refreshingCount,total:analysisItems.length};
+  },[analysisItems,s.analysisData]);
+  const analysisStatusLabel=(()=>{
+    if(!analysisFreshnessSummary)return null;
+    const {oldestIso,failedCount,refreshingCount,total}=analysisFreshnessSummary;
+    if(refreshingCount>0)return {text:`取得中…（${refreshingCount}/${total}件）`,color:"var(--inkSoft)"};
+    if(!oldestIso)return {text:"未取得",color:"#c62828"};
+    const ageMin=(analysisNowTick-new Date(oldestIso).getTime())/60000;
+    const hhmmss=new Date(oldestIso).toLocaleTimeString("ja-JP");
+    if(failedCount>0)return {text:`⚠ 更新失敗あり（${failedCount}/${total}件）・最古取得 ${hhmmss}`,color:"#c62828"};
+    if(ageMin<=ANALYSIS_STALE_MINUTES)return {text:`最終取得 ${hhmmss}（最も古いカード基準）`,color:"var(--inkSoft)"};
+    return {text:`⚠ STALE：最も古いカードが${Math.round(ageMin)}分前（${hhmmss}取得）`,color:"var(--warn)"};
+  })();
   // v3-6 Step1（銘柄分析画面のStatus統合）：監視銘柄タブと全く同じcomputeEnrichedWatch()を
   // 分析対象銘柄にも適用し、Primary Status／Action Statusを二重ロジックにせず共有する
   // （「一覧ではHOT+WAIT、分析画面では別判定」という矛盾を防ぐ）。code→enrichWatchRow結果のMap。
@@ -10548,7 +10719,15 @@ function App(){
     const tick=()=>{
       if(cancelled)return;
       const ad=sRef.current.analysisData;
-      const targets=sRef.current.analysisTargets.map(code=>allWatch.find(w=>w.code===code)).filter(Boolean).filter(w=>{
+      // sRef.current経由でその時点の最新watchlist/analysisTargetMarketsを見る（このeffect自体は
+      // [tab]依存で固定のクロージャのため、allWatchを直接使うと初回マウント時点のまま古くなる）。
+      // allWatchに見つからない銘柄（監視銘柄から削除済み等）も、記録済みmarketで
+      // フォールバックして対象から脱落させない（2026-09-14修正：STALE不具合の原因）。
+      const freshAllWatch=[...sRef.current.watchlist,...sRef.current.watchlistUS];
+      const targets=sRef.current.analysisTargets.map(code=>
+        freshAllWatch.find(w=>w.code===code) ||
+        {code,market:sRef.current.analysisTargetMarkets[code]||"JP",name:ad[code]?.name||code}
+      ).filter(w=>{
         const a=ad[w.code];
         return !a||!a._refreshing;
       });
@@ -10794,17 +10973,19 @@ function App(){
 
   // 5章：「分析」ボタン。押すたびに分析タブ（12章）の対象銘柄リストに追加/削除をトグルし、
   // 追加・削除いずれの場合も結果をすぐ確認できるよう「分析」タブに遷移する。
-  const toggleAnalysisTarget=(code)=>{
+  const toggleAnalysisTarget=(code,market)=>{
     setS(p=>({...p,analysisTargets:p.analysisTargets.includes(code)
-      ?p.analysisTargets.filter(c=>c!==code):[...p.analysisTargets,code]}));
+      ?p.analysisTargets.filter(c=>c!==code):[...p.analysisTargets,code],
+      analysisTargetMarkets:market?{...p.analysisTargetMarkets,[code]:market}:p.analysisTargetMarkets}));
     setTab("analysis");
   };
 
   // v3-4（今日の注目TOP5バナー用）：toggleAnalysisTargetは既に分析対象の銘柄を押すと
   // 「外して」しまう（トグル）ため、TOP5バナーのクリックには使えない。追加専用＋遷移のみ行う
   // ラッパーを別途用意する（analysisTargetsへの追加ロジック自体はtoggleAnalysisTargetと同じ）。
-  const openAnalysisFor=(code)=>{
-    setS(p=>({...p,analysisTargets:p.analysisTargets.includes(code)?p.analysisTargets:[...p.analysisTargets,code]}));
+  const openAnalysisFor=(code,market)=>{
+    setS(p=>({...p,analysisTargets:p.analysisTargets.includes(code)?p.analysisTargets:[...p.analysisTargets,code],
+      analysisTargetMarkets:market?{...p.analysisTargetMarkets,[code]:market}:p.analysisTargetMarkets}));
     setTab("analysis");
   };
 
@@ -11729,6 +11910,9 @@ function App(){
           {analysisEntering
             ? <span style={{fontSize:11,color:"var(--inkSoft)",fontWeight:700}}>🔄 現在値・市場指標を最新化しています…</span>
             : analyzing && <span style={{fontSize:11,color:"var(--inkSoft)"}}>取得中…</span>}
+          {/* 2026-09-14新規：STALE不具合調査依頼への対応。監視銘柄タブと同様に、このタブ全体の
+              取得時刻・鮮度・更新状態をひと目で確認できるようにする。 */}
+          {analysisStatusLabel && <span style={{fontSize:11,color:analysisStatusLabel.color}}>{analysisStatusLabel.text}</span>}
         </div>
         {/* 12-2章：免責表示（必須・断定的表現を避ける）。2026-09-08 UI整理：常時表示の長文から
             1行へ短縮（削除はしない＝過去に「必須」指定された表示のため）。 */}
@@ -11764,7 +11948,7 @@ function App(){
                         {a && <button className="action-btn" title="FAST（現在値・ENTRY条件）+HEAVY（詳細分析）を今すぐ強制的に完全更新する" onClick={()=>forceFullRefresh(w)} disabled={a._refreshing}>{a._refreshing?"更新中…":"🔄 今すぐ更新"}</button>}
                         {a && <button className="action-btn" onClick={()=>copyAnalysisConsult(w,a)}>🤖 詳細分析を相談</button>}
                         {a && <button className="action-btn" onClick={()=>openJournalDraft(w,a)}>記録に追加</button>}
-                        <button className="iconbtn" title="分析対象から外す" onClick={()=>toggleAnalysisTarget(w.code)}>×</button>
+                        <button className="iconbtn" title="分析対象から外す" onClick={()=>toggleAnalysisTarget(w.code,w.market)}>×</button>
                       </div>
                     </div>
                     {showTransition && <div style={{fontSize:11.5,fontWeight:700,color:transition.text==="RISKへ変化"?"var(--down)":"var(--up)",background:transition.text==="RISKへ変化"?"var(--downBg)":"var(--upBg)",border:`1px solid ${transition.text==="RISKへ変化"?"var(--down)":"var(--up)"}`,borderRadius:4,padding:"4px 8px",marginBottom:6}}>
