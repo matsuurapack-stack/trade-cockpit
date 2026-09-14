@@ -3827,34 +3827,63 @@ X_SOCIAL_SOURCE_PLATFORM = "X"
 # にこそく（MARKET_COMMENTARY）向けロジックはそのまま維持する（指示書2・4番「後方互換」）。
 # ============================================================
 
-SOURCE_TYPES = ("MARKET_COMMENTARY", "PREDICTION_MARKET", "STOCK_BREAKING", "CORPORATE_BREAKING")
+SOURCE_TYPES = ("MARKET_COMMENTARY", "PREDICTION_MARKET", "STOCK_BREAKING", "CORPORATE_BREAKING", "NEWS_MEDIA")
 
 # 指示書1・13番：初期登録する4source。DBのmarket_sources行が既にあれば上書きしない
 # （ensure_market_sourceの既存方針を継続）——ここはあくまで「初回の種」。intervalは
 # rate limit優先で設定可能にする（指示書1番「intervalは設定可能にする」）。
+# 2026-09-15追加（X Intelligence Phase1、指示書「正式指定7アカウント」）：日本経済新聞・
+# Reuters Japan・Bloomberg Japanの公式Xアカウント3件を追加。この3者は個人発信ではなく
+# 報道機関の公式発信のため新設のNEWS_MEDIA種別とする（他の個人発信4者とは信頼度の
+# 重み付けを分ける前提、指示書の重み付けルール「一次情報/公式 > Reuters/Bloomberg/日経 >
+# 個人発信」に対応する土台）。既存4source（にこそく/Polymarket Japan/KGB/ありゃりゃ）の
+# 設定値・ロジックは一切変更しない。
 MARKET_SOURCE_CONFIGS = [
     {"handle": "nicosokufx", "display_name": "にこそく", "priority": "HIGH", "source_type": "MARKET_COMMENTARY",
      "poll_interval_market_sec": 240, "poll_interval_off_sec": 750,
      "categories": ["JP_MARKET", "MACRO"],
      "strengths": ["macro", "sectors", "technical", "events"],
      "evaluation_modes": ["prediction_accuracy"]},
+    {"handle": "nikkei", "display_name": "日本経済新聞", "priority": "HIGH", "source_type": "NEWS_MEDIA",
+     "poll_interval_market_sec": 300, "poll_interval_off_sec": 900,
+     "categories": ["JP_MARKET", "MACRO", "CORPORATE_NEWS"],
+     "strengths": ["jp_market_news", "monetary_policy", "fx", "corporate_news", "sector_trends"],
+     "evaluation_modes": ["primary_source_accuracy"]},
     {"handle": "polymarketjapan", "display_name": "Polymarket Japan", "priority": "HIGH",
      "source_type": "PREDICTION_MARKET", "poll_interval_market_sec": 300, "poll_interval_off_sec": 600,
      "categories": ["PREDICTION_MARKET", "MACRO"],
      "strengths": ["prediction_probability", "politics", "macro_events"],
      "evaluation_modes": ["calibration", "probability_movement"]},
-    {"handle": "kgbukabu", "display_name": "急騰", "priority": "HIGH", "source_type": "STOCK_BREAKING",
-     "poll_interval_market_sec": 180, "poll_interval_off_sec": 600,
-     "categories": ["JP_STOCK", "BREAKING"],
-     "strengths": ["stock_breaking", "momentum", "catalysts"],
-     "evaluation_modes": ["timeliness", "subsequent_price_movement"]},
     {"handle": "aryarya", "display_name": "ありゃりゃ", "priority": "HIGH", "source_type": "CORPORATE_BREAKING",
      "poll_interval_market_sec": 180, "poll_interval_off_sec": 600,
      "categories": ["JP_STOCK", "DISCLOSURE"],
      "strengths": ["corporate_breaking", "disclosure_discovery", "policy"],
      "evaluation_modes": ["discovery_speed", "primary_source_accuracy"]},
+    {"handle": "kgbukabu", "display_name": "KGB", "priority": "HIGH", "source_type": "STOCK_BREAKING",
+     "poll_interval_market_sec": 180, "poll_interval_off_sec": 600,
+     "categories": ["JP_STOCK", "BREAKING"],
+     "strengths": ["stock_breaking", "momentum", "catalysts"],
+     "evaluation_modes": ["timeliness", "subsequent_price_movement"]},
+    {"handle": "reutersjapan", "display_name": "Reuters Japan", "priority": "HIGH", "source_type": "NEWS_MEDIA",
+     "poll_interval_market_sec": 300, "poll_interval_off_sec": 900,
+     "categories": ["MACRO", "GEOPOLITICS", "FX"],
+     "strengths": ["global_macro", "monetary_policy", "geopolitics", "fx", "market_breaking"],
+     "evaluation_modes": ["primary_source_accuracy"]},
+    {"handle": "bloombergjapan", "display_name": "Bloomberg Japan", "priority": "HIGH", "source_type": "NEWS_MEDIA",
+     "poll_interval_market_sec": 300, "poll_interval_off_sec": 900,
+     "categories": ["MACRO", "CENTRAL_BANK", "FX"],
+     "strengths": ["financial_markets", "rates", "fx", "central_banks", "global_macro", "corporate_news"],
+     "evaluation_modes": ["primary_source_accuracy"]},
 ]
 MARKET_SOURCE_BY_HANDLE = {c["handle"]: c for c in MARKET_SOURCE_CONFIGS}
+# 指示書「重み付けの考え方」：FACTの信頼度は 一次情報/公式 > Reuters/Bloomberg/日経 > 個人発信。
+# NEWS_MEDIA（報道機関の公式発信）はPREDICTION_MARKET/個人発信系（MARKET_COMMENTARY・
+# STOCK_BREAKING・CORPORATE_BREAKING）より高い既定信頼度を持つ、という重み付けの土台として
+# 参照用の数値を定義する（既存の的中率評価等は変更しない、あくまで新規参照値）。
+MARKET_SOURCE_TYPE_TRUST_WEIGHT = {
+    "NEWS_MEDIA": 3, "PREDICTION_MARKET": 2, "STOCK_BREAKING": 1,
+    "CORPORATE_BREAKING": 1, "MARKET_COMMENTARY": 1,
+}
 
 
 # ---- source_type別の一次情報リンク判定・投稿分類（指示書11・12番） ----
@@ -4135,12 +4164,20 @@ def _detect_social_post_mentions(database_url, user_id, text):
     return result
 
 
-def _detect_events_from_social_text(text, posted_at_date):
+def _detect_events_from_social_text(text, posted_at_date, source_handle=None, source_display_name=None,
+                                     post_id=None, post_url=None):
     """指示書8番：投稿本文から将来イベント候補を検出する（M/D＋イベント種別キーワード）。
-    確定登録はせずdraft（source='nicosoku_x', verification_status='UNVERIFIED'）として返す。
-    呼び出し側でinvestment_db.import_market_eventsへ渡す前に重複チェックを行う。"""
+    確定登録はせずdraft（verification_status='UNVERIFIED'）として返す。呼び出し側で
+    investment_db.import_market_eventsへ渡す前に重複チェックを行う。
+    2026-09-15更新（X Intelligence Phase1B）：従来はにこそく専用でsource="nicosoku_x"を
+    固定していたが、複数アカウント対応のためsource_handle等を引数化した（省略時は
+    従来通りnicosokufx相当の表示に倒れる、既存呼び出し元への後方互換）。source_handle・
+    post_id・posted_at相当の情報はraw_payloadへ保持し、Phase3（X由来イベントのsource追跡）
+    で専用列へ昇格させる前段として残す。"""
     if not text:
         return []
+    handle = source_handle or "nicosokufx"
+    display_name = source_display_name or (MARKET_SOURCE_BY_HANDLE.get(handle) or {}).get("display_name") or "にこそく"
     drafts = []
     for m in X_POST_EVENT_DATE_RE.finditer(text):
         month, day, tail = int(m.group(1)), int(m.group(2)), m.group(3)
@@ -4156,12 +4193,149 @@ def _detect_events_from_social_text(text, posted_at_date):
         if event_date < posted_at_date - datetime.timedelta(days=3):
             event_date = datetime.date(year + 1, month, day)  # 年またぎ（12月の投稿で1月のイベント等）
         drafts.append({
-            "event_date": event_date.isoformat(), "title": f"{title}（にこそく投稿より検出）",
+            # 2026-09-15更新（X Intelligence Phase3）：タイトルへ発信者名を埋め込むと
+            # （旧「（にこそく投稿より検出）」）、同じイベントを別アカウントが投稿した場合に
+            # 自然キーUNIQUE(user_id,event_date,title)が一致せず、常に別行になってしまい
+            # 複数source統合ができなかった。汎用の「（X投稿より検出）」へ変更し、発信者の
+            # 識別は専用列（source_handle等）とraw_payload.additional_sourcesへ委ねる。
+            "event_date": event_date.isoformat(), "title": f"{title}（X投稿より検出）",
             "event_type": event_type, "importance": "MEDIUM",
-            "source": "nicosoku_x", "source_type": "X_POST", "verification_status": "UNVERIFIED",
-            "raw_payload": {"confidence": "LOW", "detected_text": tail.strip()},
+            "source": f"x:{handle}", "source_type": "X_POST", "verification_status": "UNVERIFIED",
+            "raw_payload": {"confidence": "LOW", "detected_text": tail.strip(), "source_handle": handle,
+                             "source_post_id": post_id, "source_post_url": post_url,
+                             "published_at": posted_at_date.isoformat()},
         })
     return drafts
+
+
+# ============================================================
+# X Intelligence Phase1B（2026-09-15新規）：手動X投稿取り込み経路。
+# 監査（2026-09-14）で判明した問題点：
+#  - X_API_BEARER_TOKEN未設定のため自動取得が0件のまま（Phase1A時点）。
+#  - 既存のSOCIAL_IMAGE_ANALYSIS経路はsocial_market_postsへのUPDATE-onlyで、
+#    対象投稿が事前に存在しない限り保存できなかった（新規X投稿を取り込む手段が無い）。
+# この2点を解消するため、ユーザーがSmart ImportへX投稿のURL・本文・投稿日時・画像解析結果
+# を手動で貼り付けるだけで、既存のsocial_market_postsテーブル・既存カラムへそのまま保存
+# できる経路を追加する（別テーブルは新設しない、既存のX自動取得経路と完全に同じ形の
+# レコードを組み立てて共有する）。
+# ============================================================
+
+X_POST_URL_RE = re.compile(r"(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)/status/(\d+)")
+
+
+def parse_x_post_url(url):
+    """X/Twitter投稿URLから(source_handle, post_id)を抽出する。マッチしなければ(None, None)
+    （不明な値を推測して埋めない、判定不能ならNoneのまま呼び出し側に委ねる）。"""
+    if not url:
+        return None, None
+    m = X_POST_URL_RE.search(url)
+    if not m:
+        return None, None
+    return m.group(1), m.group(2)
+
+
+def _manual_import_post_id(handle, url, text, posted_at_str):
+    """手動投入でpost_id（実際のX投稿ID）を解決できない場合の代替ID。同一入力からは常に
+    同じIDになるUUID5（uuid標準ライブラリのみ使用、新規依存を増やさない）にすることで、
+    同一投稿の再貼り付けによる重複登録を防ぐ（指示書7番）。実際のX post_idではないことが
+    分かるよう"manual:"を付与する。"""
+    basis = f"{handle}|{url or ''}|{text or ''}|{posted_at_str or ''}"
+    return "manual:" + str(uuid.uuid5(uuid.NAMESPACE_URL, basis))
+
+
+def normalize_social_post_import(database_url, user_id, draft, raw_text=None, import_source="unknown"):
+    """Smart Import「X投稿の手動貼り付け」経路（指示書1・2・3・5番）。X_API_BEARER_TOKEN
+    無しでも、投稿URL・source_handle・本文・投稿日時・画像解析結果を受け取り、既存の
+    _build_social_post_record()と同じ形のレコードへ正規化する（自動取得経路と完全に
+    同じテーブル・列を共有し、別スキーマを作らない）。
+    urlからhandleが解決できる場合はそちらを優先せず、明示的なsource_handle指定を優先する
+    （ユーザーが意図的に上書きした場合を尊重する）。
+    戻り値：Noneまたは{"post_record":..., "image_analysis":..., "is_official_source":bool,
+    "resolved_handle":...}。post_record単体でinvestment_db.insert_social_post_if_new()へ
+    そのまま渡せる。"""
+    draft = draft or {}
+    text = draft.get("text") or draft.get("post_text") or ""
+    post_url = draft.get("post_url") or draft.get("url")
+    if not text and not post_url:
+        return None
+    url_handle, url_post_id = parse_x_post_url(post_url)
+    handle = draft.get("source_handle") or url_handle
+    if not handle:
+        return None
+    handle = str(handle).lstrip("@").strip()
+    if not handle:
+        return None
+    post_id = draft.get("post_id") or url_post_id
+
+    posted_at_str = draft.get("posted_at") or draft.get("published_at")
+    posted_at = None
+    if posted_at_str:
+        try:
+            posted_at = datetime.datetime.fromisoformat(str(posted_at_str).replace("Z", "+00:00"))
+        except ValueError:
+            posted_at = None  # 不正な日時は推測せずNoneのまま（指示書「不明な値を推測して埋めない」）
+
+    if not post_id:
+        post_id = _manual_import_post_id(handle, post_url, text, posted_at_str)
+
+    cfg = MARKET_SOURCE_BY_HANDLE.get(handle)
+    is_official = cfg is not None
+    source_name = (cfg or {}).get("display_name") or handle
+    account_type = (cfg or {}).get("source_type") or "MARKET_COMMENTARY"
+
+    categories = _classify_social_post_categories(text)
+    mentions = _detect_social_post_mentions(database_url, user_id, text)
+    try:
+        positions = investment_db.list_portfolio(database_url, user_id) if investment_db else []
+        position_codes = {p.get("code") for p in positions}
+        watchlist = investment_db.list_watchlist(database_url, user_id, market="JP") if investment_db else []
+    except Exception:
+        position_codes, watchlist = set(), []
+    importance = _classify_social_post_importance(text, categories, mentions["direct_mentions"], position_codes)
+    facts, opinions = _split_facts_opinions(text)
+
+    # 画像解析結果（ユーザー/ChatGPT等が目視解析した構造化JSON）があれば、FACTと
+    # 投稿者見解の分離方針を維持したままfacts/author_opinionへ統合する（指示書2番
+    # 「投稿者の意見をFACT扱いしない」を、画像由来の情報にも一貫して適用する）。
+    image_analysis = draft.get("image_analysis") if isinstance(draft.get("image_analysis"), dict) else None
+    if image_analysis:
+        img_facts = image_analysis.get("facts")
+        if isinstance(img_facts, list):
+            facts = facts + [str(x) for x in img_facts if x]
+        img_view = image_analysis.get("author_view") or image_analysis.get("author_opinion")
+        if img_view:
+            opinions = opinions + [str(img_view)]
+
+    prediction_market = extract_prediction_market_data(text) if account_type == "PREDICTION_MARKET" and text else None
+    stock_breaking = extract_stock_breaking_data(text, watchlist=watchlist) if account_type == "STOCK_BREAKING" and text else None
+    corporate_breaking = extract_corporate_breaking_data(text, url=post_url) if account_type == "CORPORATE_BREAKING" and text else None
+    if prediction_market and classify_prediction_market_shift(prediction_market.get("probability_change")):
+        importance = "HIGH" if importance in ("LOW", "MEDIUM") else importance
+
+    urls = re.findall(r"https?://\S+", text)
+    primary_source_url = next((u for u in urls if u != post_url), None)
+    primary_source_type = classify_primary_source_type(primary_source_url) if primary_source_url else None
+    post_classification = classify_post_relay_type(text, bool(urls))
+
+    post_record = {
+        "source_type": "X_MARKET_SOURCE", "source_name": source_name, "source_handle": handle,
+        "post_id": post_id, "posted_at": posted_at.isoformat() if posted_at else None,
+        "text": text, "url": post_url or f"https://x.com/{handle}/status/{post_id}",
+        # 実ファイルは保存しない（指示書「自動OCRは必須ではない」＝画像バイナリ管理は対象外）。
+        # 画像添付の事実自体はmedia_jsonへ簡易メモとして残す（指示書6番の前提「media情報を保持」）。
+        "media": draft.get("media") or ([{"attached": True, "analyzed": True}] if image_analysis else []),
+        "quoted_post": None, "public_metrics": {},
+        "categories": categories, "importance": importance,
+        "facts": facts, "author_opinion": opinions, "system_inference": [],
+        "direct_mentions": mentions["direct_mentions"], "theme_related": mentions["theme_related"],
+        "verification_status": "UNVERIFIED",
+        "post_classification": post_classification, "prediction_market": prediction_market,
+        "stock_breaking": stock_breaking, "corporate_breaking": corporate_breaking,
+        "primary_source_url": primary_source_url, "primary_source_type": primary_source_type,
+        "discovered_via_social": bool(urls),
+    }
+    return {"post_record": post_record, "image_analysis": image_analysis,
+            "is_official_source": is_official, "resolved_handle": handle}
 
 
 # ============================================================
@@ -4228,17 +4402,24 @@ def _resolve_stock_mentions_to_codes(database_url, user_id, mention_names):
     return sorted(codes)
 
 
-def _normalize_image_economic_events(analysis, posted_date):
+def _normalize_image_economic_events(analysis, posted_date, source_handle=None, source_display_name=None,
+                                      post_id=None, post_url=None):
     """analysis中のeconomic_eventsを market_events importable な draft へ変換する
     （文字列「9/10 PPI」形式は既存の_detect_events_from_social_textを再利用、
-    {"date":...,"title":...}形式は直接構築——別ロジックの重複実装を避ける）。"""
+    {"date":...,"title":...}形式は直接構築——別ロジックの重複実装を避ける）。
+    2026-09-15更新（X Intelligence Phase1B）：source_handle等を引数化し、にこそく専用の
+    固定文言から複数アカウント対応へ拡張（省略時は従来通りにこそく相当、後方互換）。"""
+    handle = source_handle or "nicosokufx"
+    display_name = source_display_name or (MARKET_SOURCE_BY_HANDLE.get(handle) or {}).get("display_name") or "にこそく"
     raw = (analysis or {}).get("economic_events") or []
     if not isinstance(raw, list):
         return []
     drafts = []
     for item in raw:
         if isinstance(item, str) and item.strip():
-            drafts.extend(_detect_events_from_social_text(item, posted_date))
+            drafts.extend(_detect_events_from_social_text(item, posted_date, source_handle=handle,
+                                                            source_display_name=display_name,
+                                                            post_id=post_id, post_url=post_url))
         elif isinstance(item, dict) and item.get("title"):
             event_date = posted_date
             date_str = item.get("date")
@@ -4250,10 +4431,15 @@ def _normalize_image_economic_events(analysis, posted_date):
                     except ValueError:
                         event_date = posted_date
             drafts.append({
-                "event_date": event_date.isoformat(), "title": f"{item['title']}（にこそく画像解析より検出）",
+                # 2026-09-15更新（X Intelligence Phase3）：タイトルへ発信者名を埋め込まない
+                # （_detect_events_from_social_textと同じ理由：自然キー一致による複数source
+                # 統合を可能にするため）。
+                "event_date": event_date.isoformat(), "title": f"{item['title']}（X投稿の画像解析より検出）",
                 "event_type": item.get("event_type") or "OTHER", "importance": item.get("importance") or "MEDIUM",
-                "source": "nicosoku_x_image", "source_type": "X_POST_IMAGE", "verification_status": "UNVERIFIED",
-                "raw_payload": {"confidence": "MEDIUM", "detected_from": "image_analysis"},
+                "source": f"x:{handle}", "source_type": "X_POST_IMAGE", "verification_status": "UNVERIFIED",
+                "raw_payload": {"confidence": "MEDIUM", "detected_from": "image_analysis",
+                                 "source_handle": handle, "source_post_id": post_id, "source_post_url": post_url,
+                                 "published_at": posted_date.isoformat()},
             })
     return drafts
 
@@ -6365,6 +6551,34 @@ def _event_title_key(title):
     イベントが既存の公式イベントとおおよそ同じかを見る軽量チェック用（指示書17番
     「重複チェック必須」、完全一致でなくても明らかに同じイベントの二重登録を避ける）。"""
     return re.sub(r"\s+", "", (title or "")).lower()
+
+
+def _filter_fresh_event_drafts(event_drafts, existing_events):
+    """X Intelligence Phase3（2026-09-15新規）：SmartImport側の重複チェック（指示書17番）が、
+    DB側の複数source統合ロジック（_upsert_market_event_conn）と競合しないようにする。
+    従来は(event_date, title_key)だけで「既に存在するので送信しない」と判定していたため、
+    別アカウントが同一(date,title)の同じイベントを投稿しても、SmartImport層で弾かれて
+    import_market_eventsへ届かず、複数source統合（raw_payload.additional_sources）が
+    一度も発動しなかった（実データE2Eで確認した不具合）。
+    source_post_idを持つ（＝X由来の）draftは、既存イベントの(date,title,source_post_id)が
+    完全一致する場合だけ「送信不要」とし、それ以外（別postからの同一(date,title)を含む）は
+    常にimport_market_eventsへ送る——DB側のON CONFLICT UPSERTが実際の重複挿入を防ぎつつ、
+    別sourceならraw_payloadへ追記する。source_post_idを持たない（一般テキスト/手動由来）
+    draftは従来通り(event_date, title_key)のみで判定する（既存動作を変えない）。"""
+    existing_keys_no_source = {(e.get("event_date"), _event_title_key(e.get("title"))) for e in existing_events}
+    existing_keys_with_source = {(e.get("event_date"), _event_title_key(e.get("title")), e.get("source_post_id"))
+                                  for e in existing_events if e.get("source_post_id")}
+    fresh = []
+    for d in event_drafts:
+        source_post_id = (d.get("raw_payload") or {}).get("source_post_id")
+        key = (d["event_date"], _event_title_key(d["title"]))
+        if source_post_id:
+            if (key[0], key[1], source_post_id) in existing_keys_with_source:
+                continue  # 同一投稿がすでに記録済み
+        elif key in existing_keys_no_source:
+            continue  # 従来通り：一般テキスト/手動由来はdate+titleのみで重複判定
+        fresh.append(d)
+    return fresh
 
 
 def _representative_social_signal(database_url, source_handle, post_id):
@@ -13190,6 +13404,29 @@ def _nicosoku_poll_interval_seconds():
     return 240 if "08:00" <= hhmm <= "15:40" else 750  # 4分 / 12.5分
 
 
+def ensure_all_market_sources_registered(database_url):
+    """X Intelligence Phase1（2026-09-15新規）：MARKET_SOURCE_CONFIGSの全source（現在7件）を
+    market_sourcesへ登録する（無ければ作るだけ、既存行は上書きしない、ensure_market_source
+    の既存方針のまま）。X_API_BEARER_TOKEN未設定でも呼べる（登録＝設定の存在確認であり、
+    実際の投稿取得とは独立）。戻り値：{handle: source_row_or_None, ...}。"""
+    if investment_db is None or not database_url:
+        return {}
+    results = {}
+    for cfg in MARKET_SOURCE_CONFIGS:
+        try:
+            results[cfg["handle"]] = investment_db.ensure_market_source(
+                database_url, X_SOCIAL_SOURCE_PLATFORM, cfg["handle"],
+                display_name=cfg.get("display_name"), priority=cfg.get("priority", "HIGH"),
+                categories=cfg.get("categories"), source_type=cfg.get("source_type"),
+                poll_interval_market_sec=cfg.get("poll_interval_market_sec"),
+                poll_interval_off_sec=cfg.get("poll_interval_off_sec"),
+                strengths=cfg.get("strengths"), evaluation_modes=cfg.get("evaluation_modes"))
+        except Exception as e:
+            print("  market_source登録失敗", cfg["handle"], e)
+            results[cfg["handle"]] = None
+    return results
+
+
 def _nicosoku_poll_scheduler_loop():
     """Market Intelligence Phase6（指示書2・29番）：にこそく専用だったこのスケジューラを
     poll_all_market_sources_once()経由の全source対応へ一般化した（関数名・スレッド起動元は
@@ -13197,6 +13434,13 @@ def _nicosoku_poll_scheduler_loop():
     影響しない、指示書19番）。429検出時はexponential backoff（指示書2番）。tickは60秒間隔
     （最短source間隔180秒より十分細かい）、各sourceは自身のpoll_interval_*_secに達した時だけ
     実際にポーリングされる（poll_all_market_sources_once・_source_due_for_poll）。"""
+    # 2026-09-15修正（X Intelligence Phase1、監査で判明した不具合）：従来はトークン未設定時に
+    # ここで即returnしていたため、MARKET_SOURCE_CONFIGSに設定を追加してもmarket_sourcesへ
+    # 一切登録されず（初回起動時の種まきすら行われない）、DB上は最初に登録された1件
+    # （にこそく、旧Phase1〜5の別経路由来）だけが残る実害が実データで確認された。
+    # トークンの有無に関わらず「登録」自体は独立して常に行う（実際の投稿取得はこの後
+    # X_API_BEARER_TOKEN未設定なら従来通り行わない）。
+    ensure_all_market_sources_registered(DATABASE_URL)
     if not X_API_BEARER_TOKEN:
         print("  [Market Intelligence] X_API_BEARER_TOKEN未設定のためポーリングは無効（DEGRADED）")
         return
@@ -16988,14 +17232,16 @@ SMART_IMPORT_CATEGORIES = [  # 指示書2番。将来カテゴリ追加時はこ
 SMART_IMPORT_IMPLEMENTED_CATEGORIES = {
     "CATALYST", "EVENT", "EXPERT_OPINION", "MARKET_ANALYSIS", "MORNING_MARKET_CHECK",
     "INTRADAY_REPORT", "TRADE_RULE", "CHATGPT_LEGACY", "WATCHLIST_UPDATE", "WATCHLIST_MASTER_UPDATE",
-    "POSITION_UPDATE", "SOCIAL_IMAGE_ANALYSIS",
+    "POSITION_UPDATE", "SOCIAL_IMAGE_ANALYSIS", "SOCIAL_POST_IMPORT",
 }
 # 指示書16番（Phase SI-C）：重要操作（TRADE_RULE・WATCHLIST_UPDATEのREMOVE・POSITION_UPDATE
 # 全般）は「安全な項目のみ選択」の対象外とする。POSITION_UPDATEはカテゴリ全体が対象外
 # （指示書6番：HIGH confidenceでも自動保存禁止、常に確認）。SOCIAL_IMAGE_ANALYSISは既存投稿
-# への追記のみ（売買・ルールに直接影響しない）のため安全側に含める。
+# への追記のみ（売買・ルールに直接影響しない）のため安全側に含める。SOCIAL_POST_IMPORT
+# （X Intelligence Phase1B、2026-09-15新規）も同様に売買・ルールへ直接影響しないため含める。
 SMART_IMPORT_SAFE_CATEGORIES_BACKEND = {"CATALYST", "EVENT", "EXPERT_OPINION", "MARKET_ANALYSIS",
-                                          "MORNING_MARKET_CHECK", "INTRADAY_REPORT", "SOCIAL_IMAGE_ANALYSIS"}
+                                          "MORNING_MARKET_CHECK", "INTRADAY_REPORT", "SOCIAL_IMAGE_ANALYSIS",
+                                          "SOCIAL_POST_IMPORT"}
 
 _JSON_CODEBLOCK_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 
@@ -17082,6 +17328,17 @@ def _classify_json_item(item):
         # 2026-09-10新規（にこそく画像解析待ちキュー）：post_idが無い場合は保存できないため
         # confidenceを下げる（他のtype判定と同じ「必須項目が無ければ下げる」方針）。
         return "SOCIAL_IMAGE_ANALYSIS", ("HIGH" if item.get("post_id") else "LOW"), item
+    if t == "social_post_import" or (("post_url" in item or "source_handle" in item) and
+                                       ("text" in item or "post_text" in item)):
+        # 2026-09-15新規（X Intelligence Phase1B）：X_API_BEARER_TOKEN無しでもユーザーが
+        # 投稿URL・本文・投稿日時を手動で貼り付ければsocial_market_postsへ保存できる経路。
+        # source_handle・post_urlのいずれかから発信者を解決できない場合はconfidenceを下げる
+        # （他のtype判定と同じ「必須項目が無ければ下げる」方針）。
+        url_handle, _ = parse_x_post_url(item.get("post_url") or item.get("url"))
+        resolvable_handle = item.get("source_handle") or url_handle
+        text_present = bool(item.get("text") or item.get("post_text"))
+        confidence = "HIGH" if (resolvable_handle and text_present) else "LOW"
+        return "SOCIAL_POST_IMPORT", confidence, item
     if _looks_like_legacy_chatgpt_payload(item):
         return "CHATGPT_LEGACY", "HIGH", item
 
@@ -17104,7 +17361,11 @@ def _classify_json_item(item):
 # 同じ方針）。日付が併記されているかどうかでconfidenceを分ける（指示書21番：勝手に日付を
 # 補完しない、無ければMEDIUM/LOWに留める）。
 _SMART_IMPORT_EVENT_KEYWORDS = ["FOMC", "日銀", "日銀会合", "金融政策決定会合", "CPI", "PPI",
-    "雇用統計", "GDP", "SQ", "MSQ", "決算発表", "決算", "要人発言", "製品発表", "ロックアップ解除"]
+    "雇用統計", "GDP", "小売売上高", "SQ", "MSQ", "決算発表", "決算", "要人発言", "製品発表",
+    "ロックアップ解除"]
+# 2026-09-14追加：「小売売上高」は既存のECONOMIC_EVENT/ECONOMIC/ECONOMIC_INDICATOR
+# キーワード群（他箇所）には既にあったが、Smart ImportのEVENT検出キーワードにだけ
+# 抜けていたため追加（米国の主要経済指標の1つ、他の経済指標語と同じ扱い）。
 _SMART_IMPORT_DATE_PATTERNS = [
     re.compile(r"\d{4}年\d{1,2}月\d{1,2}日"), re.compile(r"\d{1,2}月\d{1,2}日"),
     re.compile(r"\d{1,2}/\d{1,2}"), re.compile(r"今日|明日|明後日|今週|来週|今月|来月"),
@@ -17942,6 +18203,7 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
     watchlist_master_update_results = []
     position_update_results = []
     social_image_analysis_results = []
+    social_post_import_results = []
 
     for c in candidates or []:
         category = c.get("category")
@@ -18169,8 +18431,7 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
                                 existing = investment_db.list_market_events(
                                     database_url, user_id, from_date=posted_date.isoformat(),
                                     to_date=(posted_date + datetime.timedelta(days=120)).isoformat())
-                                existing_keys = {(e.get("event_date"), _event_title_key(e.get("title"))) for e in existing}
-                                fresh = [d for d in event_drafts if (d["event_date"], _event_title_key(d["title"])) not in existing_keys]
+                                fresh = _filter_fresh_event_drafts(event_drafts, existing)
                                 if fresh:
                                     imp = investment_db.import_market_events(database_url, user_id, fresh)
                                     events_imported = imp.get("imported", 0)
@@ -18205,6 +18466,68 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
                     except Exception:
                         pass
                 social_image_analysis_results.append({"ok": False, "reason": str(e), "post_id": fallback_post_id})
+            continue
+
+        if category == "SOCIAL_POST_IMPORT":
+            # X Intelligence Phase1B（2026-09-15新規）：X投稿の手動貼り付け→social_market_posts
+            # 新規INSERT→（画像解析結果があれば）追記→イベント抽出、まで1件で完結させる。
+            # 既存SOCIAL_IMAGE_ANALYSIS（UPDATE-only）と異なり、投稿レコードが存在しなくても
+            # ここで新規作成する（監査で判明した「新規X投稿を取り込む手段が無い」の解消）。
+            try:
+                normalized = normalize_social_post_import(database_url, user_id, draft, raw_text, import_source)
+                if normalized is None:
+                    social_post_import_results.append(
+                        {"ok": False, "reason": "投稿本文または発信者（source_handle/post_url）が不足しています"})
+                else:
+                    post_record = normalized["post_record"]
+                    handle = normalized["resolved_handle"]
+                    saved = investment_db.insert_social_post_if_new(database_url, post_record)
+                    if saved is None:
+                        social_post_import_results.append({
+                            "ok": False, "reason": "既に取り込み済みの投稿です（重複）",
+                            "source_handle": handle, "post_id": post_record["post_id"],
+                            "is_official_source": normalized["is_official_source"]})
+                    else:
+                        # 画像解析結果があれば、既存のUPDATE経路（save_social_post_image_analysis）
+                        # をそのまま再利用する——今このINSERTで投稿自体が確実に存在するため、
+                        # 従来の「対象投稿が見つからない」問題は起きない。
+                        image_analysis = normalized.get("image_analysis")
+                        if image_analysis:
+                            if "confidence" in image_analysis:
+                                image_analysis["confidence"] = _normalize_confidence(image_analysis.get("confidence"))
+                            investment_db.save_social_post_image_analysis(database_url, handle, post_record["post_id"], [image_analysis])
+                        events_imported = 0
+                        try:
+                            posted_at_str = saved.get("posted_at") or post_record.get("posted_at")
+                            posted_date = datetime.datetime.fromisoformat(posted_at_str).date() if posted_at_str else datetime.date.today()
+                            source_cfg = MARKET_SOURCE_BY_HANDLE.get(handle)
+                            display_name = (source_cfg or {}).get("display_name") or handle
+                            event_drafts = _detect_events_from_social_text(
+                                post_record["text"], posted_date, source_handle=handle,
+                                source_display_name=display_name, post_id=post_record["post_id"],
+                                post_url=post_record.get("url"))
+                            if image_analysis:
+                                event_drafts += _normalize_image_economic_events(
+                                    image_analysis, posted_date, source_handle=handle,
+                                    source_display_name=display_name, post_id=post_record["post_id"],
+                                    post_url=post_record.get("url"))
+                            if event_drafts:
+                                existing = investment_db.list_market_events(
+                                    database_url, user_id, from_date=posted_date.isoformat(),
+                                    to_date=(posted_date + datetime.timedelta(days=120)).isoformat())
+                                fresh = _filter_fresh_event_drafts(event_drafts, existing)
+                                if fresh:
+                                    imp = investment_db.import_market_events(database_url, user_id, fresh)
+                                    events_imported = imp.get("imported", 0) + imp.get("updated", 0)
+                        except Exception as e:
+                            print("  SmartImport: 手動X投稿からのイベント検出失敗", e)
+                        social_post_import_results.append({
+                            "ok": True, "source_handle": handle, "post_id": post_record["post_id"],
+                            "is_official_source": normalized["is_official_source"],
+                            "events_imported": events_imported, "has_image_analysis": bool(image_analysis)})
+            except Exception as e:
+                print("  SmartImport: 手動X投稿保存失敗", e)
+                social_post_import_results.append({"ok": False, "reason": str(e)})
             continue
 
     results = {}
@@ -18247,6 +18570,10 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
         results["SOCIAL_IMAGE_ANALYSIS"] = {"imported": sum(1 for r in social_image_analysis_results if r["ok"]),
                                              "skipped": sum(1 for r in social_image_analysis_results if not r["ok"]),
                                              "details": social_image_analysis_results}
+    if social_post_import_results:
+        results["SOCIAL_POST_IMPORT"] = {"imported": sum(1 for r in social_post_import_results if r["ok"]),
+                                          "skipped": sum(1 for r in social_post_import_results if not r["ok"]),
+                                          "details": social_post_import_results}
     return {"results": results, "rejected_low_confidence": rejected, "skipped_unimplemented": skipped_unimplemented,
             "skipped_existing_report": skipped_existing_report}
 

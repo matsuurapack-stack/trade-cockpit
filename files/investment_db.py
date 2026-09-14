@@ -1570,6 +1570,7 @@ def init_schema(database_url):
         conn.execute(_MIGRATE_MORNING_CHECK_SHARED_SCOPE_SQL)
         conn.execute(_SCHEMA_NEWS_NOTIFICATION_LOG_SQL)
         conn.execute(_MIGRATE_MARKET_NEWS_CONTEXT_SQL)
+        conn.execute(_MIGRATE_MARKET_EVENT_SOURCE_TRACKING_SQL)
         conn.commit()
 
 
@@ -9191,8 +9192,20 @@ def list_auto_signal_events(database_url, user_id, code=None, signal_type=None, 
 # upsertする設計にする。
 _MARKET_EVENT_COLS = ["event_time", "timezone", "country", "event_type", "importance",
                        "affected_markets", "affected_sectors", "affected_stocks", "impact_channels",
-                       "source", "source_type", "verification_status", "notes", "raw_payload"]
+                       "source", "source_type", "verification_status", "notes", "raw_payload",
+                       "source_handle", "source_post_id", "source_post_url", "source_published_at"]
 _MARKET_EVENT_JSONB_COLS = {"affected_markets", "affected_sectors", "affected_stocks", "impact_channels", "raw_payload"}
+# X Intelligence Phase3（2026-09-15新規）：X由来イベントのsource追跡専用列。既存の
+# source/source_type（自由記述、"IMAGE|TEXT|MANUAL等"）とは別に、構造化されたX投稿の
+# 出典を追跡する。全てNULL許容——X由来でない既存イベント・一般テキストSmart Import・
+# 手動イベント登録には一切影響しない（指示書4・5番）。
+_MARKET_EVENT_SOURCE_TRACKING_COLS = ("source_handle", "source_post_id", "source_post_url", "source_published_at")
+_MIGRATE_MARKET_EVENT_SOURCE_TRACKING_SQL = """
+ALTER TABLE market_events ADD COLUMN IF NOT EXISTS source_handle TEXT;
+ALTER TABLE market_events ADD COLUMN IF NOT EXISTS source_post_id TEXT;
+ALTER TABLE market_events ADD COLUMN IF NOT EXISTS source_post_url TEXT;
+ALTER TABLE market_events ADD COLUMN IF NOT EXISTS source_published_at TIMESTAMPTZ;
+"""
 
 
 _MARKET_EVENT_IMPORTANCE_LEGACY = {5: "HIGH", 4: "HIGH", 3: "MEDIUM", 2: "LOW", 1: "LOW"}
@@ -9224,6 +9237,23 @@ def _normalize_market_event(ev):
         if legacy_time:
             ev["event_time"] = legacy_time
 
+    # X Intelligence Phase3（2026-09-15新規）：X由来イベント（_detect_events_from_social_text/
+    # _normalize_image_economic_eventsが生成するraw_payload={"source_handle":...,
+    # "source_post_id":...,"source_post_url":...,"published_at":...}）から、専用列へ
+    # 自動的に昇格させる。既にトップレベルキーで明示されていればそちらを優先し上書きしない
+    # （標準形式のキーが既にある場合は変えない、という既存方針を踏襲）。X由来でない
+    # 既存イベント・一般テキストSmart Import・手動イベント登録のraw_payloadにはこれらの
+    # キーが無いため、一切影響しない（列はNULLのまま）。
+    raw_payload_in = ev.get("raw_payload") if isinstance(ev.get("raw_payload"), dict) else {}
+    if not ev.get("source_handle") and raw_payload_in.get("source_handle"):
+        ev["source_handle"] = raw_payload_in["source_handle"]
+    if not ev.get("source_post_id") and raw_payload_in.get("source_post_id"):
+        ev["source_post_id"] = raw_payload_in["source_post_id"]
+    if not ev.get("source_post_url") and raw_payload_in.get("source_post_url"):
+        ev["source_post_url"] = raw_payload_in["source_post_url"]
+    if not ev.get("source_published_at") and raw_payload_in.get("published_at"):
+        ev["source_published_at"] = raw_payload_in["published_at"]
+
     imp = ev.get("importance")
     imp_int = None
     if isinstance(imp, bool):
@@ -9234,6 +9264,14 @@ def _normalize_market_event(ev):
         imp_int = int(imp.strip())
     if imp_int is not None and imp_int in _MARKET_EVENT_IMPORTANCE_LEGACY:
         ev["importance"] = _MARKET_EVENT_IMPORTANCE_LEGACY[imp_int]
+    if not ev.get("importance"):
+        # 2026-09-14追加：スキーマ上はimportance TEXT DEFAULT 'MEDIUM'だが、本番テーブルは
+        # このDEFAULT定義より前から存在しており、INSERT文からimportance列自体を省略した
+        # 場合にDEFAULTが適用されずNULLのまま入る実態が確認された（イベント画面の
+        # HIGH+MEDIUMフィルタで何も表示されない一因）。DBのDEFAULTに依存せず、
+        # ここで明示的にMEDIUMへフォールバックする（値の無いイベントを重要度不明のまま
+        # 埋もれさせない、既存の列DEFAULT意図と同じ既定値）。
+        ev["importance"] = "MEDIUM"
 
     et = ev.get("event_time")
     if et:
@@ -9266,6 +9304,24 @@ def _event_display_title(ev):
     return ev.get("title") or ev.get("event") or None
 
 
+def _merge_market_event_additional_sources(existing_raw_payload, incoming_source):
+    """X Intelligence Phase3（2026-09-15新規）：同一イベント（同一user_id・event_date・title）
+    を別のX投稿source（別アカウントの別post_id）が指しているとき、専用列（source_handle等）
+    は「最初に確定した1件」を保持したまま上書きしない（指示書6番「既存dedupeロジックとの
+    競合を確認する」＝自然キーUNIQUE(user_id,event_date,title)による重複防止と、複数source
+    保持は両立させる必要がある）。2件目以降のsourceはraw_payload.additional_sourcesへ
+    追記し、情報を失わない。同一source_post_idの再取り込み（同じ投稿の再Smart Import）は
+    重複追加しない。戻り値：マージ後のraw_payload dict。"""
+    payload = dict(existing_raw_payload or {})
+    additional = list(payload.get("additional_sources") or [])
+    incoming_post_id = incoming_source.get("source_post_id")
+    if incoming_post_id and any(a.get("source_post_id") == incoming_post_id for a in additional):
+        return payload  # 同一投稿の再取り込み：重複追加しない
+    additional.append(incoming_source)
+    payload["additional_sources"] = additional
+    return payload
+
+
 def _upsert_market_event_conn(conn, user_id, ev):
     """正規化済み（_normalize_market_event適用後）のイベント1件をupsertする。
     event_date・titleが無い場合はNoneを返す（呼び出し側でスキップ扱い）。
@@ -9273,7 +9329,14 @@ def _upsert_market_event_conn(conn, user_id, ev):
     既定の安全側）。戻り値：新規作成ならTrue、既存行の更新ならFalse、保存不可ならNone。
     2026-09-07追加（STEP4：新規/更新の件数を分けて報告できるようにする）：
     `RETURNING (xmax = 0) AS is_insert`は、そのUPSERTが実際にINSERTだったか
-    （ON CONFLICTでのUPDATEではなかったか）をPostgreSQL内部列xmaxから判定する定石。"""
+    （ON CONFLICTでのUPDATEではなかったか）をPostgreSQL内部列xmaxから判定する定石。
+    2026-09-15更新（X Intelligence Phase3）：source_handle/source_post_id/source_post_url/
+    source_published_atは、既存行に既に値がある場合はEXCLUDEDで上書きしない
+    （COALESCE、最初に確定したsourceを保持）。既存行のsource_post_idと今回のsource_post_id
+    が両方あり異なる場合だけ、raw_payload.additional_sourcesへ2件目以降のsourceとして
+    追記する（指示書「同一イベントとして関連付けつつsourceは複数保持可能」）。
+    X由来でない既存イベント（source_post_idが無い）は、この特別扱いに一切該当せず、
+    従来通りraw_payload等がEXCLUDEDで単純上書きされる（後方互換）。"""
     event_date = ev.get("event_date")
     title = ev.get("title")
     if not event_date or not title:
@@ -9292,14 +9355,58 @@ def _upsert_market_event_conn(conn, user_id, ev):
         else:
             values.append(ev.get(c))
     update_cols = [c for c in cols if c not in ("event_date", "title")]
+
+    incoming_post_id = ev.get("source_post_id")
     with conn.cursor(row_factory=dict_row) as cur:
+        # source_post_idを持つ（＝X由来の）イベントだけ、複数source統合のため既存行を
+        # 事前にロックして読む（FOR UPDATEで同時実行時の競合を防ぐ）。X由来でないイベントは
+        # 従来通り単純なINSERT ... ON CONFLICT DO UPDATEのみで済ませ、余計なSELECTを増やさない
+        # （既存の挙動・性能特性を変えない）。
+        existing = None
+        if incoming_post_id:
+            cur.execute(
+                "SELECT source_handle, source_post_id, source_post_url, source_type, "
+                "source_published_at, raw_payload FROM market_events "
+                "WHERE user_id=%s AND event_date=%s AND title=%s FOR UPDATE",
+                [user_id, event_date, title])
+            existing = cur.fetchone()
+
+        # "source"は旧来の自由記述列（例："x:nicosokufx"）で、専用列source_handleと同じ
+        # 「主たる発信者」を指す。複数source統合時にsource_handleだけ既存を維持してsourceが
+        # 新しいEXCLUDEDへ上書きされると、両者が食い違って見える（実データE2Eで発見）ため
+        # 一緒に既存維持する。
+        _first_source_wins_cols = _MARKET_EVENT_SOURCE_TRACKING_COLS + ("source_type", "source")
+        set_clauses = [f"{c} = EXCLUDED.{c}" for c in update_cols if c not in _first_source_wins_cols and c != "raw_payload"]
+        params_extra = []
+        if existing and existing.get("source_post_id") and existing["source_post_id"] != incoming_post_id:
+            # 既に別sourceが確定済み：専用列（source_type含む）は既存を維持し、raw_payloadへ
+            # 今回のsourceを追記する。
+            for c in _first_source_wins_cols:
+                if c in update_cols:
+                    set_clauses.append(f"{c} = market_events.{c}")
+            if "raw_payload" in update_cols:
+                merged_payload = _merge_market_event_additional_sources(
+                    existing.get("raw_payload"),
+                    {"source_handle": ev.get("source_handle"), "source_post_id": ev.get("source_post_id"),
+                     "source_post_url": ev.get("source_post_url"), "source_type": ev.get("source_type"),
+                     "source_published_at": ev.get("source_published_at")})
+                set_clauses.append("raw_payload = %s::jsonb")
+                params_extra.append(json.dumps(merged_payload, ensure_ascii=False))
+        else:
+            # 初回、またはX由来でない、または同一投稿の再取り込み：従来通りEXCLUDEDで上書き。
+            for c in _first_source_wins_cols:
+                if c in update_cols:
+                    set_clauses.append(f"{c} = EXCLUDED.{c}")
+            if "raw_payload" in update_cols:
+                set_clauses.append("raw_payload = EXCLUDED.raw_payload")
+
         cur.execute(
             f"INSERT INTO market_events (user_id, {', '.join(cols)}) "
             f"VALUES (%s, {', '.join(['%s::jsonb' if c in _MARKET_EVENT_JSONB_COLS else '%s' for c in cols])}) "
             f"ON CONFLICT (user_id, event_date, title) DO UPDATE SET "
-            f"{', '.join(c + ' = EXCLUDED.' + c for c in update_cols)}, updated_at = now() "
+            f"{', '.join(set_clauses)}, updated_at = now() "
             f"RETURNING (xmax = 0) AS is_insert",
-            [user_id] + values,
+            [user_id] + values + params_extra,
         )
         row = cur.fetchone()
     return bool(row and row.get("is_insert"))

@@ -24,12 +24,15 @@ class RealSourceValidatorHelperTests(unittest.TestCase):
 
 
 class FourSourceResultStructureTests(unittest.TestCase):
-    """2. four-source result structure（指示書2・3番）"""
+    """2. four-source result structure（指示書2・3番）。
+    2026-09-15更新（X Intelligence Phase1）：正式指定7アカウントへ拡張されたため、
+    従来の4件固定から`server.MARKET_SOURCE_BY_HANDLE`基準の動的検証へ変更
+    （ハードコードした集合が拡張のたびに壊れないようにする）。"""
 
-    def test_all_four_handles_present(self):
+    def test_all_configured_handles_present(self):
         with mock.patch.object(server, "X_API_BEARER_TOKEN", None):
             results = server.validate_market_sources()
-        self.assertEqual(set(results.keys()), {"nicosokufx", "polymarketjapan", "kgbukabu", "aryarya"})
+        self.assertEqual(set(results.keys()), set(server.MARKET_SOURCE_BY_HANDLE.keys()))
 
 
 class ParserAuditStorageTests(unittest.TestCase):
