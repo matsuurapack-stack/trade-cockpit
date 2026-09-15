@@ -6306,12 +6306,67 @@ const POSITION_CHART_POLL_MS=45000; // 5分足データの再取得間隔（yfin
 // 広がった瞬間だけ、赤枠の診断パネルを自動表示する（ユーザーがDevToolsを開かなくても
 // スクリーンショット1枚で必要な情報を送れるようにする）。
 const CHART_OVERFLOW_WATCH_MS=15000;
+const CHART_OVERFLOW_HISTORY_MAX=240; // 15秒×240＝1時間分。read-onlyのサンプル保持のみ（styleは一切変更しない）
+const CHART_OVERFLOW_LOG_KEY="trade-cockpit-chart-overflow-log";
+const CHART_OVERFLOW_LOG_MAX=20; // 直近20回分の検知だけ保持（無限に肥大化させない）
+
+// 2026-09-16追加（ユーザー指示：console/既存diagnosticsへの記録＋関係性の確認）：はみ出し検知時に
+// localStorageへ追記するだけの読み取り専用ヘルパー。既存の永続化パターン（trade-cockpit-v1等）に
+// 合わせてlocalStorageキーを新設（バックエンドへは送らない、フロント単体の診断ログ）。
+function appendChartOverflowLog(entry){
+  try{
+    const raw=localStorage.getItem(CHART_OVERFLOW_LOG_KEY);
+    const list=raw?JSON.parse(raw):[];
+    list.push(entry);
+    while(list.length>CHART_OVERFLOW_LOG_MAX)list.shift();
+    localStorage.setItem(CHART_OVERFLOW_LOG_KEY,JSON.stringify(list));
+  }catch(e){/* localStorage不可時は静かに諦める（診断機能自体が主機能に影響してはならない） */}
+}
+
+// 単純なピアソン相関係数。candle数増加とcanvas/container幅増加の相関確認用（指示書）。
+// 純粋関数・DOM不関与。サンプルが少なすぎる場合はnull（過大解釈を避ける）。
+function pearsonCorrelation(xs,ys){
+  const n=Math.min(xs.length,ys.length);
+  if(n<3)return null;
+  const xs2=xs.slice(-n),ys2=ys.slice(-n);
+  const mean=a=>a.reduce((s,v)=>s+v,0)/a.length;
+  const mx=mean(xs2),my=mean(ys2);
+  let num=0,dx=0,dy=0;
+  for(let i=0;i<n;i++){const a=xs2[i]-mx,b=ys2[i]-my;num+=a*b;dx+=a*a;dy+=b*b;}
+  if(dx===0||dy===0)return null;
+  return Math.round((num/Math.sqrt(dx*dy))*1000)/1000;
+}
+
+// ページ内で最も右へはみ出している要素を特定する（指示書：はみ出し原因の切り分け用）。
+// getBoundingClientRect()は読み取りのみでレイアウトを変更しない（styleへの書き込み無し＝
+// ResizeObserverを誘発しない）。document.body配下全要素を走査するが、はみ出し検知時のみ
+// （15秒おきの通常チェックでは呼ばない）実行するため負荷は許容範囲。
+function findRightmostElement(){
+  let bestEl=null,bestRect=null,bestRight=-Infinity;
+  const all=document.body.querySelectorAll("*");
+  for(let i=0;i<all.length;i++){
+    const el=all[i];
+    const r=el.getBoundingClientRect();
+    if(r.width===0&&r.height===0)continue;
+    if(r.right>bestRight){bestRight=r.right;bestEl=el;bestRect=r;}
+  }
+  if(!bestEl)return null;
+  return {
+    tag:bestEl.tagName,
+    id:bestEl.id||null,
+    className:(typeof bestEl.className==="string"?bestEl.className:(bestEl.className&&bestEl.className.baseVal))||null,
+    rect:{top:Math.round(bestRect.top),left:Math.round(bestRect.left),right:Math.round(bestRect.right),
+          bottom:Math.round(bestRect.bottom),width:Math.round(bestRect.width),height:Math.round(bestRect.height)},
+  };
+}
+
 function PositionIntradayChart({item,currentPrice}){
   const containerRef=useRef(null);
   const apiRef=useRef(null); // {chart,series,volSeries,lines}
   const [msg,setMsg]=useState("読み込み中…");
   const barCountRef=useRef(0);
   const lastAppliedWidthRef=useRef(null);
+  const historyRef=useRef([]); // read-onlyサンプル履歴（15秒毎、直近1時間分）。styleは書かない。
   const [overflowDebug,setOverflowDebug]=useState(null);
 
   // チャート本体の作成・5分足OHLCVの定期取得。item.code/marketが変わった時だけ作り直す。
@@ -6349,22 +6404,71 @@ function PositionIntradayChart({item,currentPrice}){
     const ro=new ResizeObserver(entries=>{const w=entries[0]?.contentRect?.width;if(w){chart.applyOptions({width:Math.floor(w)});lastAppliedWidthRef.current=Math.floor(w);}});
     ro.observe(el);
 
-    // 診断計装：はみ出しが実際に発生した瞬間だけ実測値を残す（通常時は何もしない）。
+    // 診断計装（2026-09-16拡張、ユーザー指示）：15秒おきに読み取り専用のサンプルを履歴へ積む
+    // （style変更なし＝ResizeObserverを誘発しない）。はみ出しを検知した回だけ、履歴から
+    // 傾向（chart width・candle数の時間推移、相関）と「最も右にはみ出している要素」を求めて
+    // console.error＋localStorageへ記録する。
     const overflowCheck=setInterval(()=>{
       if(cancelled)return;
       const docEl=document.documentElement;
+      const canvas=el.querySelector("canvas");
+      const parentEl=el.parentElement;
+      const sample={
+        ts:Date.now(),
+        viewportWidth:window.innerWidth,
+        docScrollWidth:docEl.scrollWidth,
+        containerWidth:Math.round(el.getBoundingClientRect().width),
+        parentWidth:parentEl?Math.round(parentEl.getBoundingClientRect().width):null,
+        canvasWidth:canvas?Math.round(canvas.getBoundingClientRect().width):null,
+        canvasAttrWidth:canvas?canvas.width:null,
+        appliedChartWidth:lastAppliedWidthRef.current,
+        barCount:barCountRef.current,
+      };
+      const hist=historyRef.current;
+      hist.push(sample);
+      while(hist.length>CHART_OVERFLOW_HISTORY_MAX)hist.shift();
+
       if(docEl.scrollWidth>window.innerWidth+4){
-        const canvas=el.querySelector("canvas");
-        setOverflowDebug({
-          at:new Date().toLocaleTimeString("ja-JP"),
-          viewportWidth:window.innerWidth,
-          docScrollWidth:docEl.scrollWidth,
-          containerWidth:Math.round(el.getBoundingClientRect().width),
-          canvasWidth:canvas?Math.round(canvas.getBoundingClientRect().width):null,
-          canvasAttrWidth:canvas?canvas.width:null,
-          appliedChartWidth:lastAppliedWidthRef.current,
-          barCount:barCountRef.current,
-        });
+        // 指示書「lastResizeObserverWidthが時間経過で増加していないか」：履歴内での傾向を見る
+        // （直近と履歴先頭の比較、read-onlyな数値比較のみ）。
+        const widths=hist.map(h=>h.appliedChartWidth).filter(w=>w!=null);
+        let widthTrend="insufficient_history";
+        if(widths.length>=3){
+          const first=widths[0],last=widths[widths.length-1];
+          const monotonicNonDecreasing=widths.every((w,i)=>i===0||w>=widths[i-1]);
+          const monotonicNonIncreasing=widths.every((w,i)=>i===0||w<=widths[i-1]);
+          widthTrend=monotonicNonDecreasing&&last>first?"INCREASING(単調増加)"
+            :monotonicNonIncreasing&&last<first?"DECREASING(単調減少)"
+            :last>first?"NET_INCREASE(増減あるが結果的に増加)"
+            :last<first?"NET_DECREASE(増減あるが結果的に減少)":"FLAT(横ばい)";
+        }
+        // 指示書「candle count増加とcanvas/container幅増加に相関があるか」：ピアソン相関係数。
+        const barCounts=hist.map(h=>h.barCount);
+        const containerWidths=hist.map(h=>h.containerWidth);
+        const canvasWidths=hist.map(h=>h.canvasWidth).filter(w=>w!=null);
+        const corrBarVsContainer=pearsonCorrelation(barCounts,containerWidths);
+        const corrBarVsCanvas=barCounts.length===canvasWidths.length?pearsonCorrelation(barCounts,canvasWidths):null;
+
+        const rightmost=findRightmostElement();
+
+        const diag={
+          at:new Date().toLocaleString("ja-JP"),
+          code:item.code,name:item.name,
+          docOverflow:{value:docEl.scrollWidth>window.innerWidth,docScrollWidth:docEl.scrollWidth,viewportWidth:window.innerWidth},
+          containerOverflowsParent:{value:sample.parentWidth!=null&&sample.containerWidth>sample.parentWidth,containerWidth:sample.containerWidth,parentWidth:sample.parentWidth},
+          canvasOverflowsContainer:{value:sample.canvasWidth!=null&&sample.canvasWidth>sample.containerWidth,canvasWidth:sample.canvasWidth,containerWidth:sample.containerWidth},
+          appliedChartWidth:sample.appliedChartWidth,
+          resizeObserverWidthTrend:widthTrend,
+          resizeObserverWidthHistory:widths,
+          barCount:sample.barCount,
+          correlation_barCount_vs_containerWidth:corrBarVsContainer,
+          correlation_barCount_vs_canvasWidth:corrBarVsCanvas,
+          historySampleCount:hist.length,
+          rightmostElement:rightmost,
+        };
+        console.error("[ChartOverflowDiag]",diag);
+        appendChartOverflowLog(diag);
+        setOverflowDebug(diag);
       }
     },CHART_OVERFLOW_WATCH_MS);
 
@@ -6395,15 +6499,19 @@ function PositionIntradayChart({item,currentPrice}){
   return <div style={{marginTop:8}}>
     {msg && <div style={{fontSize:11,color:"var(--inkFaint)",marginBottom:4}}>{msg}</div>}
     <div ref={containerRef} style={{width:"100%",minHeight:280}}/>
-    {/* 診断計装（2026-09-16新規）：実際にウィンドウより広がった瞬間だけ表示。ユーザーが
-        「そのままスクリーンショットを送る」だけで原因特定に必要な実測値が揃う設計。
+    {/* 診断計装（2026-09-16拡張）：実際にウィンドウより広がった瞬間だけ表示。console.error・
+        localStorage（キー: trade-cockpit-chart-overflow-log）にも同じ内容を記録済みなので、
+        画面のスクリーンショットが撮れない状況でも後から参照できる。
         再現していない間は完全に非表示（既存表示への影響なし）。 */}
     {overflowDebug && <div style={{marginTop:6,padding:"6px 8px",border:"2px solid var(--down)",borderRadius:4,
         background:"var(--card)",fontSize:10.5,color:"var(--down)",fontFamily:"monospace"}}>
-      ⚠ CHART OVERFLOW DETECTED {overflowDebug.at}<br/>
-      viewport={overflowDebug.viewportWidth}px　docScrollWidth={overflowDebug.docScrollWidth}px<br/>
-      container実幅={overflowDebug.containerWidth}px　canvas実幅={overflowDebug.canvasWidth}px（属性width={overflowDebug.canvasAttrWidth}）<br/>
-      chart適用width={overflowDebug.appliedChartWidth}px　バー本数={overflowDebug.barCount}本
+      ⚠ CHART OVERFLOW DETECTED {overflowDebug.at}（consoleとlocalStorageにも記録済み）<br/>
+      doc overflow: {String(overflowDebug.docOverflow.value)}　viewport={overflowDebug.docOverflow.viewportWidth}px　docScrollWidth={overflowDebug.docOverflow.docScrollWidth}px<br/>
+      container&gt;parent: {String(overflowDebug.containerOverflowsParent.value)}　container={overflowDebug.containerOverflowsParent.containerWidth}px　parent={overflowDebug.containerOverflowsParent.parentWidth}px<br/>
+      canvas&gt;container: {String(overflowDebug.canvasOverflowsContainer.value)}　canvas={overflowDebug.canvasOverflowsContainer.canvasWidth}px　container={overflowDebug.canvasOverflowsContainer.containerWidth}px<br/>
+      chart適用width={overflowDebug.appliedChartWidth}px　widthの推移={overflowDebug.resizeObserverWidthTrend}<br/>
+      バー本数={overflowDebug.barCount}本　相関(バー数×container幅)={overflowDebug.correlation_barCount_vs_containerWidth}　相関(バー数×canvas幅)={overflowDebug.correlation_barCount_vs_canvasWidth}<br/>
+      最も右にはみ出た要素：{overflowDebug.rightmostElement?`<${overflowDebug.rightmostElement.tag}> class="${overflowDebug.rightmostElement.className||""}" right=${overflowDebug.rightmostElement.rect.right}px`:"特定できず"}
     </div>}
   </div>;
 }
