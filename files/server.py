@@ -3721,12 +3721,16 @@ ENTRY_STATE_META = {
 }
 
 
-def _entry_score_components(row, stage2, snapshot, auto_rs_current, auto_sector_current, catalysts, event_signals):
+def _entry_score_components(row, stage2, snapshot, auto_rs_current, auto_sector_current, catalysts, event_signals,
+                             entry_risk=None):
     """entry_score（0-100、内訳の合計をclampしたもの）を配点ごとに算出する。既存の各エンジンが
     既に計算済みの値だけを使い、新しい取得経路は増やさない。データが無い項目は0点（無理に
     加点も減点もしない、「取得できない値は推測しない」の踏襲）。
     配点：Momentum20/VWAP15/5分足構造15/MarketRelative15/Volume10/AUTO_RS10/AUTO_SECTOR5/
-    Catalyst5/RiskEvent-5〜0/Overheat-10〜0。"""
+    Catalyst5/RiskEvent-5〜0/Overheat-10〜0/Experience-8〜+3（2026-09-15新規、指示書3・4番）。
+    entry_risk（compute_entry_risk_assessment()の戻り値）は信頼度MEDIUM/HIGH（サンプル5件以上）
+    の時だけ加減点し、サンプル不足（LOW）では一切スコアに影響させない（過去の損切り学習を
+    「過大評価しない」既存方針＝compute_experience_score等と同じキャップ思想を踏襲）。"""
     day_change = row.get("changePct")
     market_rs = row.get("marketRS")
     momentum = _scale_score(day_change, 0, 5, 20) if day_change is not None else 0.0
@@ -3766,8 +3770,21 @@ def _entry_score_components(row, stage2, snapshot, auto_rs_current, auto_sector_
         elif d >= 2:
             overheat_penalty = -5.0
 
+    experience_penalty = 0.0
+    experience_bonus = 0.0
+    if entry_risk and entry_risk.get("confidence") in ("MEDIUM", "HIGH"):
+        risk_score = entry_risk.get("entry_risk_score") or 0.0
+        if risk_score >= 50:
+            experience_penalty = -8.0
+        elif risk_score >= 25:
+            experience_penalty = -4.0
+        good_sim = entry_risk.get("good_entry_similarity") or 0.0
+        if experience_penalty == 0.0 and good_sim >= 0.5:
+            experience_bonus = 3.0
+
     total = (momentum + vwap_score + structure_score + market_rel_score + volume_score
-             + auto_rs_score + auto_sector_score + catalyst_score + risk_event_penalty + overheat_penalty)
+             + auto_rs_score + auto_sector_score + catalyst_score + risk_event_penalty + overheat_penalty
+             + experience_penalty + experience_bonus)
     total = max(0.0, min(100.0, total))
     return {
         "total": round(total, 1),
@@ -3776,11 +3793,13 @@ def _entry_score_components(row, stage2, snapshot, auto_rs_current, auto_sector_
         "autoRs": round(auto_rs_score, 1), "autoSector": round(auto_sector_score, 1),
         "catalyst": round(catalyst_score, 1), "riskEvent": round(risk_event_penalty, 1),
         "overheat": round(overheat_penalty, 1),
+        "experiencePenalty": round(experience_penalty, 1), "experienceBonus": round(experience_bonus, 1),
         "volumeType": volume_type, "positiveCatalysts": pos_cat[:1], "negativeCatalysts": neg_cat[:1],
     }
 
 
-def _classify_entry_state(entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present, nikkei_chg=None):
+def _classify_entry_state(entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present, nikkei_chg=None,
+                           entry_risk=None):
     """ENTRY_STATE（8種＋PROVISIONAL）をルールベースで決定する（AI不使用、既存AUTO系エンジンと
     同じ方針）。2026-09-10更新（Phase2-C「TOP5選考基準の全面見直し」指示書2・3・24番）：
     「原則プラス銘柄からしか選ばない」ゲートを追加した。当日騰落率がマイナスの銘柄は、以下を
@@ -3831,10 +3850,15 @@ def _classify_entry_state(entry_score, row, stage2, snapshot, data_quality, even
         return "WEAK", exception_applied
     if "EVENT_RISK_HIGH" in (event_signals or []) and entry_score < 60:
         return "WATCH", exception_applied
+    # 指示書4番：過去の損切りパターンとの類似度が高く信頼できるサンプル数がある場合は、
+    # NOW_BUYABLE/ENTRY_READYへの昇格をWATCHに留める（entry_score自体は変更しない、
+    # 状態遷移だけを止める＝「ENTRYを止めている理由」を呼び出し側がreasonsで明示できるようにする）。
+    loss_pattern_block = bool(entry_risk and entry_risk.get("risk_level") == "HIGH"
+                               and entry_risk.get("confidence") != "LOW")
     if above_vwap and structure == "higher_highs" and (market_rs is not None and market_rs > 0) and entry_score >= 70:
-        return "NOW_BUYABLE", exception_applied
+        return ("WATCH" if loss_pattern_block else "NOW_BUYABLE"), exception_applied
     if above_vwap and structure in ("higher_highs", "mixed") and entry_score >= 55:
-        return "ENTRY_READY", exception_applied
+        return ("WATCH" if loss_pattern_block else "ENTRY_READY"), exception_applied
     if entry_score >= 40 and above_vwap is False:
         return "WAIT_BREAKOUT", exception_applied
     if entry_score >= 40 and above_vwap:
@@ -4275,11 +4299,18 @@ def _score_entry_candidates(database_url, user_id):
         catalysts = support.get("catalysts", [])
         event_signals = (support.get("eventInfo") or {}).get("signals", [])
 
-        comp = _entry_score_components(row, stage2, snapshot or {}, auto_rs_current, auto_sector_current, catalysts, event_signals)
+        # Trade Experience Learning新規（指示書3・4番）：ENTRY_RISK_SCOREをentry_score本体・
+        # entry_stateの両方が参照できるよう、_entry_score_components()の前に取り出す。
+        exp_summary = support.get("tradeExperience")
+        entry_risk = (exp_summary or {}).get("entryRisk")
+
+        comp = _entry_score_components(row, stage2, snapshot or {}, auto_rs_current, auto_sector_current, catalysts,
+                                        event_signals, entry_risk=entry_risk)
         neg_cat_present = bool(comp["negativeCatalysts"])
         entry_score = comp["total"]
         entry_state, exception_applied = _classify_entry_state(
-            entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present, nikkei_chg)
+            entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present, nikkei_chg,
+            entry_risk=entry_risk)
         resilience = _rs_resilience_tier({"changePct": row.get("changePct"), "marketRS": row.get("marketRS")}, nikkei_chg)
 
         reasons = []
@@ -4306,6 +4337,9 @@ def _score_entry_candidates(database_url, user_id):
             risks.append("重要イベント接近")
         if comp["overheat"] < 0:
             risks.append("直近高値からの乖離が大きい（高値掴み注意）")
+        # 指示書4番：「何が似ているのか」「過去何件中何件失敗したか」を具体的に表示する。
+        if entry_risk and entry_risk.get("risk_level") in ("HIGH", "MEDIUM") and entry_risk.get("explanation"):
+            risks.append(f"⚠ 過去の損切りパターンと類似：{entry_risk['explanation']}")
 
         # Market Intelligence Phase9新規（指示書21・38番）：entry_score自体には一切加点も
         # 減点もしない、隣に並べるだけの追加専用表示。
@@ -4314,8 +4348,8 @@ def _score_entry_candidates(database_url, user_id):
         event_support = support.get("eventSupport")
 
         # Trade Experience Learning新規（指示書7・20番）：EXPERIENCE_SCORE（0〜10）。
-        # 既存entry_scoreには一切加点しない、完全に別枠の補助スコア。
-        exp_summary = support.get("tradeExperience")
+        # 既存entry_scoreには一切加点しない、完全に別枠の補助スコア（ENTRY_RISK_SCOREのみ
+        # comp側で既に加減点済み——ここでは表示用にそのまま添えるだけ）。
         if exp_summary:
             experience_score = exp_summary["experience_score"]
             experience_summary = exp_summary["similar"]
@@ -4331,7 +4365,7 @@ def _score_entry_candidates(database_url, user_id):
             "analysisConfidence": analysis_confidence, "dataQuality": data_quality,
             "scoreBreakdown": comp, "reasons": reasons or ["総合スコア上位"], "risks": risks,
             "eventSupport": event_support,
-            "experienceScore": experience_score, "experienceSummary": experience_summary,
+            "experienceScore": experience_score, "experienceSummary": experience_summary, "entryRisk": entry_risk,
             "marketDataCacheStatus": market_data_cache_status,  # "ok"|"stale_cache"|"rate_limited"|"failed"（指示書STEP9）
         })
         per_symbol_ms.append((code, (time.time() - _t_symbol) * 1000))
@@ -4692,11 +4726,21 @@ def compute_light_trade_analysis_snapshot(database_url, user_id, code, market="J
         if (investment_db and database_url) else {"signals": []}
     event_signals = events.get("signals", [])
 
-    comp = _entry_score_components(row, stage2, snapshot or {}, auto_rs_current, auto_sector_current, catalysts, event_signals)
+    experience_score, entry_risk = None, None
+    try:
+        exp_summary = build_trade_experience_summary_for_symbol(database_url, user_id, code)
+        experience_score = exp_summary["experience_score"]
+        entry_risk = exp_summary.get("entryRisk")
+    except Exception as e:
+        print("  trade-analysis/live: experience score取得で例外（無視して続行）", code, e)
+
+    comp = _entry_score_components(row, stage2, snapshot or {}, auto_rs_current, auto_sector_current, catalysts,
+                                    event_signals, entry_risk=entry_risk)
     neg_cat_present = bool(comp["negativeCatalysts"])
     entry_score = comp["total"]
     entry_state, _exception_applied = _classify_entry_state(
-        entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present, nikkei_chg)
+        entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present, nikkei_chg,
+        entry_risk=entry_risk)
 
     rsi_val, short_ma_val = None, None
     daily = _cached_daily_arrays(code, CACHE_TTL["daily_arrays"])
@@ -4709,13 +4753,6 @@ def compute_light_trade_analysis_snapshot(database_url, user_id, code, market="J
                 short_ma_val = _sma(closes, 5)
         except Exception as e:
             print("  trade-analysis/live: RSI/短期MA計算失敗", code, e)
-
-    experience_score = None
-    try:
-        exp_summary = build_trade_experience_summary_for_symbol(database_url, user_id, code)
-        experience_score = exp_summary["experience_score"]
-    except Exception as e:
-        print("  trade-analysis/live: experience score取得で例外（無視して続行）", code, e)
 
     fields = _light_snapshot_fields(code, row, comp, entry_state, snapshot, rsi_val, short_ma_val, experience_score)
 
@@ -12187,6 +12224,260 @@ def evaluate_trade_experience(trade):
     return total, breakdown
 
 
+# ============================================================
+# トレード学習・損切り分析強化（2026-09-15新規）。既存trade_experiencesのスキーマ・
+# sync_trade_experiences_for_date()の枠組みは一切変更せず、当日約定の生の5分足
+# （_fetch_intraday_bars、既存のポジション画面チャートと同じ取得関数を再利用）から
+# エントリー/エグジット時点の市場コンテキストを再構築し、損切り理由14タグの自動分類を追加する
+# だけの拡張。指示書7番「不明な情報を推測で埋めない。取得できない項目はunknownとする」に
+# 厳密に従い、算出できない項目はNoneのまま返す（ダミー値・平均値での穴埋めはしない）。
+# ============================================================
+
+LOSS_REASON_TAGS = (
+    "CHASE_ENTRY", "LATE_ENTRY", "FALSE_BREAKOUT", "VWAP_LOSS", "VOLUME_FADE",
+    "SECTOR_WEAKNESS", "MARKET_REVERSAL", "ENTRY_BEFORE_CONFIRMATION", "POOR_RISK_REWARD",
+    "EVENT_RISK", "RULE_VIOLATION", "STOP_TOO_TIGHT", "THESIS_WRONG", "GOOD_ENTRY_BAD_OUTCOME",
+)
+
+
+def reconstruct_trade_market_context(code, market, trade_date, entry_time_iso, exit_time_iso):
+    """指示書1・7番：損切りトレードを「エントリー判断教材」として保存するための市場コンテキスト
+    再構築。当日5分足からエントリー/エグジット時点のVWAP位置・当日高安位置・出来高推移・
+    RSI/MA・MFE/MAE・エグジット後の値動きを算出する。未来データを混ぜない
+    （エントリー時点の指標はエントリーバーまでのデータだけで計算＝後知恵禁止）。
+    取得失敗・データ不足時は該当フィールドをNoneのまま返す（指示書7番、推測しない）。"""
+    empty = {
+        "vwap_at_entry": None, "above_vwap_at_entry": None, "vwap_at_exit": None,
+        "day_open": None, "day_high_so_far_at_entry": None, "day_low_so_far_at_entry": None,
+        "day_high": None, "day_low": None,
+        "distance_from_low_pct": None, "distance_from_high_pct": None,
+        "rsi_at_entry": None, "rsi_at_exit": None,
+        "short_ma": None, "mid_ma": None, "long_ma": None,
+        "volume_ratio": None, "volume_trend_after_entry": None,
+        "trend_5m_before_entry": None, "entry_setup_type": None,
+        "broke_prior_high_then_failed": None,
+        "max_favorable_excursion_pct": None, "max_adverse_excursion_pct": None,
+        "post_exit_max_price": None, "post_exit_min_price": None, "post_exit_direction": None,
+        "data_quality": "NO_DATA",
+    }
+    if yf is None or not code:
+        return empty
+    symbol = f"{code}.T" if (market or "JP") == "JP" else code
+    try:
+        bars = _fetch_intraday_bars(symbol, interval="5m", period="5d")
+    except Exception as e:
+        print("  トレード学習：5分足再構築失敗", code, e)
+        return empty
+    if not bars:
+        return empty
+    try:
+        day_bars = [b for b in bars if datetime.datetime.fromtimestamp(b["time"], tz=datetime.timezone.utc)
+                    .astimezone(_JST).strftime("%Y-%m-%d") == str(trade_date)]
+    except Exception:
+        day_bars = []
+    if len(day_bars) < 2:
+        return empty
+
+    def _parse(iso):
+        if not iso:
+            return None
+        try:
+            return datetime.datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    entry_dt, exit_dt = _parse(entry_time_iso), _parse(exit_time_iso)
+    entry_idx = 0
+    if entry_dt:
+        for i, b in enumerate(day_bars):
+            if b["time"] <= entry_dt.timestamp():
+                entry_idx = i
+            else:
+                break
+    exit_idx = len(day_bars) - 1
+    if exit_dt:
+        for i, b in enumerate(day_bars):
+            if b["time"] <= exit_dt.timestamp():
+                exit_idx = i
+    exit_idx = max(exit_idx, entry_idx)
+
+    pre_entry = day_bars[:entry_idx + 1]
+    closes_pre, vols_pre = [b["close"] for b in pre_entry], [b["volume"] for b in pre_entry]
+    vwap_entry = _vwap(closes_pre, vols_pre)
+    up_to_exit = day_bars[:exit_idx + 1]
+    vwap_exit = _vwap([b["close"] for b in up_to_exit], [b["volume"] for b in up_to_exit])
+
+    day_open = day_bars[0]["open"]
+    day_high_so_far = max(b["high"] for b in pre_entry)
+    day_low_so_far = min(b["low"] for b in pre_entry)
+    entry_price = day_bars[entry_idx]["close"]
+
+    result = dict(empty)
+    result["data_quality"] = "RECONSTRUCTED_5M"
+    result["day_open"] = round(day_open, 2)
+    result["day_high_so_far_at_entry"] = round(day_high_so_far, 2)
+    result["day_low_so_far_at_entry"] = round(day_low_so_far, 2)
+    result["day_high"] = round(max(b["high"] for b in day_bars), 2)
+    result["day_low"] = round(min(b["low"] for b in day_bars), 2)
+    if vwap_entry is not None:
+        result["vwap_at_entry"] = round(vwap_entry, 2)
+        result["above_vwap_at_entry"] = entry_price >= vwap_entry
+    if vwap_exit is not None:
+        result["vwap_at_exit"] = round(vwap_exit, 2)
+    if day_low_so_far:
+        result["distance_from_low_pct"] = round((entry_price - day_low_so_far) / day_low_so_far * 100, 2)
+    if day_high_so_far:
+        result["distance_from_high_pct"] = round((entry_price - day_high_so_far) / day_high_so_far * 100, 2)
+    # 既存の_rsi()/_sma()（日足RSI・MA判定と同じ実装、行2242・2260）をそのまま再利用——
+    # 過去日5分足専用の別実装は作らない。
+    result["rsi_at_entry"] = _rsi(closes_pre) if len(closes_pre) >= 15 else None
+    result["rsi_at_exit"] = _rsi([b["close"] for b in up_to_exit]) if len(up_to_exit) >= 15 else None
+    sma5, sma15, sma25 = _sma(closes_pre, 5), _sma(closes_pre, 15), _sma(closes_pre, 25)
+    result["short_ma"] = round(sma5, 2) if sma5 is not None else None
+    result["mid_ma"] = round(sma15, 2) if sma15 is not None else None
+    result["long_ma"] = round(sma25, 2) if sma25 is not None else None
+    if len(pre_entry) >= 6:
+        recent3, prior3 = vols_pre[-3:], vols_pre[-6:-3]
+        avg_recent = sum(recent3) / 3
+        avg_prior = (sum(prior3) / 3) if prior3 else None
+        if avg_prior:
+            result["volume_ratio"] = round(avg_recent / avg_prior, 2)
+    post_entry_bars = day_bars[entry_idx:exit_idx + 1]
+    if len(post_entry_bars) >= 4:
+        half = len(post_entry_bars) // 2
+        first_half_vol = sum(b["volume"] for b in post_entry_bars[:half]) or 0
+        second_half_vol = sum(b["volume"] for b in post_entry_bars[half:]) or 0
+        if first_half_vol:
+            result["volume_trend_after_entry"] = ("FADING" if second_half_vol < first_half_vol * 0.7
+                                                    else ("RISING" if second_half_vol > first_half_vol * 1.3 else "FLAT"))
+    if len(closes_pre) >= 4:
+        last4 = closes_pre[-4:]
+        result["trend_5m_before_entry"] = "UP" if last4[-1] > last4[0] else ("DOWN" if last4[-1] < last4[0] else "FLAT")
+
+    # エントリー形態の3分類（指示書1番「上昇直後の飛び乗りか、押し目か、ブレイクか」）。
+    broke_prior_high = entry_idx > 0 and entry_price >= day_high_so_far * 0.999
+    if broke_prior_high:
+        result["entry_setup_type"] = "BREAKOUT"
+    elif result["distance_from_low_pct"] is not None and result["distance_from_low_pct"] <= 2.0 \
+            and result.get("trend_5m_before_entry") != "DOWN":
+        result["entry_setup_type"] = "PULLBACK"
+    elif result.get("trend_5m_before_entry") == "UP" and (result["distance_from_low_pct"] or 0) >= 5.0:
+        result["entry_setup_type"] = "CHASE"
+    else:
+        result["entry_setup_type"] = "OTHER"
+
+    if broke_prior_high:
+        post_min = min(b["low"] for b in day_bars[entry_idx:exit_idx + 1])
+        result["broke_prior_high_then_failed"] = post_min < day_high_so_far
+
+    window = day_bars[entry_idx:exit_idx + 1]
+    if window:
+        mfe, mae = compute_mfe_mae_pct(entry_price, max(b["high"] for b in window), min(b["low"] for b in window))
+        result["max_favorable_excursion_pct"] = mfe
+        result["max_adverse_excursion_pct"] = mae
+
+    # エグジット後の値動き（同日のみ。翌日以降は未収集、既知の制約——推測しない）。
+    post_exit = day_bars[exit_idx + 1:]
+    if post_exit:
+        post_max = round(max(b["high"] for b in post_exit), 2)
+        post_min = round(min(b["low"] for b in post_exit), 2)
+        result["post_exit_max_price"] = post_max
+        result["post_exit_min_price"] = post_min
+        exit_price_bar = day_bars[exit_idx]["close"]
+        if post_min < exit_price_bar * 0.998:
+            result["post_exit_direction"] = "FURTHER_DOWN"
+        elif post_max > exit_price_bar * 1.002:
+            result["post_exit_direction"] = "RECOVERED"
+        else:
+            result["post_exit_direction"] = "FLAT"
+    return result
+
+
+def classify_loss_reasons(gross_pnl_pct, ctx, exit_price=None, sector_state_at_entry=None,
+                           market_mode_at_entry=None, market_mode_at_exit=None,
+                           event_risk_at_entry=None, rule_compliance_score=None):
+    """指示書2番：損切りトレードに複数タグを付与する。「結果論だけで悪いエントリーと判定
+    しない」（指示書2番の重要事項）に従い、判定材料が無いタグは付けない（POOR_RISK_REWARD・
+    THESIS_WRONGは、想定リスクリワードや投資仮説を記録する仕組みが現状無いため、常に
+    自動判定しない——憶測でタグ付けしない）。GOOD_ENTRY_BAD_OUTCOMEは他のネガティブタグと
+    排他にせず、悪材料タグが実質無い場合にのみ独立して付与する（「正しいエントリーだったが
+    偶然損切りになったケース」を分離するため）。"""
+    tags = []
+    ctx = ctx or {}
+    rsi_entry = ctx.get("rsi_at_entry")
+    if ctx.get("entry_setup_type") == "CHASE" or (rsi_entry is not None and rsi_entry >= 70):
+        tags.append("CHASE_ENTRY")  # 当日値幅での急伸追随、またはRSI70以上の過熱局面での飛び乗り
+    if ctx.get("entry_setup_type") == "OTHER" and ctx.get("trend_5m_before_entry") == "UP" \
+            and ctx.get("distance_from_high_pct") is not None and ctx["distance_from_high_pct"] < -3:
+        tags.append("LATE_ENTRY")
+    if ctx.get("broke_prior_high_then_failed"):
+        tags.append("FALSE_BREAKOUT")
+    if ctx.get("vwap_at_exit") is not None and exit_price is not None and ctx.get("above_vwap_at_entry") \
+            and exit_price < ctx["vwap_at_exit"]:
+        tags.append("VWAP_LOSS")
+    if ctx.get("volume_trend_after_entry") == "FADING":
+        tags.append("VOLUME_FADE")
+    if sector_state_at_entry in ("WEAKENING", "LAGGING", "RISK_OFF"):
+        tags.append("SECTOR_WEAKNESS")
+    if market_mode_at_entry and market_mode_at_exit and market_mode_at_entry != market_mode_at_exit \
+            and "RISK_OFF" in str(market_mode_at_exit).upper():
+        tags.append("MARKET_REVERSAL")
+    # 下落継続中（反転未確認）に飛び込んだ場合。押し目待ち・反転確認を待たずに入ったケース
+    # （RSI売られすぎでの「まだ下げ止まっていない」逆張りエントリーを含む）。
+    if ctx.get("trend_5m_before_entry") == "DOWN" and not ctx.get("above_vwap_at_entry"):
+        tags.append("ENTRY_BEFORE_CONFIRMATION")
+    elif ctx.get("entry_setup_type") in ("CHASE", "OTHER") and ctx.get("trend_5m_before_entry") == "UP":
+        tags.append("ENTRY_BEFORE_CONFIRMATION")
+    mae = ctx.get("max_adverse_excursion_pct")
+    if mae is not None and gross_pnl_pct is not None and abs(mae) < 2.0 and gross_pnl_pct <= mae + 0.3:
+        tags.append("STOP_TOO_TIGHT")
+    if event_risk_at_entry and str(event_risk_at_entry).upper() not in ("", "NONE", "LOW"):
+        tags.append("EVENT_RISK")
+    if rule_compliance_score is not None and rule_compliance_score < 60:
+        tags.append("RULE_VIOLATION")
+    negative_tags = [t for t in tags if t != "RULE_VIOLATION"]
+    good_entry_bad_outcome = (
+        ctx.get("entry_setup_type") in ("PULLBACK", "BREAKOUT")
+        and not negative_tags
+        and (rule_compliance_score is None or rule_compliance_score >= 80)
+    )
+    if good_entry_bad_outcome:
+        tags.append("GOOD_ENTRY_BAD_OUTCOME")
+    return tags
+
+
+def compute_entry_risk_assessment(similar_result):
+    """指示書3番：GOOD_ENTRY_SIMILARITY / LOSS_PATTERN_SIMILARITY / ENTRY_RISK_SCOREを算出する。
+    既存find_similar_trade_experiences()が返すsimilar_result（symbol一致＋タグ/特徴量類似度）を
+    そのまま使う解釈レイヤーであり、類似度計算そのものは変更しない。サンプル不足時は
+    過大評価しない（compute_experience_score/compute_behavior_scoreと同じ信頼度キャップの思想）。"""
+    empty = {"good_entry_similarity": None, "loss_pattern_similarity": None, "entry_risk_score": None,
+             "risk_level": "UNKNOWN", "explanation": None, "confidence": "LOW"}
+    if not similar_result or not similar_result.get("similar_count"):
+        return empty
+    n = similar_result["similar_count"]
+    win_rate = similar_result.get("win_rate") or 0.0
+    loss_rate = 1.0 - win_rate
+    max_sim = similar_result.get("max_similarity") or 0.0
+    confidence = classify_pattern_confidence(n)
+    conf_factor = {"HIGH": 1.0, "MEDIUM": 0.6, "LOW": 0.25}[confidence]
+    good_entry_similarity = round(win_rate * max_sim, 3)
+    loss_pattern_similarity = round(loss_rate * max_sim, 3)
+    entry_risk_score = round(min(100.0, loss_pattern_similarity * 100 * conf_factor), 1)
+    if entry_risk_score >= 50 and confidence != "LOW":
+        risk_level = "HIGH"
+    elif entry_risk_score >= 25:
+        risk_level = "MEDIUM"
+    else:
+        risk_level = "LOW"
+    losses = similar_result.get("losses") or 0
+    explanation = (f"過去の類似セットアップ{n}件中、{losses}件が損切り"
+                   f"（勝率{round(win_rate * 100)}%、信頼度{confidence}）")
+    return {"good_entry_similarity": good_entry_similarity, "loss_pattern_similarity": loss_pattern_similarity,
+            "entry_risk_score": entry_risk_score, "risk_level": risk_level, "explanation": explanation,
+            "confidence": confidence, "similar_count": n, "losses": losses, "win_rate": similar_result.get("win_rate")}
+
+
 # 指示書9番：sample_count/win_rateがこの水準を超えたパターンのみ「候補」として提示する
 # （自動でACTIVEにはしない、指示書冒頭「重要」）。
 RULE_CANDIDATE_MIN_SAMPLE = 15
@@ -12275,7 +12566,8 @@ def build_trade_experience_summary_for_symbol(database_url, user_id, symbol, cur
     similar = find_similar_trade_experiences(database_url, user_id, symbol=symbol, current_tags=current_tags,
                                                 current_features=current_features, _preloaded_experiences=_preloaded_experiences)
     score = compute_experience_score(similar)
-    return {"experience_score": score, "similar": similar}
+    entry_risk = compute_entry_risk_assessment(similar)
+    return {"experience_score": score, "similar": similar, "entryRisk": entry_risk}
 
 
 def build_trade_experience_payload(trade):
@@ -12426,10 +12718,53 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
         except Exception as e:
             print("  daily-review: sector rotation取得で例外（無視して続行）", t.get("code"), e)
 
+        entry_time_iso, exit_time_iso = t.get("acquired_at"), t.get("closed_at")
+        holding_minutes = None
+        if entry_time_iso and exit_time_iso:
+            try:
+                et = datetime.datetime.fromisoformat(str(entry_time_iso).replace("Z", "+00:00"))
+                xt = datetime.datetime.fromisoformat(str(exit_time_iso).replace("Z", "+00:00"))
+                holding_minutes = max(0, round((xt - et).total_seconds() / 60))
+            except Exception:
+                pass
+
+        # トレード学習・損切り分析強化（2026-09-15新規、指示書1・2・7番）：当日5分足から
+        # エントリー/エグジット時点の市場コンテキストを再構築し（reconstruct_trade_market_context）、
+        # 損切りトレードには理由タグを自動分類する（classify_loss_reasons）。取得できない値は
+        # 推測せずNoneのまま保存する（指示書7番「不明な情報を推測で埋めない」）。
+        market_ctx = reconstruct_trade_market_context(t.get("code"), t.get("market", "JP"), review_date,
+                                                        entry_time_iso, exit_time_iso)
+        loss_tags = []
+        if result_class == "LOSS":
+            loss_tags = classify_loss_reasons(gross_pnl_pct, market_ctx, exit_price=exit_price,
+                                               sector_state_at_entry=sector_state,
+                                               market_mode_at_entry=market_mode_today,
+                                               market_mode_at_exit=market_mode_today,
+                                               event_risk_at_entry=event_risk_today)
+        entry_setup_tags = []
+        if market_ctx.get("entry_setup_type"):
+            entry_setup_tags.append(f"SETUP_{market_ctx['entry_setup_type']}")
+        if market_ctx.get("rsi_at_entry") is not None and market_ctx["rsi_at_entry"] <= 35:
+            entry_setup_tags.append("OVERSOLD_REVERSAL")
+        if market_ctx.get("short_ma") is not None and entry_price is not None and entry_price >= market_ctx["short_ma"]:
+            entry_setup_tags.append("SHORT_MA_RECLAIM")
+        if market_ctx.get("volume_ratio") is not None and market_ctx["volume_ratio"] >= 1.5:
+            entry_setup_tags.append("VOLUME_EXPANSION")
+        pattern_tags = entry_setup_tags + loss_tags
+
+        avoidable_at_entry = None
+        if market_ctx.get("data_quality") != "NO_DATA" and result_class == "LOSS":
+            if "GOOD_ENTRY_BAD_OUTCOME" in loss_tags:
+                avoidable_at_entry = False
+            elif loss_tags:
+                avoidable_at_entry = True
+
         fields = {
             "trade_date": review_date, "symbol": t.get("code"), "stock_name": t.get("name"),
-            "side": "BUY", "quantity": qty, "entry_price": entry_price, "exit_price": exit_price,
-            "exit_time": t.get("closed_at"), "gross_pnl": gross_pnl, "gross_pnl_pct": gross_pnl_pct,
+            "side": "BUY", "trade_style": t.get("trade_style"),
+            "quantity": qty, "entry_price": entry_price, "exit_price": exit_price,
+            "entry_time": entry_time_iso, "exit_time": exit_time_iso, "holding_minutes": holding_minutes,
+            "gross_pnl": gross_pnl, "gross_pnl_pct": gross_pnl_pct,
             "result_class": result_class,
             "trade_result_score": compute_trade_result_score(gross_pnl_pct),
             "market_mode_at_entry": market_mode_today, "market_mode_at_exit": market_mode_today,
@@ -12440,6 +12775,34 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
             "sector_at_entry": sector_at_entry, "sector_state_at_entry": sector_state,
             "sector_flow_score_at_entry": sector_flow_score, "sector_state_at_exit": sector_state,
             "sector_flow_score_at_exit": sector_flow_score, "rotation_context_json": rotation_context,
+            "rsi_at_entry": market_ctx.get("rsi_at_entry"), "rsi_at_exit": market_ctx.get("rsi_at_exit"),
+            "short_ma": market_ctx.get("short_ma"), "mid_ma": market_ctx.get("mid_ma"),
+            "long_ma": market_ctx.get("long_ma"), "volume_ratio": market_ctx.get("volume_ratio"),
+            "intraday_high": market_ctx.get("day_high"), "intraday_low": market_ctx.get("day_low"),
+            "distance_from_low_pct": market_ctx.get("distance_from_low_pct"),
+            "distance_from_high_pct": market_ctx.get("distance_from_high_pct"),
+            "max_favorable_excursion_pct": market_ctx.get("max_favorable_excursion_pct"),
+            "max_adverse_excursion_pct": market_ctx.get("max_adverse_excursion_pct"),
+            "post_exit_max_price": market_ctx.get("post_exit_max_price"),
+            "post_exit_min_price": market_ctx.get("post_exit_min_price"),
+            "pattern_tags_json": pattern_tags or None, "exit_reason_json": loss_tags or None,
+            "decision_snapshot_json": {
+                "day_open": market_ctx.get("day_open"), "vwap_at_entry": market_ctx.get("vwap_at_entry"),
+                "above_vwap_at_entry": market_ctx.get("above_vwap_at_entry"),
+                "distance_from_low_pct": market_ctx.get("distance_from_low_pct"),
+                "distance_from_high_pct": market_ctx.get("distance_from_high_pct"),
+                "trend_5m_before_entry": market_ctx.get("trend_5m_before_entry"),
+                "entry_setup_type": market_ctx.get("entry_setup_type"),
+                "data_quality": market_ctx.get("data_quality"),
+            },
+            "post_trade_analysis_json": ({
+                "loss_reason_tags": loss_tags, "vwap_at_exit": market_ctx.get("vwap_at_exit"),
+                "volume_trend_after_entry": market_ctx.get("volume_trend_after_entry"),
+                "broke_prior_high_then_failed": market_ctx.get("broke_prior_high_then_failed"),
+                "post_exit_direction": market_ctx.get("post_exit_direction"),
+                "avoidable_at_entry": avoidable_at_entry,
+                "data_quality": market_ctx.get("data_quality"),
+            } if result_class == "LOSS" else None),
             "notes": "15:30自動評価による自動登録（sync_trade_experiences_for_date）。",
         }
         try:
@@ -12450,6 +12813,18 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
         if saved:
             result["trades_synced"] += 1
             result["experience_ids"].append(saved.get("id"))
+            # 指示書5番：損した／利益が出た、だけで判断品質を決めない——entry_timing/risk_control/
+            # exit_execution/rule_compliance/repeatabilityの5軸をトレードごとに自動採点する
+            # （evaluate_trade_experience()は既存関数、これまで手動APIからしか呼ばれていなかった
+            # ものを15:30自動評価にも接続するだけ）。
+            try:
+                merged = {**saved, **fields}
+                _total, breakdown = evaluate_trade_experience(merged)
+                investment_db.update_trade_experience(database_url, user_id, saved["id"],
+                                                       {"execution_score": breakdown["total"],
+                                                        "score_breakdown_json": breakdown})
+            except Exception as e:
+                print("  daily-review: trade experience自動採点で例外（無視して続行）", t.get("code"), e)
 
     # WAITのみで終わった判断（当日ENTRYに至らなかったWAIT決断イベント）もGOOD_WAIT等として記録する
     try:
@@ -12703,8 +13078,40 @@ def generate_daily_review_with_learning(database_url, user_id, review_date, user
     return {
         "review": review, "sync": sync_result, "behaviorUpdated": behavior_updated,
         "patternCandidatesTracked": len(pattern_stats), "ruleCandidatesProposed": rule_candidates_proposed,
-        "choruco": choruco_result,
+        "choruco": choruco_result, "tradeBreakdown": build_trade_breakdown_for_day(today_trades),
     }
+
+
+def build_trade_breakdown_for_day(day_trades):
+    """指示書5番：日次振り返りを損切り中心に強化——「損した＝悪い判断」にせず、トレードごとに
+    ①entry_timing_score（エントリー判断）②exit_execution_score・risk_control_score（損切り判断）
+    ③rule_compliance_score（ルール遵守）④trade_result_score（結果）を分離して表示できるよう、
+    既存daily_reviewsの日次集計スコア（score_total等、無変更）とは別に、トレード単位の内訳を
+    一覧として組み立てる（execution_score/score_breakdown_jsonはsync_trade_experiences_for_date
+    内で既に自動採点済み、ここでは整形するだけ。DB永続化はしない——呼び出し側が都度
+    trade_experiencesから読み直して再構成する設計）。day_trades：side!='WAIT'の
+    trade_experiences行リスト（generate_daily_review_with_learning・GET /api/daily-reviewの
+    両方から同じ関数を使う、二重実装を避ける）。"""
+    trade_breakdown = []
+    for e in (day_trades or []):
+        bd = e.get("score_breakdown_json") or {}
+        trade_breakdown.append({
+            "symbol": e.get("symbol"), "stockName": e.get("stock_name"), "resultClass": e.get("result_class"),
+            "grossPnlPct": e.get("gross_pnl_pct"),
+            "entryTimingScore": bd.get("entry_timing_score"),
+            "exitExecutionScore": bd.get("exit_execution_score"),
+            "riskControlScore": bd.get("risk_control_score"),
+            "ruleComplianceScore": bd.get("rule_compliance_score"),
+            "tradeResultScore": e.get("trade_result_score"),
+            # 損切りGOOD／問題はENTRY、を機械的に読み取れるよう明示する（指示書5番）。
+            "exitWasGoodButEntryWasBad": (
+                (bd.get("exit_execution_score") or 0) >= 15 and (bd.get("entry_timing_score") or 0) < 10
+                if e.get("result_class") == "LOSS" else None
+            ),
+            "lossReasonTags": e.get("exit_reason_json") or [],
+            "avoidableAtEntry": (e.get("post_trade_analysis_json") or {}).get("avoidable_at_entry"),
+        })
+    return trade_breakdown
 
 
 # 15:30自動評価スケジューラ（指示書4・5・11・28・29・30番）。既存_morning_check_scheduler_loop
@@ -20655,11 +21062,14 @@ class Handler(SimpleHTTPRequestHandler):
             # には触れない追加専用セクション。
             trade_learning = {"best_trade": None, "worst_trade": None, "best_wait": None,
                                 "rule_violations": [], "learning_notes": []}
+            trade_breakdown = []
             try:
                 if investment_db is not None and DATABASE_URL:
                     day_experiences = investment_db.list_trade_experiences(DATABASE_URL, self.current_user,
                                                                               trade_date=date)
                     trade_learning = build_daily_trade_learning_summary(day_experiences)
+                    trade_breakdown = build_trade_breakdown_for_day(
+                        [e for e in day_experiences if e.get("side") != "WAIT"])
             except Exception as e:
                 print("  daily-review: trade learning summary生成で例外（無視して続行）", e)
             # Cross-Market Link Phase 2新規（2026-09-12、指示書16番）：「🔗今日の市場連動学習」。
@@ -20687,7 +21097,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json({"review": review, "decisionReview": decision_review, "tradeLearning": trade_learning,
                               "crossMarketLearning": cross_market_learning,
                               "sectorRotationLearning": sector_rotation_learning,
-                              "themeLearning": theme_learning})
+                              "themeLearning": theme_learning, "tradeBreakdown": trade_breakdown})
         # ---- 2026-09-10新規（朝一マーケット自動分析システム） ----
         elif self.path.startswith("/api/morning-check/list"):
             qs = urllib.parse.urlparse(self.path).query
@@ -21620,7 +22030,8 @@ class Handler(SimpleHTTPRequestHandler):
                 self._send_json({"error": "レビュー生成に失敗しました"}); return
             self._send_json({"review": result["review"], "sync": result["sync"],
                               "behaviorUpdated": result["behaviorUpdated"],
-                              "ruleCandidatesProposed": result["ruleCandidatesProposed"]})
+                              "ruleCandidatesProposed": result["ruleCandidatesProposed"],
+                              "tradeBreakdown": result.get("tradeBreakdown", [])})
         elif self.path == "/api/daily-review/feedback":
             # 指示書18・19番：ユーザー感想を保存し、翌日以降の分析（recent_reflections_for）へ
             # 使えるようにする。保存と同時にreflection_tagsを抽出し、その日のスコアも再計算する

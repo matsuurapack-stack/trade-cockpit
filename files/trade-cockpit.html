@@ -199,6 +199,14 @@ body{padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bot
    エリアの2カラム化。PCでは左：チャート／右：売却判断、スマホでは縦積みにする
    （item19。既存の.watch-table-desktop/mobile切替と同じ@media(max-width:768px)を流用）。 */
 .pos-judgment-grid{display:grid;grid-template-columns:3fr 2fr;gap:12px;align-items:start}
+/* 2026-09-15修正（トレード学習・損切り分析強化 指示書8番）：CSS Gridの子要素は既定で
+   min-width:auto（コンテンツの最小内容サイズ）になるため、ローソク足本数が増えて
+   LightweightChartsの内部canvasが要求する実測幅が育つと、containerRef側のwidth:100%指定が
+   あってもグリッドの列自体がその幅より縮まなくなり、結果として.pos-judgment-grid全体・
+   ページ全体が右にはみ出す（売却判断パネル・数値が画面外に押し出される）。子要素へ
+   min-width:0を明示してグリッド列が親幅まで縮められるようにする（チャート側のResizeObserver
+   によるwidth追従は既存のまま変更しない）。*/
+.pos-judgment-grid>*{min-width:0;max-width:100%}
 @media (max-width:768px){
   .pos-judgment-grid{grid-template-columns:1fr}
 }
@@ -3772,6 +3780,20 @@ function KnowledgeJudgmentPanel({code,sector,market,tradeStyle,baseSignal,a}){
     {sim&&sim.similar_count>0 && <div style={{fontSize:11,color:"var(--inkSoft)",marginTop:4}}>
       🧠 経験 {sim.similar_count}件{sim.win_rate!=null?` / 勝率${Math.round(sim.win_rate*100)}%`:""}
       {tradeExperience.experience_score!=null && <span style={{marginLeft:6,fontWeight:700}}>経験値 {tradeExperience.experience_score}/10</span>}
+    </div>}
+    {/* トレード学習・損切り分析強化（2026-09-15新規、指示書4番）：ENTRYを止めている具体的理由
+        （何が似ているか・過去何件中何件失敗したか）を表示する。entryRiskはbuild_trade_experience_
+        summary_for_symbol()が既に返している値（compute_entry_risk_assessment）、lossExamples/
+        tagCountsは既存コード（3725-3728行）が既に計算していたが未使用だった値を初めて使う。 */}
+    {tradeExperience?.entryRisk?.risk_level==="HIGH" && <div style={{fontSize:11.5,color:"var(--down)",
+        fontWeight:700,marginTop:4,padding:"4px 6px",border:"1px solid var(--down)",borderRadius:4}}>
+      ⚠ 過去の損切りパターンと類似：{tradeExperience.entryRisk.explanation}
+      {lossExamples.length>0 && <div style={{fontWeight:400,marginTop:2,color:"var(--inkSoft)"}}>
+        類似タグ：{tagCounts(lossExamples).join("・")||"（タグ無し）"}
+      </div>}
+      <div style={{fontWeight:400,marginTop:2,color:"var(--inkSoft)"}}>
+        確認できればENTRY可：VWAP回復・出来高の増加継続・対セクター優位のいずれかを確認してから判断してください
+      </div>
     </div>}
     {/* 銘柄クセ学習（2026-09-12新規、指示書18・32番）：通常はコンパクト表示のみ、クリックで
         統計の内訳を展開する（UIを肥大化させない）。 */}
@@ -8978,6 +9000,9 @@ function DailyReviewPanel(){
   // 「🔄今日のセクターローテーション学習」。
   const [crossMarketLearning,setCrossMarketLearning]=useState(null);
   const [sectorRotationLearning,setSectorRotationLearning]=useState(null);
+  // トレード学習・損切り分析強化（2026-09-15新規、指示書5番）：「損した＝悪い判断」にしない、
+  // トレードごとのエントリー/損切り判断/ルール遵守/結果の内訳。
+  const [tradeBreakdown,setTradeBreakdown]=useState([]);
 
   const load=async(d)=>{
     setLoading(true);
@@ -8988,6 +9013,7 @@ function DailyReviewPanel(){
     setTradeLearning((r&&r.tradeLearning)||null);
     setCrossMarketLearning((r&&r.crossMarketLearning)||null);
     setSectorRotationLearning((r&&r.sectorRotationLearning)||null);
+    setTradeBreakdown((r&&r.tradeBreakdown)||[]);
     setFeedbackDraft(rev?.user_feedback||"");
     setLoading(false);
     const ls=await fetchJsonSafe(`/api/trade-learning/summary?date=${d}`);
@@ -9012,6 +9038,7 @@ function DailyReviewPanel(){
     if(r&&r.review){
       setReview(r.review);setFeedbackDraft(r.review.user_feedback||"");loadHistory();
       setGenResult({sync:r.sync,behaviorUpdated:r.behaviorUpdated,ruleCandidatesProposed:r.ruleCandidatesProposed});
+      setTradeBreakdown(r.tradeBreakdown||[]);
       const ls=await fetchJsonSafe(`/api/trade-learning/summary?date=${date}`);
       if(ls)setLearningSummary(ls);
     }
@@ -9075,6 +9102,40 @@ function DailyReviewPanel(){
               <div style={{fontSize:18,fontWeight:700,color:scoreColor(review[key],max)}}>{review[key]}/{max}</div>
             </div>)}
         </div>
+
+        {/* トレード学習・損切り分析強化（2026-09-15新規、指示書5番）：トレードごとの内訳。
+            「損した＝悪い判断」「利益＝良い判断」には絶対にしない——エントリー判断/損切り判断/
+            ルール遵守/結果を別々に採点し、損切り自体が正しかった場合は「損切りGOOD／問題は
+            ENTRY」と分かるようにする。 */}
+        {tradeBreakdown.length>0 && <div className="card" style={{padding:"10px 12px",marginTop:10}}>
+          <b style={{fontSize:12}}>トレード別の内訳（{tradeBreakdown.length}件）</b>
+          <div style={{marginTop:8,display:"flex",flexDirection:"column",gap:8}}>
+            {tradeBreakdown.map((t,i)=><div key={i} style={{border:"1px solid var(--rule)",borderRadius:4,padding:"6px 8px"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:6}}>
+                <span style={{fontWeight:700,fontSize:12.5}}>{t.symbol} {t.stockName||""}</span>
+                <span style={{fontSize:12,fontWeight:700,color:t.resultClass==="WIN"?"var(--up)":t.resultClass==="LOSS"?"var(--down)":"var(--inkSoft)"}}>
+                  {t.resultClass}{t.grossPnlPct!=null?` ${t.grossPnlPct>0?"+":""}${t.grossPnlPct}%`:""}
+                </span>
+              </div>
+              {t.exitWasGoodButEntryWasBad && <div style={{fontSize:11,fontWeight:700,color:"var(--accent)",marginTop:2}}>
+                損切りGOOD／問題はENTRY
+              </div>}
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(90px,1fr))",gap:"2px 10px",marginTop:4,fontSize:11}}>
+                <span>エントリー判断 <b>{t.entryTimingScore??"-"}</b>/25</span>
+                <span>損切り判断 <b>{t.exitExecutionScore??"-"}</b>/20</span>
+                <span>リスク管理 <b>{t.riskControlScore??"-"}</b>/20</span>
+                <span>ルール遵守 <b>{t.ruleComplianceScore??"-"}</b>/20</span>
+                <span>結果 <b>{t.tradeResultScore??"-"}</b>/100</span>
+              </div>
+              {t.lossReasonTags&&t.lossReasonTags.length>0 && <div style={{fontSize:11,color:"var(--inkSoft)",marginTop:4}}>
+                損切り理由：{t.lossReasonTags.join("・")}
+                {t.avoidableAtEntry!=null && <span style={{marginLeft:6,fontWeight:700,color:t.avoidableAtEntry?"var(--down)":"var(--inkSoft)"}}>
+                  {t.avoidableAtEntry?"（エントリー時点で回避可能だった可能性）":"（エントリー自体は妥当、結果は不運）"}
+                </span>}
+              </div>}
+            </div>)}
+          </div>
+        </div>}
 
         {(review.good_points||[]).length>0 && <div className="card" style={{padding:"10px 12px",marginTop:10,borderLeft:"3px solid var(--up)"}}>
           <b style={{fontSize:12,color:"var(--up)"}}>良かった点</b>
