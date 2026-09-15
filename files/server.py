@@ -4141,6 +4141,7 @@ def _score_entry_candidates(database_url, user_id):
     _t_loop = time.time()
     candidates = []
     quality_counts = {"FULL": 0, "PARTIAL": 0, "DEGRADED": 0}
+    snapshot_ready_count = 0  # 場中リアルタイム化指示書 STEP1・20：5分足スナップショットが取得できた銘柄数（"intraday_ready"の実体）
     for w in watchlist:
         code = w.get("code")
         row = stage1_rows.get(code)
@@ -4167,6 +4168,7 @@ def _score_entry_candidates(database_url, user_id):
             func_stats["_intraday_stock_snapshot"]["max_ms"] = max(func_stats["_intraday_stock_snapshot"]["max_ms"], fn_ms)
             if snap.get("dataStatus") != "failed":
                 snapshot = snap
+                snapshot_ready_count += 1
         except Exception as e:
             print("  entry-candidates: 5分足スナップショット失敗", code, e)
 
@@ -4293,6 +4295,11 @@ def _score_entry_candidates(database_url, user_id):
     section_ms["other"] = max(0, section_ms["total"] - sum(
         v for k, v in section_ms.items() if k not in ("total", "other")))
 
+    # 場中リアルタイム化指示書 STEP2・20：ENTRY_TOP5_DIAGNOSTICS用の追加専用フィールド
+    # （watchlist_count/intraday_ready相当）。既存のscanned等の集計ロジックには一切影響しない。
+    debug["watchlistCount"] = len(watchlist)
+    debug["readyCount"] = snapshot_ready_count
+    debug["qualityCounts"] = quality_counts
     debug["marketDataDiagnostics"] = market_data_diagnostics  # Phase I：デバッグ/ログ専用の追加フィールド（UI必須ではない）
     debug["entrySupportContextDiagnostics"] = entry_support_diagnostics  # Phase 2 G：DB N+1解消の診断情報（デバッグ/ログ専用）
     debug["dailyArraysDiagnostics"] = daily_arrays_diagnostics  # Phase 3 STEP10：日足prefetchの診断情報（デバッグ/ログ専用）
@@ -4319,6 +4326,179 @@ def compute_entry_ready_candidates(database_url, user_id):
     candidates()をそのまま返すだけで、stock_thesesへの永続化は行わない（永続化は朝TOP5＝
     generate_morning_entry_top5+persist_morning_thesesの専任、指示書22・23番）。"""
     return _score_entry_candidates(database_url, user_id)
+
+
+# ============================================================
+# 今買い時TOP5 場中リアルタイム化指示書（2026-09-15新規）。
+#
+# 背景：2026-09-15、/api/entry-candidates（_score_entry_candidates）は監視銘柄281件を
+# 毎回フルスキャンする重い同期処理で、本日Phase1〜5（DB N+1解消・Tachibana個別API呼び出し
+# 削減・restart warmupガード追加）で初めて実用的な速度になった。それ以前はボタン押下1回が
+# 数十分かかることがあり、これが15:36頃までまともなENTRY候補が出なかった主因だった
+# （調査結果）。_score_entry_candidates自体のロジック・Phase1〜5の高速化は一切変更しない。
+#
+# ここで追加するのは「_score_entry_candidates を5分足更新に合わせて自動的に呼び、結果を
+# メモリキャッシュへ保存し、frontendはそのキャッシュを軽量APIで読むだけにする」仕組み。
+# 新しい全市場スキャン・新しい判定ロジックは追加しない（指示書の最重要注意点：重いフルスキャンを
+# そのまま5分ごとにscheduler化するとPhase1〜5で潰したDB N+1・Tachibana個別取得・warmup競合が
+# 別経路で再発するため、既存のprefetch/batch化された_score_entry_candidates経路を"1本だけ"
+# 定期的に叩く設計にし、二重化はしない）。
+# ============================================================
+
+ENTRY_TOP5_SCAN_INTERVAL_MIN = 5  # 5分足更新に合わせた場中再評価間隔
+ENTRY_TOP5_MORNING_WINDOW = ("09:05", "11:30")  # 寄り後、最初の5分足確定後から前場終了まで
+ENTRY_TOP5_AFTERNOON_WINDOW = ("12:30", "15:30")  # 後場再開〜大引け（昼休みは不要な再計算をしない）
+ENTRY_TOP5_UPDATE_DELAY_WARNING_SEC = 600  # 2周期（10分）以上更新が無ければ「⚠更新遅延」表示
+ENTRY_TOP5_STALE_DATA_SEC = 900  # 3周期（15分）以上更新が無ければENTRY READY等を安全側（WAIT_DATA_STALE）へ降格
+
+
+def _entry_top5_scan_time_marks(window):
+    """windowの開始〜終了（"HH:MM"）を5分刻みで列挙する（scheduler発火時刻の集合を作るためだけの
+    純粋関数）。"""
+    start_h, start_m = (int(x) for x in window[0].split(":"))
+    end_h, end_m = (int(x) for x in window[1].split(":"))
+    cur = start_h * 60 + start_m
+    end = end_h * 60 + end_m
+    marks = []
+    while cur <= end:
+        marks.append(f"{cur // 60:02d}:{cur % 60:02d}")
+        cur += ENTRY_TOP5_SCAN_INTERVAL_MIN
+    return marks
+
+
+ENTRY_TOP5_SCAN_TIMES = set(
+    _entry_top5_scan_time_marks(ENTRY_TOP5_MORNING_WINDOW) + _entry_top5_scan_time_marks(ENTRY_TOP5_AFTERNOON_WINDOW))
+
+_ENTRY_TOP5_CACHE = {}  # user_id -> 最新スキャン結果（軽量API・手動更新の両方がここを読み書きする）
+_ENTRY_TOP5_CACHE_LOCK = threading.Lock()
+_ENTRY_TOP5_SCAN_LOCK = threading.Lock()  # scheduler・手動更新の二重スキャン防止（1プロセス内で常に1本だけ実行）
+
+
+def get_entry_top5_cached(user_id):
+    """軽量API（frontend polling用）が読むだけの関数。ここでは一切の再計算をしない。"""
+    with _ENTRY_TOP5_CACHE_LOCK:
+        entry = _ENTRY_TOP5_CACHE.get(user_id)
+    return dict(entry) if entry is not None else None
+
+
+def _apply_entry_top5_staleness(cache_entry):
+    """指示書「stale data対策」：ranking_generated_at（=market_data_at、_score_entry_candidates
+    は毎回フレッシュにmarket dataを取り直すため両者は同一時刻になる）が古い場合、安全側に倒す。
+    ranking_age_sec > STALE_DATA_SECならNOW_BUYABLE/ENTRY_READYをWAIT_DATA_STALEへ降格して返す
+    （キャッシュ本体は書き換えない、レスポンス生成時だけの変換）。"""
+    now = time.time()
+    age_sec = max(0.0, now - cache_entry["generatedAtEpoch"])
+    stale = age_sec > ENTRY_TOP5_STALE_DATA_SEC
+    delayed = age_sec > ENTRY_TOP5_UPDATE_DELAY_WARNING_SEC
+    top5 = cache_entry["entryReadyTop5"]
+    if stale:
+        downgraded = []
+        for c in top5:
+            if c.get("entryState") in ("NOW_BUYABLE", "ENTRY_READY"):
+                c = {**c, "entryState": "WAIT_DATA_STALE", "staleDowngraded": True}
+            downgraded.append(c)
+        top5 = downgraded
+    return {
+        "entryReadyTop5": top5,
+        "watchCandidates": cache_entry["watchCandidates"],
+        "dataQuality": cache_entry["dataQuality"],
+        "generatedAt": cache_entry["generatedAt"],
+        "marketDataAt": cache_entry["marketDataAt"],
+        "watchlistCount": cache_entry["watchlistCount"],
+        "readyCount": cache_entry["readyCount"],
+        "scoredCount": cache_entry["scoredCount"],
+        "entryReadyCount": cache_entry["entryReadyCount"],
+        "waitCount": cache_entry["waitCount"],
+        "riskCount": cache_entry["riskCount"],
+        "debug": cache_entry.get("debug", {}),
+        "durationMs": cache_entry["durationMs"],
+        "trigger": cache_entry["trigger"],
+        "rankingAgeSec": round(age_sec),
+        "dataStale": stale,
+        "updateDelayWarning": delayed,
+    }
+
+
+def _run_entry_top5_scan(database_url, user_id, trigger="AUTO", wait_for_lock=False, lock_timeout=120):
+    """_score_entry_candidates()を1回実行してキャッシュへ保存する。指示書「scheduler二重起動
+    防止」「手動更新と自動更新が競合して二重スキャンしない」：_ENTRY_TOP5_SCAN_LOCKで
+    プロセス内の同時実行を1本に制限する。
+    trigger="SCHEDULER"（自動、5分ごと）：ロック取得できなければ即座に諦めて既存キャッシュを返す
+    （次の5分周期でまた試みるため、待ち合わせて処理を積み重ねない＝指示書「同一5分足に対する
+    重複計算」防止）。
+    trigger="MANUAL"（手動「今買い時TOP5を更新」ボタン）：ロックが空くまで待ってから必ず
+    フルスキャンを実行する（ユーザーが明示的に最新化を求めているため）。lock_timeout秒待っても
+    空かない場合はタイムアウトして既存キャッシュを返す（フリーズ防止）。"""
+    acquired = _ENTRY_TOP5_SCAN_LOCK.acquire(blocking=wait_for_lock, timeout=lock_timeout if wait_for_lock else -1)
+    if not acquired:
+        print(f"  [EntryTop5Scan] trigger={trigger} user={user_id}: 既存スキャン実行中のためスキップ（既存キャッシュを使用）")
+        return get_entry_top5_cached(user_id)
+    try:
+        t0 = time.time()
+        result = _score_entry_candidates(database_url, user_id)
+        t1 = time.time()
+        debug = result.get("debug", {})
+        cache_entry = {
+            "entryReadyTop5": result["entryReadyTop5"],
+            "watchCandidates": result["watchCandidates"],
+            "dataQuality": result["dataQuality"],
+            "generatedAt": result["generatedAt"],
+            "generatedAtEpoch": t1,
+            "marketDataAt": result["generatedAt"],
+            "watchlistCount": debug.get("watchlistCount", 0),
+            "readyCount": debug.get("readyCount", 0),
+            "scoredCount": debug.get("scanned", 0),
+            "entryReadyCount": debug.get("entry_ready", 0),
+            "waitCount": debug.get("active_break", 0) + debug.get("watch_near_ready", 0),
+            "riskCount": debug.get("risk_excluded", 0),
+            "debug": debug,  # 既存の🔧デバッグ表示（scanned/entry_ready/…）を維持するため丸ごと保持
+            "durationMs": round((t1 - t0) * 1000),
+            "trigger": trigger,
+            "scanStartedAt": datetime.datetime.fromtimestamp(t0, datetime.timezone.utc).isoformat(),
+            "scanFinishedAt": datetime.datetime.fromtimestamp(t1, datetime.timezone.utc).isoformat(),
+        }
+        with _ENTRY_TOP5_CACHE_LOCK:
+            _ENTRY_TOP5_CACHE[user_id] = cache_entry
+        print(f"  [EntryTop5Scan] trigger={trigger} user={user_id} duration={cache_entry['durationMs']}ms "
+              f"watchlist={cache_entry['watchlistCount']} ready={cache_entry['readyCount']} "
+              f"scored={cache_entry['scoredCount']} entryReady={cache_entry['entryReadyCount']} "
+              f"wait={cache_entry['waitCount']} risk={cache_entry['riskCount']}")
+        return cache_entry
+    except Exception as e:
+        print(f"  [EntryTop5Scan] trigger={trigger} user={user_id}: スキャン失敗", e)
+        return get_entry_top5_cached(user_id)
+    finally:
+        _ENTRY_TOP5_SCAN_LOCK.release()
+
+
+def _entry_top5_scheduler_loop():
+    """場中5分足更新に合わせてENTRY TOP5を自動再評価するデーモンスレッド。他のscheduler
+    （_morning_check_scheduler_loop等）と同じ「60秒間隔でJST時刻をポーリングし、対象HH:MMの
+    分に一度だけ発火（プロセス内fired setで二重発火防止）」パターンを踏襲する——新しい
+    poll方式は増やさない。営業日のみ、ENTRY_TOP5_SCAN_TIMES（09:05〜11:30・12:30〜15:30の
+    5分刻み、昼休みは対象外）の時刻だけ発火する。"""
+    fired = set()  # {(trade_date, hhmm, user_id)}
+    JST = datetime.timezone(datetime.timedelta(hours=9))
+    while True:
+        try:
+            now_jst = datetime.datetime.now(JST)
+            hhmm = now_jst.strftime("%H:%M")
+            if _is_jp_market_business_day(now_jst) and hhmm in ENTRY_TOP5_SCAN_TIMES:
+                trade_date = now_jst.date().isoformat()
+                for user_id in _morning_check_scheduler_users():
+                    key = (trade_date, hhmm, user_id)
+                    if key in fired:
+                        continue
+                    fired.add(key)
+                    try:
+                        _run_entry_top5_scan(DATABASE_URL, user_id, trigger="SCHEDULER", wait_for_lock=False)
+                    except Exception as e:
+                        print(f"  [EntryTop5Scheduler] {user_id} {hhmm} 実行失敗", e)
+                if len(fired) > 400:
+                    fired = {k for k in fired if k[0] == now_jst.date().isoformat()}
+        except Exception as e:
+            print("  [EntryTop5Scheduler] スケジューラループで例外", e)
+        time.sleep(60)
 
 
 # ============================================================
@@ -20570,16 +20750,39 @@ class Handler(SimpleHTTPRequestHandler):
                     self._send_json({"error": "対象銘柄の当日値が取得できません"}, status=404)
                 else:
                     self._send_json(result)
+        elif self.path.startswith("/api/entry-candidates/live"):
+            # 場中リアルタイム化指示書（2026-09-15新規）：frontend polling専用の軽量API。
+            # ここでは一切の再計算をしない——_entry_top5_scheduler_loopが5分ごとに更新した
+            # キャッシュ（_ENTRY_TOP5_CACHE）を読むだけ（指示書「frontendからのGETによって
+            # 56銘柄のENTRY分析を毎回開始してはいけない」）。stale判定は_apply_entry_top5_
+            # staleness()で読み取り時に適用する（キャッシュ本体は書き換えない）。
+            cache_entry = get_entry_top5_cached(self.current_user) if (investment_db is not None and DATABASE_URL) else None
+            if cache_entry is None:
+                self._send_json({"entryReadyTop5": [], "watchCandidates": [], "dataQuality": "DEGRADED",
+                                  "generatedAt": None, "marketDataAt": None, "watchlistCount": 0, "readyCount": 0,
+                                  "scoredCount": 0, "entryReadyCount": 0, "waitCount": 0, "riskCount": 0,
+                                  "durationMs": None, "trigger": None, "rankingAgeSec": None,
+                                  "dataStale": False, "updateDelayWarning": False, "notReadyYet": True})
+            else:
+                self._send_json(_apply_entry_top5_staleness(cache_entry))
         elif self.path.startswith("/api/entry-candidates"):
             # 2026-09-10新規（Market Intelligence Timeline Phase2-C「今買い時TOP5＋Thesis永続化」）：
             # entry_ready_top5（ENTRY_SCOREで選ばれた「今エントリー条件が整っている」候補）と
             # Watch候補を返す。既存の共有Stage1・AUTO_RS/AUTO_SECTOR_LEADER・AUTO_VOLUME Stage2・
             # 個別銘柄5分足判定を再利用（新規の全市場スキャンではない、監視銘柄のみ対象）。
-            print("[取得] ENTRY TOP5候補スキャン開始…")
-            result = compute_entry_ready_candidates(DATABASE_URL, self.current_user) \
-                if (investment_db is not None and DATABASE_URL) else \
-                {"entryReadyTop5": [], "watchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None}
-            print(f"  ENTRY TOP5：{len(result['entryReadyTop5'])}件、Watch候補：{len(result['watchCandidates'])}件"
+            # 場中リアルタイム化指示書（2026-09-15更新）：手動「今買い時TOP5を更新」ボタン用。
+            # _run_entry_top5_scan()経由にして、①結果を_ENTRY_TOP5_CACHEへも保存し以後の
+            # frontend pollingへ即座に反映させる、②schedulerと同じロックで二重スキャンを防ぐ
+            # （ロック使用中ならスキャン完了まで待ってから実行、指示書「自動更新と手動更新が
+            # 競合して二重スキャンしない」）。
+            print("[取得] ENTRY TOP5候補スキャン開始（手動更新）…")
+            if investment_db is not None and DATABASE_URL:
+                cache_entry = _run_entry_top5_scan(DATABASE_URL, self.current_user, trigger="MANUAL", wait_for_lock=True)
+                result = _apply_entry_top5_staleness(cache_entry) if cache_entry else {
+                    "entryReadyTop5": [], "watchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None}
+            else:
+                result = {"entryReadyTop5": [], "watchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None}
+            print(f"  ENTRY TOP5：{len(result['entryReadyTop5'])}件、Watch候補：{len(result.get('watchCandidates', []))}件"
                   f"（dataQuality={result['dataQuality']}）")
             self._send_json(result)
         elif self.path.startswith("/api/stock-theses"):
@@ -22329,6 +22532,11 @@ def main():
         # 定時スケジューラ（Phase2-A範囲）。別スレッドに分離し、Morning Checkのスケジューラが
         # 万一詰まってもこちらは独立して動く（指示書31番のサービス分離方針）。
         threading.Thread(target=_intraday_report_scheduler_loop, daemon=True).start()
+        # 今買い時TOP5 場中リアルタイム化指示書（2026-09-15新規）：09:05〜11:30・12:30〜15:30の
+        # 5分刻みでENTRY TOP5を自動再評価し_ENTRY_TOP5_CACHEへ保存する独立スケジューラ。他の
+        # スケジューラと同じくサービス分離方針（指示書31番）で別スレッドにする。既存の
+        # _restart_time_morning_warmup・281銘柄warmupガードには一切触れない（別経路）。
+        threading.Thread(target=_entry_top5_scheduler_loop, daemon=True).start()
         # 2026-09-10新規（にこそく@nicosokufx X投稿連携、指示書2番）：X_API_BEARER_TOKEN
         # 未設定なら_nicosoku_poll_scheduler_loop内で即returnする（アプリ本体には影響しない）。
         threading.Thread(target=_nicosoku_poll_scheduler_loop, daemon=True).start()

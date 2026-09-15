@@ -1992,6 +1992,9 @@ const ENTRY_STATE_META = {
   WEAK:          {label:"弱い",             color:"var(--inkFaint)"},
   INVALID:       {label:"根拠崩れ",         color:"var(--down)"},
   PROVISIONAL:   {label:"データ不足",       color:"var(--inkFaint)"},
+  // 場中リアルタイム化指示書（2026-09-15新規）：ranking_generated_atが古くなった場合の
+  // 安全側フォールバック表示。NOW_BUYABLE/ENTRY_READYの代わりにサーバー側で降格される。
+  WAIT_DATA_STALE: {label:"データ更新遅延",  color:"var(--accent)"},
 };
 
 // Phase2-C改訂（TOP5選考基準の全面見直し、指示書21番）：ENTRY SCOREの内訳を「X/満点」の形で
@@ -5235,7 +5238,20 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
       <div style={{fontSize:10.5,color:"var(--inkFaint)",marginBottom:8}}>
         「一番上がっている銘柄」ではなく「今から入ってもリスクリワードが良い銘柄」を上位表示します。ENTRY READY最優先、次点でスコアの高いブレイク待ち・押し目待ち候補も表示します（候補数は0〜5件、必ず5件揃える表示ではありません）。
       </div>
+      {/* 場中リアルタイム化指示書STEP12：最終評価時刻・評価済件数・更新遅延の可視化。
+          「今のランキングなのか？」を一目で確認できるようにする（指示書の要求そのもの）。 */}
+      {entryResult && entryResult.generatedAt && <div style={{fontSize:10.5,color:entryResult.updateDelayWarning?"var(--down)":"var(--inkFaint)",marginBottom:6,display:"flex",flexWrap:"wrap",gap:"2px 10px",alignItems:"center"}}>
+        <span>最終評価 {new Date(entryResult.generatedAt).toLocaleTimeString("ja-JP",{hour12:false})}</span>
+        {entryResult.scoredCount!=null && <span>評価済 {entryResult.readyCount??"—"}/{entryResult.watchlistCount??entryResult.scoredCount}</span>}
+        {entryResult.updateDelayWarning && <span style={{fontWeight:700}}>⚠ 更新遅延</span>}
+      </div>}
+      {entryResult && entryResult.dataStale && <div style={{fontSize:11,color:"var(--down)",fontWeight:700,marginBottom:6}}>
+        ⚠ 元データが古いため、一部の「今すぐ買える／準備完了」は安全側で「データ更新遅延」表示に変更しています。
+      </div>}
       {entryResult && entryDebugOpen && <div style={{fontSize:10.5,color:"var(--inkFaint)",marginBottom:8,padding:"4px 6px",background:"var(--bg)",borderRadius:4,display:"flex",flexWrap:"wrap",gap:"2px 12px"}} className="mono">
+        <span>trigger: {entryResult.trigger??"—"}</span>
+        <span>duration: {entryResult.durationMs!=null?entryResult.durationMs+"ms":"—"}</span>
+        <span>ranking_age: {entryResult.rankingAgeSec!=null?entryResult.rankingAgeSec+"s":"—"}</span>
         <span>scanned: {entryResult.debug?.scanned??"—"}</span>
         <span>entry_ready: {entryResult.debug?.entry_ready??"—"}</span>
         <span>active_break: {entryResult.debug?.active_break??"—"}</span>
@@ -11359,6 +11375,32 @@ function App(){
     }catch(e){}
     setEntryScanning(false);
   };
+
+  // 今買い時TOP5 場中リアルタイム化指示書（2026-09-15新規）：frontend自動polling。
+  // backend側_entry_top5_scheduler_loopが5分ごとに更新するキャッシュを、軽量API
+  // （/api/entry-candidates/live、再計算なし）経由で45秒間隔（指示書「30〜60秒程度」）で
+  // 取得しentryResultへ反映する。手動「今買い時TOP5を更新」ボタン（runEntryScan）が実行中は
+  // 上書きしない（指示書「自動更新と手動更新が競合しない」、entryScanningRefで同期的に判定）。
+  const entryScanningRef=useRef(false);
+  useEffect(()=>{entryScanningRef.current=entryScanning;},[entryScanning]);
+  const entryLiveFetchingRef=useRef(false);
+  useEffect(()=>{
+    const fetchLive=async()=>{
+      if(entryScanningRef.current||entryLiveFetchingRef.current)return; // 手動更新中・前回未完了なら重複取得しない
+      entryLiveFetchingRef.current=true;
+      try{
+        const r=await fetch("/api/entry-candidates/live");
+        if(r.ok){
+          const d=await r.json();
+          if(!d.notReadyYet)setEntryResult(d); // schedulerがまだ一度も走っていない（キャッシュ空）間は既存表示を維持
+        }
+      }catch(e){}
+      entryLiveFetchingRef.current=false;
+    };
+    fetchLive();
+    const id=setInterval(()=>{if(isJstMarketHours())fetchLive();},45*1000);
+    return()=>clearInterval(id);
+  },[]);
 
   // 売買記録（トレードジャーナル）：銘柄分析カードの「記録に追加」ボタンから、そのカードの
   // entry/stop/target/marketEnv/entryReasonを初期値にしたドラフトを開き、「記録」タブへ遷移する。
