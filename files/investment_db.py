@@ -1571,6 +1571,7 @@ def init_schema(database_url):
         conn.execute(_SCHEMA_NEWS_NOTIFICATION_LOG_SQL)
         conn.execute(_MIGRATE_MARKET_NEWS_CONTEXT_SQL)
         conn.execute(_MIGRATE_MARKET_EVENT_SOURCE_TRACKING_SQL)
+        conn.execute(_MIGRATE_EXTERNAL_INTELLIGENCE_CONTEXT_SQL)
         conn.commit()
 
 
@@ -4828,6 +4829,7 @@ _MORNING_CHECK_JSON_COLS = [
     "resilience_json", "market_risk_warnings_json", "event_risk_json",
     "strategy_json", "raw_payload_json",
     "market_news_context_json",  # News Intelligence Phase 2（指示書12）
+    "external_intelligence_json",  # X Intelligence Phase5（2026-09-15）
 ]
 _MORNING_CHECK_SCALAR_COLS = [
     "market_regime", "volatility_regime", "trend_type", "market_risk_score", "volatility_score",
@@ -4990,6 +4992,7 @@ _MARKET_INTEL_JSON_COLS = [
     "news_changes_json", "event_risk_json", "strategy_update_json", "data_health_json",
     "social_signals_json",
     "market_news_context_json",  # News Intelligence Phase 2（指示書12）
+    "external_intelligence_json",  # X Intelligence Phase5（2026-09-15）
 ]
 _MARKET_INTEL_SCALAR_COLS = [
     "scheduled_time", "morning_check_id", "market_regime", "volatility_regime", "market_summary",
@@ -7380,6 +7383,18 @@ def list_recent_notifications(database_url, limit=100):
 _MIGRATE_MARKET_NEWS_CONTEXT_SQL = """
 ALTER TABLE morning_market_checks ADD COLUMN IF NOT EXISTS market_news_context_json JSONB;
 ALTER TABLE market_intelligence_reports ADD COLUMN IF NOT EXISTS market_news_context_json JSONB;
+"""
+
+# ============================================================
+# X Intelligence Phase5（2026-09-15新規）：朝一チェック／場中4レポートへ、共通Intelligence
+# Context（build_external_intelligence_context()の戻り値、facts/expert_views/consensus/
+# disagreements/event_signals/warnings/stock_signals/sector_signals/freshness/diagnostics）
+# を持たせるための列追加。既存のexternal_market_commentary（にこそく専用、
+# raw_payload_json内）とは別枠——既存フィールドは削除・変更しない。
+# ============================================================
+_MIGRATE_EXTERNAL_INTELLIGENCE_CONTEXT_SQL = """
+ALTER TABLE morning_market_checks ADD COLUMN IF NOT EXISTS external_intelligence_json JSONB;
+ALTER TABLE market_intelligence_reports ADD COLUMN IF NOT EXISTS external_intelligence_json JSONB;
 """
 
 

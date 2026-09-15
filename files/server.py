@@ -2770,6 +2770,12 @@ def generate_morning_market_check(database_url, user_id, snapshot_time):
     # ニュース候補を再利用する）。
     news_catalyst_map = attach_news_catalyst_flags(
         {c["code"] for c in entry_ready_top5}, _news_alert_cache.get("candidates") or [])
+    # X Intelligence Phase5（指示書7番）：ENTRY TOP5のscore/rank計算式は変更せず、
+    # 候補へexternalIntelligenceを注記するだけ（X投稿だけを理由に順位を上げない）。
+    # payload全体で1回だけ計算し、下のexternal_intelligence_jsonでも再利用する
+    # （同じ情報を重複取得しない）。
+    external_intel_ctx = build_external_intelligence_context_safe(database_url, user_id) or {}
+    _stock_intel_map = {s["code"]: s for s in (external_intel_ctx.get("stock_signals") or [])}
     watchlist_top5_json = [{
         "code": c["code"], "name": c["name"], "rank": c["rank"],
         "entryScore": c["entryScore"], "score": c["entryScore"], "entryState": c["entryState"],
@@ -2779,6 +2785,10 @@ def generate_morning_market_check(database_url, user_id, snapshot_time):
         "trigger": "寄り後VWAP維持＋5分足安値切り上げを確認してからのエントリーを推奨",
         "avoidCondition": "寄り天・出来高を伴わない上昇・悪材料の追加",
         "newsCatalyst": news_catalyst_map.get(c["code"]),
+        "externalIntelligence": ({"consensus": _stock_intel_map[c["code"]]["direction"],
+                                    "bullishSources": _stock_intel_map[c["code"]]["bullish_sources"],
+                                    "bearishSources": _stock_intel_map[c["code"]]["bearish_sources"]}
+                                   if c["code"] in _stock_intel_map else None),
     } for c in entry_ready_top5]
 
     try:
@@ -2837,6 +2847,13 @@ def generate_morning_market_check(database_url, user_id, snapshot_time):
         # News Intelligence Phase 2（指示書12）：既にキャッシュ済みのニュース候補（新規取得
         # なし、_fetch_news_alert_candidatesの5分キャッシュを再利用）から構造化要約のみ生成。
         "market_news_context_json": build_market_news_context(_news_alert_cache.get("candidates") or []),
+        # X Intelligence Phase5（指示書4番）：共通Intelligence Context（FACT/expert_views/
+        # consensus/disagreements/event_signals/warnings/stock_signals/sector_signals）。
+        # 既存のexternal_market_commentary（にこそく専用、raw_payload_json内）は無変更で
+        # 残す——こちらは複数source統合済みの構造化contextを追加するだけ（指示書1・4番）。
+        # external_intel_ctx（上でENTRY TOP5注記にも使用済み）を再利用し、同じ情報を
+        # 二重取得しない（指示書1番「同じ情報を重複投入しないこと」）。
+        "external_intelligence_json": external_intel_ctx,
     }
     saved = investment_db.save_morning_check(database_url, user_id, check_date, snapshot_time, payload) if investment_db else None
     # 朝TOP5をstock_thesesへ永続化（source='MORNING'固定、以後書き換えない成績評価用スナップ
@@ -6812,6 +6829,319 @@ def build_market_intelligence_consensus(database_url, lookback_minutes=CONSENSUS
             "confidence": confidence, "related_stocks": related_stocks,
         })
     return {"consensus": consensus, "disagreements": disagreements}
+
+
+# ============================================================
+# X Intelligence Phase5（2026-09-15新規）：共通Intelligence Context。
+# social_market_posts・expert_views・market_events・build_market_intelligence_
+# consensus()を横断して1つの構造化contextへまとめ、各分析関数（朝一チェック・
+# 4レポート・Sector Rotation・ENTRY TOP5・個別銘柄分析）が個別にX投稿テーブルへ
+# 直接クエリしなくて済むようにする（指示書1番）。
+#
+# 最重要原則（指示書2・11番）：FACT／AUTHOR_VIEW／PREDICTION／MARKET_OBSERVATION／
+# SYSTEM_INFERENCEを混同しない。個人アカウントの強気/弱気やPolymarketの確率は
+# FACTではない——post["facts_json"]（本文中の事実の羅列）だけをcontext["facts"]へ
+# 入れ、author_opinion_json由来の内容はstock_signals/sector_signals/warningsへ
+# MARKET_OBSERVATION等として別枠で保持する。
+#
+# 鮮度（指示書3番）：一律TTLにせず、種別ごとに減衰させる。市場実況・個別株観測
+# （nicosokufx/aryarya/kgbukabu等）は短時間で失効、ニュース（nikkei/reutersjapan/
+# bloombergjapan）はやや長め、Expert Viewはconfirmations/invalidation_conditions
+# と有効期間（effective_until優先、無ければrisk_window_end、それも無ければ既定
+# 30日）を考慮、イベントはevent_date当日まで有効とする。
+# ============================================================
+
+INTELLIGENCE_MARKET_OBSERVATION_STALE_HOURS = 3     # nicosokufx等の市場実況
+INTELLIGENCE_STOCK_OBSERVATION_STALE_HOURS = 6       # aryarya/kgbukabu等の個別株観測
+INTELLIGENCE_NEWS_STALE_HOURS = 20                   # nikkei/reutersjapan/bloombergjapan
+INTELLIGENCE_PREDICTION_STALE_HOURS = 24             # polymarketjapan
+INTELLIGENCE_EXPERT_VIEW_DEFAULT_DAYS = 30           # effective_until/risk_window_end無指定時
+
+
+def _intelligence_role_for_handle(handle):
+    """指示書2番：7アカウントを同じ意味・同じ重みで扱わない。source_typeから
+    FACT寄り／MARKET_OBSERVATION／PREDICTION／STOCK_OBSERVATIONの役割を判定する。
+    未登録handle（監査の"unknown/manual_source"）はMARKET_OBSERVATION扱いに倒す
+    （個人発信と同じ安全側、事実として昇格させない）。"""
+    cfg = MARKET_SOURCE_BY_HANDLE.get(handle)
+    source_type = (cfg or {}).get("source_type")
+    if source_type == "NEWS_MEDIA":
+        return "FACT_LEANING"
+    if source_type == "PREDICTION_MARKET":
+        return "PREDICTION"
+    if source_type in ("STOCK_BREAKING", "CORPORATE_BREAKING"):
+        return "STOCK_OBSERVATION"
+    return "MARKET_OBSERVATION"  # MARKET_COMMENTARY・未登録
+
+
+def _intelligence_stale_hours_for_role(role):
+    return {
+        "FACT_LEANING": INTELLIGENCE_NEWS_STALE_HOURS,
+        "PREDICTION": INTELLIGENCE_PREDICTION_STALE_HOURS,
+        "STOCK_OBSERVATION": INTELLIGENCE_STOCK_OBSERVATION_STALE_HOURS,
+        "MARKET_OBSERVATION": INTELLIGENCE_MARKET_OBSERVATION_STALE_HOURS,
+    }.get(role, INTELLIGENCE_MARKET_OBSERVATION_STALE_HOURS)
+
+
+def _intelligence_post_age_hours(post, now=None):
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    posted_at = post.get("posted_at")
+    if not posted_at:
+        return None  # 投稿日時不明＝鮮度判定不能（推測せず、呼び出し側で除外扱いにする）
+    try:
+        dt = datetime.datetime.fromisoformat(str(posted_at).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    return (now - dt).total_seconds() / 3600.0
+
+
+def _expert_view_is_active(view, today=None):
+    """指示書3・9番：effective_until優先、無ければrisk_window_end、それも無ければ
+    published_atから既定30日。confirmations/invalidation_conditions自体の真偽判定
+    （実際に確認されたか）はここでは行わない（判定材料が無いため、有効期間の
+    経過だけを見る保守的な実装）。"""
+    today = today or datetime.date.today()
+    for key in ("effective_until", "risk_window_end"):
+        val = view.get(key)
+        if val:
+            try:
+                return today <= datetime.date.fromisoformat(str(val)[:10])
+            except ValueError:
+                continue
+    published_at = view.get("published_at")
+    if published_at:
+        try:
+            pub = datetime.date.fromisoformat(str(published_at)[:10])
+            return today <= pub + datetime.timedelta(days=INTELLIGENCE_EXPERT_VIEW_DEFAULT_DAYS)
+        except ValueError:
+            pass
+    return True  # 判定材料が無い場合は除外せず含める（安全側だが情報を失わない）
+
+
+def _infer_expert_view_topics(view):
+    """指示書9番：topicがnullでも完全に捨てず、thesis/outlook/key_pointsから
+    関連セクター・テーマを安全に判定する（既存extract_related_tagsのキーワード
+    一致を再利用——勝手な推測はしない、既知キーワードとの一致のみ）。"""
+    text_parts = [view.get("thesis") or "", view.get("outlook") or ""]
+    key_points = view.get("key_points")
+    if isinstance(key_points, list):
+        text_parts.extend(str(p) for p in key_points)
+    combined = "\n".join(text_parts)
+    tags = extract_related_tags(combined)
+    return {"inferred_sectors": tags["relatedSectors"], "inferred_themes": tags["relatedThemes"]}
+
+
+def build_external_intelligence_context(database_url, user_id, lookback_hours=24):
+    """X Intelligence Phase5の中核（指示書1番）。social_market_posts・expert_views・
+    market_events・build_market_intelligence_consensus()を横断し、以下の構造化
+    dictを返す：
+    {as_of, sources_used, facts, expert_views, consensus, disagreements,
+     event_signals, warnings, stock_signals, sector_signals, freshness, diagnostics}
+    diagnostics（指示書15番）：sources_found/sources_used/stale_skipped/
+    duplicates_skipped/errorsで、各段階の状態を確認可能にする（silent failure対策）。
+    呼び出し側（朝一チェック・4レポート・Sector Rotation・ENTRY TOP5・個別銘柄分析）
+    は、この関数が返した値をそのまま注記として使うだけで、既存のスコア計算式・
+    state判定には一切混入させない（指示書14番）。"""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    diagnostics = {"sources_found": 0, "sources_used": 0, "stale_skipped": 0,
+                   "duplicates_skipped": 0, "errors": []}
+    empty = {
+        "as_of": now.isoformat(), "sources_used": [], "facts": [], "expert_views": [],
+        "consensus": [], "disagreements": [], "event_signals": [], "warnings": [],
+        "stock_signals": [], "sector_signals": [], "freshness": {
+            "market_observation_stale_hours": INTELLIGENCE_MARKET_OBSERVATION_STALE_HOURS,
+            "stock_observation_stale_hours": INTELLIGENCE_STOCK_OBSERVATION_STALE_HOURS,
+            "news_stale_hours": INTELLIGENCE_NEWS_STALE_HOURS,
+            "prediction_stale_hours": INTELLIGENCE_PREDICTION_STALE_HOURS,
+            "expert_view_default_days": INTELLIGENCE_EXPERT_VIEW_DEFAULT_DAYS,
+        }, "diagnostics": diagnostics,
+    }
+    if investment_db is None or not database_url:
+        return empty
+
+    since_iso = (now - datetime.timedelta(hours=lookback_hours)).isoformat()
+    try:
+        posts = investment_db.list_recent_social_posts_all_sources(database_url, since_iso, limit=300)
+    except Exception as e:
+        diagnostics["errors"].append(f"social_posts取得失敗: {e}")
+        posts = []
+    diagnostics["sources_found"] = len({p.get("source_handle") for p in posts if p.get("source_handle")})
+
+    sources_used = set()
+    facts = []
+    seen_fact_keys = set()
+    stock_signal_map = {}  # code -> {bullish:[], bearish:[]}
+
+    for p in posts:
+        handle = p.get("source_handle")
+        role = _intelligence_role_for_handle(handle)
+        age_hours = _intelligence_post_age_hours(p, now)
+        stale_limit = _intelligence_stale_hours_for_role(role)
+        if age_hours is None or age_hours > stale_limit:
+            diagnostics["stale_skipped"] += 1
+            continue
+        contributed = False
+        for fact_text in (p.get("facts_json") or []):
+            key = (handle, p.get("post_id"), str(fact_text))
+            if key in seen_fact_keys:
+                diagnostics["duplicates_skipped"] += 1
+                continue
+            seen_fact_keys.add(key)
+            facts.append({"text": fact_text, "source_handle": handle, "role": role,
+                           "posted_at": p.get("posted_at"), "age_hours": round(age_hours, 1)})
+            contributed = True
+        direction = _detect_signal_direction(p.get("text") or "")
+        if direction in ("BULLISH", "BEARISH") and role in ("MARKET_OBSERVATION", "STOCK_OBSERVATION", "FACT_LEANING"):
+            for code in (p.get("direct_mentions_json") or []):
+                bucket = stock_signal_map.setdefault(code, {"bullish": [], "bearish": []})
+                bucket["bullish" if direction == "BULLISH" else "bearish"].append(handle)
+                contributed = True
+        if contributed and handle:
+            sources_used.add(handle)
+
+    stock_signals = []
+    for code, bucket in stock_signal_map.items():
+        bulls, bears = sorted(set(bucket["bullish"])), sorted(set(bucket["bearish"]))
+        if bulls and bears:
+            direction_summary = "MIXED"
+        elif bulls:
+            direction_summary = "BULLISH"
+        elif bears:
+            direction_summary = "BEARISH"
+        else:
+            continue
+        stock_signals.append({"code": code, "direction": direction_summary,
+                               "bullish_sources": bulls, "bearish_sources": bears})
+
+    try:
+        consensus_result = build_market_intelligence_consensus(database_url, lookback_minutes=lookback_hours * 60)
+    except Exception as e:
+        diagnostics["errors"].append(f"consensus計算失敗: {e}")
+        consensus_result = {"consensus": [], "disagreements": []}
+    consensus_list = consensus_result.get("consensus") or []
+    disagreements_list = consensus_result.get("disagreements") or []
+    sector_signals = [c for c in consensus_list if c.get("target_type") == "SECTOR"]
+    for c in consensus_list:
+        sources_used.update(c.get("sources") or [])
+    for d in disagreements_list:
+        sources_used.update(d.get("sources") or [])
+
+    try:
+        expert_views_raw = investment_db.list_expert_views(database_url, user_id, limit=50)
+    except Exception as e:
+        diagnostics["errors"].append(f"expert_views取得失敗: {e}")
+        expert_views_raw = []
+    expert_views = []
+    today = now.date()
+    for v in expert_views_raw:
+        if not _expert_view_is_active(v, today=today):
+            diagnostics["stale_skipped"] += 1
+            continue
+        topics = _infer_expert_view_topics(v)
+        expert_views.append({
+            "expert_name": v.get("expert_name"), "published_at": v.get("published_at"),
+            "topic": v.get("topic"), "inferred_sectors": topics["inferred_sectors"],
+            "inferred_themes": topics["inferred_themes"], "thesis": v.get("thesis"),
+            "outlook": v.get("outlook"), "confirmations": v.get("confirmations"),
+            "invalidation_conditions": v.get("invalidation_conditions"),
+            "confidence": v.get("confidence"),
+        })
+        diagnostics["sources_found"] += 1
+        if v.get("expert_name"):
+            sources_used.add(f"expert:{v.get('expert_name')}")
+
+    try:
+        today_str = _jst_today_date_str()
+        end_str = (datetime.date.fromisoformat(today_str) + datetime.timedelta(days=14)).isoformat()
+        events_raw = investment_db.list_market_events(database_url, user_id, from_date=today_str, to_date=end_str)
+    except Exception as e:
+        diagnostics["errors"].append(f"market_events取得失敗: {e}")
+        events_raw = []
+    event_signals = []
+    for ev in events_raw:
+        imp = (ev.get("importance") or "").upper()
+        if imp not in ("HIGH", "MEDIUM"):
+            continue
+        event_signals.append({
+            "title": ev.get("title"), "event_date": ev.get("event_date"),
+            "event_type": ev.get("event_type"), "importance": ev.get("importance"),
+            "source_handle": ev.get("source_handle"), "source_type": ev.get("source_type"),
+        })
+
+    warnings = []
+    for d in disagreements_list:
+        warnings.append(f"⚠ {d.get('topic')}：見解不一致（{'/'.join(f'{h}:{dir_}' for h, dir_ in (d.get('directions') or {}).items())}）")
+
+    diagnostics["sources_used"] = len(sources_used)
+    return {
+        "as_of": now.isoformat(), "sources_used": sorted(sources_used),
+        "facts": facts, "expert_views": expert_views,
+        "consensus": consensus_list, "disagreements": disagreements_list,
+        "event_signals": event_signals, "warnings": warnings,
+        "stock_signals": stock_signals, "sector_signals": sector_signals,
+        "freshness": empty["freshness"], "diagnostics": diagnostics,
+    }
+
+
+def build_stock_intelligence_annotation(code, external_intel_ctx):
+    """X Intelligence Phase5（指示書8番）：analyze_stock()等が読み取り専用で使う、
+    銘柄コード単位のexternal intelligence注記。build_external_intelligence_context()の
+    戻り値から、該当銘柄に関係する情報だけを取り出して区別する：
+    - marketObservation：direct_mentionsで直接言及されたX投稿の方向性（MARKET_OBSERVATION）
+    - sectorConsensus/sectorDisagreement：銘柄が属するテーマの複数source consensus
+      （SECTOR_ROTATION_THEME_CODESで逆引き、あくまでセクター単位でありこの銘柄固有の
+      判断材料ではないことを呼び出し側が区別できるようlevel="SECTOR"を明示する）
+    - expertViews：inferred_sectorsが一致するExpert View（同じくセクター単位）
+    個人X投稿だけを根拠にBUY/SELL判定を変更しない、という方針を守るため、この関数は
+    値を返すだけで判定は一切行わない。"""
+    if not external_intel_ctx:
+        return None
+    theme = next((t for t, codes in SECTOR_ROTATION_THEME_CODES.items() if code in codes), None)
+
+    market_observation = None
+    for s in (external_intel_ctx.get("stock_signals") or []):
+        if s.get("code") == code:
+            market_observation = {"direction": s.get("direction"), "bullishSources": s.get("bullish_sources"),
+                                    "bearishSources": s.get("bearish_sources")}
+            break
+
+    sector_consensus, sector_disagreement = None, None
+    if theme:
+        target_key = next((k for k, v in SECTOR_SIGNAL_TARGET_KEY_TO_ROTATION_THEME.items() if v == theme), None)
+        if target_key:
+            for c in (external_intel_ctx.get("sector_signals") or []):
+                if c.get("topic") == target_key:
+                    sector_consensus = {"level": "SECTOR", "sector": theme, "direction": c.get("direction"),
+                                          "sourceCount": c.get("independent_source_count"), "confidence": c.get("confidence")}
+                    break
+            for d in (external_intel_ctx.get("disagreements") or []):
+                if d.get("topic") == target_key:
+                    sector_disagreement = {"level": "SECTOR", "sector": theme, "directions": d.get("directions")}
+                    break
+
+    expert_views = []
+    if theme:
+        for v in (external_intel_ctx.get("expert_views") or []):
+            if theme in (v.get("inferred_sectors") or []):
+                expert_views.append({"level": "SECTOR", "sector": theme, "expertName": v.get("expert_name"),
+                                       "outlook": v.get("outlook"), "confidence": v.get("confidence")})
+
+    if not (market_observation or sector_consensus or sector_disagreement or expert_views):
+        return None
+    return {"marketObservation": market_observation, "sectorConsensus": sector_consensus,
+            "sectorDisagreement": sector_disagreement, "expertViews": expert_views}
+
+
+def build_external_intelligence_context_safe(database_url, user_id, lookback_hours=24):
+    """指示書：この機能単体の不具合が朝一チェック等の生成自体を壊さないようにする
+    （既存の_nicosoku_morning_commentary_safe等と同じ安全側パターン）。"""
+    try:
+        return build_external_intelligence_context(database_url, user_id, lookback_hours=lookback_hours)
+    except Exception as e:
+        print("  X Intelligence: 共通コンテキスト生成で例外（無視して続行）", e)
+        return None
 
 
 # ============================================================
@@ -12381,6 +12711,14 @@ SECTOR_ROTATION_THEMES = (
     "半導体", "半導体製造装置", "AI/データセンター", "電線", "MLCC/電子部品",
     "重工/防衛", "海運", "エネルギー", "銀行", "保険", "SaaS", "自動車", "商社", "内需ディフェンシブ",
 )
+# X Intelligence Phase5（2026-09-15新規）：build_external_intelligence_context()の
+# sector_signals/disagreements（SOCIAL_EVAL_SECTOR_KEY_MAPの英語target_key、"BANK"等）を
+# SECTOR_ROTATION_THEMES（日本語テーマ名）へ対応付けるための明示マップ。曖昧な自動変換は
+# せず、既知の対応関係だけを列挙する（対象外テーマはNoneのまま＝無理に紐付けない）。
+SECTOR_SIGNAL_TARGET_KEY_TO_ROTATION_THEME = {
+    "SEMICONDUCTOR": "半導体", "SHIPPING": "海運", "INSURANCE": "保険",
+    "AUTO": "自動車", "SAAS": "SaaS", "AI_INFRA": "AI/データセンター", "BANK": "銀行",
+}
 
 SECTOR_ROTATION_THEME_CODES = {
     "半導体": {"6963", "3436", "4063"},  # ローム・SUMCO・信越化学
@@ -12713,6 +13051,22 @@ def build_sector_rotation_snapshot(database_url, user_id):
     # アラートキャッシュ、無ければ空）からテーマ別のsector_news_scoreを補助情報として計算する。
     # 新規のニュース取得は行わない（このsnapshot生成自体を遅くしないため）。
     _news_candidates_for_sectors = _news_alert_cache.get("candidates") or []
+    # X Intelligence Phase5（指示書6番）：X/Expert consensus・disagreementをテーマ別の
+    # 補助情報として追加する。既存のprice/volume/RS由来のstate/score判定には一切混入させず
+    # （classify_sector_state()はscoreのみを受け取る、シグネチャ不変をテストで確認）、
+    # 別フィールド"external_intelligence"としてのみ保持する。
+    _intel_ctx_for_sectors = build_external_intelligence_context_safe(database_url, user_id) or {}
+    _sector_intel_by_theme = {}
+    for c in (_intel_ctx_for_sectors.get("sector_signals") or []):
+        theme = SECTOR_SIGNAL_TARGET_KEY_TO_ROTATION_THEME.get(c.get("topic"))
+        if theme:
+            _sector_intel_by_theme[theme] = {"consensus": c.get("direction"), "source_count": c.get("independent_source_count"),
+                                              "confidence": c.get("confidence"), "sources": c.get("sources")}
+    for d in (_intel_ctx_for_sectors.get("disagreements") or []):
+        theme = SECTOR_SIGNAL_TARGET_KEY_TO_ROTATION_THEME.get(d.get("topic"))
+        if theme:
+            _sector_intel_by_theme[theme] = {"consensus": "DISAGREEMENT", "directions": d.get("directions"),
+                                              "sources": d.get("sources")}
 
     sectors = {}
     for theme in SECTOR_ROTATION_THEMES:
@@ -12721,7 +13075,8 @@ def build_sector_rotation_snapshot(database_url, user_id):
         if not rows:
             sectors[theme] = {"score": None, "state": "NEUTRAL", "breadth": None, "volume_expansion": None,
                                 "relative_strength": None, "sample_count": 0,
-                                "sector_news_score": compute_sector_news_score(theme, _news_candidates_for_sectors)}
+                                "sector_news_score": compute_sector_news_score(theme, _news_candidates_for_sectors),
+                                "external_intelligence": _sector_intel_by_theme.get(theme)}
             continue
         changes = [r.get("changePct") for r in rows if r.get("changePct") is not None]
         avg_change = sum(changes) / len(changes) if changes else 0.0
@@ -12754,7 +13109,8 @@ def build_sector_rotation_snapshot(database_url, user_id):
                             "up_count": up_count,
                             # 指示書10：PRICE/RELATIVE STRENGTHによるscore/state（上記）とは
                             # 独立の補助フィールド。既存のclassify_sector_state()の入力には含めない。
-                            "sector_news_score": compute_sector_news_score(theme, _news_candidates_for_sectors)}
+                            "sector_news_score": compute_sector_news_score(theme, _news_candidates_for_sectors),
+                            "external_intelligence": _sector_intel_by_theme.get(theme)}
 
     curr_snapshot = {"sectors": sectors, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
     prev_entry = _cache_get(_sector_rotation_prev_snapshot_key(user_id))
@@ -13862,6 +14218,11 @@ def generate_intraday_report(database_url, user_id, report_type, trade_date=None
         # News Intelligence Phase 2（指示書12）：朝一チェックと同じキャッシュ済みニュース候補
         # から構造化要約を生成（新規取得なし）。
         "market_news_context_json": build_market_news_context(_news_alert_cache.get("candidates") or []),
+        # X Intelligence Phase5（指示書5番）：OPENING_30M/前引け/AFTERNOON_30M/大引け全てで
+        # 共通Intelligence Contextを都度再計算する。build_external_intelligence_context()
+        # 自体が種別ごとの鮮度（市場実況は3時間で失効等）を適用するため、朝の古い実況が
+        # 大引けまでそのまま強く使われることはない（呼び出し時点のas_ofを都度計算し直す）。
+        "external_intelligence_json": build_external_intelligence_context_safe(database_url, user_id),
     }
     saved = investment_db.save_market_intelligence_report(database_url, user_id, trade_date, report_type, payload) if investment_db else None
     # Phase MU-S2：DBに保存するのはSHARED部分のみ（上のpayloadにPRIVATE情報は含まない）。
@@ -16055,11 +16416,16 @@ def get_position_intraday_chart(code, market="JP", interval="5m", period=None):
     return {"bars": bars, "interval": interval}
 
 
-def analyze_stock(w, market_env=None):
+def analyze_stock(w, market_env=None, external_intelligence=None):
     """12-1章・technical_analysis_rules.md：ローソク足パターン・移動平均線の並び／クロス・
     ボリンジャーバンド・RCI・複合底打ち条件などから買い/売りシグナルを判定し、その中から
     最有力のシグナルに基づいて購入・損切り・利確の目安単価と算出根拠を返す。
-    値はあくまで目安であり断定的な推奨ではない(12-2章の方針)。"""
+    値はあくまで目安であり断定的な推奨ではない(12-2章の方針)。
+    X Intelligence Phase5（2026-09-15新規）：external_intelligenceは呼び出し側が
+    build_external_intelligence_context()等から事前計算した銘柄別の参考情報（オプション、
+    省略時None）。戻り値へ読み取り専用でそのまま付与するだけで、この関数内の判定ロジック
+    （entry/stop/target等）には一切使わない（指示書「個人X投稿だけを根拠にBUY/SELL判定を
+    変更しない」）。"""
     if not isinstance(market_env, dict):
         market_env = {"text": market_env or "", "nikkeiChangePct": None, "bad": False}
     code = w.get("code", "")
@@ -17106,6 +17472,12 @@ def analyze_stock(w, market_env=None):
             "timeHorizonNote": time_horizon_note,
             "lossCutPhilosophyNote": loss_cut_philosophy_note,
         },
+        # X Intelligence Phase5（指示書8番）：呼び出し側が事前に計算した銘柄別external
+        # intelligence（FACT/IR・TDnet/NEWS/X市場観測/Expert View/consensus/disagreement、
+        # build_external_intelligence_context()由来）を読み取り専用で注記するだけの
+        # オプション引数。BUY/SELL判定（entry/stop/target等、上記の値）には一切使わない。
+        # 省略時（既存の全呼び出し元）はNoneのままで、既存動作は完全に無変更。
+        "externalIntelligence": external_intelligence,
     }
 
 
