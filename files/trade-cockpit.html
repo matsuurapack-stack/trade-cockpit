@@ -8995,6 +8995,15 @@ function DailyReviewPanel(){
   // （新規Trade Experience/更新銘柄プロフィール/新しいPattern Candidate/Rule Candidate）。
   const [genResult,setGenResult]=useState(null);
   const [learningSummary,setLearningSummary]=useState(null);
+  // 損切り学習レポート（2026-09-15新規、ユーザー運用指示）：勝率最大化ではなく期待値の高い
+  // ENTRYを残す目的で、損切り件数・回避可能率・頻出LOSSタグ・タグ別成績・成功パターンとの
+  // 比較を定期的に見る。既定は閉じたまま（毎日は必ずしも見ない前提の集計専用パネルのため）。
+  const [lossReport,setLossReport]=useState(null);
+  const [lossReportOpen,setLossReportOpen]=useState(false);
+  const loadLossReport=async()=>{
+    const r=await fetchJsonSafe("/api/trade-learning/loss-report");
+    if(r)setLossReport(r);
+  };
   const [notifySettings,setNotifySettings]=useState(loadDailyReviewNotifySettings);
   // Cross-Market Link / Sector Rotation Engine新規（2026-09-12）：「🔗今日の市場連動学習」
   // 「🔄今日のセクターローテーション学習」。
@@ -9174,6 +9183,56 @@ function DailyReviewPanel(){
             <span>Rule Candidate　<b>{learningSummary.rule_candidates_pending}</b>件</span>
           </div>
         </div>}
+
+        {/* 損切り学習レポート（2026-09-15新規、ユーザー運用指示）：定期的に眺めてENTRY判定
+            改善に使う集計。開くまでは取得しない（軽量化、他のカードのように毎回自動取得しない）。 */}
+        <div className="card" style={{padding:"12px 14px",marginTop:10}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer"}}
+            onClick={()=>{const next=!lossReportOpen;setLossReportOpen(next);if(next&&!lossReport)loadLossReport();}}>
+            <div style={{fontWeight:800,fontSize:13}}>📊 損切り学習レポート（全期間）</div>
+            <span style={{fontSize:11,color:"var(--inkSoft)"}}>{lossReportOpen?"▲ 閉じる":"▼ 開く"}</span>
+          </div>
+          {lossReportOpen && (!lossReport ? <div style={{fontSize:11.5,color:"var(--inkFaint)",marginTop:6}}>読み込み中…</div> :
+          <div style={{marginTop:8}}>
+            <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:6}}>
+              目的は勝率最大化ではなく、期待値の高いENTRYを残し期待値の低いENTRYを減らすこと。
+              サンプル数が少ないタグ（confidence:LOW）は参考程度に留めてください。
+            </div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:14,fontSize:11.5,marginBottom:8}}>
+              <span>対象トレード　<b>{lossReport.totalTrades??lossReport.period?.totalTrades}</b>件</span>
+              <span>損切り　<b style={{color:"var(--down)"}}>{lossReport.lossCount}</b>件</span>
+              <span>利確　<b style={{color:"var(--up)"}}>{lossReport.winCount}</b>件</span>
+              <span>回避可能だった損切り　<b>{lossReport.avoidableLossCount}</b>件</span>
+              <span>エントリー自体は妥当（不運）　<b>{lossReport.notAvoidableLossCount}</b>件</span>
+              <span>正しいENTRYだが結果損切り　<b>{lossReport.goodEntryBadOutcomeCount}</b>件</span>
+              <span>損切りGOOD／問題はENTRY　<b>{lossReport.exitWasGoodEntryWasBadCount}</b>件</span>
+            </div>
+            {lossReport.lossTagFrequency?.length>0 && <div style={{marginBottom:8}}>
+              <div style={{fontSize:11.5,fontWeight:700,marginBottom:3}}>頻出LOSSタグ</div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:8,fontSize:11}}>
+                {lossReport.lossTagFrequency.map((t,i)=><span key={i} style={{padding:"2px 6px",background:"var(--band)",borderRadius:3}}>{t.tag} ×{t.count}</span>)}
+              </div>
+            </div>}
+            {lossReport.lossTagPerformance?.length>0 && <div style={{marginBottom:8}}>
+              <div style={{fontSize:11.5,fontWeight:700,marginBottom:3}}>LOSSタグ別のその後の成績</div>
+              <div style={{display:"flex",flexDirection:"column",gap:2,fontSize:11}}>
+                {lossReport.lossTagPerformance.map((t,i)=><div key={i}>
+                  {t.tag}　勝率{Math.round((t.win_rate||0)*100)}%　平均{t.avg_pnl_pct>0?"+":""}{t.avg_pnl_pct}%
+                  ({t.sample_count}件・信頼度{t.confidence_level})
+                </div>)}
+              </div>
+            </div>}
+            {lossReport.winningPatternPerformance?.length>0 && <div>
+              <div style={{fontSize:11.5,fontWeight:700,marginBottom:3}}>成功パターンとの比較（ENTRY setup系タグ）</div>
+              <div style={{display:"flex",flexDirection:"column",gap:2,fontSize:11}}>
+                {lossReport.winningPatternPerformance.map((t,i)=><div key={i}>
+                  {t.tag}　勝率{Math.round((t.win_rate||0)*100)}%　平均{t.avg_pnl_pct>0?"+":""}{t.avg_pnl_pct}%
+                  ({t.sample_count}件・信頼度{t.confidence_level})
+                </div>)}
+              </div>
+            </div>}
+          </div>)}
+        </div>
 
         {/* Cross-Market Link Phase 2新規（2026-09-12、指示書16番）：「🔗今日の市場連動学習」。 */}
         {crossMarketLearning?.items?.length>0 && <div className="card" style={{padding:"12px 14px",marginTop:10}}>

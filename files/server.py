@@ -12598,6 +12598,77 @@ def get_trade_experience_diagnostics(database_url, user_id):
     return {"total_experiences": len(exps), "rule_candidates_pending": len(candidates), "patterns_tracked": len(stats)}
 
 
+def build_loss_learning_report(database_url, user_id, since_date=None, limit=1000):
+    """運用ルール（2026-09-15、ユーザー明示指示）：ENTRY判定改善のため損切りトレードを定期的に
+    集計するレポート。既存compute_pattern_statistics()（タグ別win_rate/avg_pnl_pct/
+    confidence_level、行12084付近）をそのまま再利用し、二重の集計ロジックは作らない。
+    目的は勝率最大化ではなく「期待値の高いENTRYを残し、期待値の低いENTRYを減らす」こと
+    （ユーザー明示）——win_rateだけでなくavg_pnl_pctも必ず併記し、confidence_level
+    （サンプル<5=LOW/5〜14=MEDIUM/15+=HIGH）で過信を防ぐ。since_date省略時は全期間。
+    このレポート自体はENTRYスコアやWAIT/CAUTION判定に直接介入しない（既存
+    compute_entry_risk_assessment()の信頼度ゲートが個別candidateへの反映を担う——
+    このレポートは人間・Claude Codeが定期的に眺めて傾向を把握するための集計専用）。"""
+    empty = {
+        "period": {"since": since_date, "totalTrades": 0},
+        "lossCount": 0, "winCount": 0,
+        "avoidableLossCount": 0, "notAvoidableLossCount": 0, "unknownAvoidabilityCount": 0,
+        "goodEntryBadOutcomeCount": 0, "exitWasGoodEntryWasBadCount": 0,
+        "lossTagFrequency": [], "lossTagPerformance": [], "winningPatternPerformance": [],
+    }
+    if investment_db is None or not database_url:
+        return empty
+    exps = investment_db.list_trade_experiences(database_url, user_id, limit=limit)
+    entered = [e for e in exps if e.get("side") != "WAIT"]
+    if since_date:
+        entered = [e for e in entered if str(e.get("trade_date") or "") >= since_date]
+    losses = [e for e in entered if e.get("result_class") == "LOSS"]
+    wins = [e for e in entered if e.get("result_class") == "WIN"]
+
+    avoidable = sum(1 for e in losses if (e.get("post_trade_analysis_json") or {}).get("avoidable_at_entry") is True)
+    not_avoidable = sum(1 for e in losses if (e.get("post_trade_analysis_json") or {}).get("avoidable_at_entry") is False)
+    unknown_avoidability = len(losses) - avoidable - not_avoidable
+    good_entry_bad_outcome = sum(1 for e in losses if "GOOD_ENTRY_BAD_OUTCOME" in (e.get("pattern_tags_json") or []))
+
+    # 指示書「損切り自体は正しかったケース」：exit_execution_scoreが高い（損切り実行自体は
+    # 適切）のにentry_timing_scoreが低い（エントリー判断に問題があった）ケースを機械的に抽出
+    # （build_trade_breakdown_for_dayのexitWasGoodButEntryWasBadと同じ判定基準、全期間版）。
+    exit_good_entry_bad = 0
+    for e in losses:
+        bd = e.get("score_breakdown_json") or {}
+        if (bd.get("exit_execution_score") or 0) >= 15 and (bd.get("entry_timing_score") or 0) < 10:
+            exit_good_entry_bad += 1
+
+    tag_counter = {}
+    for e in losses:
+        for tag in (e.get("exit_reason_json") or []):
+            tag_counter[tag] = tag_counter.get(tag, 0) + 1
+    loss_tag_frequency = sorted(({"tag": t, "count": c} for t, c in tag_counter.items()),
+                                 key=lambda x: -x["count"])
+
+    pattern_stats = compute_pattern_statistics(entered)  # 既存関数の再利用（二重集計を避ける）
+    loss_tag_performance = sorted(
+        [{"tag": tag, **pattern_stats[tag]} for tag in LOSS_REASON_TAGS if tag in pattern_stats],
+        key=lambda x: -(x.get("sample_count") or 0))
+    # 「成功パターンとの比較」：ENTRY setup系タグ（損切り理由タグとは別軸）の成績を並記する。
+    winning_setup_tags = ("WAIT_TO_ENTRY", "OVERSOLD_REVERSAL", "SHORT_MA_RECLAIM", "ROUND_NUMBER_RECLAIM",
+                           "VOLUME_EXPANSION", "SETUP_PULLBACK", "SETUP_BREAKOUT")
+    winning_pattern_performance = sorted(
+        [{"tag": tag, **pattern_stats[tag]} for tag in winning_setup_tags if tag in pattern_stats],
+        key=lambda x: -(x.get("sample_count") or 0))
+
+    return {
+        "period": {"since": since_date, "totalTrades": len(entered)},
+        "lossCount": len(losses), "winCount": len(wins),
+        "avoidableLossCount": avoidable, "notAvoidableLossCount": not_avoidable,
+        "unknownAvoidabilityCount": unknown_avoidability,
+        "goodEntryBadOutcomeCount": good_entry_bad_outcome,
+        "exitWasGoodEntryWasBadCount": exit_good_entry_bad,
+        "lossTagFrequency": loss_tag_frequency,
+        "lossTagPerformance": loss_tag_performance,
+        "winningPatternPerformance": winning_pattern_performance,
+    }
+
+
 # ============================================================
 # 「今日の振り返り」独立タブ化 + 15:30自動評価 + トレード経験/銘柄クセ学習（2026-09-12新規）。
 # 既存daily_reviewsのscore_total計算・既存Trade Experience Learning（Task E）のCRUD/評価関数は
@@ -20890,6 +20961,16 @@ class Handler(SimpleHTTPRequestHandler):
             summary = build_learning_accumulation_summary(DATABASE_URL, self.current_user, date) \
                 if (investment_db is not None and DATABASE_URL) else {}
             self._send_json(summary)
+        elif self.path.split("?")[0] == "/api/trade-learning/loss-report":
+            # 2026-09-15新規（ユーザー運用指示）：損切り件数・回避可能率・頻出LOSSタグ・
+            # タグ別成績・成功パターンとの比較を定期的に見るためのレポート。?since=YYYY-MM-DDで
+            # 期間を絞れる（省略時は全期間）。
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            since = params.get("since", [None])[0]
+            report = build_loss_learning_report(DATABASE_URL, self.current_user, since_date=since) \
+                if (investment_db is not None and DATABASE_URL) else {}
+            self._send_json(report)
         # ---- Choruco Style / ちょる子式（2026-09-12新規、指示書58番）----
         # /sector-flow・/event-risk・/market-modeは固定パス、/stock/{symbol}・/story/{symbol}は
         # 動的パス——具体形状を先に判定する（Trade Experience Learning等と同じ徹）。
