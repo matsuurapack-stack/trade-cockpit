@@ -12446,6 +12446,106 @@ def classify_loss_reasons(gross_pnl_pct, ctx, exit_price=None, sector_state_at_e
     return tags
 
 
+def classify_entry_avoidability(loss_tags, data_quality):
+    """指示書6番：AVOIDABLE/PARTIALLY_AVOIDABLE/NOT_AVOIDABLE/UNKNOWNの4段階。
+    「負けたから悪いENTRY」を禁止する（指示書7番）——判定材料はclassify_loss_reasons()が
+    既に算出した客観的な市場シグナルのタグ数のみで、損益の符号は一切見ない。
+    データ不足（reconstruct_trade_market_context()がNO_DATAを返した場合）は無理に判定しない。"""
+    if not data_quality or data_quality == "NO_DATA":
+        return "UNKNOWN"
+    if "GOOD_ENTRY_BAD_OUTCOME" in (loss_tags or []):
+        return "NOT_AVOIDABLE"
+    warning_tags = [t for t in (loss_tags or []) if t != "GOOD_ENTRY_BAD_OUTCOME"]
+    if len(warning_tags) >= 2:
+        return "AVOIDABLE"
+    if len(warning_tags) == 1:
+        return "PARTIALLY_AVOIDABLE"
+    return "UNKNOWN"  # 悪材料タグ0件だがGOOD_ENTRY_BAD_OUTCOMEの条件（PULLBACK/BREAKOUT等）も
+                       # 満たさない＝判断材料が不十分（無理にNOT_AVOIDABLEにしない）
+
+
+# 指示書9番「ENTRYを止めるだけでなく、待てば入れる条件を出す」：各損切り理由タグに対応する
+# 「何が変わればENTRYを解禁してよいか」を機械的に紐付ける固定辞書（AI不使用、他のAUTO系
+# エンジンと同じ方針）。判定不能なタグ（EVENT_RISK等、市況要因）には解禁条件を出さない。
+LOSS_TAG_UNBLOCK_CONDITIONS = {
+    "CHASE_ENTRY": "5分足RSIが70未満へ低下（過熱解消）",
+    "LATE_ENTRY": "押し目（直近安値からの調整）を確認してからのエントリーに切り替える",
+    "FALSE_BREAKOUT": "直近高値を出来高を伴って明確に上抜け、その後も高値を維持",
+    "VWAP_LOSS": "5分足VWAPを再突破し、その後も維持",
+    "VOLUME_FADE": "出来高が再び増加（直近3本平均が減少前の水準を回復）",
+    "SECTOR_WEAKNESS": "セクター全体の相対強弱が改善",
+    "MARKET_REVERSAL": "地合い（日経平均）が反転・落ち着きを確認",
+    "ENTRY_BEFORE_CONFIRMATION": "下落が止まり、短期MA・VWAPを回復する反転確認後にエントリー",
+    "STOP_TOO_TIGHT": "初期損切り幅をATR等のボラティリティに応じて広げる",
+    "RULE_VIOLATION": "該当ルールを満たしてからエントリー",
+}
+
+
+def build_entry_unblock_conditions(loss_tags):
+    """指示書9番：LOSS PATTERN MATCH表示の下に「ENTRY解禁条件」を添える。既知の損切り理由
+    タグにのみ条件を返す（判定不能なものは無理に条件を作らない）。"""
+    return [LOSS_TAG_UNBLOCK_CONDITIONS[t] for t in (loss_tags or []) if t in LOSS_TAG_UNBLOCK_CONDITIONS]
+
+
+def build_entry_snapshot(code, entry_price, entry_time_iso, market_ctx, market_mode_today=None,
+                          sector_state_at_entry=None, nikkei_chg=None, database_url=None, user_id=None):
+    """指示書5番：ENTRY時点のスナップショットを固定スキーマで保存する。後から現在値を使って
+    再評価しない（後知恵禁止）。取得できない値はNoneのまま（指示書：unknown/null、推測しない）。
+    entry_score/entry_state/loss_pattern_similarity/event_riskは、この売買がアプリのENTRY TOP5
+    →WAIT/ENTRY判断イベントを経由していた場合のみtrade_decision_eventsから拾う（手動記録のみの
+    トレードでは常にNone、無理に埋めない——指示書「未来の情報をENTRY評価に混ぜない」）。"""
+    ctx = market_ctx or {}
+    distance_from_vwap_pct = None
+    if ctx.get("vwap_at_entry") and entry_price is not None:
+        distance_from_vwap_pct = round((entry_price - ctx["vwap_at_entry"]) / ctx["vwap_at_entry"] * 100, 2)
+    nikkei_trend = None
+    if nikkei_chg is not None:
+        nikkei_trend = "UP" if nikkei_chg > 0 else ("DOWN" if nikkei_chg < 0 else "FLAT")
+
+    entry_score = entry_state = loss_pattern_similarity = event_risk = None
+    if investment_db is not None and database_url:
+        try:
+            events = investment_db.list_trade_decision_events(database_url, user_id, symbol=code, limit=50)
+            entry_dt = None
+            try:
+                entry_dt = datetime.datetime.fromisoformat(str(entry_time_iso).replace("Z", "+00:00")) if entry_time_iso else None
+            except Exception:
+                entry_dt = None
+            candidate = None
+            for e in events:
+                if e.get("decision_type") != "ENTRY":
+                    continue
+                if entry_dt is None:
+                    candidate = e
+                    break
+                try:
+                    et = datetime.datetime.fromisoformat(str(e.get("event_time")).replace("Z", "+00:00"))
+                    if abs((et - entry_dt).total_seconds()) <= 3600:
+                        candidate = e
+                        break
+                except Exception:
+                    continue
+            if candidate:
+                snap = candidate.get("technical_snapshot_json") or {}
+                entry_score = snap.get("entry_score")
+                entry_state = snap.get("entry_state")
+                event_risk = snap.get("event_risk")
+                loss_pattern_similarity = (snap.get("entryRisk") or {}).get("loss_pattern_similarity")
+        except Exception as e:
+            print("  build_entry_snapshot: trade_decision_events照合で例外（無視して続行）", code, e)
+
+    return {
+        "price": entry_price, "time": entry_time_iso,
+        "vwap": ctx.get("vwap_at_entry"), "distance_from_vwap_pct": distance_from_vwap_pct,
+        "rsi_5m": ctx.get("rsi_at_entry"), "ma5": ctx.get("short_ma"), "ma25": ctx.get("long_ma"),
+        "volume_ratio": ctx.get("volume_ratio"),
+        "day_high": ctx.get("day_high_so_far_at_entry"), "distance_from_day_high_pct": ctx.get("distance_from_high_pct"),
+        "market_regime": market_mode_today, "sector_strength": sector_state_at_entry, "nikkei_trend": nikkei_trend,
+        "entry_score": entry_score, "entry_state": entry_state,
+        "loss_pattern_similarity": loss_pattern_similarity, "event_risk": event_risk,
+    }
+
+
 def compute_entry_risk_assessment(similar_result):
     """指示書3番：GOOD_ENTRY_SIMILARITY / LOSS_PATTERN_SIMILARITY / ENTRY_RISK_SCOREを算出する。
     既存find_similar_trade_experiences()が返すsimilar_result（symbol一致＋タグ/特徴量類似度）を
@@ -12624,9 +12724,26 @@ def build_loss_learning_report(database_url, user_id, since_date=None, limit=100
     losses = [e for e in entered if e.get("result_class") == "LOSS"]
     wins = [e for e in entered if e.get("result_class") == "WIN"]
 
-    avoidable = sum(1 for e in losses if (e.get("post_trade_analysis_json") or {}).get("avoidable_at_entry") is True)
-    not_avoidable = sum(1 for e in losses if (e.get("post_trade_analysis_json") or {}).get("avoidable_at_entry") is False)
-    unknown_avoidability = len(losses) - avoidable - not_avoidable
+    # 2026-09-16更新（4段階評価に統一）：post_trade_analysis_json.entry_avoidability
+    # （AVOIDABLE/PARTIALLY_AVOIDABLE/NOT_AVOIDABLE/UNKNOWN）を集計する。旧booleanフィールド
+    # （avoidable_at_entry）しか無い古い行（2026-09-15時点で生成済みの3件）は無理に4段階へ
+    # 変換せず、UNKNOWN扱いにする（推測で埋めない）。
+    avoidability_counts = {"AVOIDABLE": 0, "PARTIALLY_AVOIDABLE": 0, "NOT_AVOIDABLE": 0, "UNKNOWN": 0}
+    for e in losses:
+        pta = e.get("post_trade_analysis_json") or {}
+        av = pta.get("entry_avoidability")
+        if av in avoidability_counts:
+            avoidability_counts[av] += 1
+        elif pta.get("avoidable_at_entry") is True:
+            avoidability_counts["AVOIDABLE"] += 1
+        elif pta.get("avoidable_at_entry") is False:
+            avoidability_counts["NOT_AVOIDABLE"] += 1
+        else:
+            avoidability_counts["UNKNOWN"] += 1
+    avoidable = avoidability_counts["AVOIDABLE"]
+    partially_avoidable = avoidability_counts["PARTIALLY_AVOIDABLE"]
+    not_avoidable = avoidability_counts["NOT_AVOIDABLE"]
+    unknown_avoidability = avoidability_counts["UNKNOWN"]
     good_entry_bad_outcome = sum(1 for e in losses if "GOOD_ENTRY_BAD_OUTCOME" in (e.get("pattern_tags_json") or []))
 
     # 指示書「損切り自体は正しかったケース」：exit_execution_scoreが高い（損切り実行自体は
@@ -12659,8 +12776,8 @@ def build_loss_learning_report(database_url, user_id, since_date=None, limit=100
     return {
         "period": {"since": since_date, "totalTrades": len(entered)},
         "lossCount": len(losses), "winCount": len(wins),
-        "avoidableLossCount": avoidable, "notAvoidableLossCount": not_avoidable,
-        "unknownAvoidabilityCount": unknown_avoidability,
+        "avoidableLossCount": avoidable, "partiallyAvoidableLossCount": partially_avoidable,
+        "notAvoidableLossCount": not_avoidable, "unknownAvoidabilityCount": unknown_avoidability,
         "goodEntryBadOutcomeCount": good_entry_bad_outcome,
         "exitWasGoodEntryWasBadCount": exit_good_entry_bad,
         "lossTagFrequency": loss_tag_frequency,
@@ -12747,6 +12864,13 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
         event_risk_today = mode_result.get("event_risk_level")
     except Exception as e:
         print("  daily-review: choruco market mode取得で例外（無視して続行）", e)
+    # ENTRY時点スナップショット用（指示書5番、2026-09-16新規）：run_momentum_stage1()は
+    # プロセス内で共有キャッシュ済みのため、ここで1回呼んでも新規の全市場スキャンにはならない。
+    nikkei_chg_today = None
+    try:
+        nikkei_chg_today = run_momentum_stage1().get("nikkeiChangePct")
+    except Exception as e:
+        print("  daily-review: nikkei変化率取得で例外（無視して続行）", e)
     history = investment_db.list_trade_history(database_url, user_id, limit=500)
     exits_today = [t for t in history if str(t.get("closed_at") or "")[:10] == review_date]
     for t in exits_today:
@@ -12823,12 +12947,17 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
             entry_setup_tags.append("VOLUME_EXPANSION")
         pattern_tags = entry_setup_tags + loss_tags
 
-        avoidable_at_entry = None
-        if market_ctx.get("data_quality") != "NO_DATA" and result_class == "LOSS":
-            if "GOOD_ENTRY_BAD_OUTCOME" in loss_tags:
-                avoidable_at_entry = False
-            elif loss_tags:
-                avoidable_at_entry = True
+        # 指示書6番：AVOIDABLE/PARTIALLY_AVOIDABLE/NOT_AVOIDABLE/UNKNOWNの4段階（損益の符号は
+        # 一切見ない、指示書7番「負けたから悪いENTRY」の禁止を厳守）。
+        entry_avoidability = classify_entry_avoidability(loss_tags, market_ctx.get("data_quality")) \
+            if result_class == "LOSS" else None
+        # 指示書9番：ENTRYを止めるだけでなく「待てば入れる条件」を添える。
+        entry_unblock_conditions = build_entry_unblock_conditions(loss_tags) if result_class == "LOSS" else []
+        # 指示書5番：ENTRY時点スナップショット（全トレード対象、勝敗を問わない）。後から現在値を
+        # 使って再評価しない固定スキーマ。
+        entry_snapshot = build_entry_snapshot(t.get("code"), entry_price, entry_time_iso, market_ctx,
+                                               market_mode_today=market_mode_today, sector_state_at_entry=sector_state,
+                                               nikkei_chg=nikkei_chg_today, database_url=database_url, user_id=user_id)
 
         fields = {
             "trade_date": review_date, "symbol": t.get("code"), "stock_name": t.get("name"),
@@ -12858,6 +12987,7 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
             "post_exit_min_price": market_ctx.get("post_exit_min_price"),
             "pattern_tags_json": pattern_tags or None, "exit_reason_json": loss_tags or None,
             "decision_snapshot_json": {
+                "entry_snapshot": entry_snapshot,  # 指示書5番：ENTRY時点固定スキーマ
                 "day_open": market_ctx.get("day_open"), "vwap_at_entry": market_ctx.get("vwap_at_entry"),
                 "above_vwap_at_entry": market_ctx.get("above_vwap_at_entry"),
                 "distance_from_low_pct": market_ctx.get("distance_from_low_pct"),
@@ -12871,7 +13001,8 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
                 "volume_trend_after_entry": market_ctx.get("volume_trend_after_entry"),
                 "broke_prior_high_then_failed": market_ctx.get("broke_prior_high_then_failed"),
                 "post_exit_direction": market_ctx.get("post_exit_direction"),
-                "avoidable_at_entry": avoidable_at_entry,
+                "entry_avoidability": entry_avoidability,  # 指示書6番：4段階評価
+                "entry_unblock_conditions": entry_unblock_conditions,  # 指示書9番
                 "data_quality": market_ctx.get("data_quality"),
             } if result_class == "LOSS" else None),
             "notes": "15:30自動評価による自動登録（sync_trade_experiences_for_date）。",
@@ -13180,9 +13311,92 @@ def build_trade_breakdown_for_day(day_trades):
                 if e.get("result_class") == "LOSS" else None
             ),
             "lossReasonTags": e.get("exit_reason_json") or [],
-            "avoidableAtEntry": (e.get("post_trade_analysis_json") or {}).get("avoidable_at_entry"),
+            "entryAvoidability": (e.get("post_trade_analysis_json") or {}).get("entry_avoidability"),
+            "entryUnblockConditions": (e.get("post_trade_analysis_json") or {}).get("entry_unblock_conditions") or [],
         })
     return trade_breakdown
+
+
+def plan_unconfirmed_position_cleanup(database_url, user_id, code, market):
+    """未約定ポジション削除連動（2026-09-16新規、指示書1・2・3・13番）：portfolio行を削除する
+    "前"に呼ぶ判定専用関数（DB書き込みは一切しない）。list_portfolio()はまだ削除されていない
+    行を必要とするため、必ず投稿delete_portfolio_item()より前に呼ぶこと（実際の再生成は
+    apply_unconfirmed_position_cleanup()が削除"後"に行う——generate_daily_review_with_learning()
+    はlist_portfolio()の「今この瞬間」の状態を読むため、削除前に再生成すると削除される行が
+    まだ残ったまま再計算されてしまうバグを直接テストで発見した経緯がある。必ずこの2関数を
+    delete_portfolio_item()を挟んでこの順で呼ぶこと）。
+    「実際に売買したトレードは絶対に消さない」を最優先に、以下の条件を"すべて"満たす場合だけ
+    shouldRegenerate=Trueを返す：
+      ①削除される建玉のacquired_at時点の日付に、既にdaily_reviewsが生成済み
+      ②その銘柄について、その日付をacquired_at〜closed_atの範囲に含むtrade_history行が
+        1件も無い（＝約定を伴う確定売買が既存データ上に存在しない）
+    trade_history側にすでに行がある「実際に売買して損切り・利確した」ケースは②で除外される
+    ため、既存のtrade_history/trade_experiencesを一切変更・削除しない（再生成はdaily_reviews
+    の再計算のみ、既存portfolio/trade_history/trade_experiencesスキーマは無変更＝二重schemaを
+    作らない、指示書の方針通り）。"""
+    plan = {"shouldRegenerate": False, "reviewDate": None, "wasFinalized": False, "reason": None}
+    if investment_db is None or not database_url or not code:
+        plan["reason"] = "no_db"
+        return plan
+    try:
+        positions = investment_db.list_portfolio(database_url, user_id)
+    except Exception as e:
+        print("  plan_unconfirmed_position_cleanup: portfolio取得で例外", code, e)
+        plan["reason"] = f"portfolio_fetch_failed: {e}"
+        return plan
+    pos = next((p for p in positions if p.get("code") == code and (p.get("market") or "JP") == (market or "JP")), None)
+    if not pos:
+        plan["reason"] = "position_not_found"
+        return plan
+    acquired_date = investment_db._to_jst_date_str(pos.get("acquired_at") or pos.get("created_at"))
+    if not acquired_date:
+        plan["reason"] = "no_acquired_date"
+        return plan
+    try:
+        existing_review = investment_db.get_daily_review(database_url, user_id, acquired_date)
+    except Exception as e:
+        print("  plan_unconfirmed_position_cleanup: daily_review取得で例外", code, e)
+        plan["reason"] = f"review_fetch_failed: {e}"
+        return plan
+    if not existing_review:
+        plan["reason"] = "no_existing_review"
+        return plan
+    try:
+        history = investment_db.list_trade_history(database_url, user_id, limit=1000)
+    except Exception as e:
+        print("  plan_unconfirmed_position_cleanup: trade_history取得で例外", code, e)
+        plan["reason"] = f"history_fetch_failed: {e}"
+        return plan
+    confirmed = any(
+        t.get("code") == code
+        and investment_db._to_jst_date_str(t.get("acquired_at")) and investment_db._to_jst_date_str(t.get("acquired_at")) <= acquired_date
+        and (investment_db._to_jst_date_str(t.get("closed_at")) or "9999-12-31") >= acquired_date
+        for t in history
+    )
+    if confirmed:
+        plan["reason"] = "confirmed_trade_exists"
+        return plan
+    plan["shouldRegenerate"] = True
+    plan["reviewDate"] = acquired_date
+    plan["wasFinalized"] = bool(existing_review.get("is_finalized"))
+    plan["reason"] = "unconfirmed_position_pending_delete"
+    return plan
+
+
+def apply_unconfirmed_position_cleanup(database_url, user_id, plan):
+    """未約定ポジション削除連動：delete_portfolio_item()の"後"に呼ぶ。plan_unconfirmed_
+    position_cleanup()の判定に従い、shouldRegenerate=Trueの場合のみdaily_reviewsを
+    再生成する（削除後なので、対象銘柄は再生成時のlist_portfolio()にもう含まれない）。"""
+    if not plan or not plan.get("shouldRegenerate"):
+        return {"triggered": False, "reviewDate": (plan or {}).get("reviewDate"), "reason": (plan or {}).get("reason")}
+    review_date = plan["reviewDate"]
+    try:
+        generate_daily_review_with_learning(database_url, user_id, review_date, finalize=plan.get("wasFinalized", False))
+        print(f"  [PositionCleanup] 未約定ポジション削除連動：acquired_date={review_date} のdaily_reviewを再生成しました")
+        return {"triggered": True, "reviewDate": review_date, "reason": "unconfirmed_position_removed"}
+    except Exception as e:
+        print("  apply_unconfirmed_position_cleanup: 再生成で例外", review_date, e)
+        return {"triggered": False, "reviewDate": review_date, "reason": f"regenerate_failed: {e}"}
 
 
 # 15:30自動評価スケジューラ（指示書4・5・11・28・29・30番）。既存_morning_check_scheduler_loop
@@ -22857,8 +23071,17 @@ class Handler(SimpleHTTPRequestHandler):
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
-            investment_db.delete_portfolio_item(DATABASE_URL, self.current_user, body.get("code"), body.get("market"))
-            self._send_json({"ok": True})
+            code, market = body.get("code"), body.get("market")
+            # 未約定ポジション削除連動（2026-09-16新規、指示書1・2・3・13番）：判定は削除"前"
+            # （acquired_atの判定にportfolio行自体が必要）、実際の再生成は削除"後"に行う
+            # （generate_daily_review_with_learning()はlist_portfolio()の「今この瞬間」の状態を
+            # 読むため、削除前に再生成すると対象行がまだ残ったまま計算されてしまう——直接
+            # テストで検出した不具合、必ずこの順で呼ぶこと）。実際に売買済み
+            # （trade_historyに行がある）の場合は何もしない安全設計。
+            cleanup_plan = plan_unconfirmed_position_cleanup(DATABASE_URL, self.current_user, code, market)
+            investment_db.delete_portfolio_item(DATABASE_URL, self.current_user, code, market)
+            cleanup_result = apply_unconfirmed_position_cleanup(DATABASE_URL, self.current_user, cleanup_plan)
+            self._send_json({"ok": True, "reviewCleanup": cleanup_result})
         elif self.path == "/api/portfolio/add-entry":
             # 2026-09-07新規（監視銘柄→ポジション連携）：監視銘柄カードの「ポジション追加」/
             # 保有カードの「買い増し」から呼ぶ。既存ポジションがあれば加重平均で合算する。
