@@ -8,6 +8,7 @@
 import io
 import os
 import re
+import difflib
 import json
 import math
 import time
@@ -904,12 +905,21 @@ def compute_news_importance(title, code=None, source=None, is_tdnet=False, is_re
     return {"score": score, "level": level, "badges": badges}
 
 
+_NEWS_DEDUPE_DECORATION_WORDS = ["速報", "独自", "詳報", "全文", "続報", "号外"]
+_NEWS_DEDUPE_CODE_RE = re.compile(r"[<＜(（]\s*\d{4}\s*[>＞)）]|証券コード\s*\d{4}")
+
+
 def _normalize_news_title_for_dedupe(title):
-    """指示書C（重複排除）：媒体名サフィックス・記号・空白差を吸収した正規化タイトル。"""
+    """指示書C・「重複排除」指示書7番：媒体名サフィックス・記号・空白差に加え、証券コードの
+    括弧書き（例：<1802>）や「速報」等の装飾語の有無で同一記事が別記事扱いになるのを防ぐ
+    （実例：大林組1802「M&Aなど投資見通しが計画の約2倍に」が転載媒体差で2件表示された問題）。"""
     if not title:
         return ""
     t = unicodedata.normalize("NFKC", title)
     t = _clean_title(t)
+    t = _NEWS_DEDUPE_CODE_RE.sub("", t)
+    for w in _NEWS_DEDUPE_DECORATION_WORDS:
+        t = t.replace(w, "")
     t = re.sub(r"[\s　]+", "", t)
     t = re.sub(r"[【】\[\]（）()「」『』｜|・、。,.!！?？:：;；\-─―]", "", t)
     return t.lower()
@@ -948,18 +958,71 @@ def _news_dedupe_key(item):
     return f"title:{code}:{norm_title}:{published_date}"
 
 
+_NEWS_DEDUPE_TITLE_SIMILARITY_THRESHOLD = 0.90  # 指示書7番：同一銘柄・48時間以内でこの類似度以上なら同一クラスタ
+_NEWS_DEDUPE_CLUSTER_WINDOW_SEC = 48 * 3600
+
+
+def _news_dedupe_representative_rank(item):
+    """指示書7番：同一クラスタ内の代表記事選定順位（小さいほど優先）。
+    企業公式IR/TDnet → 日経 → Reuters/Bloomberg等 → 業界専門媒体 → その他転載媒体、の順。
+    classify_source_tierのTier（1〜4）をそのまま流用する（地方局・ポータル等の転載媒体は
+    Tier4=その他に落ちるため、自動的に代表から外れる）。"""
+    try:
+        tier, _ = classify_source_tier(item.get("source"), item.get("url"), is_tdnet=(item.get("source") == "TDnet"))
+    except Exception:
+        tier = SOURCE_TIER_AGGREGATOR
+    return tier
+
+
 def dedupe_news_items(items):
-    """指示書C：_news_dedupe_key()が示す同一記事・同一開示を1件に集約する
-    （最初に出てきたものを残す＝呼び出し元で優先度順に並べてから渡すこと）。"""
-    seen = set()
-    out = []
+    """指示書C・「重複排除」指示書7番：_news_dedupe_key()が示す完全一致（同一URL・同一TDnet
+    開示・正規化タイトル完全一致）に加え、同一銘柄コードかつ48時間以内でタイトル類似度が
+    _NEWS_DEDUPE_TITLE_SIMILARITY_THRESHOLD以上のものも同一ニュースclusterとして1件に集約する
+    （実例：大林組1802の同一内容記事が別媒体の転載で2件表示されていた問題）。
+    クラスタ内の代表記事はsource優先順位（企業公式IR/TDnet＞日経＞Reuters/Bloomberg等＞
+    業界専門媒体＞その他転載媒体）で選ぶ（"最初に出てきたもの"は使わない）。"""
+    # 1) 完全一致キーでグルーピング（従来通り）。
+    exact_groups = {}
+    order = []
     for it in items:
         key = _news_dedupe_key(it)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(it)
-    return out
+        if key not in exact_groups:
+            exact_groups[key] = []
+            order.append(key)
+        exact_groups[key].append(it)
+    exact_reps = []
+    for key in order:
+        group = exact_groups[key]
+        best = min(group, key=_news_dedupe_representative_rank)
+        exact_reps.append(best)
+
+    # 2) 完全一致では拾いきれない同一クラスタ（別媒体の転載で表記ゆれがある場合）を、
+    #    同一銘柄コード×48時間以内×タイトル類似度で追加集約する。
+    clusters = []  # each: {"items": [...], "norm_titles": [...]}
+    for it in exact_reps:
+        code = it.get("code") or ""
+        norm_title = _normalize_news_title_for_dedupe(it.get("title"))
+        ts = resolve_news_ts(it)
+        placed = False
+        if norm_title:
+            for cluster in clusters:
+                if cluster["code"] != code:
+                    continue
+                if ts and cluster["ts"] and abs(ts - cluster["ts"]) > _NEWS_DEDUPE_CLUSTER_WINDOW_SEC:
+                    continue
+                ratio = difflib.SequenceMatcher(None, norm_title, cluster["norm_title"]).ratio()
+                if ratio >= _NEWS_DEDUPE_TITLE_SIMILARITY_THRESHOLD:
+                    cluster["items"].append(it)
+                    if _news_dedupe_representative_rank(it) < _news_dedupe_representative_rank(cluster["rep"]):
+                        cluster["rep"] = it
+                        cluster["norm_title"] = norm_title
+                        cluster["ts"] = ts
+                    placed = True
+                    break
+        if not placed:
+            clusters.append({"code": code, "norm_title": norm_title, "ts": ts, "rep": it, "items": [it]})
+
+    return [c["rep"] for c in clusters]
 
 
 # ============================================================
@@ -1781,12 +1844,27 @@ STOCK_NAME_NEWS_EXCLUDE_KEYWORDS_PROMO = [
 # 2026-09-08further追加（ユーザー指摘：「9月8日 ソフトバンク―日本ハム23回戦 写真特集」が
 # 2282日本ハムに混入。既存語（野球・ファイターズ・ホークス等）はこの見出しに含まれておらず
 # すり抜けていたため、実際の見出しから頻出語を追加）。
+# 2026-09-15拡充（指示書「投資関連性フィルタ＋重複排除＋IR/PR分離」）：野球・サッカー以外の
+# 競技（体操・陸上・バスケ・バレー・ゴルフ・テニス・ラグビー・卓球・水泳・フィギュア・格闘技・
+# モータースポーツ等）と、種目を問わない大会・代表関連の一般語を追加し、SPORTS_CATEGORY
+# （＝特定競技名の固定列挙に頼らず種目横断で判定する仕組み）として機能させる
+# （実例：味の素2802の体操女子・大会記事、双日2768のサッカー記事の混入）。
 STOCK_NAME_NEWS_EXCLUDE_KEYWORDS_SPORTS = [
     "プロ野球", "野球", "イーグルス", "ホークス", "ファイターズ", "甲子園", "高校野球",
     "Jリーグ", "J1リーグ", "J2リーグ", "明治安田", "パ・リーグ", "セ・リーグ", "サッカー", "アントラーズ",
     "サヨナラ", "1軍", "2軍", "登板", "先発", "被安打", "ユース", "サンケイスポーツ", "FOOTBALL ZONE",
-    "高校サッカードットコム",
-    "試合", "回戦", "写真特集", "投手", "打者", "本塁打", "ホームラン", "勝利", "敗戦", "球場",
+    "高校サッカードットコム", "フットボール・トライブ", "Football Tribe",
+    "試合", "回戦", "写真特集", "投手", "打者", "捕手", "キャッチャー", "本塁打", "ホームラン",
+    "勝利", "敗戦", "球場",
+    # 種目横断（SPORTS_CATEGORY）：個別競技名
+    "体操", "新体操", "陸上競技", "陸上", "バスケットボール", "バスケ", "Bリーグ", "バレーボール",
+    "ゴルフ", "テニス", "ラグビー", "卓球", "競泳", "水泳", "フィギュアスケート", "フィギュア",
+    "柔道", "レスリング", "格闘技", "ボクシング", "モータースポーツ", "F1", "マラソン", "駅伝",
+    "バドミントン", "ハンドボール",
+    # 種目を問わない大会・代表・スポーツ一般語
+    "五輪", "オリンピック", "パラリンピック", "W杯", "ワールドカップ", "世界選手権", "選手権大会",
+    "全日本選手権", "国体", "代表戦", "日本代表", "代表候補", "選手", "監督", "コーチ", "予選",
+    "決勝", "準決勝", "メダル", "金メダル", "銀メダル", "銅メダル", "種目別", "スポーツ",
 ]
 # 2026-09-08新規（指示書4番）：スポーツキーワード・対戦カード形式に該当しても、経営に関係する
 # 文脈があれば除外しない（球団事業の売却・再編、スポンサー契約、球場関連投資、業績への影響、
@@ -1796,6 +1874,29 @@ STOCK_NAME_NEWS_EXCLUDE_KEYWORDS_SPORTS = [
 STOCK_NAME_NEWS_SPORTS_BUSINESS_OVERRIDE = [
     "決算", "業績", "IR", "適時開示", "売却", "譲渡", "再編", "スポンサー", "契約", "投資",
     "子会社", "事業", "黒字", "赤字", "買収", "出資", "上方修正", "下方修正", "説明会",
+]
+
+# 2026-09-15新規（指示書「投資関連性フィルタ＋重複排除＋IR/PR分離」2・6番）：将棋・囲碁・芸能
+# 記事は登録銘柄名がスポンサー名・棋戦名・大会名として本文に出るだけで、投資判断とはほぼ無関係
+# （実例：JT2914の藤井聡太記事）。ビジネスoverrideは設けない（「〇〇杯」等の冠スポンサー記事に
+# 決算等の語が偶然含まれる可能性は低く、混在した場合も将棋・芸能記事である比重の方が高いため）。
+STOCK_NAME_NEWS_EXCLUDE_KEYWORDS_SHOGI_ENTERTAINMENT = [
+    "将棋", "囲碁", "棋士", "棋戦", "竜王戦", "名人戦", "王将戦", "棋王戦", "王位戦", "叡王戦",
+    "棋聖戦", "王座戦", "藤井聡太", "藤井六冠", "藤井竜王", "藤井名人", "七大タイトル",
+    "タレント", "俳優", "女優", "アイドル", "お笑い芸人", "芸人", "ドラマ主演", "映画公開", "映画監督",
+    "声優", "歌手", "アーティスト", "芸能人",
+]
+
+# 2026-09-15新規（指示書4・6番）：求人・採用・SEO/広告記事、商品開発担当者インタビュー等の
+# 一般PR記事（実例：積水ハウス1928「年収800万円、AI時代にも魅力の…」、味の素2802
+# 「ヒットのヒント 味の素…開発担当…」）。IRのうち重要な人事（役員人事・代表取締役交代）は
+# IR_KEYWORDS／TDNET_CRITICAL_KEYWORDS側で別途拾われるため、ここでの除外と競合しない。
+STOCK_NAME_NEWS_EXCLUDE_KEYWORDS_RECRUIT = [
+    "求人", "採用情報", "中途採用", "新卒採用", "転職", "就職", "年収", "インターンシップ",
+    "働き方", "社員インタビュー",
+]
+STOCK_NAME_NEWS_EXCLUDE_KEYWORDS_PRODUCT_PR = [
+    "ヒットのヒント", "ヒットの秘密", "開発秘話", "開発担当者", "担当者に聞く", "開発の裏側",
 ]
 
 
@@ -1822,6 +1923,10 @@ STOCK_NAME_NEWS_EXCLUDE_SOURCES = [
     "BASEBALL KING", "道新スポーツ", "スポニチ Sponichi Annex", "サンスポ", "Goal.com",
     "スポーツブル", "サッカー批評Web", "sportingnews.com", "targma.jp", "デイリースポーツ",
     "日刊スポーツ", "スポーツ報知", "東スポWEB", "Full-Count", "THE ANSWER", "SOCCER DIGEST Web",
+    # 2026-09-15追加：種目横断のスポーツ専門媒体
+    "フットボールチャンネル", "Football Tribe", "フットボール・トライブ", "西日本スポーツ",
+    "中日スポーツ", "Number Web", "REAL SPORTS", "バスケットボールキング", "卓球王国",
+    "テニスマガジンONLINE",
 ]
 
 
@@ -1831,6 +1936,15 @@ def _is_promo_news(title, source="", name=""):
     # 比較してから判定することで、全角/半角どちらの表記でも確実に弾けるようにする。
     norm_title = unicodedata.normalize("NFKC", title)
     if any(unicodedata.normalize("NFKC", k) in norm_title for k in STOCK_NAME_NEWS_EXCLUDE_KEYWORDS_PROMO):
+        return True
+    # 2026-09-15新規：将棋・囲碁・芸能、求人・採用、商品開発担当者インタビュー系PRは
+    # ビジネスoverride無しで一律除外する（スポーツと違い「〇〇杯」等の冠スポンサー記事に
+    # 業績関連の語が混在していても、記事本体が将棋・芸能・求人記事である比重の方が高いため）。
+    if any(unicodedata.normalize("NFKC", k) in norm_title for k in STOCK_NAME_NEWS_EXCLUDE_KEYWORDS_SHOGI_ENTERTAINMENT):
+        return True
+    if any(unicodedata.normalize("NFKC", k) in norm_title for k in STOCK_NAME_NEWS_EXCLUDE_KEYWORDS_RECRUIT):
+        return True
+    if any(unicodedata.normalize("NFKC", k) in norm_title for k in STOCK_NAME_NEWS_EXCLUDE_KEYWORDS_PRODUCT_PR):
         return True
     if any(s == source for s in STOCK_NAME_NEWS_EXCLUDE_SOURCES):
         return True
