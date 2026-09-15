@@ -19,10 +19,18 @@ def make_hist(dates_closes):
 
 class TachibanaDailyArraysLiveQuoteGoldenTests(unittest.TestCase):
     """_tachibana_daily_arrays()：live_quoteを渡した場合と、省略時（get_market_priceを
-    個別に呼ぶ従来経路）で同じ結果になること（指示書STEP11・R9）。"""
+    個別に呼ぶ従来経路）で同じ結果になること（指示書STEP11・R9）。
+    2026-09-15更新（Market Data Phase 4）：日足履歴の取得元がtrading_date scopedキャッシュ
+    経由になったため、他テスト（test_morning_warmup.py等）との"daily_history:{実行日}:7203"
+    キー衝突を避けるべく、固定のtrading_dateを明示的に渡してテスト間の独立性を保つ。"""
+
+    _TEST_TRADING_DATE = "2099-01-01"  # 他テストの実行日と衝突しない固定値
+
+    def setUp(self):
+        server._CACHE_STORE.pop(f"daily_history:{self._TEST_TRADING_DATE}:7203", None)
 
     def _hist_missing_today(self):
-        # 直近日が確実に「今日」ではない過去日（2020年1-2月、テスト実行日に関わらず常に過去）。
+        # 直近日が確実に「_TEST_TRADING_DATEではない」過去日。
         # len(hist) < 20 の早期returnを避けるため25日分用意する。
         return make_hist([(f"2020-01-{d:02d}", 100 + d) for d in range(1, 26)])
 
@@ -33,11 +41,12 @@ class TachibanaDailyArraysLiveQuoteGoldenTests(unittest.TestCase):
         with mock.patch.object(server.tachibana_api, "get_daily_history", return_value=hist):
             with mock.patch.object(server.tachibana_api, "get_market_price",
                                     return_value={"7203": live}) as mock_gmp:
-                legacy = server._tachibana_daily_arrays("7203")
+                legacy = server._tachibana_daily_arrays("7203", trading_date=self._TEST_TRADING_DATE)
             mock_gmp.assert_called_once()  # 省略時は従来通りget_market_priceを呼ぶ
 
+            server._CACHE_STORE.pop(f"daily_history:{self._TEST_TRADING_DATE}:7203", None)
             with mock.patch.object(server.tachibana_api, "get_market_price") as mock_gmp2:
-                preloaded = server._tachibana_daily_arrays("7203", live_quote=live)
+                preloaded = server._tachibana_daily_arrays("7203", live_quote=live, trading_date=self._TEST_TRADING_DATE)
             mock_gmp2.assert_not_called()  # live_quote指定時はget_market_priceを呼ばない
 
         self.assertEqual(legacy, preloaded)
@@ -46,13 +55,13 @@ class TachibanaDailyArraysLiveQuoteGoldenTests(unittest.TestCase):
         """既に当日分が日足履歴に含まれている場合は、live_quote/get_market_priceどちらも
         不要（分岐に入らない）——この場合は元々1回のAPI呼び出しで済んでいたため、Phase3の
         削減対象はあくまで「当日分が無い場合」に限られることの確認。"""
-        jst = __import__("datetime").timezone(__import__("datetime").timedelta(hours=9))
-        today_str = __import__("datetime").datetime.now(jst).strftime("%Y-%m-%d")
+        today_str = self._TEST_TRADING_DATE
         hist = make_hist([(f"2020-01-{d:02d}", 100 + d) for d in range(1, 25)] + [(today_str, 105)])
-        with mock.patch.object(server.tachibana_api, "get_daily_history", return_value=hist):
-            with mock.patch.object(server.tachibana_api, "get_market_price") as mock_gmp:
-                result = server._tachibana_daily_arrays("7203", live_quote={"t": 999})
-            mock_gmp.assert_not_called()
+        with mock.patch.object(server, "_jst_today_date_str", return_value=today_str):
+            with mock.patch.object(server.tachibana_api, "get_daily_history", return_value=hist):
+                with mock.patch.object(server.tachibana_api, "get_market_price") as mock_gmp:
+                    result = server._tachibana_daily_arrays("7203", live_quote={"t": 999})
+                mock_gmp.assert_not_called()
         self.assertIsNotNone(result)
         self.assertEqual(result[0][-1], 105)  # todayの終値がそのまま使われる（合成なし）
 

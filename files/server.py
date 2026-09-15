@@ -2997,21 +2997,168 @@ def _is_jp_market_business_day(d):
     return d.weekday() < 5
 
 
+# ============================================================
+# Market Data高速化指示書 Phase 4（2026-09-15新規）：Morning Warmup / Cold Start解消。
+#
+# STEP1監査結果：既存schedulerは全て「専用デーモンスレッドが60秒間隔でJST時刻をポーリングし、
+# 対象時刻の分だけ一度発火する」という同じ設計（_morning_check_scheduler_loop・
+# _intraday_report_scheduler_loop等）。新しいスレッドを増やさず、既存の
+# _morning_check_scheduler_loop（このすぐ下）に発火時刻を追加する形で統合する
+# （指示書STEP1「新しいschedulerを乱立させない」）。
+#
+# STEP3時刻の根拠：既存MORNING_CHECK_SNAPSHOT_TIMESはT0530(05:30)/T0700(07:00)/T0800(08:00)/
+# T0830(08:30)/T0850(08:50、最終)。281銘柄の日足取得（cold）は実測約440秒（Phase3）〜615秒
+# （Phase3前）かかるため、
+#   - T0730(07:30)：Historical warmup。T0700(07:00)の通常実行が既にこの経路を通っている
+#     （Phase4のtrading_date scopedキャッシュにより副産物としてhistorical部分を温める）ため、
+#     07:30時点では大半がcache hitで即座に終わるはず（idempotent、指示書STEP12）。T0700が
+#     未実行・失敗した場合のフォールバックとしても機能する。市場開場(09:00)まで90分、
+#     T0850まで80分の余裕（指示書「10〜15分の余裕」を大きく上回る）。
+#   - T0845(08:45)：Stage1（TTL=600秒=10分）・Market Data（TTL=45〜90秒）はhistorical daily
+#     bars（trading_date scoped、当日中ずっとfresh）と違って短命なため、07:30時点で温めても
+#     T0850には確実に失効している（600秒後には切れる）。T0850の直前（5分前）に再度温める
+#     ことで、T0850実行時点のStage1/Market Dataがfreshな状態になるようにする
+#     （指示書STEP9「Historical warmup→早め、Stage1 warmup→08:45〜08:55の二段構成」）。
+# ============================================================
+MORNING_WARMUP_TIMES = {"T0730": "07:30", "T0845": "08:45"}
+
+
+def get_morning_warmup_status(user_id):
+    """Phase4 STEP10・STEP14：直近のrun_morning_market_warmup()結果を返す（内部関数、
+    デバッグ/運用確認用。UIボタンやHTTPエンドポイントの追加は必須ではないという指示書の
+    方針に従い、まずは呼び出し可能な関数として提供する）。未実行ならNone。"""
+    entry = _cache_get(f"morning_warmup_status:{user_id}")
+    return entry["value"] if entry is not None else None
+
+
+def run_morning_market_warmup(database_url, user_id):
+    """Market Data Phase 4：ENTRY TOP5・朝一チェックが場中に使うキャッシュ
+    （historical daily bars・momentum stage1・market data quote/5分足）を事前にウォーム
+    アップする。指示書「既存分析結果は生成しない」の通り、entry_score・MorningMarketCheck・
+    stock_theses等は一切生成・保存しない——既存のprefetch系関数（Phase1
+    prefetch_market_data_for_watchlist・run_momentum_stage1・Phase4
+    _tachibana_daily_history_cached）をそのまま呼んでキャッシュへ投入するだけの副作用フリー
+    な処理。戻り値：diagnostics（Phase4 STEP10・STEP15、status="READY"|"PARTIAL"|"FAILED"）。"""
+    _mark_scheduler_tick("morning_warmup")
+    t0 = time.time()
+    trading_date = _jst_today_date_str()
+    diagnostics = {
+        "trading_date": trading_date,
+        "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "completed_at": None,
+        "symbols_requested": 0,
+        "historical_cache_hits": 0, "historical_network_requests": 0,
+        "historical_success": 0, "historical_failed": 0,
+        "stage1_elapsed_ms": 0, "stage1_ready": False,
+        "market_data_elapsed_ms": 0, "market_data_ready": False,
+        "total_elapsed_ms": 0, "status": "FAILED",
+    }
+    if investment_db is None or not database_url:
+        diagnostics["total_elapsed_ms"] = round((time.time() - t0) * 1000)
+        _mark_scheduler_error("morning_warmup", "investment_db unavailable")
+        return diagnostics
+    try:
+        watchlist = investment_db.list_watchlist(database_url, user_id, market="JP")
+    except Exception as e:
+        print("  [MorningWarmup] watchlist取得失敗", e)
+        watchlist = []
+    diagnostics["symbols_requested"] = len(watchlist)
+
+    # 1) Stage1 warmup（既存run_momentum_stage1のプロセス内キャッシュ・クールダウン・
+    #    二重チェックロッキングをそのまま利用。同時に他エンジンが呼んでも実スキャンは1回）。
+    t_stage1 = time.time()
+    try:
+        stage1 = run_momentum_stage1()
+        diagnostics["stage1_ready"] = bool(stage1.get("rows")) and not stage1.get("scanFailed")
+    except Exception as e:
+        print("  [MorningWarmup] Stage1 warmupで例外", e)
+        stage1 = {"rows": {}}
+    diagnostics["stage1_elapsed_ms"] = round((time.time() - t_stage1) * 1000)
+    stage1_rows = stage1.get("rows", {})
+
+    # 2) Market data（quote/5分足）warmup：STEP8の通り、短TTLのため09:00直前の値として使う
+    #    目的ではなく、Tachibanaセッション確立・symbol正規化・API経路の健全性確認が主目的。
+    t_md = time.time()
+    try:
+        md_diag = prefetch_market_data_for_watchlist(watchlist)
+        diagnostics["market_data_ready"] = md_diag.get("errors", 0) == 0
+    except Exception as e:
+        print("  [MorningWarmup] Market data warmupで例外", e)
+        md_diag = {"error": str(e)}
+    diagnostics["market_data_elapsed_ms"] = round((time.time() - t_md) * 1000)
+
+    # 3) Historical daily bars warmup（本Phaseの主目的）：trading_date scopedキャッシュへ
+    #    銘柄ごとに1回だけ投入する。既にfreshなキャッシュがある銘柄（=同日に既に実行済み、
+    #    T0700の通常実行やこの関数の前回実行の副産物）は再取得しない（指示書STEP4・STEP12
+    #    「idempotent」）。失敗銘柄だけdiagnosticsへ記録し、281件への無制限再取得はしない
+    #    （指示書STEP11）。
+    codes = list(dict.fromkeys(w.get("code", "") for w in watchlist if w.get("code")))
+    for code in codes:
+        key = f"daily_history:{trading_date}:{code}"
+        if _cache_get(key) is not None:
+            diagnostics["historical_cache_hits"] += 1
+            continue
+        diagnostics["historical_network_requests"] += 1
+        hist = _tachibana_daily_history_cached(code, trading_date=trading_date)
+        if hist is not None:
+            diagnostics["historical_success"] += 1
+        else:
+            diagnostics["historical_failed"] += 1
+
+    diagnostics["total_elapsed_ms"] = round((time.time() - t0) * 1000)
+    diagnostics["completed_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if diagnostics["symbols_requested"] > 0 and diagnostics["historical_failed"] == 0 \
+            and diagnostics["stage1_ready"] and diagnostics["market_data_ready"]:
+        diagnostics["status"] = "READY"
+    elif diagnostics["historical_success"] > 0 or diagnostics["historical_cache_hits"] > 0:
+        diagnostics["status"] = "PARTIAL"
+    else:
+        diagnostics["status"] = "FAILED"
+    _cache_set(f"morning_warmup_status:{user_id}", diagnostics)
+    if diagnostics["status"] == "FAILED":
+        _mark_scheduler_error("morning_warmup", "historical warmup failed for all symbols")
+    else:
+        _mark_scheduler_success("morning_warmup", processed_count=diagnostics["historical_success"])
+    print(f"  [MorningWarmup] status={diagnostics['status']} symbols={diagnostics['symbols_requested']} "
+          f"historical_cache_hits={diagnostics['historical_cache_hits']} "
+          f"historical_success={diagnostics['historical_success']} historical_failed={diagnostics['historical_failed']} "
+          f"stage1_ready={diagnostics['stage1_ready']} market_data_ready={diagnostics['market_data_ready']} "
+          f"elapsed={diagnostics['total_elapsed_ms']}ms")
+    return diagnostics
+
+
+def _restart_time_morning_warmup():
+    """Market Data Phase4 STEP13：サーバープロセス起動直後に1回だけ実行するwarmup
+    （ループではない、_morning_check_scheduler_loopとは別スレッド）。DATABASE_URL未設定
+    環境（他PC/共有先等）では何もしない（既存の他機能と同じ後方互換方針）。"""
+    if not DATABASE_URL or investment_db is None:
+        return
+    for user_id in _morning_check_scheduler_users():
+        try:
+            run_morning_market_warmup(DATABASE_URL, user_id)
+        except Exception as e:
+            print(f"  [MorningWarmup] 起動時warmup失敗（{user_id}）", e)
+
+
 def _morning_check_scheduler_loop():
     """指示書2番の定時（05:30/07:00/08:00/08:30/08:50 JST）にMorningMarketCheckを自動生成する
     デーモンスレッド。60秒間隔でJST時刻をチェックし、対象時刻の分に一度だけ発火する
     （プロセス内メモリの発火済みセットで同一プロセス内の二重発火を防ぎ、DBのUNIQUE制約
-    （user_id, check_date, snapshot_time）が最終防衛線としてさらに二重生成を防ぐ）。"""
-    fired = set()  # {(check_date, snapshot_time, user_id)}
+    （user_id, check_date, snapshot_time）が最終防衛線としてさらに二重生成を防ぐ）。
+    2026-09-15更新（Market Data Phase 4）：同じ発火判定・同じ"fired"セットの仕組みを使って
+    MORNING_WARMUP_TIMES（07:30・08:45）でrun_morning_market_warmup()も発火させる——新しい
+    スレッドは追加しない（指示書STEP1）。warmupはMorningMarketCheckを生成しない副作用フリーな
+    処理のため、既存のMorningCheck発火ロジックとは完全に独立した分岐にしている。"""
+    fired = set()  # {(check_date, snapshot_time, user_id)}（snapshot_timeは"T0530"等、warmup分は"WARMUP:T0730"等でnamespace分離）
     JST = datetime.timezone(datetime.timedelta(hours=9))
     while True:
         try:
             now_jst = datetime.datetime.now(JST)
             hhmm = now_jst.strftime("%H:%M")
             if _is_jp_market_business_day(now_jst):
+                check_date = now_jst.date().isoformat()
                 for snapshot_time, target_hhmm in MORNING_CHECK_SNAPSHOT_TIMES.items():
                     if hhmm == target_hhmm:
-                        check_date = now_jst.date().isoformat()
                         for user_id in _morning_check_scheduler_users():
                             key = (check_date, snapshot_time, user_id)
                             if key in fired:
@@ -3022,6 +3169,17 @@ def _morning_check_scheduler_loop():
                                 print(f"  [MorningCheck] {user_id} {snapshot_time}（{target_hhmm}）生成完了")
                             except Exception as e:
                                 print(f"  [MorningCheck] {user_id} {snapshot_time} 生成失敗", e)
+                for warmup_time, target_hhmm in MORNING_WARMUP_TIMES.items():
+                    if hhmm == target_hhmm:
+                        for user_id in _morning_check_scheduler_users():
+                            key = (check_date, f"WARMUP:{warmup_time}", user_id)
+                            if key in fired:
+                                continue
+                            fired.add(key)
+                            try:
+                                run_morning_market_warmup(DATABASE_URL, user_id)
+                            except Exception as e:
+                                print(f"  [MorningWarmup] {user_id} {warmup_time}（{target_hhmm}）実行失敗", e)
                 # 日付が変わったら発火済みセットをクリアして無限に肥大化しないようにする
                 if len(fired) > 200:
                     fired = {k for k in fired if k[0] == now_jst.date().isoformat()}
@@ -10665,7 +10823,8 @@ SHADOW_MODE = True  # 指示書22番：Phase12中はShadow Modeを基本とす�
 # 指示書12・13番：schedulerレジストリ＋heartbeat。プロセス内メモリのみ（再起動でリセット
 # される——常時稼働プロセスの「現在の状態」を見る用途であり、永続履歴ではない、既知の制約）。
 SCHEDULER_REGISTRY = ["morning_check", "intraday_report", "nicosoku_poll",
-                       "social_signal_evaluation", "event_reaction", "candidate_outcome"]
+                       "social_signal_evaluation", "event_reaction", "candidate_outcome",
+                       "morning_warmup"]  # Market Data Phase4新規
 
 
 def _empty_heartbeat():
@@ -14810,7 +14969,38 @@ def _margin_badge(ratio):
     return "normal", f"貸借倍率{ratio:.2f}倍（通常水準）"
 
 
-def _tachibana_daily_arrays(code, live_quote=None):
+def _tachibana_daily_history_cached(code, trading_date=None):
+    """Market Data Phase 4（2026-09-15新規、STEP5〜7）：tachibana_api.get_daily_history(code)
+    が返す「前営業日までの確定値」部分だけを、trading_date（省略時は当日のJST日付）を
+    キーに含めた長期キャッシュ（"daily_history:{trading_date}:{code}"）へ保存する。
+    この部分は前営業日で確定しておりtrading_date内は変化しないため、TTLで期限切れさせる
+    代わりに「キーに日付が含まれる」ことそのものを鮮度保証にする——存在すれば常にfresh
+    として扱ってよく、翌営業日になれば自動的に別キーになるため、古い日の履歴を当日分として
+    誤用することはない（明示的な失効処理は不要）。
+    朝の事前warmup（run_morning_market_warmup）で1回取得しておけば、場中に
+    _volume_stage2_detail()がwatchlist全銘柄分呼ばれても、この関数（＝Tachibanaへの
+    get_daily_history個別リクエスト）は1銘柄につき1日1回で済む。
+    戻り値：get_daily_history()と同じ形式のリスト（直近400営業日）、失敗時None。"""
+    if tachibana_api is None or not code:
+        return None
+    trading_date = trading_date or _jst_today_date_str()
+    key = f"daily_history:{trading_date}:{code}"
+    entry = _cache_get(key)
+    if entry is not None:
+        return entry["value"]
+    try:
+        hist = tachibana_api.get_daily_history(code)
+    except Exception as e:
+        print(f"  立花証券API 日足取得失敗（{code}）。yfinanceにフォールバック", e)
+        return None
+    if len(hist) < 20:
+        return None
+    hist = hist[-400:]
+    _cache_set(key, hist)
+    return hist
+
+
+def _tachibana_daily_arrays(code, live_quote=None, trading_date=None):
     """立花証券APIの日足履歴（分割調整済み・上場来）から closes/opens/highs/lows/volumes を作る。
     日足履歴は前営業日までの確定値のみのため、当日分は時価情報（ライブ気配）から合成して
     末尾に追加する（yfinanceのhistory()が当日分もリアルタイムに含めて返す挙動に合わせるため。
@@ -14824,20 +15014,19 @@ def _tachibana_daily_arrays(code, live_quote=None):
     呼び出し元（_volume_stage2_detail）は既にrun_momentum_stage1()がバッチ取得済みの
     stage1_row（t/open/high/low/volumeを含む、get_market_price()と同じ形式）を持っている。
     live_quoteにこれを渡すと、この個別get_market_price呼び出しを省略できる
-    （Tachibana APIへの呼び出し回数を1銘柄あたり最大2回→1回に削減。実測：get_daily_history
-    には複数銘柄batch endpointが存在しない＜1銘柄のみ・期間指定不可＞ため、この冗長な
-    2回目の呼び出しを消すのが安全に削減できる唯一の箇所だった）。省略時は従来通り
-    個別にget_market_priceを呼ぶ（既存の他の呼び出し元は完全に無変更）。"""
+    （Tachibana APIへの呼び出し回数を1銘柄あたり最大2回→1回に削減）。省略時は従来通り
+    個別にget_market_priceを呼ぶ（既存の他の呼び出し元は完全に無変更）。
+
+    2026-09-15追加（Market Data Phase 4）：日足履歴自体の取得は
+    _tachibana_daily_history_cached()（trading_date scopedの長期キャッシュ）を経由する
+    ように変更した。計算・合成ロジックは完全に無変更（ゴールデン比較テストで確認）——
+    変わったのは「取得元」だけで、warmup済みならTachibanaへの新規リクエストなしで
+    このキャッシュから即座に返る。"""
     if tachibana_api is None or not code:
         return None
-    try:
-        hist = tachibana_api.get_daily_history(code)
-    except Exception as e:
-        print(f"  立花証券API 日足取得失敗（{code}）。yfinanceにフォールバック", e)
+    hist = _tachibana_daily_history_cached(code, trading_date=trading_date)
+    if not hist:
         return None
-    if len(hist) < 20:
-        return None
-    hist = hist[-400:]
     closes = [r["close"] for r in hist]
     opens = [r["open"] for r in hist]
     highs = [r["high"] for r in hist]
@@ -21969,6 +22158,17 @@ def main():
         # デーモンスレッドで起動する。サーバーが起動している間だけ機能する
         # （start.bat/サーバー常駐が前提、CLAUDE.md「使用中は閉じない」と整合）。
         threading.Thread(target=_morning_check_scheduler_loop, daemon=True).start()
+        # Market Data Phase4新規（STEP13）：全キャッシュ（daily_history含む）はプロセス内
+        # メモリのみ（_CACHE_STORE、永続化なし）のため、サーバー再起動（PCの再起動・
+        # start.bat再実行等）をまたぐとwarmup済み状態は失われる。指示書STEP13の選択肢のうち
+        # 「A. 再起動時warmup」が最小変更（新しい永続化基盤を作らない）かつ安全（サーバーは
+        # 手動起動のため、07:30/08:45を過ぎてから起動された場合に次の定時発火＝翌営業日まで
+        # 一切warmされないのを防ぐ）と判断し採用した。起動直後に1回だけ（ループではない）
+        # 別スレッドでrun_morning_market_warmup()を実行する——サーバー起動そのものは
+        # 待たせない（daemon=True・fire-and-forget）。平日以外・時間外でも実行して構わない
+        # （warmupはentry_score等を生成しない副作用フリーな処理のため、市場が閉まっていても
+        # 安全＝ただ古いキャッシュが更新されるだけ）。
+        threading.Thread(target=_restart_time_morning_warmup, daemon=True).start()
         # 「今日の振り返り」独立タブ化+15:30自動評価（2026-09-12新規、指示書4・28番）：
         # 毎営業日15:30の引け後に当日評価を自動生成する独立スケジューラ。他のスケジューラと
         # 同じくサービス分離方針（指示書31番）で別スレッドにする。
