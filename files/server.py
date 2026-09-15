@@ -403,6 +403,7 @@ def get_stock_quotes(watchlist, cache_ttl=0, status_out=None):
             else:
                 to_fetch.append((code, sym))
 
+    newly_fetched_codes = set()
     if to_fetch:
         symbols = [sym for _, sym in to_fetch]
 
@@ -444,8 +445,7 @@ def get_stock_quotes(watchlist, cache_ttl=0, status_out=None):
                     print("  個別銘柄失敗", code, sym, e)
             if quote is not None:
                 out[code] = quote
-                if cache_ttl > 0:
-                    _cache_set(f"stockquote:{sym}", quote)
+                newly_fetched_codes.add(code)
                 if status_out is not None:
                     status_out[code] = "ok"
             elif cache_ttl > 0 and exc is not None:
@@ -463,7 +463,29 @@ def get_stock_quotes(watchlist, cache_ttl=0, status_out=None):
             elif status_out is not None:
                 status_out[code] = "ok"  # バッチは成功したがこの銘柄だけデータ無し（従来通り欠損扱い、quality影響なし）
 
-    _overlay_tachibana_prices(out, watchlist)
+    # Market Data高速化指示書 Phase 5（2026-09-15新規、STEP5〜6監査で判明）：
+    # _overlay_tachibana_prices()は「今回このget_stock_quotes呼び出しで対象になった
+    # watchlist全体」に対して無条件でtachibana_api.get_market_price()を呼んでいた——
+    # cache_ttl>0でstockquote:{sym}がキャッシュヒットした銘柄についても毎回オーバーレイ
+    # し直していたため、_intraday_stock_snapshot()がwatchlist 1件ずつ
+    # get_stock_quotes([item], cache_ttl=90)を呼ぶ既存ループ（Phase1で対応した経路）で、
+    # 実は「1銘柄だけのTachibana get_market_price個別呼び出し」がキャッシュヒット時にも
+    # 毎回発生し続けていた（Phase1のバッチ化を部分的に無効化していた隠れfallback、
+    # 281銘柄で数百秒規模——STEP11のネットワーク禁止fixtureテストで検出）。
+    # 修正：cache_ttl>0の場合はオーバーレイ対象を「今回新規に取得した銘柄
+    # （newly_fetched_codes、cache missだった銘柄）」だけに絞り、オーバーレイ後の値を
+    # cache_ttl>0の場合のみ改めてキャッシュへ保存する（＝一度オーバーレイされた値は
+    # TTL内は再オーバーレイしない）。cache_ttl=0の既存呼び出し元（メインダッシュボード等）
+    # は従来通りwatchlist全件を毎回オーバーレイし続ける（動作完全維持）。
+    if cache_ttl > 0:
+        if newly_fetched_codes:
+            overlay_targets = [w for w in watchlist if w.get("code") in newly_fetched_codes]
+            _overlay_tachibana_prices(out, overlay_targets)
+            for code, sym in to_fetch:
+                if code in out:
+                    _cache_set(f"stockquote:{sym}", out[code])
+    else:
+        _overlay_tachibana_prices(out, watchlist)
     return out
 
 
@@ -3947,6 +3969,32 @@ def get_entry_candidate_support_context(database_url, user_id, codes_with_sector
     return result, diagnostics
 
 
+def _summarize_per_symbol_ms(per_symbol_ms):
+    """Market Data高速化指示書 Phase 5 STEP3：per_symbol_ms（[(code, elapsed_ms), ...]）から
+    count/avg/median/p90/p95/max・slowest上位10件を集計する（通常ログへ281行出さないための
+    集計専用ヘルパー、分析ロジックには関与しない）。"""
+    if not per_symbol_ms:
+        return {"count": 0, "avgMs": 0, "medianMs": 0, "p90Ms": 0, "p95Ms": 0, "maxMs": 0, "slowest": []}
+    values = sorted(per_symbol_ms, key=lambda x: x[1])
+    ms_values = [v for _c, v in values]
+    n = len(ms_values)
+
+    def _percentile(p):
+        idx = min(n - 1, max(0, int(round(p * (n - 1)))))
+        return round(ms_values[idx], 2)
+
+    slowest = sorted(per_symbol_ms, key=lambda x: -x[1])[:10]
+    return {
+        "count": n,
+        "avgMs": round(sum(ms_values) / n, 2),
+        "medianMs": _percentile(0.5),
+        "p90Ms": _percentile(0.9),
+        "p95Ms": _percentile(0.95),
+        "maxMs": round(max(ms_values), 2),
+        "slowest": [{"code": c, "elapsedMs": round(v, 2)} for c, v in slowest],
+    }
+
+
 def _score_entry_candidates(database_url, user_id):
     """今買い時TOP5（entry_ready_top5）とWatch候補を算出する純粋関数（DB書き込みなし）。
     既存の共有Stage1（run_momentum_stage1、複数AUTOエンジンとキャッシュ共有）・
@@ -3965,14 +4013,28 @@ def _score_entry_candidates(database_url, user_id):
                        "provisional_excluded": 0, "final_candidates": 0, "rendered": 0}}
     if investment_db is None or not database_url:
         return empty
+
+    # Market Data高速化指示書 Phase 5（2026-09-15新規）：STEP2区間計測。ロジックには一切
+    # 関与しない計測専用のtime.time()呼び出しのみを追加している（既存の分岐・計算式は不変）。
+    # section_msはdebugへ追加専用フィールドとして格納するだけ（デバッグ/ログ専用、UI必須ではない）。
+    _t_start = time.time()
+    section_ms = {}
+
     watchlist = investment_db.list_watchlist(database_url, user_id, market="JP")
+    section_ms["watchlistLoad"] = round((time.time() - _t_start) * 1000)
     if not watchlist:
         return empty
+
+    _t = time.time()
     stage1 = run_momentum_stage1()
+    section_ms["stage1"] = round((time.time() - _t) * 1000)
     stage1_rows = stage1.get("rows", {})
     nikkei_chg = stage1.get("nikkeiChangePct")
+
+    _t = time.time()
     auto_rs_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_RS_CURRENT", market="JP")
     auto_sector_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_SECTOR_LEADER_CURRENT", market="JP")
+    section_ms["autoTags"] = round((time.time() - _t) * 1000)
 
     # Market Data高速化指示書 Phase B（2026-09-15新規）：この関数は以下のwatchlist全件
     # （監視銘柄すべて、Phase 0計測で300件超を確認）に対して1件ずつ_intraday_stock_snapshot()
@@ -3983,6 +4045,7 @@ def _score_entry_candidates(database_url, user_id):
     # （prefetch）で、ループ内の個別呼び出しをキャッシュヒットに変える。ループ内の既存ロジック
     # （_intraday_stock_snapshot・_volume_stage2_detail・_entry_score_components等）は一切
     # 変更していない——prefetch失敗時も個別フォールバックでこれまで通り動作する。
+    _t = time.time()
     try:
         market_data_diagnostics = prefetch_market_data_for_watchlist(watchlist)
     except Exception as e:
@@ -3992,6 +4055,7 @@ def _score_entry_candidates(database_url, user_id):
         # 経路でこれまで通り動作する）。
         print("  entry-candidates: market data prefetchで例外（無視して続行）", e)
         market_data_diagnostics = {"error": str(e)}
+    section_ms["marketDataPrefetch"] = round((time.time() - _t) * 1000)
 
     # Market Data高速化指示書 Phase 2（2026-09-15新規）：DB N+1解消。この下のループは
     # candidate 1件ごとにrelevant_catalysts_for/upcoming_event_signals/
@@ -4009,6 +4073,7 @@ def _score_entry_candidates(database_url, user_id):
         row = stage1_rows.get(code)
         if row and row.get("current") is not None:
             support_targets.append((code, row.get("sector")))
+    _t = time.time()
     try:
         support_context, entry_support_diagnostics = get_entry_candidate_support_context(database_url, user_id, support_targets)
     except Exception as e:
@@ -4018,6 +4083,7 @@ def _score_entry_candidates(database_url, user_id):
         # catalysts等が空でも計算できる設計のため、分析全体は落ちない）。
         print("  entry-candidates: support contextバッチ取得で例外（catalysts等は空扱いで続行、個別フォールバックはしない）", e)
         support_context, entry_support_diagnostics = {}, {"error": str(e)}
+    section_ms["dbSupportPrefetch"] = round((time.time() - _t) * 1000)
 
     # Market Data高速化指示書 Phase 3（2026-09-15新規）：この下のループが候補1件ごとに呼ぶ
     # _volume_stage2_detail()→_cached_daily_arrays()→tachibana_api.get_daily_history()
@@ -4029,12 +4095,21 @@ def _score_entry_candidates(database_url, user_id):
     # 個別呼び出しの排除（このループより上の_cached_daily_arrays呼び出しでも同様）で
     # 削減する。失敗時も281件への無制限フォールバックはせず、ループ内の既存
     # _cached_daily_arrays()がキャッシュミス分だけ個別に取得を試みる（既存の安全側動作）。
+    _t = time.time()
     try:
         daily_arrays_diagnostics = prefetch_daily_arrays_for_watchlist(watchlist, stage1_rows)
     except Exception as e:
         print("  entry-candidates: daily arrays prefetchで例外（無視して続行、既存の個別取得へ委ねる）", e)
         daily_arrays_diagnostics = {"error": str(e)}
+    section_ms["dailyArraysPrefetch"] = round((time.time() - _t) * 1000)
 
+    # Phase5 STEP3・STEP4：銘柄ごとのtotal elapsed（percentile集計用）と、
+    # ループ内で実際に呼ばれる2関数（_volume_stage2_detail・_intraday_stock_snapshot）
+    # それぞれのcall count/total_ms/max_msを集計する（通常ログへは281行出さない）。
+    per_symbol_ms = []
+    func_stats = {"_volume_stage2_detail": {"calls": 0, "total_ms": 0.0, "max_ms": 0.0},
+                  "_intraday_stock_snapshot": {"calls": 0, "total_ms": 0.0, "max_ms": 0.0}}
+    _t_loop = time.time()
     candidates = []
     quality_counts = {"FULL": 0, "PARTIAL": 0, "DEGRADED": 0}
     for w in watchlist:
@@ -4042,14 +4117,25 @@ def _score_entry_candidates(database_url, user_id):
         row = stage1_rows.get(code)
         if not row or row.get("current") is None:
             continue
+        _t_symbol = time.time()
         stage2 = None
         try:
+            _t_fn = time.time()
             stage2 = _volume_stage2_detail(code, row)
+            fn_ms = (time.time() - _t_fn) * 1000
+            func_stats["_volume_stage2_detail"]["calls"] += 1
+            func_stats["_volume_stage2_detail"]["total_ms"] += fn_ms
+            func_stats["_volume_stage2_detail"]["max_ms"] = max(func_stats["_volume_stage2_detail"]["max_ms"], fn_ms)
         except Exception as e:
             print("  entry-candidates: Stage2取得失敗", code, e)
         snapshot = None
         try:
+            _t_fn = time.time()
             snap = _intraday_stock_snapshot(w)
+            fn_ms = (time.time() - _t_fn) * 1000
+            func_stats["_intraday_stock_snapshot"]["calls"] += 1
+            func_stats["_intraday_stock_snapshot"]["total_ms"] += fn_ms
+            func_stats["_intraday_stock_snapshot"]["max_ms"] = max(func_stats["_intraday_stock_snapshot"]["max_ms"], fn_ms)
             if snap.get("dataStatus") != "failed":
                 snapshot = snap
         except Exception as e:
@@ -4126,12 +4212,19 @@ def _score_entry_candidates(database_url, user_id):
             "eventSupport": event_support,
             "experienceScore": experience_score, "experienceSummary": experience_summary,
         })
+        per_symbol_ms.append((code, (time.time() - _t_symbol) * 1000))
+
+    section_ms["candidateLoopTotal"] = round((time.time() - _t_loop) * 1000)
 
     # 指示書6番「値上がり率だけでは選ばない」：ソート基準はentry_score（既に過熱ペナルティ・
     # VWAP/構造/RS等を織り込み済み）であり、changePct単純降順ではない。
+    _t = time.time()
     candidates.sort(key=lambda c: -c["entryScore"])
+    section_ms["sortRank"] = round((time.time() - _t) * 1000)
 
+    _t = time.time()
     entry_ready_top5, watch_candidates, debug = _select_entry_ready_top5(candidates)
+    section_ms["top5Selection"] = round((time.time() - _t) * 1000)
     overall_quality = "FULL" if quality_counts["DEGRADED"] == 0 and quality_counts["PARTIAL"] == 0 else (
         "DEGRADED" if quality_counts["FULL"] == 0 else "PARTIAL")
 
@@ -4139,23 +4232,50 @@ def _score_entry_candidates(database_url, user_id):
     # 買わなかったものも含め原則すべてsnapshot保存する（survivorship bias防止）。entry_score・
     # entryState自体は一切変更しない、隣で記録するだけ。dedupe_keyが1日・銘柄・状態単位で
     # 重複保存を防ぐ。
+    _t = time.time()
+    snapshot_persistence_calls = 0
     try:
         for i, c in enumerate(entry_ready_top5):
             capture_entry_candidate_snapshot_safe(
                 database_url, user_id, c["code"], "ENTRY", price=c.get("current"), entry_score=c.get("entryScore"),
                 event_support=c.get("eventSupport"), candidate_state=c.get("eventSupport") or c.get("entryState"),
                 candidate_rank=i + 1)
+            snapshot_persistence_calls += 1
         for c in watch_candidates:
             capture_entry_candidate_snapshot_safe(
                 database_url, user_id, c["code"], "WAIT", price=c.get("current"), entry_score=c.get("entryScore"),
                 event_support=c.get("eventSupport"), candidate_state=c.get("eventSupport") or c.get("entryState"),
                 wait_reason=c.get("entryState"))
+            snapshot_persistence_calls += 1
     except Exception as e:
         print("  entry-candidates: candidate snapshot保存で例外（無視して続行）", e)
+    section_ms["snapshotPersistence"] = round((time.time() - _t) * 1000)
+
+    # Phase5 STEP3：per-symbol timingのpercentile集計（通常ログには281行出さない、
+    # debugへ集計値とslowest上位10件だけ格納する）。
+    _t = time.time()
+    per_symbol_summary = _summarize_per_symbol_ms(per_symbol_ms)
+    func_call_counts = {name: {"calls": v["calls"], "totalMs": round(v["total_ms"]),
+                                 "avgMs": round(v["total_ms"] / v["calls"], 2) if v["calls"] else 0,
+                                 "maxMs": round(v["max_ms"], 2)}
+                          for name, v in func_stats.items()}
+    section_ms["payloadConstruction"] = round((time.time() - _t) * 1000)
+    section_ms["total"] = round((time.time() - _t_start) * 1000)
+    section_ms["other"] = max(0, section_ms["total"] - sum(
+        v for k, v in section_ms.items() if k not in ("total", "other")))
 
     debug["marketDataDiagnostics"] = market_data_diagnostics  # Phase I：デバッグ/ログ専用の追加フィールド（UI必須ではない）
     debug["entrySupportContextDiagnostics"] = entry_support_diagnostics  # Phase 2 G：DB N+1解消の診断情報（デバッグ/ログ専用）
     debug["dailyArraysDiagnostics"] = daily_arrays_diagnostics  # Phase 3 STEP10：日足prefetchの診断情報（デバッグ/ログ専用）
+    debug["sectionTimingsMs"] = section_ms  # Phase5 STEP2：デバッグ/ログ専用の追加フィールド
+    debug["perSymbolTiming"] = per_symbol_summary  # Phase5 STEP3
+    debug["funcCallCounts"] = func_call_counts  # Phase5 STEP4
+    debug["snapshotPersistenceCalls"] = snapshot_persistence_calls  # Phase5 STEP8
+    print(f"  [EntryCandidatesTiming] total={section_ms['total']}ms "
+          f"watchlistLoad={section_ms['watchlistLoad']} stage1={section_ms['stage1']} "
+          f"marketDataPrefetch={section_ms['marketDataPrefetch']} dbSupportPrefetch={section_ms['dbSupportPrefetch']} "
+          f"dailyArraysPrefetch={section_ms['dailyArraysPrefetch']} candidateLoopTotal={section_ms['candidateLoopTotal']} "
+          f"snapshotPersistence={section_ms['snapshotPersistence']} other={section_ms['other']}")
     return {
         "entryReadyTop5": [{**c, "rank": i + 1} for i, c in enumerate(entry_ready_top5)],
         "watchCandidates": watch_candidates,
