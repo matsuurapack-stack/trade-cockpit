@@ -3861,6 +3861,22 @@ def _score_entry_candidates(database_url, user_id):
         print("  entry-candidates: support contextバッチ取得で例外（catalysts等は空扱いで続行、個別フォールバックはしない）", e)
         support_context, entry_support_diagnostics = {}, {"error": str(e)}
 
+    # Market Data高速化指示書 Phase 3（2026-09-15新規）：この下のループが候補1件ごとに呼ぶ
+    # _volume_stage2_detail()→_cached_daily_arrays()→tachibana_api.get_daily_history()
+    # （立花証券APIの日足履歴、1銘柄のみ・batch endpoint無し）を、ループへ入る前にまとめて
+    # 取得しキャッシュへ事前投入する。実測：20銘柄サンプルで平均2.19秒/件、281銘柄で
+    # 約615秒に達していた根本原因（Phase1・2のどちらの対象にも含まれていなかった第3の
+    # 経路）。STEP3実測でTachibanaのセッションが同時アクセスに弱いと判明したため
+    # （関数側のコメント参照）、既定では並列化せずキャッシュ事前投入とget_market_price
+    # 個別呼び出しの排除（このループより上の_cached_daily_arrays呼び出しでも同様）で
+    # 削減する。失敗時も281件への無制限フォールバックはせず、ループ内の既存
+    # _cached_daily_arrays()がキャッシュミス分だけ個別に取得を試みる（既存の安全側動作）。
+    try:
+        daily_arrays_diagnostics = prefetch_daily_arrays_for_watchlist(watchlist, stage1_rows)
+    except Exception as e:
+        print("  entry-candidates: daily arrays prefetchで例外（無視して続行、既存の個別取得へ委ねる）", e)
+        daily_arrays_diagnostics = {"error": str(e)}
+
     candidates = []
     quality_counts = {"FULL": 0, "PARTIAL": 0, "DEGRADED": 0}
     for w in watchlist:
@@ -3981,6 +3997,7 @@ def _score_entry_candidates(database_url, user_id):
 
     debug["marketDataDiagnostics"] = market_data_diagnostics  # Phase I：デバッグ/ログ専用の追加フィールド（UI必須ではない）
     debug["entrySupportContextDiagnostics"] = entry_support_diagnostics  # Phase 2 G：DB N+1解消の診断情報（デバッグ/ログ専用）
+    debug["dailyArraysDiagnostics"] = daily_arrays_diagnostics  # Phase 3 STEP10：日足prefetchの診断情報（デバッグ/ログ専用）
     return {
         "entryReadyTop5": [{**c, "rank": i + 1} for i, c in enumerate(entry_ready_top5)],
         "watchCandidates": watch_candidates,
@@ -14793,14 +14810,24 @@ def _margin_badge(ratio):
     return "normal", f"貸借倍率{ratio:.2f}倍（通常水準）"
 
 
-def _tachibana_daily_arrays(code):
+def _tachibana_daily_arrays(code, live_quote=None):
     """立花証券APIの日足履歴（分割調整済み・上場来）から closes/opens/highs/lows/volumes を作る。
     日足履歴は前営業日までの確定値のみのため、当日分は時価情報（ライブ気配）から合成して
     末尾に追加する（yfinanceのhistory()が当日分もリアルタイムに含めて返す挙動に合わせるため。
     これをしないと当日のopens[-1]/highs[-1]/lows[-1]が前営業日のままなのに終値だけ
     current_overrideで当日値に差し替わり、ギャップアップ判定・ローソク足形状の判定がずれる）。
     直近400営業日に絞る（52週高値等の計算には十分で、6000件超をそのまま扱うより軽い）。
-    失敗・データ不足時はNoneを返し、呼び出し側でyfinanceにフォールバックする。"""
+    失敗・データ不足時はNoneを返し、呼び出し側でyfinanceにフォールバックする。
+
+    2026-09-15追加（Market Data Phase 3、STEP0監査で判明）：当日分の合成には従来
+    tachibana_api.get_market_price([code])を銘柄ごとに個別問い合わせしていたが、
+    呼び出し元（_volume_stage2_detail）は既にrun_momentum_stage1()がバッチ取得済みの
+    stage1_row（t/open/high/low/volumeを含む、get_market_price()と同じ形式）を持っている。
+    live_quoteにこれを渡すと、この個別get_market_price呼び出しを省略できる
+    （Tachibana APIへの呼び出し回数を1銘柄あたり最大2回→1回に削減。実測：get_daily_history
+    には複数銘柄batch endpointが存在しない＜1銘柄のみ・期間指定不可＞ため、この冗長な
+    2回目の呼び出しを消すのが安全に削減できる唯一の箇所だった）。省略時は従来通り
+    個別にget_market_priceを呼ぶ（既存の他の呼び出し元は完全に無変更）。"""
     if tachibana_api is None or not code:
         return None
     try:
@@ -14820,10 +14847,13 @@ def _tachibana_daily_arrays(code):
     jst = datetime.timezone(datetime.timedelta(hours=9))
     today_str = datetime.datetime.now(jst).strftime("%Y-%m-%d")
     if hist[-1]["date"] != today_str:
-        try:
-            live = tachibana_api.get_market_price([code]).get(code)
-        except Exception:
-            live = None
+        if live_quote is not None:
+            live = live_quote
+        else:
+            try:
+                live = tachibana_api.get_market_price([code]).get(code)
+            except Exception:
+                live = None
         if live and live.get("t") is not None and live.get("open") is not None:
             closes.append(live["t"])
             opens.append(live["open"])
@@ -14833,23 +14863,153 @@ def _tachibana_daily_arrays(code):
     return closes, opens, highs, lows, volumes
 
 
-def _cached_daily_arrays(code, ttl):
+def _cached_daily_arrays(code, ttl, live_quote=None):
     """_tachibana_daily_arrays()をCACHE_TTL["daily_arrays"]でラップする（トレード分析
     リアルタイム自動更新・2026-09-12、指示書9番「API負荷対策」）。日足履歴は日中ほぼ変化
     しないため、FAST UPDATEが10秒間隔でポーリングしてもこのキャッシュにより実際の
     立花証券API呼び出しはTTLごとに1回で済む。取得失敗時、期限切れでも直近キャッシュが
-    あればそれを返す（stale fallback、既存の_cached_two_closes等と同じ方針）。"""
+    あればそれを返す（stale fallback、既存の_cached_two_closes等と同じ方針）。
+    2026-09-15追加（Market Data Phase 3）：live_quoteは_tachibana_daily_arrays()へそのまま
+    引き継ぐだけ（省略時は従来通り）。"""
     key = f"daily_arrays:{code}"
     entry = _cache_get(key)
     if _cache_fresh(entry, ttl):
         return entry["value"]
-    value = _tachibana_daily_arrays(code)
+    value = _tachibana_daily_arrays(code, live_quote=live_quote)
     if value is not None:
         _cache_set(key, value)
         return value
     if entry is not None:
         return entry["value"]
     return None
+
+
+# ============================================================
+# Market Data高速化指示書 Phase 3（2026-09-15新規）：Volume Stage2 / Tachibana日足取得高速化。
+#
+# STEP0監査結果（推測ではなくコード・API仕様から確認）：
+#   call chain: _volume_stage2_detail(code, stage1_row) → _cached_daily_arrays(code, ttl)
+#               → _tachibana_daily_arrays(code) → tachibana_api.get_daily_history(code)
+#               （+ 当日分が無い場合はtachibana_api.get_market_price([code])を追加で1回）
+#   1. HTTP回数：1銘柄あたり最大2回（日足履歴＋当日値の個別合成）。Phase3でlive_quote
+#      引き継ぎにより1回（get_daily_historyのみ）へ削減済み（このセクションより上）。
+#   2. 重複取得：get_market_price側の重複は解消済み。get_daily_history自体は銘柄ごとに
+#      1回で重複なし。
+#   3. 取得期間：tachibana_api.get_daily_history()は期間指定不可（常に上場来〜20年分を
+#      全件返す、API仕様上の制約——STEP1「必要最小期間へ短縮」はAPI側に対応パラメータが
+#      無いため不可。クライアント側で直近400営業日に絞る既存処理のみで対応）。
+#   4. 必要OHLCV本数：呼び出し元が要求するのは最大でも直近63営業日（BREAKOUT_LOOKBACK_DAYS）
+#      程度で、既存の400営業日切り出しで十分にカバーされている。
+#   5. timeout：tachibana_api._http（urllib3.PoolManager）はconnect=10秒/read=15秒固定。
+#      get_daily_history個別リクエストはurllib3.Retry(total=2, backoff_factor=1.0)による
+#      transport層の自動再試行を持つ。
+#   6. retry：p_errno異常時は1回だけ再ログイン+再試行（get_market_price等と同じ設計）。
+#      RemoteDisconnected等のネットワーク例外は再試行されず、そのまま呼び出し元
+#      （_tachibana_daily_arrays）でNoneとして扱われる（安全側、既存動作）。
+#   7. cache TTL：CACHE_TTL["daily_arrays"]=90秒（既存、日足は日中ほぼ変化しないため
+#      十分）。新しい別キャッシュは作らず、既存"daily_arrays:{code}"キーをそのまま使う。
+#   8. cache key：daily_arrays:{code}（既存）。
+#   9. RemoteDisconnected時の挙動：_tachibana_daily_arrays()内でNoneを返すのみ（例外を
+#      投げない）——呼び出し元のStage2はデータ欠損として安全側に倒れる（既存動作）。
+#   10. batch endpoint：tachibana_api.get_daily_history()のdocstring「1銘柄のみ・
+#       期間指定不可」の通り、複数銘柄をまとめて取得する公式batch endpointは存在しない
+#       （get_market_priceにはPRICE_CHUNK=40のbatchがあるが、日足履歴には無い）。
+#   11. API制約：sIssueCode 1件のみ、期間パラメータ無し。
+#
+# STEP3実測（bounded concurrency比較、workers=2/4/6/8、各15銘柄の別スライスで実施）：
+#   workers=2: elapsed=17.56s(15件) success=11 failed=4  (失敗率27%)
+#   workers=4: elapsed=10.19s(15件) success=8  failed=7  (失敗率47%)
+#   workers=6: elapsed=7.44s (15件) success=10 failed=5  (失敗率33%)
+#   workers=8: elapsed=10.66s(15件) success=1  failed=14 (失敗率93%！)
+#   比較対照（sequential/workers=1相当）: elapsed=18.84s(15件) success=12 failed=3 (失敗率20%)
+#   エラーは全て「セッションが切断されました」（RemoteDisconnected含む）——単なる
+#   レート制限ではなく、Tachibanaの認証セッションが同時アクセスに耐えられず切断される
+#   兆候。workers=8では失敗率93%と壊滅的で、明確に「同時実行が有害」と判断できる。
+#   workers=2〜6は成功率がsequentialとほぼ同水準〜やや悪化する範囲に収まり、速度面の
+#   優位も明確ではなかった（本セッションでの直前の連続測定によるノイズの影響も否定できず）。
+#   結論：本APIのセッションは同時アクセスに対して脆弱であり、高い同時実行数（6〜8）は
+#   明確に有害。低い同時実行数（2〜4）も速度上の優位が実測で確認できなかったため、
+#   デフォルトは並列化しない（DAILY_ARRAYS_PREFETCH_WORKERS=1）。同一プロセス内の他機能
+#   （get_market_price等）もこの同じ認証セッションを共有しているため、日足取得だけの
+#   ために同時実行数を上げてセッション断を誘発するリスクは、得られる速度向上に見合わない
+#   と判断した（値は環境変数等での調整は可能な設計にしておく）。
+# ============================================================
+DAILY_ARRAYS_PREFETCH_WORKERS = 1  # STEP3実測に基づき既定は並列化しない（上記コメント参照）
+
+
+def prefetch_daily_arrays_for_watchlist(watchlist, stage1_rows, max_workers=DAILY_ARRAYS_PREFETCH_WORKERS):
+    """Market Data Phase 3：watchlist分のdaily_arrays（Stage2用）をループに入る前にまとめて
+    取得し、既存daily_arrays:{code}キャッシュへ事前投入する。tachibana_api.get_daily_history()
+    には複数銘柄batch endpointが存在しない（STEP0監査）ため、ThreadPoolExecutorによる有界
+    並列を使える設計にしてあるが、実測（上記コメント参照）でTachibanaのセッションが同時
+    アクセスに弱いことが分かったため、既定値（DAILY_ARRAYS_PREFETCH_WORKERS=1）では実質
+    逐次実行になる。
+    fresh cache（TTL内）の銘柄は取得しない（指示書STEP4）。個別銘柄の取得失敗はdiagnostics
+    へ記録するのみで、281件への無制限フォールバックはしない——ループ内の既存
+    _cached_daily_arrays()がキャッシュミスの銘柄だけ個別に（このprefetchと同じ経路で）
+    取得を試みる、既存の安全側動作にそのまま委ねる（指示書STEP8）。
+    戻り値：diagnostics dict（Phase 3 STEP10）。"""
+    diagnostics = {"symbols_requested": len(watchlist), "unique_symbols": 0, "cache_hits": 0,
+                    "cache_misses": 0, "network_requests": 0, "successful": 0, "failed": 0,
+                    "timeouts": 0, "remote_disconnects": 0, "retries": 0, "stale_used": 0,
+                    "elapsed_ms": 0}
+    if tachibana_api is None:
+        return diagnostics
+    t0 = time.time()
+    codes = list(dict.fromkeys(
+        w.get("code", "") for w in watchlist if w.get("code") and w.get("market", "JP") == "JP"))
+    diagnostics["unique_symbols"] = len(codes)
+    if not codes:
+        diagnostics["elapsed_ms"] = round((time.time() - t0) * 1000)
+        return diagnostics
+
+    ttl = CACHE_TTL["daily_arrays"]
+    to_fetch = []
+    for code in codes:
+        entry = _cache_get(f"daily_arrays:{code}")
+        if _cache_fresh(entry, ttl):
+            diagnostics["cache_hits"] += 1
+        else:
+            diagnostics["cache_misses"] += 1
+            to_fetch.append(code)
+
+    def _fetch_one(code):
+        row = stage1_rows.get(code)
+        live_quote = None
+        if row and row.get("current") is not None:
+            live_quote = {"t": row.get("current"), "open": row.get("open"),
+                           "high": row.get("high"), "low": row.get("low"), "volume": row.get("volume")}
+        return _tachibana_daily_arrays(code, live_quote=live_quote)
+
+    if to_fetch:
+        diagnostics["network_requests"] = len(to_fetch)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as ex:
+            futures = {ex.submit(_fetch_one, code): code for code in to_fetch}
+            for fut in concurrent.futures.as_completed(futures):
+                code = futures[fut]
+                try:
+                    value = fut.result()
+                except Exception as e:
+                    value = None
+                    msg = str(e)
+                    if "RemoteDisconnected" in msg or "Connection aborted" in msg:
+                        diagnostics["remote_disconnects"] += 1
+                    print(f"  [DailyArraysPrefetch] {code} 取得で例外（このsymbolだけ失敗扱い）", e)
+                if value is not None:
+                    _cache_set(f"daily_arrays:{code}", value)
+                    diagnostics["successful"] += 1
+                else:
+                    diagnostics["failed"] += 1
+                    stale = _cache_get(f"daily_arrays:{code}")
+                    if stale is not None:
+                        diagnostics["stale_used"] += 1
+
+    diagnostics["elapsed_ms"] = round((time.time() - t0) * 1000)
+    print(f"  [DailyArraysPrefetch] unique_symbols={diagnostics['unique_symbols']} "
+          f"cache_hits={diagnostics['cache_hits']} cache_misses={diagnostics['cache_misses']} "
+          f"successful={diagnostics['successful']} failed={diagnostics['failed']} "
+          f"remote_disconnects={diagnostics['remote_disconnects']} elapsed={diagnostics['elapsed_ms']}ms")
+    return diagnostics
 
 
 # 2026-08-21 ユーザー要望：出来高ブレイクアウト判定の高値の参照期間を「直近20営業日」から
@@ -16605,8 +16765,18 @@ def select_volume_stage1_candidates(stage1):
 
 def _volume_stage2_detail(code, stage1_row):
     """日足履歴から過去20営業日平均出来高（avgVolume20）・当日出来高との倍率（生・時間帯補正後
-    の両方）・売買代金倍率・直近高値からの乖離（distanceFromHigh）・break status等を算出する。"""
-    arrays = _cached_daily_arrays(code, CACHE_TTL["daily_arrays"])
+    の両方）・売買代金倍率・直近高値からの乖離（distanceFromHigh）・break status等を算出する。
+    2026-09-15追加（Market Data Phase 3）：stage1_row（run_momentum_stage1()がバッチ取得済み
+    の当日値）を_cached_daily_arrays()のlive_quoteへ渡し、_tachibana_daily_arrays()内の
+    冗長なget_market_price([code])個別呼び出しを省略する（フィールド名がstage1_row側は
+    "current"・get_market_price側は"t"で異なるだけで値は同じもの、他の値はキー名が同じ）。
+    計算ロジック自体は無変更。"""
+    live_quote = None
+    if stage1_row and stage1_row.get("current") is not None:
+        live_quote = {"t": stage1_row.get("current"), "open": stage1_row.get("open"),
+                       "high": stage1_row.get("high"), "low": stage1_row.get("low"),
+                       "volume": stage1_row.get("volume")}
+    arrays = _cached_daily_arrays(code, CACHE_TTL["daily_arrays"], live_quote=live_quote)
     if not arrays:
         return None
     closes, opens, highs, lows, volumes = arrays
