@@ -3149,13 +3149,42 @@ def run_morning_market_warmup(database_url, user_id):
     return diagnostics
 
 
+def _should_run_restart_time_warmup(now_jst, user_id):
+    """Market Data Phase5 STEP7：_restart_time_morning_warmup()の発火条件判定を切り出した
+    純粋関数（テスト容易性のため）。以下をすべて満たす場合のみTrueを返す：
+    ① 東証営業日（土日は対象外） ② JST 05:00〜15:30（寄り前〜場中。引け後・深夜の
+    再起動で当日分を再取得する価値は薄く、翌営業日は改めてT0730/T0845が発火するため対象外）
+    ③ 当日分がまだREADYでない（get_morning_warmup_status()で確認、既にREADYなら2度手間
+    になるだけなのでスキップ）。
+    2026-09-15新規：無条件に281銘柄historical warmupを開始すると、開発中の頻繁な
+    サーバー再起動やテスト時にもライブAPI負荷をかけてしまう（本日Phase0〜5の開発中に
+    実際に問題となった）ため追加した安全弁。"""
+    if not _is_jp_market_business_day(now_jst):
+        return False, "非営業日"
+    hhmm = now_jst.strftime("%H:%M")
+    if not ("05:00" <= hhmm <= "15:30"):
+        return False, f"対象時間外（現在{hhmm}）"
+    status = get_morning_warmup_status(user_id)
+    if status and status.get("trading_date") == now_jst.date().isoformat() and status.get("status") == "READY":
+        return False, "当日分は既にREADY"
+    return True, None
+
+
 def _restart_time_morning_warmup():
     """Market Data Phase4 STEP13：サーバープロセス起動直後に1回だけ実行するwarmup
     （ループではない、_morning_check_scheduler_loopとは別スレッド）。DATABASE_URL未設定
-    環境（他PC/共有先等）では何もしない（既存の他機能と同じ後方互換方針）。"""
+    環境（他PC/共有先等）では何もしない（既存の他機能と同じ後方互換方針）。
+    2026-09-15更新（Phase5 STEP7）：_should_run_restart_time_warmup()の条件を満たす
+    場合のみ実行する（無条件実行によるライブAPI負荷を防ぐ）。"""
     if not DATABASE_URL or investment_db is None:
         return
+    JST = datetime.timezone(datetime.timedelta(hours=9))
+    now_jst = datetime.datetime.now(JST)
     for user_id in _morning_check_scheduler_users():
+        should_run, reason = _should_run_restart_time_warmup(now_jst, user_id)
+        if not should_run:
+            print(f"  [MorningWarmup] 起動時warmupスキップ（{user_id}）：{reason}")
+            continue
         try:
             run_morning_market_warmup(DATABASE_URL, user_id)
         except Exception as e:

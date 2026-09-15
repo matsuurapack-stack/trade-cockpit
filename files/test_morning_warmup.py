@@ -222,5 +222,83 @@ class VolumeStage2ScoreUnchangedByWarmupTests(unittest.TestCase):
         self.assertEqual(result_warmed, result_cold)
 
 
+class RestartTimeWarmupGuardTests(unittest.TestCase):
+    """Market Data Phase5 STEP7：_should_run_restart_time_warmup()の発火条件（営業日・
+    JST時刻・当日READY状態）を検証する。無条件に281銘柄warmupを開始しないことの確認
+    （サーバー再起動のたびにライブAPI負荷をかけないための安全弁）。"""
+
+    def setUp(self):
+        server._CACHE_STORE.pop("morning_warmup_status:guard_test_user", None)
+
+    def _dt(self, y, m, d, hh, mm):
+        jst = server.datetime.timezone(server.datetime.timedelta(hours=9))
+        return server.datetime.datetime(y, m, d, hh, mm, tzinfo=jst)
+
+    def test_weekend_is_skipped(self):
+        # 2026-09-19は土曜日
+        should_run, reason = server._should_run_restart_time_warmup(self._dt(2026, 9, 19, 7, 0), "guard_test_user")
+        self.assertFalse(should_run)
+        self.assertIn("非営業日", reason)
+
+    def test_late_night_restart_is_skipped(self):
+        # 2026-09-15（火）22:00の再起動はスキップ対象
+        should_run, reason = server._should_run_restart_time_warmup(self._dt(2026, 9, 15, 22, 0), "guard_test_user")
+        self.assertFalse(should_run)
+        self.assertIn("対象時間外", reason)
+
+    def test_after_market_close_restart_is_skipped(self):
+        # 引け後（15:31）の再起動もスキップ対象
+        should_run, reason = server._should_run_restart_time_warmup(self._dt(2026, 9, 15, 15, 31), "guard_test_user")
+        self.assertFalse(should_run)
+
+    def test_weekday_morning_within_window_triggers(self):
+        should_run, reason = server._should_run_restart_time_warmup(self._dt(2026, 9, 15, 8, 0), "guard_test_user")
+        self.assertTrue(should_run)
+        self.assertIsNone(reason)
+
+    def test_weekday_before_market_open_triggers(self):
+        should_run, _ = server._should_run_restart_time_warmup(self._dt(2026, 9, 15, 5, 0), "guard_test_user")
+        self.assertTrue(should_run)
+
+    def test_already_ready_today_is_skipped(self):
+        server._cache_set("morning_warmup_status:guard_test_user",
+                            {"trading_date": "2026-09-15", "status": "READY"})
+        should_run, reason = server._should_run_restart_time_warmup(self._dt(2026, 9, 15, 8, 0), "guard_test_user")
+        self.assertFalse(should_run)
+        self.assertIn("READY", reason)
+
+    def test_ready_status_from_different_trading_date_does_not_block(self):
+        """前日分のREADYステータスが残っていても、当日分としては扱わずwarmupを実行する。"""
+        server._cache_set("morning_warmup_status:guard_test_user",
+                            {"trading_date": "2026-09-14", "status": "READY"})
+        should_run, _ = server._should_run_restart_time_warmup(self._dt(2026, 9, 15, 8, 0), "guard_test_user")
+        self.assertTrue(should_run)
+
+    def test_partial_status_today_still_triggers(self):
+        """当日分がPARTIAL（一部失敗）の場合はREADYではないため、再度warmupを試みてよい。"""
+        server._cache_set("morning_warmup_status:guard_test_user",
+                            {"trading_date": "2026-09-15", "status": "PARTIAL"})
+        should_run, _ = server._should_run_restart_time_warmup(self._dt(2026, 9, 15, 8, 0), "guard_test_user")
+        self.assertTrue(should_run)
+
+    def test_restart_warmup_calls_run_only_when_guard_passes(self):
+        """_restart_time_morning_warmup()自体が、ガード条件を満たさないuser_idには
+        run_morning_market_warmup()を呼ばないこと。"""
+        with mock.patch.object(server, "DATABASE_URL", "db_url"), \
+             mock.patch.object(server, "_morning_check_scheduler_users", return_value=["guard_test_user"]), \
+             mock.patch.object(server, "_should_run_restart_time_warmup", return_value=(False, "対象時間外")), \
+             mock.patch.object(server, "run_morning_market_warmup") as mock_run:
+            server._restart_time_morning_warmup()
+        mock_run.assert_not_called()
+
+    def test_restart_warmup_calls_run_when_guard_passes(self):
+        with mock.patch.object(server, "DATABASE_URL", "db_url"), \
+             mock.patch.object(server, "_morning_check_scheduler_users", return_value=["guard_test_user"]), \
+             mock.patch.object(server, "_should_run_restart_time_warmup", return_value=(True, None)), \
+             mock.patch.object(server, "run_morning_market_warmup") as mock_run:
+            server._restart_time_morning_warmup()
+        mock_run.assert_called_once_with("db_url", "guard_test_user")
+
+
 if __name__ == "__main__":
     unittest.main()
