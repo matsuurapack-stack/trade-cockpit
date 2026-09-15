@@ -6295,10 +6295,24 @@ function PositionExitModal({position,currentPrice,onClose,onSaved}){
 // 変わらない限り実行されず、水平線だけを値の変化に応じて引き直す。既存の売却処理・
 // derivePositionStatus等のポジションSSoTには一切関与しない、表示専用の追加コンポーネント。
 const POSITION_CHART_POLL_MS=45000; // 5分足データの再取得間隔（yfinanceの分足はTachibana現在値ほど頻繁に叩く想定のAPIではないため、価格ティッカーより控えめにする）
+// 2026-09-16新規（ユーザー報告「長時間持つとチャートが右へはみ出す」への診断計装）：即時の
+// 幅チェック（1920〜768pxの6段階×75本足）では再現できず、実際は「時間が経つと」という時間軸の
+// 症状のため、ページを開いたまま長時間ポーリングし続けた後にしか再現しない可能性が高い
+// （毎回の見た目は正常）。再現していない状態でCSSを重ねて直さない方針（ユーザー明示指示）に
+// 従い、ここでは原因を推測でCSS修正せず、次に再現した瞬間の実測値
+// （viewport幅・documentのscrollWidth・チャートcontainer実幅・canvas実幅・その時点のバー本数・
+// ResizeObserverが最後に適用したwidth）を自動で記録するだけの軽量な計装を追加する。
+// 通常時は完全に無害（画面に何も表示しない、コンソールにも出さない）。実際にウィンドウより
+// 広がった瞬間だけ、赤枠の診断パネルを自動表示する（ユーザーがDevToolsを開かなくても
+// スクリーンショット1枚で必要な情報を送れるようにする）。
+const CHART_OVERFLOW_WATCH_MS=15000;
 function PositionIntradayChart({item,currentPrice}){
   const containerRef=useRef(null);
   const apiRef=useRef(null); // {chart,series,volSeries,lines}
   const [msg,setMsg]=useState("読み込み中…");
+  const barCountRef=useRef(0);
+  const lastAppliedWidthRef=useRef(null);
+  const [overflowDebug,setOverflowDebug]=useState(null);
 
   // チャート本体の作成・5分足OHLCVの定期取得。item.code/marketが変わった時だけ作り直す。
   useEffect(()=>{
@@ -6317,6 +6331,7 @@ function PositionIntradayChart({item,currentPrice}){
     const volSeries=chart.addHistogramSeries({priceFormat:{type:"volume"},priceScaleId:"volPane",color:"#8a8f80"});
     volSeries.priceScale().applyOptions({scaleMargins:{top:0.82,bottom:0}});
     apiRef.current={chart,series,volSeries,lines:[]};
+    lastAppliedWidthRef.current=el.clientWidth||600;
 
     const loadBars=async()=>{
       const d=await fetchJsonSafe(`/api/position-intraday-chart?code=${encodeURIComponent(item.code)}&market=${encodeURIComponent(item.market||"JP")}`);
@@ -6324,15 +6339,36 @@ function PositionIntradayChart({item,currentPrice}){
       const bars=d.bars||[];
       if(bars.length===0){setMsg(d.error||"当日の5分足データを取得できませんでした。");return;}
       setMsg("");
+      barCountRef.current=bars.length;
       series.setData(bars.map(b=>({time:b.time,open:b.open,high:b.high,low:b.low,close:b.close})));
       volSeries.setData(bars.map(b=>({time:b.time,value:b.volume,color:b.close>=b.open?"rgba(174,58,52,.5)":"rgba(44,106,72,.5)"})));
       chart.timeScale().fitContent();
     };
     loadBars();
     const timer=setInterval(loadBars,POSITION_CHART_POLL_MS);
-    const ro=new ResizeObserver(entries=>{const w=entries[0]?.contentRect?.width;if(w)chart.applyOptions({width:Math.floor(w)});});
+    const ro=new ResizeObserver(entries=>{const w=entries[0]?.contentRect?.width;if(w){chart.applyOptions({width:Math.floor(w)});lastAppliedWidthRef.current=Math.floor(w);}});
     ro.observe(el);
-    return ()=>{cancelled=true;clearInterval(timer);ro.disconnect();chart.remove();apiRef.current=null;};
+
+    // 診断計装：はみ出しが実際に発生した瞬間だけ実測値を残す（通常時は何もしない）。
+    const overflowCheck=setInterval(()=>{
+      if(cancelled)return;
+      const docEl=document.documentElement;
+      if(docEl.scrollWidth>window.innerWidth+4){
+        const canvas=el.querySelector("canvas");
+        setOverflowDebug({
+          at:new Date().toLocaleTimeString("ja-JP"),
+          viewportWidth:window.innerWidth,
+          docScrollWidth:docEl.scrollWidth,
+          containerWidth:Math.round(el.getBoundingClientRect().width),
+          canvasWidth:canvas?Math.round(canvas.getBoundingClientRect().width):null,
+          canvasAttrWidth:canvas?canvas.width:null,
+          appliedChartWidth:lastAppliedWidthRef.current,
+          barCount:barCountRef.current,
+        });
+      }
+    },CHART_OVERFLOW_WATCH_MS);
+
+    return ()=>{cancelled=true;clearInterval(timer);clearInterval(overflowCheck);ro.disconnect();chart.remove();apiRef.current=null;};
   },[item.code,item.market]);
 
   // 建値・初期SL・現在SL・TP1・TP2・現在値の水平線。item21〜7の要件：値が変わった時だけ
@@ -6359,6 +6395,16 @@ function PositionIntradayChart({item,currentPrice}){
   return <div style={{marginTop:8}}>
     {msg && <div style={{fontSize:11,color:"var(--inkFaint)",marginBottom:4}}>{msg}</div>}
     <div ref={containerRef} style={{width:"100%",minHeight:280}}/>
+    {/* 診断計装（2026-09-16新規）：実際にウィンドウより広がった瞬間だけ表示。ユーザーが
+        「そのままスクリーンショットを送る」だけで原因特定に必要な実測値が揃う設計。
+        再現していない間は完全に非表示（既存表示への影響なし）。 */}
+    {overflowDebug && <div style={{marginTop:6,padding:"6px 8px",border:"2px solid var(--down)",borderRadius:4,
+        background:"var(--card)",fontSize:10.5,color:"var(--down)",fontFamily:"monospace"}}>
+      ⚠ CHART OVERFLOW DETECTED {overflowDebug.at}<br/>
+      viewport={overflowDebug.viewportWidth}px　docScrollWidth={overflowDebug.docScrollWidth}px<br/>
+      container実幅={overflowDebug.containerWidth}px　canvas実幅={overflowDebug.canvasWidth}px（属性width={overflowDebug.canvasAttrWidth}）<br/>
+      chart適用width={overflowDebug.appliedChartWidth}px　バー本数={overflowDebug.barCount}本
+    </div>}
   </div>;
 }
 
