@@ -3810,13 +3810,20 @@ def _business_days_between(base, target):
     return n
 
 
-def upcoming_event_signals(database_url, user_id, code=None, sector=None, position=None, today=None, days_ahead=7):
+def upcoming_event_signals(database_url, user_id, code=None, sector=None, position=None, today=None, days_ahead=7,
+                             _preloaded_events=None):
     """当日/1営業日前/2営業日前/3営業日前/1週間以内の重要イベントを判定し、補助判断フラグを
     生成する（指示書3番）。positionは{"trade_style":"DAY"|"SWING", ...}等（省略可、無ければ
-    NO_OVERNIGHT系の判定はスキップ）。戻り値: {"events":[...], "signals":[...]}。"""
+    NO_OVERNIGHT系の判定はスキップ）。戻り値: {"events":[...], "signals":[...]}。
+    2026-09-15追加（Market Data Phase 2、DB N+1解消）：_preloaded_eventsを渡すと
+    list_market_events()への問い合わせを省略し、渡されたリスト（list_market_eventsと同じ形式）
+    をそのままフィルタ対象にする。ENTRY TOP5のバッチ経路専用のオプション引数で、省略時の
+    動作（毎回list_market_eventsを呼ぶ）は完全に維持される——同一のfrom_date/to_date・
+    同一user_idのeventsであれば、単体呼び出しを何度実行しても同じ結果を1回のDB取得で
+    再現できる（events自体はcode/sectorに依存しないクエリのため）。"""
     today = today or datetime.date.today()
-    events = list_market_events(database_url, user_id, from_date=today.isoformat(),
-                                 to_date=(today + datetime.timedelta(days=days_ahead)).isoformat())
+    events = _preloaded_events if _preloaded_events is not None else list_market_events(
+        database_url, user_id, from_date=today.isoformat(), to_date=(today + datetime.timedelta(days=days_ahead)).isoformat())
     relevant = []
     for e in events:
         affected_codes = e.get("affected_stocks") or []
@@ -3851,11 +3858,16 @@ def upcoming_event_signals(database_url, user_id, code=None, sector=None, positi
 
 # ---- ニュース・カタリストの分析接続（指示書4番） ----
 
-def relevant_catalysts_for(database_url, user_id, code=None, sector=None, limit=5, max_freshness_days=FRESHNESS_STALE_DAYS):
+def relevant_catalysts_for(database_url, user_id, code=None, sector=None, limit=5, max_freshness_days=FRESHNESS_STALE_DAYS,
+                             _preloaded_catalysts=None):
     """news_catalystsを分析へ使う（指示書4番）。affected_stocks/affected_sectors一致で
     絞り込み、freshness（catalyst_date基準）がEXPIRED（STALE_DAYSを超過）のものは除外。
-    重要度＞鮮度の順でソートする（直近重要ネガティブを優先的に前へ）。"""
-    catalysts = list_news_catalysts(database_url, user_id, limit=200)
+    重要度＞鮮度の順でソートする（直近重要ネガティブを優先的に前へ）。
+    2026-09-15追加（Market Data Phase 2、DB N+1解消）：_preloaded_catalystsを渡すと
+    list_news_catalysts()への問い合わせを省略し、渡されたリストをそのままフィルタ対象にする
+    （catalysts自体はcode/sectorに依存しないクエリのため、同一user_idなら1回の取得を全銘柄で
+    使い回せる）。ENTRY TOP5のバッチ経路専用のオプション引数で、省略時は従来通り動作する。"""
+    catalysts = _preloaded_catalysts if _preloaded_catalysts is not None else list_news_catalysts(database_url, user_id, limit=200)
     _importance_rank = {"high": 0, "medium_high": 1, "medium": 2, "low": 3}
     out = []
     for c in catalysts:
@@ -6725,6 +6737,38 @@ def list_event_decision_support_for_ticker(database_url, ticker, since_iso, limi
                 [ticker, since_iso, limit])
             rows = cur.fetchall()
     return [_row_to_json(r) for r in rows]
+
+
+def list_event_decision_support_for_tickers(database_url, tickers, since_iso, limit=50):
+    """Market Data Phase 2（2026-09-15新規）：list_event_decision_support_for_ticker()の
+    バッチ版。ENTRY TOP5がwatchlist件数だけ個別にこの関数を呼んでいたDB N+1を解消するため、
+    複数tickerを1回のSQL（WHERE ticker = ANY(%s)）でまとめて取得し、{ticker: [rows]}で返す。
+    各tickerの中身・並び順・件数上限は単体版と完全に同一になるようDISTINCT ON (ticker,
+    event_id)で同じ集約をSQL側に任せたうえ、limitでの打ち切りだけPython側で行う——単体版は
+    "ORDER BY event_id, evaluated_at DESC LIMIT %s"だが、DISTINCT ONで(event_id)ごとに
+    既に1行へ収束済みのためevaluated_at DESCは同点タイブレークとしてしか働かず、実質
+    event_id昇順にLIMIT件を切り出しているだけ——本関数もticker, event_id昇順でグループ化
+    してから同じ件数だけ切り出すことで同じ結果になる（ゴールデン比較テストで確認）。
+    tickersが空、またはpool取得失敗時は{ticker: []}を返す（存在しないtickerも同様）。"""
+    out = {t: [] for t in tickers}
+    pool = _get_pool(database_url)
+    if pool is None or not tickers:
+        return out
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT DISTINCT ON (ticker, event_id) * FROM event_decision_support "
+                "WHERE ticker = ANY(%s) AND evaluated_at >= %s "
+                "ORDER BY ticker, event_id, evaluated_at DESC",
+                [list(tickers), since_iso])
+            rows = cur.fetchall()
+    grouped = {}
+    for r in rows:
+        grouped.setdefault(r["ticker"], []).append(_row_to_json(r))
+    for t, rs in grouped.items():
+        if t in out:
+            out[t] = rs[:limit]
+    return out
 
 
 def count_event_decision_support_since(database_url, since_iso, flag_col=None, state=None):

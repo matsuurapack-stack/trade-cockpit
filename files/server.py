@@ -3659,6 +3659,136 @@ def _select_entry_ready_top5(candidates):
     return entry_ready_top5, watch_candidates, debug
 
 
+ENTRY_CANDIDATE_EVENT_LOOKBACK_DAYS = 7  # build_ticker_intelligence_summary()のデフォルトlookback_daysと合わせる
+ENTRY_CANDIDATE_EVENT_SIGNALS_DAYS_AHEAD = 7  # upcoming_event_signals()のデフォルトdays_aheadと合わせる
+ENTRY_CANDIDATE_CATALYSTS_LIMIT = 3  # 既存の個別呼び出し（relevant_catalysts_for(..., limit=3)）と同じ値
+
+
+def get_entry_candidate_support_context(database_url, user_id, codes_with_sector):
+    """Market Data高速化指示書 Phase 2（2026-09-15新規）：ENTRY TOP5のDB N+1解消。
+    _score_entry_candidates()のwatchlistループが候補1件ごとに個別DB取得していた
+    catalysts/events/event_support/trade_experienceを、symbol数によらず高々4回のDB取得
+    （news_catalysts一覧・market_events一覧・trade_experiences一覧・event_decision_support
+    バッチ）にまとめる。実測（Phase 1完了後）：30銘柄で計約238秒（4 helper×30回＝120回の
+    個別DB接続）かかっていたが、catalysts/events/trade_experiencesの取得クエリ自体はcode/
+    sectorに依存しないuser_id単位のものだった（絞り込みはPython側）ため、1回だけ取得して
+    使い回せる。event_decision_supportだけticker単位のWHERE句が要るため、
+    list_event_decision_support_for_tickers()（ANY(%s)によるバッチSQL）を新設した。
+
+    判定ロジックは一切変更していない——既存の各helper関数（relevant_catalysts_for・
+    upcoming_event_signals・build_entry_top5_event_support_label・
+    build_trade_experience_summary_for_symbol）へ_preloaded_*引数で事前取得済みデータを
+    渡すだけで、フィルタ・集計・スコアリングの実装そのものは完全に同じコードパスを通る
+    （指示書E・F「判定式をSQLへ移植しない」、ゴールデン比較テストで既存結果と一致を確認）。
+
+    codes_with_sector: [(code, sector), ...]（sectorはNone可）。
+    戻り値: (context, diagnostics)。
+    context = {code: {"catalysts": [...], "eventInfo": {"events":[...],"signals":[...]},
+                        "eventSupport": "STRONG"|"NEUTRAL"|"CAUTION"|"AVOID_CHASE"|None,
+                        "tradeExperience": {"experience_score":..,"similar":{...}}|None}, ...}
+    diagnostics = {"symbols":N,"db_connections":N,"db_queries":N,"db_elapsed_ms":N,
+                    "batch_loaded":bool,"fallback_queries":0,"errors":[...]}
+
+    指示書I：データ種別ごとの取得が失敗しても、その種別だけ空データにして残りは継続する
+    （catalysts取得だけ失敗してもevents/event_support/trade_experienceは通常通り計算される）。
+    281件全部を個別クエリへフォールバックすることはしない（fallback_queriesは常に0＝
+    このバッチ経路を使う限り追加のper-symbol DB接続を発生させない設計）。"""
+    # 指示書R5：同一symbolがwatchlistに重複して含まれていても（想定外の入力でも）、
+    # DB取得・後続ループとも1回だけ処理する（最初に出てきたsectorを採用、code単位でdedupe）。
+    _seen_codes = set()
+    _deduped = []
+    for code, sector in codes_with_sector:
+        if code in _seen_codes:
+            continue
+        _seen_codes.add(code)
+        _deduped.append((code, sector))
+    codes_with_sector = _deduped
+    result = {code: {"catalysts": [], "eventInfo": {"events": [], "signals": []},
+                       "eventSupport": None, "tradeExperience": None}
+               for code, _sector in codes_with_sector}
+    diagnostics = {"symbols": len(codes_with_sector), "db_connections": 0, "db_queries": 0,
+                    "db_elapsed_ms": 0, "batch_loaded": False, "fallback_queries": 0, "errors": []}
+    if investment_db is None or not database_url or not codes_with_sector:
+        return result, diagnostics
+
+    t0 = time.time()
+    today = datetime.date.today()
+
+    catalysts_all = None
+    try:
+        catalysts_all = investment_db.list_news_catalysts(database_url, user_id, limit=200)
+        diagnostics["db_connections"] += 1
+        diagnostics["db_queries"] += 1
+    except Exception as e:
+        print("  entry-candidates(batch): catalysts一括取得で例外（catalystsは空扱いで続行）", e)
+        diagnostics["errors"].append(f"catalysts:{e}")
+
+    events_all = None
+    try:
+        events_all = investment_db.list_market_events(
+            database_url, user_id, from_date=today.isoformat(),
+            to_date=(today + datetime.timedelta(days=ENTRY_CANDIDATE_EVENT_SIGNALS_DAYS_AHEAD)).isoformat())
+        diagnostics["db_connections"] += 1
+        diagnostics["db_queries"] += 1
+    except Exception as e:
+        print("  entry-candidates(batch): market_events一括取得で例外（eventsは空扱いで続行）", e)
+        diagnostics["errors"].append(f"events:{e}")
+
+    experiences_all = None
+    try:
+        experiences_all = investment_db.list_trade_experiences(database_url, user_id, limit=1000)
+        diagnostics["db_connections"] += 1
+        diagnostics["db_queries"] += 1
+    except Exception as e:
+        print("  entry-candidates(batch): trade_experiences一括取得で例外（trade_experienceは空扱いで続行）", e)
+        diagnostics["errors"].append(f"experiences:{e}")
+
+    codes = [c for c, _s in codes_with_sector]
+    event_support_rows = {}
+    try:
+        since_iso = (datetime.datetime.now(datetime.timezone.utc)
+                     - datetime.timedelta(days=ENTRY_CANDIDATE_EVENT_LOOKBACK_DAYS)).isoformat()
+        event_support_rows = investment_db.list_event_decision_support_for_tickers(database_url, codes, since_iso)
+        diagnostics["db_connections"] += 1
+        diagnostics["db_queries"] += 1
+    except Exception as e:
+        print("  entry-candidates(batch): event_decision_support一括取得で例外（event_supportは空扱いで続行）", e)
+        diagnostics["errors"].append(f"event_support:{e}")
+
+    for code, sector in codes_with_sector:
+        entry = result[code]
+        if catalysts_all is not None:
+            try:
+                entry["catalysts"] = investment_db.relevant_catalysts_for(
+                    database_url, user_id, code=code, sector=sector, limit=ENTRY_CANDIDATE_CATALYSTS_LIMIT,
+                    _preloaded_catalysts=catalysts_all)
+            except Exception as e:
+                print("  entry-candidates(batch): catalystsフィルタで例外", code, e)
+        if events_all is not None:
+            try:
+                entry["eventInfo"] = investment_db.upcoming_event_signals(
+                    database_url, user_id, code=code, sector=sector, _preloaded_events=events_all)
+            except Exception as e:
+                print("  entry-candidates(batch): eventsフィルタで例外", code, e)
+        try:
+            entry["eventSupport"] = build_entry_top5_event_support_label(
+                database_url, code, _preloaded_rows=event_support_rows.get(code, []))
+        except Exception as e:
+            print("  entry-candidates(batch): event_support算出で例外", code, e)
+        if experiences_all is not None:
+            try:
+                entry["tradeExperience"] = build_trade_experience_summary_for_symbol(
+                    database_url, user_id, code, _preloaded_experiences=experiences_all)
+            except Exception as e:
+                print("  entry-candidates(batch): trade_experience算出で例外", code, e)
+
+    diagnostics["db_elapsed_ms"] = round((time.time() - t0) * 1000)
+    diagnostics["batch_loaded"] = True
+    print(f"  [EntrySupportPrefetch] symbols={diagnostics['symbols']} db_connections={diagnostics['db_connections']} "
+          f"db_queries={diagnostics['db_queries']} errors={len(diagnostics['errors'])} elapsed={diagnostics['db_elapsed_ms']}ms")
+    return result, diagnostics
+
+
 def _score_entry_candidates(database_url, user_id):
     """今買い時TOP5（entry_ready_top5）とWatch候補を算出する純粋関数（DB書き込みなし）。
     既存の共有Stage1（run_momentum_stage1、複数AUTOエンジンとキャッシュ共有）・
@@ -3705,6 +3835,32 @@ def _score_entry_candidates(database_url, user_id):
         print("  entry-candidates: market data prefetchで例外（無視して続行）", e)
         market_data_diagnostics = {"error": str(e)}
 
+    # Market Data高速化指示書 Phase 2（2026-09-15新規）：DB N+1解消。この下のループは
+    # candidate 1件ごとにrelevant_catalysts_for/upcoming_event_signals/
+    # build_entry_top5_event_support_label/build_trade_experience_summary_for_symbolを
+    # 個別に呼んでいた（Phase 1完了後の実測で判明：30銘柄で計約238秒、281銘柄では約60分に
+    # 達する根本原因）。実際にはcatalysts/events/trade_experiencesの取得クエリ自体は
+    # user_id単位で銘柄非依存（code/sectorによる絞り込みはPython側で行っている）ため、
+    # ループへ入る前に対象銘柄分だけまとめて1回ずつ取得し、既存のフィルタ・集計ロジック
+    # そのもの（_preloaded_*引数経由で同じ関数を再利用）へ渡す。判定ロジックは一切変更
+    # していない（ゴールデン比較テストで確認）。対象はこの後のループと同じ判定条件
+    # （stage1_rowsに有効な現在値がある銘柄のみ）に絞る。
+    support_targets = []
+    for w in watchlist:
+        code = w.get("code")
+        row = stage1_rows.get(code)
+        if row and row.get("current") is not None:
+            support_targets.append((code, row.get("sector")))
+    try:
+        support_context, entry_support_diagnostics = get_entry_candidate_support_context(database_url, user_id, support_targets)
+    except Exception as e:
+        # 指示書I：batch失敗時に281件へ無制限フォールバックするとまたDB N+1（約60分）に戻って
+        # しまうため、ここでは個別フォールバックをしない——catalysts/events/event_support/
+        # trade_experienceが空のまま後続ループを続行する（価格分析・entry_score自体は
+        # catalysts等が空でも計算できる設計のため、分析全体は落ちない）。
+        print("  entry-candidates: support contextバッチ取得で例外（catalysts等は空扱いで続行、個別フォールバックはしない）", e)
+        support_context, entry_support_diagnostics = {}, {"error": str(e)}
+
     candidates = []
     quality_counts = {"FULL": 0, "PARTIAL": 0, "DEGRADED": 0}
     for w in watchlist:
@@ -3734,9 +3890,9 @@ def _score_entry_candidates(database_url, user_id):
         quality_counts[data_quality] += 1
         analysis_confidence = {"FULL": "HIGH", "PARTIAL": "MEDIUM", "DEGRADED": "LOW"}[data_quality]
 
-        catalysts = investment_db.relevant_catalysts_for(database_url, user_id, code=code, sector=row.get("sector"), limit=3)
-        events = investment_db.upcoming_event_signals(database_url, user_id, code=code, sector=row.get("sector"))
-        event_signals = events["signals"]
+        support = support_context.get(code) or {}
+        catalysts = support.get("catalysts", [])
+        event_signals = (support.get("eventInfo") or {}).get("signals", [])
 
         comp = _entry_score_components(row, stage2, snapshot or {}, auto_rs_current, auto_sector_current, catalysts, event_signals)
         neg_cat_present = bool(comp["negativeCatalysts"])
@@ -3771,22 +3927,19 @@ def _score_entry_candidates(database_url, user_id):
             risks.append("直近高値からの乖離が大きい（高値掴み注意）")
 
         # Market Intelligence Phase9新規（指示書21・38番）：entry_score自体には一切加点も
-        # 減点もしない、隣に並べるだけの追加専用表示。例外はUI側を壊さないよう握りつぶす。
-        event_support = None
-        try:
-            event_support = build_entry_top5_event_support_label(database_url, code)
-        except Exception as e:
-            print("  entry-candidates: event support表示取得で例外（無視して続行）", code, e)
+        # 減点もしない、隣に並べるだけの追加専用表示。
+        # Market Data Phase 2：event_support/experienceはsupport_context（バッチprefetch）
+        # から読むだけ——個別DB取得はしない（バッチ側で例外は既に握りつぶし済み）。
+        event_support = support.get("eventSupport")
 
         # Trade Experience Learning新規（指示書7・20番）：EXPERIENCE_SCORE（0〜10）。
         # 既存entry_scoreには一切加点しない、完全に別枠の補助スコア。
-        experience_score, experience_summary = None, None
-        try:
-            exp_summary = build_trade_experience_summary_for_symbol(database_url, user_id, code)
+        exp_summary = support.get("tradeExperience")
+        if exp_summary:
             experience_score = exp_summary["experience_score"]
             experience_summary = exp_summary["similar"]
-        except Exception as e:
-            print("  entry-candidates: experience score取得で例外（無視して続行）", code, e)
+        else:
+            experience_score, experience_summary = None, None
 
         candidates.append({
             "code": code, "name": w.get("name"), "sector": w.get("sector"),
@@ -3827,6 +3980,7 @@ def _score_entry_candidates(database_url, user_id):
         print("  entry-candidates: candidate snapshot保存で例外（無視して続行）", e)
 
     debug["marketDataDiagnostics"] = market_data_diagnostics  # Phase I：デバッグ/ログ専用の追加フィールド（UI必須ではない）
+    debug["entrySupportContextDiagnostics"] = entry_support_diagnostics  # Phase 2 G：DB N+1解消の診断情報（デバッグ/ログ専用）
     return {
         "entryReadyTop5": [{**c, "rank": i + 1} for i, c in enumerate(entry_ready_top5)],
         "watchCandidates": watch_candidates,
@@ -9263,18 +9417,25 @@ def generate_event_decision_support_safe(database_url, event_id, ticker, market_
         return None
 
 
-def build_ticker_intelligence_summary(database_url, ticker, lookback_days=7):
+def build_ticker_intelligence_summary(database_url, ticker, lookback_days=7, _preloaded_rows=None):
     """指示書18番：{"ticker":..,"active_events":N,"net_event_direction":..,
     "best_event_support_score":..,"event_conflict":bool,"avoid_chase":bool,
     "pullback_candidate":bool}を返す。event毎の最新decision_support行（直近lookback_days）を
-    集約する。"""
+    集約する。
+    2026-09-15追加（Market Data Phase 2、DB N+1解消）：_preloaded_rowsを渡すと
+    investment_db.list_event_decision_support_for_ticker()への問い合わせを省略し、渡された
+    行リスト（同関数と同じ形式・同じ集約基準で事前にバッチ取得済みのもの）をそのまま使う。
+    ENTRY TOP5のバッチ経路専用のオプション引数で、省略時は従来通り動作する。"""
     empty = {"ticker": ticker, "active_events": 0, "net_event_direction": "NEUTRAL",
               "best_event_support_score": None, "event_conflict": False, "avoid_chase": False,
               "pullback_candidate": False}
     if investment_db is None or not database_url:
         return empty
-    since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=lookback_days)).isoformat()
-    rows = investment_db.list_event_decision_support_for_ticker(database_url, ticker, since_iso)
+    if _preloaded_rows is not None:
+        rows = _preloaded_rows
+    else:
+        since_iso = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=lookback_days)).isoformat()
+        rows = investment_db.list_event_decision_support_for_ticker(database_url, ticker, since_iso)
     if not rows:
         return empty
     directions = [r.get("event_direction") for r in rows if r.get("event_direction")]
@@ -9296,10 +9457,12 @@ def build_ticker_intelligence_summary(database_url, ticker, lookback_days=7):
     }
 
 
-def build_entry_top5_event_support_label(database_url, ticker):
+def build_entry_top5_event_support_label(database_url, ticker, _preloaded_rows=None):
     """指示書21・38番：ENTRY TOP5の追加専用表示——entry_score自体は変更しない。
-    "STRONG"/"NEUTRAL"/"CAUTION"/"AVOID_CHASE"のいずれか、対象event無しならNoneを返す。"""
-    summary = build_ticker_intelligence_summary(database_url, ticker)
+    "STRONG"/"NEUTRAL"/"CAUTION"/"AVOID_CHASE"のいずれか、対象event無しならNoneを返す。
+    2026-09-15追加（Market Data Phase 2、DB N+1解消）：_preloaded_rowsは
+    build_ticker_intelligence_summary()へそのまま引き継ぐだけ（ENTRY TOP5のバッチ経路専用）。"""
+    summary = build_ticker_intelligence_summary(database_url, ticker, _preloaded_rows=_preloaded_rows)
     if not summary.get("active_events"):
         return None
     if summary.get("avoid_chase"):
@@ -11241,16 +11404,22 @@ TRADE_EXPERIENCE_MIN_LEARNING_WEIGHT = 0.3  # 指示書17番：低重み（誤�
 
 
 def find_similar_trade_experiences(database_url, user_id, symbol=None, current_tags=None,
-                                      current_features=None, limit=20, min_similarity=0.3):
+                                      current_features=None, limit=20, min_similarity=0.3,
+                                      _preloaded_experiences=None):
     """指示書5番：単純な銘柄一致だけでなく、pattern_tags/RSI/MA回復/出来高/時間帯/地合いで
     類似度を計算する。symbol一致は類似度1.0として最優先で拾う（指示書「find_similar_trade_
-    experiences(symbol=...)」の呼び出し例に対応）。"""
+    experiences(symbol=...)」の呼び出し例に対応）。
+    2026-09-15追加（Market Data Phase 2、DB N+1解消）：_preloaded_experiencesを渡すと
+    investment_db.list_trade_experiences()への問い合わせを省略し、渡されたリストをそのまま
+    走査対象にする（experiences自体はsymbolに依存しないクエリのため、同一user_idなら1回の
+    取得を全銘柄で使い回せる）。ENTRY TOP5のバッチ経路専用のオプション引数で、省略時は
+    従来通り動作する。"""
     empty = {"similar_count": 0, "wins": 0, "losses": 0, "win_rate": None, "avg_return_pct": None,
               "median_return_pct": None, "avg_mfe_pct": None, "avg_mae_pct": None, "max_similarity": 0.0,
               "recent_10_win_rate": None, "examples": []}
     if investment_db is None or not database_url:
         return empty
-    all_exps = investment_db.list_trade_experiences(database_url, user_id, limit=1000)
+    all_exps = _preloaded_experiences if _preloaded_experiences is not None else investment_db.list_trade_experiences(database_url, user_id, limit=1000)
     scored = []
     for t in all_exps:
         if (t.get("learning_weight") if t.get("learning_weight") is not None else 1.0) < TRADE_EXPERIENCE_MIN_LEARNING_WEIGHT:
@@ -11480,11 +11649,14 @@ def build_daily_trade_learning_summary(experiences_for_day):
     }
 
 
-def build_trade_experience_summary_for_symbol(database_url, user_id, symbol, current_tags=None, current_features=None):
+def build_trade_experience_summary_for_symbol(database_url, user_id, symbol, current_tags=None, current_features=None,
+                                                 _preloaded_experiences=None):
     """指示書7・8番：トレード分析／ENTRY TOP5の両方から呼ぶ共通の「経験値」要約。
-    similar_result＋EXPERIENCE_SCOREをまとめて返す。"""
+    similar_result＋EXPERIENCE_SCOREをまとめて返す。
+    2026-09-15追加（Market Data Phase 2、DB N+1解消）：_preloaded_experiencesは
+    find_similar_trade_experiences()へそのまま引き継ぐだけ（ENTRY TOP5のバッチ経路専用）。"""
     similar = find_similar_trade_experiences(database_url, user_id, symbol=symbol, current_tags=current_tags,
-                                                current_features=current_features)
+                                                current_features=current_features, _preloaded_experiences=_preloaded_experiences)
     score = compute_experience_score(similar)
     return {"experience_score": score, "similar": similar}
 
