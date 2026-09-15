@@ -3052,11 +3052,11 @@ def _fetch_intraday(tk, interval):
 # 位置と、直近半分・前半分の高値/安値比較（切り上げ/切り下げ）だけで判定する単純なルールベース
 # （AI不使用、他のAUTO系エンジンと同じ方針）。データ不足・取得失敗時はNoneを返す（推測値は
 # 作らない）。
-def _intraday_regime_uncached(symbol, interval="5m"):
-    if yf is None:
-        return None
-    tk = yf.Ticker(symbol)
-    bars = _fetch_intraday(tk, interval)
+def _regime_from_bars(bars):
+    """Market Data高速化指示書 Phase E：_intraday_regime_uncached()のVWAP/構造判定ロジック
+    そのものを純粋関数として切り出しただけ（計算式は一切変更していない）。個別取得
+    （_intraday_regime_uncached）・バッチ prefetch（_intraday_regime_batch_prefetch）の
+    両方から同じ判定ロジックを共有するため（ロジック分岐・二重実装を避ける）。"""
     if not bars or len(bars["closes"]) < 6:
         return None
     closes, highs, lows, volumes = bars["closes"], bars["highs"], bars["lows"], bars["volumes"]
@@ -3079,6 +3079,14 @@ def _intraday_regime_uncached(symbol, interval="5m"):
         regime, pattern = "MIXED", "mixed"
     return {"current": round(current, 2), "vwap": round(vwap, 2), "aboveVwap": above_vwap,
             "regime": regime, "pattern": pattern}
+
+
+def _intraday_regime_uncached(symbol, interval="5m"):
+    if yf is None:
+        return None
+    tk = yf.Ticker(symbol)
+    bars = _fetch_intraday(tk, interval)
+    return _regime_from_bars(bars)
 
 
 def _intraday_regime_cached(symbol, interval, ttl):
@@ -3120,6 +3128,143 @@ def _intraday_regime(symbol, interval="5m", cache_ttl=0):
             return None
     value, _status = _intraday_regime_cached(symbol, interval, cache_ttl)
     return value
+
+
+# ============================================================
+# Market Data高速化指示書（2026-09-15）Phase B/C/D/E/I：MARKET DATA CONTEXT。
+# 監視銘柄まるごとをループしながら1銘柄ずつ get_stock_quotes([item]) / _intraday_regime_cached()
+# を呼ぶ既存経路（_intraday_stock_snapshot、_score_entry_candidates内で監視銘柄数だけ反復）は、
+# 個々の呼び出し自体はキャッシュ+リトライ+stale fallback済みだが、キャッシュが空（コールド）の
+# 実行1回目は「1銘柄ずつyfinanceへ問い合わせる」ことになり、監視銘柄が300件超の場合は
+# 実測で数分かかっていた（Phase 0計測で確認）。
+#
+# ここで追加するprefetch_market_data_for_watchlist()は、既存のget_stock_quotes()・
+# _cache_set()・キャッシュキー命名規則（"stockquote:{sym}"・"intraday5m:{symbol}:{interval}"）を
+# そのまま流用し、ループに入る「前」に対象銘柄をバッチでまとめて取得してキャッシュへ
+# 事前投入するだけの関数である。既存の個別取得関数（_intraday_stock_snapshot・
+# _intraday_regime_cached・get_stock_quotes）は一切変更しない——prefetch後にそれらが呼ばれても、
+# 単にキャッシュヒットして高速に返るだけで、prefetchが無い/失敗した場合も従来通り個別取得に
+# フォールバックする（後方互換・安全側）。
+# 無制限並列は禁止（指示書）：5分足バッチはSTOCK_QUOTES_CHUNKと同じ80件/チャンクで区切り、
+# yf.download内部のthreads=Trueに任せる（ThreadPoolExecutorの追加多重化はしない＝
+# 二重の並列化で接続数が跳ね上がるのを避ける）。
+# ============================================================
+
+def _download_intraday_chunk(symbols, interval="5m", period="1d"):
+    """_download_chunk()の5分足版。個別Ticker().history()を銘柄数だけ連続で呼ぶ代わりに、
+    yf.downloadで一括取得する（指示書Phase E：batch取得の実測比較）。"""
+    try:
+        return yf.download(symbols, period=period, interval=interval, group_by="ticker",
+                            threads=True, progress=False, auto_adjust=False)
+    except Exception as e:
+        print("  5分足一括取得失敗", symbols[:3], "…", len(symbols), "件", e)
+        return None
+
+
+def _parse_intraday_bars_frame(h):
+    """yf.downloadが返す1銘柄分のDataFrameから_fetch_intraday()と同じ形（closes/highs/lows/
+    volumes）を作る（個別取得・バッチ取得で同じ形に正規化し、_regime_from_bars()を共有する）。"""
+    closes = h["Close"].dropna().tolist()
+    highs = h["High"].dropna().tolist()
+    lows = h["Low"].dropna().tolist()
+    volumes = h["Volume"].dropna().tolist()
+    if len(closes) < 2:
+        return None
+    return {"closes": closes, "highs": highs, "lows": lows, "volumes": volumes}
+
+
+def _intraday_regime_batch_prefetch(symbols, interval="5m", ttl=None):
+    """symbols（yfinanceシンボル、重複除去済みであること）の5分足レジームをバッチ取得し、
+    _intraday_regime_cached()と同じキャッシュキー（"intraday5m:{symbol}:{interval}"）へ
+    事前投入する。戻り値：{"attempted": N, "cached": N, "batches": N}（diagnostics用）。
+    失敗しても例外を投げない（呼び出し元の本処理は従来通り個別フォールバックで継続できる）。"""
+    stats = {"attempted": 0, "cached": 0, "batches": 0}
+    if yf is None or not symbols:
+        return stats
+    uniq = list(dict.fromkeys(symbols))
+    stats["attempted"] = len(uniq)
+    for i in range(0, len(uniq), STOCK_QUOTES_CHUNK):
+        chunk = uniq[i:i + STOCK_QUOTES_CHUNK]
+        stats["batches"] += 1
+        try:
+            data = _download_intraday_chunk(chunk, interval=interval)
+        except Exception as e:
+            print("  [MarketDataPrefetch] 5分足チャンク取得で例外（このチャンクだけスキップ）", e)
+            data = None
+        if data is None:
+            continue
+        for sym in chunk:
+            try:
+                sub = data[sym] if len(chunk) > 1 else data
+                if sub is None or sub.empty:
+                    continue
+                bars = _parse_intraday_bars_frame(sub)
+                regime = _regime_from_bars(bars)
+                if regime is not None:
+                    _cache_set(f"intraday5m:{sym}:{interval}", regime)
+                    stats["cached"] += 1
+            except Exception:
+                pass  # このシンボルだけ結果に含まれなかった（プレフェッチ失敗時は個別経路へフォールバックするだけ）
+    return stats
+
+
+def prefetch_market_data_for_watchlist(watchlist, include_5m=True):
+    """指示書Phase B「Market Data Context」：1回の分析実行（朝一チェック／ENTRY TOP5／
+    Sector Rotation等）の先頭で、対象銘柄の現在値・5分足を1回だけバッチ取得し、既存の
+    TTLキャッシュ（get_stock_quotes cache_ttl・_intraday_regime_cached）へ事前投入する。
+    以降そのTTL内で呼ばれる個別取得はキャッシュヒットになるため、同一実行内の重複取得
+    （Phase A監査で確認：7203.T等を複数機能が個別に何度も問い合わせていた）が解消される。
+    既存関数のシグネチャ・戻り値は一切変更しない（optional・追加専用のprefetchステップ）。
+    戻り値：diagnostics dict（Phase I）。"""
+    t0 = time.time()
+    diagnostics = {
+        "total_requests": 0, "unique_tickers": 0, "cache_hits": 0, "cache_misses": 0,
+        "batch_requests": 0, "timeouts": 0, "errors": 0, "stale_fallbacks": 0, "elapsed_ms": 0,
+    }
+    codes = list(dict.fromkeys(w.get("code", "") for w in watchlist if w.get("code")))
+    diagnostics["unique_tickers"] = len(codes)
+    if not codes:
+        diagnostics["elapsed_ms"] = round((time.time() - t0) * 1000)
+        return diagnostics
+
+    # 現在値：既存get_stock_quotes(cache_ttl指定)をwatchlist全体に対して1回だけ呼ぶ
+    # （既にバッチ取得＋TTLキャッシュ＋stale fallback実装済み、"stockquote:{sym}"キーを
+    # そのまま共有するのでこの後の個別呼び出しはヒットする）。
+    quote_status = {}
+    try:
+        get_stock_quotes(watchlist, cache_ttl=CACHE_TTL["stock_quote"], status_out=quote_status)
+        diagnostics["batch_requests"] += 1
+        for st in quote_status.values():
+            if st == "ok":
+                diagnostics["cache_hits"] += 1
+            elif st == "stale_cache":
+                diagnostics["stale_fallbacks"] += 1
+            elif st in ("rate_limited", "failed"):
+                diagnostics["errors"] += 1
+        diagnostics["total_requests"] += len(codes)
+    except Exception as e:
+        print("  [MarketDataPrefetch] 現在値バッチ取得失敗", e)
+        diagnostics["errors"] += 1
+
+    # 5分足（VWAP/構造判定）：日本株のみ対象（米国株はENTRY TOP5・Sector Rotationの
+    # 監視銘柄プールに現状含まれないため、指示書「無制限並列は禁止」を踏まえ対象を絞る）。
+    if include_5m:
+        jp_symbols = [_yf_symbol(w) for w in watchlist if w.get("market", "JP") == "JP" and w.get("code")]
+        try:
+            bstats = _intraday_regime_batch_prefetch(jp_symbols, "5m", CACHE_TTL["stock5m"])
+            diagnostics["batch_requests"] += bstats["batches"]
+            diagnostics["total_requests"] += bstats["attempted"]
+            diagnostics["cache_hits"] += bstats["cached"]
+            diagnostics["errors"] += max(0, bstats["attempted"] - bstats["cached"])
+        except Exception as e:
+            print("  [MarketDataPrefetch] 5分足バッチ取得失敗", e)
+            diagnostics["errors"] += 1
+
+    diagnostics["elapsed_ms"] = round((time.time() - t0) * 1000)
+    print(f"  [MarketDataPrefetch] unique_tickers={diagnostics['unique_tickers']} "
+          f"batch_requests={diagnostics['batch_requests']} cache_hits={diagnostics['cache_hits']} "
+          f"errors={diagnostics['errors']} elapsed={diagnostics['elapsed_ms']}ms")
+    return diagnostics
 
 
 # セクター代表ETF・関連するAUTO_RS拡張（テーマ相対強弱）で使う一覧。半導体のみ先行実装
@@ -3541,6 +3686,25 @@ def _score_entry_candidates(database_url, user_id):
     auto_rs_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_RS_CURRENT", market="JP")
     auto_sector_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_SECTOR_LEADER_CURRENT", market="JP")
 
+    # Market Data高速化指示書 Phase B（2026-09-15新規）：この関数は以下のwatchlist全件
+    # （監視銘柄すべて、Phase 0計測で300件超を確認）に対して1件ずつ_intraday_stock_snapshot()
+    # →get_stock_quotes([item])・_intraday_regime_cached()を呼ぶ既存ループを持つ。個別呼び出し
+    # 自体は既にキャッシュ+リトライ+stale fallback済みだが、キャッシュが空の初回実行では
+    # 「1銘柄ずつ」ネットワーク往復するため合計で数分かかる（Phase0実測、根本原因）。
+    # ここでループに入る前に対象銘柄をまとめてバッチ取得しキャッシュへ事前投入すること
+    # （prefetch）で、ループ内の個別呼び出しをキャッシュヒットに変える。ループ内の既存ロジック
+    # （_intraday_stock_snapshot・_volume_stage2_detail・_entry_score_components等）は一切
+    # 変更していない——prefetch失敗時も個別フォールバックでこれまで通り動作する。
+    try:
+        market_data_diagnostics = prefetch_market_data_for_watchlist(watchlist)
+    except Exception as e:
+        # prefetch自体は内部で各取得を個別にtry/exceptしているため通常ここには来ないが、
+        # 万一の場合でも「データがないのに分析全体を止める」ことがないよう、既存の他の
+        # 「無視して続行」ブロックと同じ方針でここでも握りつぶす（後続ループは個別フォールバック
+        # 経路でこれまで通り動作する）。
+        print("  entry-candidates: market data prefetchで例外（無視して続行）", e)
+        market_data_diagnostics = {"error": str(e)}
+
     candidates = []
     quality_counts = {"FULL": 0, "PARTIAL": 0, "DEGRADED": 0}
     for w in watchlist:
@@ -3662,6 +3826,7 @@ def _score_entry_candidates(database_url, user_id):
     except Exception as e:
         print("  entry-candidates: candidate snapshot保存で例外（無視して続行）", e)
 
+    debug["marketDataDiagnostics"] = market_data_diagnostics  # Phase I：デバッグ/ログ専用の追加フィールド（UI必須ではない）
     return {
         "entryReadyTop5": [{**c, "rank": i + 1} for i, c in enumerate(entry_ready_top5)],
         "watchCandidates": watch_candidates,
