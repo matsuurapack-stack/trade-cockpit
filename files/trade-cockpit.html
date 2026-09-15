@@ -5245,7 +5245,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         {entryResult.scoredCount!=null && <span>評価済 {entryResult.readyCount??"—"}/{entryResult.watchlistCount??entryResult.scoredCount}</span>}
         {entryResult.updateDelayWarning && <span style={{fontWeight:700}}>⚠ 更新遅延</span>}
       </div>}
-      {entryResult && entryResult.dataStale && <div style={{fontSize:11,color:"var(--down)",fontWeight:700,marginBottom:6}}>
+      {entryResult && (entryResult.dataStale||entryResult.anySymbolMarketDataStale) && <div style={{fontSize:11,color:"var(--down)",fontWeight:700,marginBottom:6}}>
         ⚠ 元データが古いため、一部の「今すぐ買える／準備完了」は安全側で「データ更新遅延」表示に変更しています。
       </div>}
       {entryResult && entryDebugOpen && <div style={{fontSize:10.5,color:"var(--inkFaint)",marginBottom:8,padding:"4px 6px",background:"var(--bg)",borderRadius:4,display:"flex",flexWrap:"wrap",gap:"2px 12px"}} className="mono">

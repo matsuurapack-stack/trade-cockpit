@@ -47,9 +47,11 @@ class EntryTop5ScanTimeMarksTests(unittest.TestCase):
         self.assertNotIn("09:04", server.ENTRY_TOP5_SCAN_TIMES)
 
 
-def _make_cache_entry(age_sec, entry_states):
+def _make_cache_entry(age_sec, entry_states, cache_statuses=None):
     now = time.time()
-    top5 = [{"code": f"{1000+i}", "entryState": st, "entryScore": 70} for i, st in enumerate(entry_states)]
+    cache_statuses = cache_statuses or ["ok"] * len(entry_states)
+    top5 = [{"code": f"{1000+i}", "entryState": st, "entryScore": 70, "marketDataCacheStatus": cs}
+            for i, (st, cs) in enumerate(zip(entry_states, cache_statuses))]
     return {
         "entryReadyTop5": top5,
         "watchCandidates": [],
@@ -102,6 +104,31 @@ class EntryTop5StalenessTests(unittest.TestCase):
         entry = _make_cache_entry(age_sec=server.ENTRY_TOP5_STALE_DATA_SEC + 30, entry_states=["ENTRY_READY"])
         server._apply_entry_top5_staleness(entry)
         self.assertEqual(entry["entryReadyTop5"][0]["entryState"], "ENTRY_READY")  # キャッシュ本体は無変更
+
+    def test_fresh_ranking_but_stale_symbol_market_data_still_downgrades(self):
+        """レビュー指摘の核心：ranking_generated_at自体は新しい（age_sec=5）が、その銘柄の
+        quote/5分足取得が失敗してstale_cacheフォールバック値を使っていた場合、ranking年齢
+        だけでは検出できない。marketDataCacheStatusを個別に見て安全側へ倒すことを確認する。"""
+        entry = _make_cache_entry(age_sec=5, entry_states=["NOW_BUYABLE", "ENTRY_READY", "WAIT_PULLBACK"],
+                                   cache_statuses=["stale_cache", "ok", "stale_cache"])
+        result = server._apply_entry_top5_staleness(entry)
+        self.assertFalse(result["dataStale"])  # ranking全体は新しいまま
+        self.assertTrue(result["anySymbolMarketDataStale"])
+        states = [c["entryState"] for c in result["entryReadyTop5"]]
+        # 1件目（NOW_BUYABLE・stale_cache）だけ降格、2件目（ENTRY_READY・ok）はそのまま、
+        # 3件目（WAIT_PULLBACK・stale_cache）はもともとNOW_BUYABLE/ENTRY_READYではないため降格対象外
+        self.assertEqual(states, ["WAIT_DATA_STALE", "ENTRY_READY", "WAIT_PULLBACK"])
+        self.assertEqual(result["entryReadyTop5"][0]["staleReason"], "symbol_market_data")
+
+    def test_rate_limited_symbol_is_also_treated_as_stale(self):
+        entry = _make_cache_entry(age_sec=5, entry_states=["ENTRY_READY"], cache_statuses=["rate_limited"])
+        result = server._apply_entry_top5_staleness(entry)
+        self.assertEqual(result["entryReadyTop5"][0]["entryState"], "WAIT_DATA_STALE")
+
+    def test_all_ok_symbols_report_no_symbol_staleness(self):
+        entry = _make_cache_entry(age_sec=5, entry_states=["NOW_BUYABLE", "ENTRY_READY"])
+        result = server._apply_entry_top5_staleness(entry)
+        self.assertFalse(result["anySymbolMarketDataStale"])
 
 
 class EntryTop5ScanAndCacheTests(unittest.TestCase):

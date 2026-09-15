@@ -4159,6 +4159,11 @@ def _score_entry_candidates(database_url, user_id):
         except Exception as e:
             print("  entry-candidates: Stage2取得失敗", code, e)
         snapshot = None
+        market_data_cache_status = "failed"  # 場中リアルタイム化指示書STEP9：ranking_generated_atだけでなく
+        # 銘柄ごとのquote/5分足が実際に"ok"（今回のスキャンでライブ取得できた値）か
+        # "stale_cache"（取得失敗しキャッシュ済みの古い値にフォールバックした値）かを
+        # 記録する。ranking全体が新しくても、この銘柄だけ古いデータで判定されている
+        # ケースを個別に検出するために必要（指示書「market_data_atも確認すること」）。
         try:
             _t_fn = time.time()
             snap = _intraday_stock_snapshot(w)
@@ -4166,6 +4171,7 @@ def _score_entry_candidates(database_url, user_id):
             func_stats["_intraday_stock_snapshot"]["calls"] += 1
             func_stats["_intraday_stock_snapshot"]["total_ms"] += fn_ms
             func_stats["_intraday_stock_snapshot"]["max_ms"] = max(func_stats["_intraday_stock_snapshot"]["max_ms"], fn_ms)
+            market_data_cache_status = snap.get("cacheStatus", "failed")
             if snap.get("dataStatus") != "failed":
                 snapshot = snap
                 snapshot_ready_count += 1
@@ -4242,6 +4248,7 @@ def _score_entry_candidates(database_url, user_id):
             "scoreBreakdown": comp, "reasons": reasons or ["総合スコア上位"], "risks": risks,
             "eventSupport": event_support,
             "experienceScore": experience_score, "experienceSummary": experience_summary,
+            "marketDataCacheStatus": market_data_cache_status,  # "ok"|"stale_cache"|"rate_limited"|"failed"（指示書STEP9）
         })
         per_symbol_ms.append((code, (time.time() - _t_symbol) * 1000))
 
@@ -4382,22 +4389,36 @@ def get_entry_top5_cached(user_id):
 
 
 def _apply_entry_top5_staleness(cache_entry):
-    """指示書「stale data対策」：ranking_generated_at（=market_data_at、_score_entry_candidates
-    は毎回フレッシュにmarket dataを取り直すため両者は同一時刻になる）が古い場合、安全側に倒す。
-    ranking_age_sec > STALE_DATA_SECならNOW_BUYABLE/ENTRY_READYをWAIT_DATA_STALEへ降格して返す
-    （キャッシュ本体は書き換えない、レスポンス生成時だけの変換）。"""
+    """指示書「stale data対策」（2026-09-15追記：レビュー指摘反映）：ranking_generated_at
+    （=market_data_at、_score_entry_candidatesは毎回フレッシュにmarket dataを取り直すため
+    両者は同一時刻になる）だけを見て安全側に倒すのでは不十分——prefetch/個別取得の両方に
+    stale_cache fallback（取得失敗時に期限切れキャッシュを返す既存の安全動作、
+    _intraday_regime_cached等）があるため、"ranking自体は今回生成されたばかりだが、
+    その銘柄個別のquote/5分足は実際には古い値のまま"というケースが起こり得る。そのため
+    二段構えで判定する：
+      ①ranking全体の経過時間（age_sec）：schedulerが止まった等、ranking自体が更新されて
+        いない場合の安全弁。ENTRY_TOP5_STALE_DATA_SEC超でTOP5全体を降格。
+      ②銘柄ごとのmarketDataCacheStatus（"ok"以外＝stale_cache/rate_limited/failedの
+        フォールバック値で判定された銘柄）：ranking自体は新しくても、その銘柄個別のNOW_BUYABLE/
+        ENTRY_READY判定の根拠になった市場データが古い場合は個別に降格する。
+    どちらの条件でもNOW_BUYABLE/ENTRY_READYはWAIT_DATA_STALEへ降格する（キャッシュ本体は
+    書き換えない、レスポンス生成時だけの変換）。"""
     now = time.time()
     age_sec = max(0.0, now - cache_entry["generatedAtEpoch"])
     stale = age_sec > ENTRY_TOP5_STALE_DATA_SEC
     delayed = age_sec > ENTRY_TOP5_UPDATE_DELAY_WARNING_SEC
     top5 = cache_entry["entryReadyTop5"]
-    if stale:
-        downgraded = []
-        for c in top5:
-            if c.get("entryState") in ("NOW_BUYABLE", "ENTRY_READY"):
-                c = {**c, "entryState": "WAIT_DATA_STALE", "staleDowngraded": True}
-            downgraded.append(c)
-        top5 = downgraded
+    downgraded = []
+    any_symbol_stale = False
+    for c in top5:
+        symbol_stale = c.get("marketDataCacheStatus") not in ("ok", None)
+        if symbol_stale:
+            any_symbol_stale = True
+        if c.get("entryState") in ("NOW_BUYABLE", "ENTRY_READY") and (stale or symbol_stale):
+            reason = "ranking_age" if stale else "symbol_market_data"
+            c = {**c, "entryState": "WAIT_DATA_STALE", "staleDowngraded": True, "staleReason": reason}
+        downgraded.append(c)
+    top5 = downgraded
     return {
         "entryReadyTop5": top5,
         "watchCandidates": cache_entry["watchCandidates"],
@@ -4415,6 +4436,7 @@ def _apply_entry_top5_staleness(cache_entry):
         "trigger": cache_entry["trigger"],
         "rankingAgeSec": round(age_sec),
         "dataStale": stale,
+        "anySymbolMarketDataStale": any_symbol_stale,  # 指示書STEP9：ranking全体は新しくても個別銘柄のmarket dataがstale fallbackだった場合にTrue
         "updateDelayWarning": delayed,
     }
 
