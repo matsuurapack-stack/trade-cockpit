@@ -3385,9 +3385,11 @@ def _parse_intraday_bars_frame(h):
 def _intraday_regime_batch_prefetch(symbols, interval="5m", ttl=None):
     """symbols（yfinanceシンボル、重複除去済みであること）の5分足レジームをバッチ取得し、
     _intraday_regime_cached()と同じキャッシュキー（"intraday5m:{symbol}:{interval}"）へ
-    事前投入する。戻り値：{"attempted": N, "cached": N, "batches": N}（diagnostics用）。
-    失敗しても例外を投げない（呼び出し元の本処理は従来通り個別フォールバックで継続できる）。"""
-    stats = {"attempted": 0, "cached": 0, "batches": 0}
+    事前投入する。戻り値：{"attempted": N, "cached": N, "batches": N, "values": {sym: regime}}
+    （diagnostics用。valuesは2026-09-15追加：呼び出し元がscan-local mapを組み立てるための
+    実値そのもの）。失敗しても例外を投げない（呼び出し元の本処理は従来通り個別フォールバックで
+    継続できる）。"""
+    stats = {"attempted": 0, "cached": 0, "batches": 0, "values": {}}
     if yf is None or not symbols:
         return stats
     uniq = list(dict.fromkeys(symbols))
@@ -3412,6 +3414,7 @@ def _intraday_regime_batch_prefetch(symbols, interval="5m", ttl=None):
                 if regime is not None:
                     _cache_set(f"intraday5m:{sym}:{interval}", regime)
                     stats["cached"] += 1
+                    stats["values"][sym] = regime
             except Exception:
                 pass  # このシンボルだけ結果に含まれなかった（プレフェッチ失敗時は個別経路へフォールバックするだけ）
     return stats
@@ -3424,12 +3427,23 @@ def prefetch_market_data_for_watchlist(watchlist, include_5m=True):
     以降そのTTL内で呼ばれる個別取得はキャッシュヒットになるため、同一実行内の重複取得
     （Phase A監査で確認：7203.T等を複数機能が個別に何度も問い合わせていた）が解消される。
     既存関数のシグネチャ・戻り値は一切変更しない（optional・追加専用のprefetchステップ）。
-    戻り値：diagnostics dict（Phase I）。"""
+    戻り値：diagnostics dict（Phase I）。
+
+    2026-09-15追加（今買い時TOP5 場中リアルタイム化指示書 レビュー反映：scan-local market
+    data reuse）：diagnostics["marketDataByCode"]として{code: {"quote":..., "quoteStatus":...,
+    "regime":..., "regimeStatus":...}}を追加で返す。呼び出し元がこれをscan-local mapとして
+    candidate loopへ渡せば、同一scan内でget_stock_quotes()/_intraday_regime_cached()の
+    グローバルTTL（90秒）を経由せず、prefetchしたこの実行1回分の値をそのまま使い回せる
+    （daily arraysで発見・修正したのと同じ「scanがTTLより長くなりうる」問題への対応）。
+    呼び出し元は必ずAPIレスポンス（debug）へ渡す前にこのキーをpopすること——281銘柄分の
+    quote/regimeを丸ごと含むため、daily_arraysのarraysByCodeと同じくpayload肥大化の原因になる。"""
     t0 = time.time()
     diagnostics = {
         "total_requests": 0, "unique_tickers": 0, "cache_hits": 0, "cache_misses": 0,
         "batch_requests": 0, "timeouts": 0, "errors": 0, "stale_fallbacks": 0, "elapsed_ms": 0,
+        "marketDataByCode": {},
     }
+    market_data_by_code = diagnostics["marketDataByCode"]
     codes = list(dict.fromkeys(w.get("code", "") for w in watchlist if w.get("code")))
     diagnostics["unique_tickers"] = len(codes)
     if not codes:
@@ -3440,8 +3454,9 @@ def prefetch_market_data_for_watchlist(watchlist, include_5m=True):
     # （既にバッチ取得＋TTLキャッシュ＋stale fallback実装済み、"stockquote:{sym}"キーを
     # そのまま共有するのでこの後の個別呼び出しはヒットする）。
     quote_status = {}
+    quotes = {}
     try:
-        get_stock_quotes(watchlist, cache_ttl=CACHE_TTL["stock_quote"], status_out=quote_status)
+        quotes = get_stock_quotes(watchlist, cache_ttl=CACHE_TTL["stock_quote"], status_out=quote_status)
         diagnostics["batch_requests"] += 1
         for st in quote_status.values():
             if st == "ok":
@@ -3454,17 +3469,29 @@ def prefetch_market_data_for_watchlist(watchlist, include_5m=True):
     except Exception as e:
         print("  [MarketDataPrefetch] 現在値バッチ取得失敗", e)
         diagnostics["errors"] += 1
+    for code in codes:
+        market_data_by_code[code] = {"quote": quotes.get(code), "quoteStatus": quote_status.get(code, "failed"),
+                                       "regime": None, "regimeStatus": "failed"}
 
     # 5分足（VWAP/構造判定）：日本株のみ対象（米国株はENTRY TOP5・Sector Rotationの
     # 監視銘柄プールに現状含まれないため、指示書「無制限並列は禁止」を踏まえ対象を絞る）。
     if include_5m:
-        jp_symbols = [_yf_symbol(w) for w in watchlist if w.get("market", "JP") == "JP" and w.get("code")]
+        jp_items = [w for w in watchlist if w.get("market", "JP") == "JP" and w.get("code")]
+        jp_symbols = [_yf_symbol(w) for w in jp_items]
         try:
             bstats = _intraday_regime_batch_prefetch(jp_symbols, "5m", CACHE_TTL["stock5m"])
             diagnostics["batch_requests"] += bstats["batches"]
             diagnostics["total_requests"] += bstats["attempted"]
             diagnostics["cache_hits"] += bstats["cached"]
             diagnostics["errors"] += max(0, bstats["attempted"] - bstats["cached"])
+            regime_values = bstats.get("values", {})
+            for w in jp_items:
+                code = w.get("code")
+                sym = _yf_symbol(w)
+                regime = regime_values.get(sym)
+                if code in market_data_by_code:
+                    market_data_by_code[code]["regime"] = regime
+                    market_data_by_code[code]["regimeStatus"] = "ok" if regime is not None else "failed"
         except Exception as e:
             print("  [MarketDataPrefetch] 5分足バッチ取得失敗", e)
             diagnostics["errors"] += 1
@@ -3597,22 +3624,36 @@ def _previous_intraday_reference(database_url, user_id, trade_date, report_type,
     return (morning_check, "morning_check") if morning_check else (None, None)
 
 
-def _intraday_stock_snapshot(watchlist_item):
+def _intraday_stock_snapshot(watchlist_item, prefetched=None):
     """TOP5銘柄1件分の「今」の状態（現在値・当日騰落率・VWAP位置・5分足構造）を取得する。
     既存の_intraday_regime()（セクターETFの当日レジーム判定で既に使っている5分足取得＋VWAP計算）
     をそのまま個別銘柄に転用するだけで、新しい分足取得経路は作らない（指示書30番）。
     2026-09-10更新（レート制限耐性）：現在値はget_stock_quotes(cache_ttl指定)、VWAP/5分足構造は
     _intraday_regime_cached()経由でキャッシュ+リトライ+stale fallbackを適用する（指示書1・2・
-    3・4番）。cacheStatusも返す（呼び出し側のdata_quality集計用）。"""
+    3・4番）。cacheStatusも返す（呼び出し側のdata_quality集計用）。
+
+    2026-09-15追加（今買い時TOP5 場中リアルタイム化指示書 レビュー反映：scan-local market
+    data reuse）：prefetched（{"quote":..., "quoteStatus":..., "regime":..., "regimeStatus":...}）
+    が渡された場合はそれをそのまま使い、get_stock_quotes()・_intraday_regime_cached()（どちらも
+    グローバルTTL＝90秒）を呼ばない。呼び出し元（_score_entry_candidates）がprefetch_market_
+    data_for_watchlist()の結果をscan-local mapとして渡すことで、daily arraysと同じ理由
+    （scan自体が90秒を超えうる）による同一scan内の重複外部取得を防ぐ。省略時（prefetched=None）
+    は従来通り個別取得する——他の既存呼び出し元（FAST UPDATE等）への影響は無い。"""
     sym = _yf_symbol(watchlist_item)
-    quote_status = {}
-    quote = get_stock_quotes([watchlist_item], cache_ttl=CACHE_TTL["stock_quote"], status_out=quote_status).get(
-        watchlist_item.get("code"))
-    regime, regime_status = _intraday_regime_cached(sym, "5m", CACHE_TTL["stock5m"])
+    if prefetched is not None:
+        quote = prefetched.get("quote")
+        quote_status_for_code = prefetched.get("quoteStatus", "failed")
+        regime, regime_status = prefetched.get("regime"), prefetched.get("regimeStatus", "failed")
+    else:
+        quote_status = {}
+        quote = get_stock_quotes([watchlist_item], cache_ttl=CACHE_TTL["stock_quote"], status_out=quote_status).get(
+            watchlist_item.get("code"))
+        quote_status_for_code = quote_status.get(watchlist_item.get("code"), "failed")
+        regime, regime_status = _intraday_regime_cached(sym, "5m", CACHE_TTL["stock5m"])
     current_change_pct = None
     if quote and quote.get("t") is not None and quote.get("p"):
         current_change_pct = round((quote["t"] - quote["p"]) / quote["p"] * 100, 2)
-    cache_status = quote_status.get(watchlist_item.get("code"), "failed") if quote else regime_status
+    cache_status = quote_status_for_code if quote else regime_status
     # 両方stale/rate_limitedならその中でより深刻な方（missing相当）を優先して報告する
     if regime_status in ("rate_limited", "failed") and cache_status == "ok":
         cache_status = regime_status
@@ -4086,6 +4127,17 @@ def _score_entry_candidates(database_url, user_id):
         market_data_diagnostics = {"error": str(e)}
     section_ms["marketDataPrefetch"] = round((time.time() - _t) * 1000)
 
+    # 場中リアルタイム化指示書 レビュー反映（scan-local quote/5分足 reuse）：daily arraysと
+    # 全く同じ理由（このscan自体がグローバルTTL=90秒を超えうる）で、quote/5分足も同一scan内は
+    # prefetch結果を使い回す。market_data_diagnosticsからpopするのもdaily_arraysと同じ理由
+    # （marketDataByCodeは281銘柄分のquote/5分足そのものを含み巨大——debug["marketDataDiagnostics"]
+    # 経由でAPIレスポンスへ漏れるとpayloadが肥大化する）。
+    market_data_by_code = market_data_diagnostics.pop("marketDataByCode", {}) or {}
+    quote_scan_local_hit = 0
+    quote_fallback_count = 0
+    intraday_scan_local_hit = 0
+    intraday_fallback_count = 0
+
     # Market Data高速化指示書 Phase 2（2026-09-15新規）：DB N+1解消。この下のループは
     # candidate 1件ごとにrelevant_catalysts_for/upcoming_event_signals/
     # build_entry_top5_event_support_label/build_trade_experience_summary_for_symbolを
@@ -4132,6 +4184,21 @@ def _score_entry_candidates(database_url, user_id):
         daily_arrays_diagnostics = {"error": str(e)}
     section_ms["dailyArraysPrefetch"] = round((time.time() - _t) * 1000)
 
+    # 場中リアルタイム化指示書 レビュー反映（scan-local daily arrays reuse）：このscan内では
+    # prefetch_daily_arrays_for_watchlist()が実際に使った値（arraysByCode）をそのまま
+    # candidate loopで使い回し、_cached_daily_arrays()のグローバルTTL（90秒）を経由しない。
+    # 281銘柄の逐次prefetch自体が90秒を超えうるため、TTL経由だと同一scan内でも後半の
+    # 銘柄で二重取得が発生していた（実測682秒中、dailyArraysPrefetch=295秒・
+    # candidateLoopTotalの一部がこの二重取得によるもの）。
+    daily_arrays_by_code = daily_arrays_diagnostics.pop("arraysByCode", {}) or {}
+    # popで取り除く理由：daily_arrays_diagnosticsはこの後debug["dailyArraysDiagnostics"]へ
+    # 丸ごと格納されAPIレスポンス（/api/entry-candidates・/api/entry-candidates/live）に
+    # 直接乗る。arraysByCodeは281銘柄×直近400営業日分のOHLCV配列を含み巨大（実測でJSON化
+    # すると数MB級）なため、ここで除去しないとAPIレスポンスサイズ・シリアライズ時間を
+    # 不必要に膨張させてしまう（診断ログ用途はcandidateループでの再利用のみで十分）。
+    daily_arrays_scan_local_hit = 0
+    daily_arrays_fallback_count = 0
+
     # Phase5 STEP3・STEP4：銘柄ごとのtotal elapsed（percentile集計用）と、
     # ループ内で実際に呼ばれる2関数（_volume_stage2_detail・_intraday_stock_snapshot）
     # それぞれのcall count/total_ms/max_msを集計する（通常ログへは281行出さない）。
@@ -4151,7 +4218,15 @@ def _score_entry_candidates(database_url, user_id):
         stage2 = None
         try:
             _t_fn = time.time()
-            stage2 = _volume_stage2_detail(code, row)
+            if code in daily_arrays_by_code:
+                daily_arrays_scan_local_hit += 1
+                stage2 = _volume_stage2_detail(code, row, daily_arrays=daily_arrays_by_code[code])
+            else:
+                # prefetchが対象外だった銘柄（米国株等、対象外市場）・prefetch自体が丸ごと
+                # 例外で失敗した場合のみここへ来る。既存の個別取得（_cached_daily_arrays経由）
+                # へ安全側でフォールバックする。
+                daily_arrays_fallback_count += 1
+                stage2 = _volume_stage2_detail(code, row)
             fn_ms = (time.time() - _t_fn) * 1000
             func_stats["_volume_stage2_detail"]["calls"] += 1
             func_stats["_volume_stage2_detail"]["total_ms"] += fn_ms
@@ -4164,9 +4239,18 @@ def _score_entry_candidates(database_url, user_id):
         # "stale_cache"（取得失敗しキャッシュ済みの古い値にフォールバックした値）かを
         # 記録する。ranking全体が新しくても、この銘柄だけ古いデータで判定されている
         # ケースを個別に検出するために必要（指示書「market_data_atも確認すること」）。
+        prefetched_md = market_data_by_code.get(code)
+        if prefetched_md is not None:
+            quote_scan_local_hit += 1
+            intraday_scan_local_hit += 1
+        else:
+            # prefetch_market_data_for_watchlist()の対象外だった銘柄（このscan対象watchlistは
+            # market="JP"のみのため、通常は発生しない安全側フォールバック）だけがここへ来る。
+            quote_fallback_count += 1
+            intraday_fallback_count += 1
         try:
             _t_fn = time.time()
-            snap = _intraday_stock_snapshot(w)
+            snap = _intraday_stock_snapshot(w, prefetched=prefetched_md)
             fn_ms = (time.time() - _t_fn) * 1000
             func_stats["_intraday_stock_snapshot"]["calls"] += 1
             func_stats["_intraday_stock_snapshot"]["total_ms"] += fn_ms
@@ -4307,6 +4391,12 @@ def _score_entry_candidates(database_url, user_id):
     debug["watchlistCount"] = len(watchlist)
     debug["readyCount"] = snapshot_ready_count
     debug["qualityCounts"] = quality_counts
+    debug["dailyArraysScanLocalHit"] = daily_arrays_scan_local_hit  # scan-local daily arrays reuse：TTLを経由せずprefetch結果をそのまま使った件数
+    debug["dailyArraysFallbackCount"] = daily_arrays_fallback_count  # 同上：scan-local mapに無くグローバルキャッシュへフォールバックした件数
+    debug["quoteScanLocalHit"] = quote_scan_local_hit  # scan-local quote reuse：同上（quote）
+    debug["quoteFallbackCount"] = quote_fallback_count
+    debug["intradayScanLocalHit"] = intraday_scan_local_hit  # scan-local 5分足reuse：同上（intraday regime）
+    debug["intradayFallbackCount"] = intraday_fallback_count
     debug["marketDataDiagnostics"] = market_data_diagnostics  # Phase I：デバッグ/ログ専用の追加フィールド（UI必須ではない）
     debug["entrySupportContextDiagnostics"] = entry_support_diagnostics  # Phase 2 G：DB N+1解消の診断情報（デバッグ/ログ専用）
     debug["dailyArraysDiagnostics"] = daily_arrays_diagnostics  # Phase 3 STEP10：日足prefetchの診断情報（デバッグ/ログ専用）
@@ -15488,11 +15578,21 @@ def prefetch_daily_arrays_for_watchlist(watchlist, stage1_rows, max_workers=DAIL
     へ記録するのみで、281件への無制限フォールバックはしない——ループ内の既存
     _cached_daily_arrays()がキャッシュミスの銘柄だけ個別に（このprefetchと同じ経路で）
     取得を試みる、既存の安全側動作にそのまま委ねる（指示書STEP8）。
-    戻り値：diagnostics dict（Phase 3 STEP10）。"""
+
+    2026-09-15追加（今買い時TOP5 場中リアルタイム化指示書 レビュー反映・scan-local daily
+    arrays reuse）：実測でCACHE_TTL["daily_arrays"]=90秒が281銘柄の逐次prefetch（実測
+    約295秒）自体より短く、prefetch前半で書き込んだキャッシュが後続のcandidate loopに
+    到達する頃にはTTL切れになり、同一scan内で同じ銘柄のTachibana daily historyを二重取得
+    してしまう不具合が判明した。TTLを延ばす対症療法ではなく、「このprefetch呼び出しで
+    実際に使った値」をdiagnostics["arraysByCode"]としてそのまま返し、呼び出し元
+    （_score_entry_candidates）が同一scan中はグローバルTTLキャッシュを経由せずこの
+    scan-localな値をそのまま使い回せるようにする。cache_hit分（prefetch時点で既にfresh
+    だった銘柄）もarraysByCodeへ含める——「このscanで見た値」を1つの辞書に統一するため。
+    戻り値：diagnostics dict（Phase 3 STEP10、+ arraysByCode）。"""
     diagnostics = {"symbols_requested": len(watchlist), "unique_symbols": 0, "cache_hits": 0,
                     "cache_misses": 0, "network_requests": 0, "successful": 0, "failed": 0,
                     "timeouts": 0, "remote_disconnects": 0, "retries": 0, "stale_used": 0,
-                    "elapsed_ms": 0}
+                    "elapsed_ms": 0, "arraysByCode": {}}
     if tachibana_api is None:
         return diagnostics
     t0 = time.time()
@@ -15504,11 +15604,13 @@ def prefetch_daily_arrays_for_watchlist(watchlist, stage1_rows, max_workers=DAIL
         return diagnostics
 
     ttl = CACHE_TTL["daily_arrays"]
+    arrays_by_code = diagnostics["arraysByCode"]
     to_fetch = []
     for code in codes:
         entry = _cache_get(f"daily_arrays:{code}")
         if _cache_fresh(entry, ttl):
             diagnostics["cache_hits"] += 1
+            arrays_by_code[code] = entry["value"]
         else:
             diagnostics["cache_misses"] += 1
             to_fetch.append(code)
@@ -15538,11 +15640,13 @@ def prefetch_daily_arrays_for_watchlist(watchlist, stage1_rows, max_workers=DAIL
                 if value is not None:
                     _cache_set(f"daily_arrays:{code}", value)
                     diagnostics["successful"] += 1
+                    arrays_by_code[code] = value
                 else:
                     diagnostics["failed"] += 1
                     stale = _cache_get(f"daily_arrays:{code}")
                     if stale is not None:
                         diagnostics["stale_used"] += 1
+                        arrays_by_code[code] = stale["value"]  # 取得失敗時もscan内では同じstale値を使い回す（既存のstale fallback方針と同じ）
 
     diagnostics["elapsed_ms"] = round((time.time() - t0) * 1000)
     print(f"  [DailyArraysPrefetch] unique_symbols={diagnostics['unique_symbols']} "
@@ -17303,20 +17407,27 @@ def select_volume_stage1_candidates(stage1):
     return scored[:VOLUME_LITE_MAX_CANDIDATES]
 
 
-def _volume_stage2_detail(code, stage1_row):
+def _volume_stage2_detail(code, stage1_row, daily_arrays=None):
     """日足履歴から過去20営業日平均出来高（avgVolume20）・当日出来高との倍率（生・時間帯補正後
     の両方）・売買代金倍率・直近高値からの乖離（distanceFromHigh）・break status等を算出する。
     2026-09-15追加（Market Data Phase 3）：stage1_row（run_momentum_stage1()がバッチ取得済み
     の当日値）を_cached_daily_arrays()のlive_quoteへ渡し、_tachibana_daily_arrays()内の
     冗長なget_market_price([code])個別呼び出しを省略する（フィールド名がstage1_row側は
     "current"・get_market_price側は"t"で異なるだけで値は同じもの、他の値はキー名が同じ）。
-    計算ロジック自体は無変更。"""
+    計算ロジック自体は無変更。
+    2026-09-15追加（scan-local daily arrays reuse）：daily_arraysが渡された場合はそれを
+    そのまま使い、_cached_daily_arrays()（グローバルTTLキャッシュ、90秒）を経由しない。
+    呼び出し元（_score_entry_candidates）がprefetch_daily_arrays_for_watchlist()の結果を
+    scan-local mapとして渡すことで、TTL切れによる同一scan内の二重Tachibana取得を防ぐ。
+    省略時（daily_arrays=None）は従来通り_cached_daily_arrays()を呼ぶ（他の既存呼び出し元
+    ・既存テストへの影響なし）。"""
     live_quote = None
     if stage1_row and stage1_row.get("current") is not None:
         live_quote = {"t": stage1_row.get("current"), "open": stage1_row.get("open"),
                        "high": stage1_row.get("high"), "low": stage1_row.get("low"),
                        "volume": stage1_row.get("volume")}
-    arrays = _cached_daily_arrays(code, CACHE_TTL["daily_arrays"], live_quote=live_quote)
+    arrays = daily_arrays if daily_arrays is not None else \
+        _cached_daily_arrays(code, CACHE_TTL["daily_arrays"], live_quote=live_quote)
     if not arrays:
         return None
     closes, opens, highs, lows, volumes = arrays

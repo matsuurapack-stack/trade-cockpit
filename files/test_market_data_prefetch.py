@@ -179,7 +179,7 @@ class IntradayRegimeBatchPrefetchTests(unittest.TestCase):
         with mock.patch.object(server, "_download_intraday_chunk") as mock_dl:
             stats = server._intraday_regime_batch_prefetch([], "5m", 90)
         mock_dl.assert_not_called()
-        self.assertEqual(stats, {"attempted": 0, "cached": 0, "batches": 0})
+        self.assertEqual(stats, {"attempted": 0, "cached": 0, "batches": 0, "values": {}})
 
     def test_download_failure_does_not_raise(self):
         with mock.patch.object(server, "_download_intraday_chunk", side_effect=RuntimeError("boom")):
