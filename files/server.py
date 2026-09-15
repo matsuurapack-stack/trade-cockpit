@@ -12446,22 +12446,87 @@ def classify_loss_reasons(gross_pnl_pct, ctx, exit_price=None, sector_state_at_e
     return tags
 
 
+# 2026-09-16追加（ユーザー明示指示：ENTRY回避可能性とEXIT/RISK問題を厳密に分離）：
+# 損切り理由タグを、そのタグが「注文・約定時刻までに観測可能だった情報」から来ているか
+# （ENTRY_CAUSE）、「エントリー後にしか確定しない情報」から来ているか
+# （POST_ENTRY_DETERIORATION／RISK_MANAGEMENT／EXIT_EXECUTION）で内部分類する。
+# classify_loss_reasons()の各タグの実際の算出根拠に基づく（reconstruct_trade_market_context()
+# 参照）：
+#   CHASE_ENTRY：entry_setup_type（entry_idxまでの値幅・trend_5m_before_entry。RSIも
+#     closes_pre＝entry_idxまでの終値のみ）→ 100%エントリー時点で観測可能。
+#   LATE_ENTRY：entry_setup_type・distance_from_high_pct（day_high_so_far＝entry_idxまでの
+#     高値）→ エントリー時点で観測可能。
+#   ENTRY_BEFORE_CONFIRMATION：trend_5m_before_entry・above_vwap_at_entry（いずれも
+#     entry_idxまでのデータ）→ エントリー時点で観測可能。
+#   EVENT_RISK：event_risk_at_entry（カレンダー上の既知イベント）→ エントリー時点で
+#     観測可能（発生タイミングの厳密さの制約はあるが、少なくとも「事前に分かる」性質）。
+#   SECTOR_WEAKNESS：sector_state_at_entry（セクターのレジームは価格ほど高速に変化しない、
+#     エントリー時点の地合いとして扱う）。
+#   FALSE_BREAKOUT：broke_prior_high_then_failed＝entry_idx〜exit_idxの安値で判定
+#     （「その後失敗したか」はエグジットまで見ないと分からない）→ エントリー後にしか
+#     確定しない。
+#   VWAP_LOSS：vwap_at_exit・exit_priceで判定（本実装では常にexit時点の値を使う）→
+#     エントリー後にしか確定しない。
+#   VOLUME_FADE：volume_trend_after_entry＝entry_idx〜exit_idxの出来高推移→ エントリー後
+#     にしか確定しない。
+#   MARKET_REVERSAL：market_mode_at_entry!=market_mode_at_exitという「変化」自体の定義上、
+#     エントリー後の発生。
+#   STOP_TOO_TIGHT：MAE（entry〜exitの最大逆行）とgross_pnl_pct（最終結果）を使う→
+#     リスク管理（ストップ幅設定）の問題であり、エントリー可否の判断材料ではない。
+#   RULE_VIOLATION：現状sync_trade_experiences_for_date()からは常にrule_compliance_score=None
+#     で呼ばれるため実質発火しないが、ルール遵守はエントリー可否そのものではないため
+#     RISK_MANAGEMENT寄りに分類する。
+#   GOOD_ENTRY_BAD_OUTCOME：他のどのカテゴリにも属さない特殊マーカー（NOT_AVOIDABLEへ
+#     直結、下記classify_entry_avoidability参照）。
+LOSS_TAG_CATEGORY = {
+    "CHASE_ENTRY": "ENTRY_CAUSE",
+    "LATE_ENTRY": "ENTRY_CAUSE",
+    "ENTRY_BEFORE_CONFIRMATION": "ENTRY_CAUSE",
+    "EVENT_RISK": "ENTRY_CAUSE",
+    "SECTOR_WEAKNESS": "ENTRY_CAUSE",
+    "FALSE_BREAKOUT": "POST_ENTRY_DETERIORATION",
+    "VWAP_LOSS": "POST_ENTRY_DETERIORATION",
+    "VOLUME_FADE": "POST_ENTRY_DETERIORATION",
+    "MARKET_REVERSAL": "POST_ENTRY_DETERIORATION",
+    "STOP_TOO_TIGHT": "RISK_MANAGEMENT",
+    "RULE_VIOLATION": "RISK_MANAGEMENT",
+}
+
+
+def categorize_loss_reason_tags(loss_tags):
+    """損切り理由タグをENTRY_CAUSE/POST_ENTRY_DETERIORATION/RISK_MANAGEMENT/EXIT_EXECUTIONの
+    4分類へ振り分ける（GOOD_ENTRY_BAD_OUTCOMEは特殊マーカーのため分類対象外）。"""
+    out = {"ENTRY_CAUSE": [], "POST_ENTRY_DETERIORATION": [], "RISK_MANAGEMENT": [], "EXIT_EXECUTION": []}
+    for t in (loss_tags or []):
+        cat = LOSS_TAG_CATEGORY.get(t)
+        if cat:
+            out[cat].append(t)
+    return out
+
+
 def classify_entry_avoidability(loss_tags, data_quality):
-    """指示書6番：AVOIDABLE/PARTIALLY_AVOIDABLE/NOT_AVOIDABLE/UNKNOWNの4段階。
-    「負けたから悪いENTRY」を禁止する（指示書7番）——判定材料はclassify_loss_reasons()が
-    既に算出した客観的な市場シグナルのタグ数のみで、損益の符号は一切見ない。
+    """指示書6番＋2026-09-16追加指示（ENTRY回避可能性とEXIT/RISK問題の厳密分離）：
+    AVOIDABLE/PARTIALLY_AVOIDABLE/NOT_AVOIDABLE/UNKNOWNの4段階。
+    「負けたから悪いENTRY」を禁止する（指示書7番）だけでなく、「エントリー後にしか確定
+    しない情報（VWAP_LOSS・STOP_TOO_TIGHT・exit後の値動き・MFE/MAEの最終値等）を理由に
+    ENTRYをAVOIDABLEへ昇格させない」——判定に使うのは注文・約定時刻までに観測可能だった
+    情報（ENTRY_CAUSEカテゴリのタグ）の件数のみ。POST_ENTRY_DETERIORATION／
+    RISK_MANAGEMENT／EXIT_EXECUTIONに分類されたタグは、そのトレードの記録・表示には残すが
+    AVOIDABLE判定のカウントには一切使わない。
     データ不足（reconstruct_trade_market_context()がNO_DATAを返した場合）は無理に判定しない。"""
     if not data_quality or data_quality == "NO_DATA":
         return "UNKNOWN"
     if "GOOD_ENTRY_BAD_OUTCOME" in (loss_tags or []):
         return "NOT_AVOIDABLE"
-    warning_tags = [t for t in (loss_tags or []) if t != "GOOD_ENTRY_BAD_OUTCOME"]
-    if len(warning_tags) >= 2:
+    entry_cause_tags = categorize_loss_reason_tags(loss_tags)["ENTRY_CAUSE"]
+    if len(entry_cause_tags) >= 2:
         return "AVOIDABLE"
-    if len(warning_tags) == 1:
+    if len(entry_cause_tags) == 1:
         return "PARTIALLY_AVOIDABLE"
-    return "UNKNOWN"  # 悪材料タグ0件だがGOOD_ENTRY_BAD_OUTCOMEの条件（PULLBACK/BREAKOUT等）も
-                       # 満たさない＝判断材料が不十分（無理にNOT_AVOIDABLEにしない）
+    # ENTRY時点で観測可能だった危険信号が0件——POST_ENTRY_DETERIORATION/RISK_MANAGEMENT
+    # タグだけが立っている場合でも、それらは「結果」を使って初めて分かる情報のため
+    # AVOIDABLEにはしない（無理にNOT_AVOIDABLEにもしない＝判断材料が不十分）。
+    return "UNKNOWN"
 
 
 # 指示書9番「ENTRYを止めるだけでなく、待てば入れる条件を出す」：各損切り理由タグに対応する
@@ -13002,6 +13067,9 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
                 "broke_prior_high_then_failed": market_ctx.get("broke_prior_high_then_failed"),
                 "post_exit_direction": market_ctx.get("post_exit_direction"),
                 "entry_avoidability": entry_avoidability,  # 指示書6番：4段階評価
+                # 2026-09-16追加：ENTRY回避可能性とEXIT/RISK問題の分離——どのタグがENTRY時点で
+                # 分かっていた危険信号で、どれがエントリー後の悪化・リスク管理の問題かを明示する。
+                "loss_reason_categories": categorize_loss_reason_tags(loss_tags),
                 "entry_unblock_conditions": entry_unblock_conditions,  # 指示書9番
                 "data_quality": market_ctx.get("data_quality"),
             } if result_class == "LOSS" else None),
@@ -13313,6 +13381,7 @@ def build_trade_breakdown_for_day(day_trades):
             "lossReasonTags": e.get("exit_reason_json") or [],
             "entryAvoidability": (e.get("post_trade_analysis_json") or {}).get("entry_avoidability"),
             "entryUnblockConditions": (e.get("post_trade_analysis_json") or {}).get("entry_unblock_conditions") or [],
+            "lossReasonCategories": (e.get("post_trade_analysis_json") or {}).get("loss_reason_categories"),
         })
     return trade_breakdown
 

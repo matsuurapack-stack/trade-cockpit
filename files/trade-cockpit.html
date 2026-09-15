@@ -9302,9 +9302,17 @@ function DailyReviewPanel(){
                 損切り理由：{t.lossReasonTags.join("・")}
                 {t.entryAvoidability && <span style={{marginLeft:6,fontWeight:700,
                     color:t.entryAvoidability==="AVOIDABLE"?"var(--down)":t.entryAvoidability==="NOT_AVOIDABLE"?"var(--up)":"var(--inkSoft)"}}>
-                  {({AVOIDABLE:"（回避可能だった可能性）",PARTIALLY_AVOIDABLE:"（一部警戒材料あり・ENTRY自体には合理性）",
+                  {({AVOIDABLE:"（ENTRY時点で回避可能だった可能性）",PARTIALLY_AVOIDABLE:"（一部警戒材料あり・ENTRY自体には合理性）",
                      NOT_AVOIDABLE:"（エントリー自体は妥当、結果は不運）",UNKNOWN:"（判断材料不足）"})[t.entryAvoidability]}
                 </span>}
+                {/* 2026-09-16新規：ENTRY回避可能性とEXIT/RISK問題の分離表示。ENTRY_CAUSE
+                    （注文・約定時刻までに観測可能だった情報）だけがAVOIDABLE判定に使われ、
+                    それ以外（エントリー後の悪化・リスク管理上の問題）は参考情報として分けて示す。 */}
+                {t.lossReasonCategories && <div style={{marginTop:3,display:"flex",flexDirection:"column",gap:1}}>
+                  {t.lossReasonCategories.ENTRY_CAUSE?.length>0 && <span>ENTRY時点で分かっていた危険信号：{t.lossReasonCategories.ENTRY_CAUSE.join("・")}</span>}
+                  {t.lossReasonCategories.POST_ENTRY_DETERIORATION?.length>0 && <span>ENTRY後に発生した悪化：{t.lossReasonCategories.POST_ENTRY_DETERIORATION.join("・")}</span>}
+                  {t.lossReasonCategories.RISK_MANAGEMENT?.length>0 && <span>損切り／リスク管理上の問題：{t.lossReasonCategories.RISK_MANAGEMENT.join("・")}</span>}
+                </div>}
                 {t.entryUnblockConditions&&t.entryUnblockConditions.length>0 && <div style={{marginTop:2}}>
                   次回ENTRY解禁条件：{t.entryUnblockConditions.join("／")}
                 </div>}
