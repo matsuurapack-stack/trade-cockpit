@@ -20101,9 +20101,12 @@ def analyze_stock(w, market_env=None, external_intelligence=None):
     # entry未調整のままstopだけ当日安値でかさ上げしていたため、entryより高いstopが出る不具合があった）。----
     stop = entry - atr_ref
     stop_reasons = [f"{atr_label}({atr_ref:.1f})の1倍を損切り幅の目安に設定"]
+    stop_reason_category = "ATR"  # Trade Learning Phase B：stopReasonの自由文とは別に、Learning用の
+    # 構造化カテゴリを最終的にstopを決定した根拠に合わせて更新していく（ATR/RECENT_LOW/VWAP/SHORT_MA）。
     if intraday_low is not None and stop < intraday_low < entry:
         stop = intraday_low
         stop_reasons.append(f"当日安値({intraday_low:.1f})を下限目安として調整")
+        stop_reason_category = "RECENT_LOW"
 
     # ---- エントリーのタイミングルール（最新版）⑦：損切り位置を「買う前に」決めるルール。候補は
     # 5分足直近安値割れ／VWAP割れ／5分足短期線の明確な割れの3つ。このうちentryより下でATR基準の
@@ -20111,22 +20114,24 @@ def analyze_stock(w, market_env=None, external_intelligence=None):
     # 採用する（ATR基準より深くする方向へは動かさない＝安全側のみ）。----
     stop_candidates = []
     if recent_low_5m is not None and recent_low_5m < entry:
-        stop_candidates.append(("5分足直近安値", recent_low_5m))
+        stop_candidates.append(("5分足直近安値", "RECENT_LOW", recent_low_5m))
     if vwap is not None and vwap < entry:
-        stop_candidates.append(("VWAP", vwap))
+        stop_candidates.append(("VWAP", "VWAP", vwap))
     if ma5_short is not None and ma5_short < entry:
-        stop_candidates.append(("5分足短期線", ma5_short))
+        stop_candidates.append(("5分足短期線", "SHORT_MA", ma5_short))
     if stop_candidates:
-        tightest_label, tightest_price = max(stop_candidates, key=lambda x: x[1])
+        tightest_label, tightest_category, tightest_price = max(stop_candidates, key=lambda x: x[2])
         if tightest_price > stop:
             stop = tightest_price
             stop_reasons.append(f"{tightest_label}({tightest_price:.1f})を割ったら損切りと判断（買う前に損切り位置を決めるルール）")
+            stop_reason_category = tightest_category
 
     # entryより低いことを必ず保証する（浅めの最小値幅を最低ラインとして確保）
     min_gap = max(entry * 0.002, 1)
     if stop >= entry:
         stop = entry - min_gap
         stop_reasons.append("損切りが購入水準を下回るよう調整")
+        stop_reason_category = "OTHER"
 
     # ---- 利確単価(目安)：ATR相当の1.5倍（リスクリワード概ね1:1.5）を利確目安とする ----
     target = entry + atr_ref * 1.5
@@ -20495,7 +20500,7 @@ def analyze_stock(w, market_env=None, external_intelligence=None):
         "current": round(current, 2),
         "entry": round(entry, 2), "entryReason": "・".join(entry_reasons),
         "pullbackEntry": pullback_entry,  # v3-7：表示用の押し目価格帯（ゾーン・根拠・分類）。entryとは独立
-        "stop": round(stop, 2), "stopReason": "・".join(stop_reasons),
+        "stop": round(stop, 2), "stopReason": "・".join(stop_reasons), "stopReasonCategory": stop_reason_category,
         "target": round(target, 2), "targetReason": "・".join(target_reasons),
         "fullExitTarget": round(full_exit_target, 2),
         # 2026-09-08新規（分析カードUI改善）：短期（5〜20営業日）ブレイク価格。indicators.resistance

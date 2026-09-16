@@ -6926,7 +6926,8 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
   // v3-8（ポジション管理ロジック再設計 Step1）：取引タイプ（DAY/SWING）を新規登録時に必須化。
   // SWINGの-10% HARD STOP等、取引タイプに応じた判断ロジックの起点となるフィールドのため。
   const emptyDraft={code:"",name:"",market:"JP",quantity:"",average_price:"",acquired_at:"",memo:"",
-    initial_stop:"",target_1:"",target_2:"",trade_style:""};
+    initial_stop:"",target_1:"",target_2:"",trade_style:"",
+    stop_reason_category:"",stop_reason_text:""}; // Trade Learning Phase B：STOP根拠（構造化カテゴリ＋自由文）
   const [draft,setDraft]=useState(emptyDraft);
   const [saving,setSaving]=useState(false);
   // 2026-09-08新規（ポジション登録機能の改善）：監視銘柄に未登録の銘柄でも、日本市場/米国株一覧が
@@ -7067,7 +7068,10 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
     setDraft(d=>({...d,
       initial_stop:analysisForDraft.stop??d.initial_stop,
       target_1:analysisForDraft.target??d.target_1,
-      target_2:analysisForDraft.fullExitTarget??d.target_2}));
+      target_2:analysisForDraft.fullExitTarget??d.target_2,
+      // Trade Learning Phase B：分析値由来のSTOPは根拠も一緒に引き継ぐ（後で手入力すればMANUALに上書きされる）
+      stop_reason_category:analysisForDraft.stopReasonCategory??d.stop_reason_category,
+      stop_reason_text:analysisForDraft.stopReason??d.stop_reason_text}));
   };
 
   const resetDraftExtras=()=>{setDraft(emptyDraft);setPreviewQuote(null);setSelectedSector("");setAlsoWatch(false);setCodeSearchOpen(false);};
@@ -7102,7 +7106,9 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
           acquired_at:draft.acquired_at||null,
           initial_stop:num(draft.initial_stop),target_1:num(draft.target_1),target_2:num(draft.target_2),
           // current_stopは新規登録時は初期SLと同じ値で開始する（トレーリング状態＝「初期SL」から始まる）
-          current_stop:num(draft.initial_stop)})}); // 空文字はTIMESTAMPTZ列に直接入らないためnullに変換
+          current_stop:num(draft.initial_stop),
+          // Trade Learning Phase B：空文字はNULL（未設定=UNKNOWN扱い）として送る
+          stop_reason_category:draft.stop_reason_category||null,stop_reason_text:draft.stop_reason_text||null})});
       if(alsoWatch)await addAlsoToWatchlist(code,draft.name,draft.market);
       resetDraftExtras();
       load();
@@ -7330,7 +7336,9 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
       {duplicatePosition && <span style={{color:"var(--accent)",fontWeight:700}}>⚠ 既にポジションにあります（{num(duplicatePosition.quantity)?.toLocaleString()}株 @{num(duplicatePosition.average_price)?.toLocaleString()}円）。追加建て（加重平均で合算）として登録されます。</span>}
     </div>}
     <div className="position-add-grid-2" style={{display:"grid",gridTemplateColumns:"90px 90px 90px 1fr auto auto",gap:6,marginBottom:6,alignItems:"center"}}>
-      <input placeholder="初期SL" value={draft.initial_stop} onChange={e=>setDraft({...draft,initial_stop:e.target.value})} style={fieldStyle}/>
+      <input placeholder="初期SL" value={draft.initial_stop} onChange={e=>setDraft({...draft,initial_stop:e.target.value,
+        // Trade Learning Phase B：手入力で上書きしたら根拠はMANUAL扱いに切り替える（分析値の根拠を誤って残さない）
+        stop_reason_category:"MANUAL",stop_reason_text:""})} style={fieldStyle}/>
       <input placeholder="利確①" value={draft.target_1} onChange={e=>setDraft({...draft,target_1:e.target.value})} style={fieldStyle}/>
       <input placeholder="利確②" value={draft.target_2} onChange={e=>setDraft({...draft,target_2:e.target.value})} style={fieldStyle}/>
       <input placeholder="メモ" value={draft.memo} onChange={e=>setDraft({...draft,memo:e.target.value})} style={fieldStyle}/>

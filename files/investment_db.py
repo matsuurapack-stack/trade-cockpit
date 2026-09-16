@@ -580,6 +580,29 @@ ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS trade_style TEXT;
 -- 残す＝無理にpositive/negativeへ寄せない（ユーザー指定：確信が無ければneutral扱いにする
 -- 判定ロジックはフロント/import時のヘルパー側が担う。ここではNULL可の列を追加するのみ）。
 ALTER TABLE news_catalysts ADD COLUMN IF NOT EXISTS sentiment TEXT;
+
+-- 2026-09-16新規（Trade Learning Phase B：STOP LOSS記録のデータ欠損修正）：ポジション決済
+-- （add_position_exit）時、portfolio.initial_stop/current_stopは既にSELECTで取得済みなのに
+-- trade_historyへのINSERT列に含まれておらず、決済と同時にSTOP情報が消えていた（6227
+-- AIメカテック実例の調査で判明）。ここではUI変更なしでデータパスのみ塞ぐ：
+--   initial_stop_price = 決済直前のportfolio.initial_stop（登録時に決めた当初の損切り値）
+--   final_stop_price   = 決済直前のportfolio.current_stop（トレーリング等で更新された最新の損切り値）
+-- stop_reason_category/textはportfolio側（登録・編集時にanalyze_stock().stopReasonCategoryを
+-- 由来として保存、無ければMANUAL/UNKNOWN）から同様に引き継ぐ。stop_quality_evidenceは
+-- 決済時にinitial_stop_priceの有無から機械的に判定する（ACTUAL_STOP|UNKNOWN）。
+-- 過去トレード（6227含む）は遡って埋め戻さない＝NULL（UNKNOWN扱い）のまま残す（推測禁止、ユーザー指示）。
+-- stop_history（変更履歴の時系列保存）はPhase Bでは実装しない（INITIAL→FINALの2点保存まで、Phase B2で検討）。
+ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS initial_stop_price NUMERIC;
+ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS final_stop_price NUMERIC;
+ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS stop_reason_category TEXT;
+ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS stop_reason_text TEXT;
+ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS stop_quality_evidence TEXT;
+
+-- 同じくPhase B：portfolio側にも登録・編集時点のSTOP根拠を保持する列を足す（決済時に
+-- trade_historyへ複製して引き継ぐための発生源。既存initial_stop/current_stopの値そのものは
+-- 変更しない、根拠の分類・自由文のみ追加）。
+ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS stop_reason_category TEXT;
+ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS stop_reason_text TEXT;
 """
 
 # 2026-09-09新規（ルール学習システム）：投資判断ログ系の他テーブルより後に作成する必要は
@@ -9994,7 +10017,8 @@ def list_portfolio(database_url, user_id):
 
 _PORTFOLIO_COLS = ["name", "quantity", "average_price", "acquired_at", "memo",
                    "initial_stop", "current_stop", "target_1", "target_2",
-                   "trade_style"]  # marketはINSERT文で別途固定列として扱うためここには含めない
+                   "trade_style", "stop_reason_category", "stop_reason_text"]
+                   # marketはINSERT文で別途固定列として扱うためここには含めない
 
 
 def upsert_portfolio_item(database_url, user_id, item):
@@ -10148,13 +10172,23 @@ def add_position_exit(database_url, user_id, code, market, exit_price, shares):
         avg_price = float(row["average_price"] or 0)
         pnl = (exit_price - avg_price) * shares  # 税引前（gross）。既存pnl列は意味を変えず維持する。
         tax, net_pnl = _calc_trade_tax(pnl)
+        # Trade Learning Phase B：決済直前にportfolioから取得済みのSTOP値をtrade_historyへ引き継ぐ
+        # （従来はここで捨てられていた＝6227実例で判明したデータ欠損）。過去トレードは埋め戻さない
+        # 方針のため、ここではrowに実際に値がある場合のみ引き継ぎ、無ければNULL（UNKNOWN扱い）のまま。
+        initial_stop_price = row.get("initial_stop")
+        final_stop_price = row.get("current_stop")
+        stop_reason_category = row.get("stop_reason_category")
+        stop_reason_text = row.get("stop_reason_text")
+        stop_quality_evidence = "ACTUAL_STOP" if initial_stop_price is not None else "UNKNOWN"
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "INSERT INTO trade_history (user_id, code, name, market, entry_price, exit_price, shares, "
-                "pnl, gross_pnl, tax, net_pnl, acquired_at, trade_style) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
+                "pnl, gross_pnl, tax, net_pnl, acquired_at, trade_style, initial_stop_price, final_stop_price, "
+                "stop_reason_category, stop_reason_text, stop_quality_evidence) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
                 [user_id, code, row.get("name"), market, avg_price, exit_price, shares, pnl, pnl, tax, net_pnl,
-                 row.get("acquired_at"), row.get("trade_style")],
+                 row.get("acquired_at"), row.get("trade_style"), initial_stop_price, final_stop_price,
+                 stop_reason_category, stop_reason_text, stop_quality_evidence],
             )
             trade = cur.fetchone()
         new_remaining = remaining - shares
