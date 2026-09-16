@@ -13053,6 +13053,11 @@ def reconstruct_trade_market_context(code, market, trade_date, entry_time_iso, e
         "opportunity_windows": None, "opportunity": None,
         "tradeable_range_score": None, "room_to_move": None, "momentum_state": None,
         "setup_type_at_entry": None, "reversal_state_at_entry": None,
+        # Trade Learning Phase C：STOP_QUALITY（構造的なSTOP幅の妥当性判定、結果を使わない）用の
+        # ENTRY時点ボラティリティ参照値。day_bars/exit_idxは呼び出し元がREENTRY_QUALITY観測
+        # （decode_reentry_stage_sequence）で使うための内部連携専用フィールドで、DB保存前に
+        # 呼び出し元が必ずpopすること（過去のarraysByCode漏洩と同種の事故を防ぐ、ユーザー指示）。
+        "pre_entry_avg_bar_range_pct": None, "day_bars": None, "exit_idx": None,
     }
     if yf is None or not code:
         return empty
@@ -13130,6 +13135,11 @@ def reconstruct_trade_market_context(code, market, trade_date, entry_time_iso, e
     result["short_ma"] = round(sma5, 2) if sma5 is not None else None
     result["mid_ma"] = round(sma15, 2) if sma15 is not None else None
     result["long_ma"] = round(sma25, 2) if sma25 is not None else None
+    # Trade Learning Phase C：STOP_QUALITY用のENTRY時点ボラティリティ参照値（直近5本の平均レンジ％）。
+    # 結果（MAE/最終P&L）を一切使わず、ENTRY時点までのデータのみから算出する（後知恵禁止）。
+    if len(pre_entry) >= 5 and entry_price:
+        avg_bar_range = sum(b["high"] - b["low"] for b in pre_entry[-5:]) / 5
+        result["pre_entry_avg_bar_range_pct"] = round(avg_bar_range / entry_price * 100, 2)
     if len(pre_entry) >= 6:
         recent3, prior3 = vols_pre[-3:], vols_pre[-6:-3]
         avg_recent = sum(recent3) / 3
@@ -13220,6 +13230,10 @@ def reconstruct_trade_market_context(code, market, trade_date, entry_time_iso, e
     result["setup_type_at_entry"] = setup_type_at_entry
     result["reversal_state_at_entry"] = (reversal_info_at_entry or {}).get("reversalState")
     result["change_from_open_pct"] = change_from_open_pct
+    # Trade Learning Phase C：REENTRY_QUALITY観測（detect_reentry_stage_sequence）が決済後の
+    # 5分足を再利用するための内部連携専用フィールド。呼び出し元は必ずDB保存前にpopすること。
+    result["day_bars"] = day_bars
+    result["exit_idx"] = exit_idx
     return result
 
 
@@ -13737,6 +13751,267 @@ def evaluate_wait_decision(entry_score_at_wait):
     return "NEUTRAL_WAIT", "判断時点でentry_score>=55（ENTRY READY相当）だったが見送り——個別確認が必要"
 
 
+# ============================================================================
+# Trade Learning Phase C（2026-09-16新規）：ENTRY_QUALITY / STOP_QUALITY / EXIT_QUALITY /
+# REENTRY_QUALITYの4軸独立評価。6227 AIメカテック実例（5600円ENTRY→5540円EXIT→14:10回復→
+# 14:50出来高急増→当日高値5700円）を基準ケースとする。
+#
+# 絶対に守る原則（ユーザー指示）：
+#   「損切りしたあと上がった → STOPが悪かった」という結果論での一括学習をしない。
+#   ENTRY（13:02の判断自体が遅かったか）とSTOP（5540円が構造上狭すぎたか）とEXIT（決済執行が
+#   計画通りだったか）とREENTRY（14:50の新しいTRIGGERを拾えたか）を完全に独立した4つの問いとして
+#   評価する——1つの軸の悪化を他の軸のマイナス評価に流用しない。
+#   本Phaseは「観測・保存」までで、ENTRY SCOREのweight変更・自動ルール昇格・STOP幅の自動変更は
+#   一切行わない（既存STOP_TOO_TIGHTヒューリスティックも無変更のまま維持する）。
+# ============================================================================
+
+def classify_entry_setup_quality_tags(ctx):
+    """ENTRY_QUALITY用：classify_loss_reasons()のENTRY_CAUSEタグ相当を、勝敗・結果を問わず
+    全トレードへ適用できる形で独立させたもの（pre_entryデータのみ・結果非依存）。
+    classify_loss_reasons()はLOSSトレードにしか呼ばれないため、勝ちトレードのENTRY自体の
+    タイミング評価にはこちらを使う。判定材料はentry_setup_type・rsi_at_entry・
+    trend_5m_before_entry・above_vwap_at_entry・distance_from_high_pctのみ
+    （いずれもentry_idxまでのデータ、reconstruct_trade_market_context参照）。"""
+    ctx = ctx or {}
+    tags = []
+    rsi_entry = ctx.get("rsi_at_entry")
+    if ctx.get("entry_setup_type") == "CHASE" or (rsi_entry is not None and rsi_entry >= 70):
+        tags.append("CHASE_ENTRY")
+    if ctx.get("entry_setup_type") == "OTHER" and ctx.get("trend_5m_before_entry") == "UP" \
+            and ctx.get("distance_from_high_pct") is not None and ctx["distance_from_high_pct"] < -3:
+        tags.append("LATE_ENTRY")
+    if ctx.get("trend_5m_before_entry") == "DOWN" and not ctx.get("above_vwap_at_entry"):
+        tags.append("ENTRY_BEFORE_CONFIRMATION")
+    elif ctx.get("entry_setup_type") in ("CHASE", "OTHER") and ctx.get("trend_5m_before_entry") == "UP":
+        tags.append("ENTRY_BEFORE_CONFIRMATION")
+    return tags
+
+
+def evaluate_entry_quality(ctx):
+    """ENTRY_QUALITY軸：GOOD_TIMING/NEUTRAL/QUESTIONABLE_TIMING/CHASE_OR_LATE_ENTRY/UNKNOWN。
+    P&L・MAE・exit後の値動きは一切参照しない（entry_idxまでのデータのみで判定、後知恵禁止）。"""
+    ctx = ctx or {}
+    dq = ctx.get("data_quality")
+    if not dq or dq == "NO_DATA":
+        return {"classification": "UNKNOWN", "evidence": [], "confidence": "LOW", "data_quality": dq or "NO_DATA"}
+    tags = classify_entry_setup_quality_tags(ctx)
+    if len(tags) >= 2:
+        classification = "CHASE_OR_LATE_ENTRY"
+    elif len(tags) == 1:
+        classification = "QUESTIONABLE_TIMING"
+    elif ctx.get("entry_setup_type") in ("PULLBACK", "BREAKOUT"):
+        classification = "GOOD_TIMING"
+    else:
+        classification = "NEUTRAL"
+    confidence = "MEDIUM" if dq == "RECONSTRUCTED_5M" else "LOW"
+    return {"classification": classification, "evidence": tags, "confidence": confidence, "data_quality": dq}
+
+
+def evaluate_stop_quality(ctx, stop_quality_evidence, initial_stop_price, entry_price):
+    """STOP_QUALITY軸：実STOPが記録されている（stop_quality_evidence=ACTUAL_STOP）トレード
+    のみ評価する。過去トレード（6227含む）や未記録トレードはUNKNOWNのまま（ユーザー指示：
+    推測禁止）。判定はSTOP幅をENTRY時点までのボラティリティ（pre_entry_avg_bar_range_pct、
+    直近5本平均レンジ％）と比較する構造的な評価であり、MAE・最終P&L・exit後の値動きは
+    一切使わない（「結果的に損切りが浅すぎた/深すぎた」という事後判定を禁止するため）。"""
+    ctx = ctx or {}
+    if stop_quality_evidence != "ACTUAL_STOP" or initial_stop_price is None or entry_price is None:
+        return {"classification": "UNKNOWN", "evidence": {}, "confidence": "LOW",
+                "data_quality": ctx.get("data_quality") or "NO_DATA"}
+    stop_distance_pct = round((entry_price - initial_stop_price) / entry_price * 100, 2)
+    avg_bar_range_pct = ctx.get("pre_entry_avg_bar_range_pct")
+    dq = ctx.get("data_quality")
+    if not avg_bar_range_pct or dq == "NO_DATA":
+        return {"classification": "UNKNOWN", "evidence": {"stopDistancePct": stop_distance_pct},
+                "confidence": "LOW", "data_quality": dq or "NO_DATA"}
+    ratio = round(stop_distance_pct / avg_bar_range_pct, 2)
+    if ratio < 1.0:
+        classification = "STRUCTURALLY_TIGHT"  # ENTRY時点の平均バーレンジ1本分未満＝ノイズで刈られやすい構造
+    elif ratio <= 4.0:
+        classification = "STRUCTURALLY_REASONABLE"
+    else:
+        classification = "STRUCTURALLY_WIDE"
+    confidence = "MEDIUM" if dq == "RECONSTRUCTED_5M" else "LOW"
+    return {"classification": classification,
+            "evidence": {"stopDistancePct": stop_distance_pct, "preEntryAvgBarRangePct": avg_bar_range_pct,
+                          "ratioToAvgBarRange": ratio},
+            "confidence": confidence, "data_quality": dq}
+
+
+def evaluate_exit_quality(stop_quality_evidence, final_stop_price, exit_price):
+    """EXIT_QUALITY軸：「決済の実行が計画（直近のcurrent_stop）通りだったか」という執行の質を
+    評価する（「決済して得だったか損だったか」は評価しない——それはtrade_result_score/gross_pnlの
+    役割であり、EXIT_QUALITYとは独立させる、ユーザー指示）。STOP記録が無いトレードはUNKNOWN。"""
+    if stop_quality_evidence != "ACTUAL_STOP" or final_stop_price is None or exit_price is None:
+        return {"classification": "UNKNOWN", "evidence": {}, "confidence": "LOW", "data_quality": "NO_DATA"}
+    diff_pct = round((exit_price - final_stop_price) / final_stop_price * 100, 2)
+    if abs(diff_pct) <= 0.3:
+        classification = "STOP_HONORED"  # 設定していたSTOP付近で計画通り執行
+    elif exit_price > final_stop_price:
+        classification = "DISCRETIONARY_EARLY_EXIT"  # STOPに達する前に裁量で決済
+    else:
+        classification = "SLIPPAGE_BEYOND_STOP"  # STOPより不利な価格で約定（ギャップ・執行遅延等）
+    return {"classification": classification, "evidence": {"exitVsFinalStopPct": diff_pct},
+            "confidence": "MEDIUM", "data_quality": "ACTUAL_STOP"}
+
+
+def detect_reentry_stage_sequence(day_bars, exit_idx, exit_price):
+    """REENTRY_QUALITY観測用：決済後の5分足を先頭バーから1本ずつ、その時点までのデータのみで
+    EARLY_SETUP→TRIGGER→CONFIRMED_BREAK→CHASEの段階検出を行う（未来情報リーク防止：バーiの
+    判定にはday_bars[:i+1]のみを使う。REENTRY_QUALITYだけは例外的にexit後のデータを参照して
+    よい、というユーザー指示に基づく——ENTRY/STOP評価とは異なり、EXIT後に何が起きたかを
+    観測するのがこの軸の目的そのものであるため）。
+    設計は[[trade-cockpit-early-trigger-stage-design]]（2026-09-16承認）のTRIGGER定義
+    （hard gate: 直近ミクロ高値ブレイク＋出来高再拡大／加点条件: VWAP reclaim・RSI非過熱・
+    momentum_state。hard gateには加点条件を使わない）に基づく。ただし本関数は同設計が想定する
+    「常時稼働の観測エンジン」（auto_signal_events拡張・全銘柄スキャン）ではなく、Phase Cの
+    1トレード単位のREENTRY_QUALITY評価にスコープを絞った最小実装（transition-only recordingや
+    仮想ENTRY追跡は行わない）。EARLY_SETUPは将来複数setup_typeへ拡張可能な構造とするため、
+    現時点ではRANGE_COMPRESSION型のみを検出する。
+    戻り値：{"dataQuality":str, "postExitBarCount":int, "stages":[{stage, ...}],
+             "earlySetup":dict|None, "trigger":dict|None, "confirmedBreak":dict|None,
+             "chase":dict|None}"""
+    result = {"dataQuality": "NO_DATA", "postExitBarCount": 0, "stages": [],
+              "earlySetup": None, "trigger": None, "confirmedBreak": None, "chase": None}
+    if not day_bars or exit_idx is None or exit_idx >= len(day_bars) - 1:
+        return result
+    post_exit = day_bars[exit_idx + 1:]
+    result["postExitBarCount"] = len(post_exit)
+    if len(post_exit) < 3:
+        return result
+    result["dataQuality"] = "RECONSTRUCTED_5M"
+    exit_bar_time = day_bars[exit_idx]["time"]
+    trigger_idx_global = None
+
+    for local_i in range(2, len(post_exit)):
+        global_i = exit_idx + 1 + local_i
+        seg = day_bars[:global_i + 1]
+        closes = [b["close"] for b in seg]
+        cur_bar = day_bars[global_i]
+        cur_price = closes[-1]
+        elapsed_min = round((cur_bar["time"] - exit_bar_time) / 60, 1)
+
+        if trigger_idx_global is None:
+            lookback_start = max(0, local_i - 6)
+            recent_prior_highs = [post_exit[j]["high"] for j in range(lookback_start, local_i)]
+            recent_prior_vols = [post_exit[j]["volume"] for j in range(lookback_start, local_i)]
+            micro_high = max(recent_prior_highs) if recent_prior_highs else None
+            avg_prior_vol = (sum(recent_prior_vols) / len(recent_prior_vols)) if recent_prior_vols else None
+
+            # EARLY_SETUP（RANGE_COMPRESSION型のみ、初回検出時に1回だけ記録）
+            if result["earlySetup"] is None:
+                bars_dict = {"closes": closes, "highs": [b["high"] for b in seg],
+                              "lows": [b["low"] for b in seg], "volumes": [b["volume"] for b in seg]}
+                range_metrics_es = compute_tradeable_range_metrics(bars_dict, current=cur_price,
+                                                                     day_high=max(b["high"] for b in seg))
+                if range_metrics_es.get("rangeTrend") == "CONTRACTING":
+                    result["earlySetup"] = {"setupType": "RANGE_COMPRESSION", "barTime": cur_bar["time"],
+                                             "price": round(cur_price, 2), "elapsedMinutesFromExit": elapsed_min}
+                    result["stages"].append({"stage": "EARLY_SETUP", **result["earlySetup"]})
+
+            broke_micro_high = micro_high is not None and cur_bar["high"] > micro_high * 1.001
+            volume_reexpansion = avg_prior_vol is not None and avg_prior_vol > 0 \
+                and cur_bar["volume"] >= avg_prior_vol * 1.8
+            if broke_micro_high and volume_reexpansion:
+                bars_dict = {"closes": closes, "highs": [b["high"] for b in seg],
+                              "lows": [b["low"] for b in seg], "volumes": [b["volume"] for b in seg]}
+                day_high_so_far = max(b["high"] for b in seg)
+                range_metrics = compute_tradeable_range_metrics(bars_dict, current=cur_price, day_high=day_high_so_far)
+                score, room = compute_tradeable_range_score(range_metrics)
+                rsi = _rsi(closes) if len(closes) >= 15 else None
+                vwap = _vwap(closes, [b["volume"] for b in seg])
+                day_open = seg[0]["open"]
+                change_from_open_pct = round((cur_price - day_open) / day_open * 100, 2) if day_open else None
+                trigger_idx_global = global_i
+                trigger_info = {
+                    "barTime": cur_bar["time"], "price": round(cur_price, 2), "elapsedMinutesFromExit": elapsed_min,
+                    "hardGate": {"volumeReexpansion": True, "microHighBreak": True,
+                                 "microHigh": round(micro_high, 2), "volumeRatio": round(cur_bar["volume"] / avg_prior_vol, 2)},
+                    "components": {  # 加点条件のsnapshotのみ、hard gateの判定には使わない
+                        "vwapReclaim": (vwap is not None and cur_price >= vwap),
+                        "rsi": round(rsi, 1) if rsi is not None else None,
+                        "rsiOverheated": (rsi is not None and rsi >= 75),
+                        "tradeableRangeScore": score, "roomToMove": room,
+                        "momentumState": classify_momentum_state(range_metrics, change_from_open_pct),
+                    },
+                }
+                result["trigger"] = trigger_info
+                result["stages"].append({"stage": "TRIGGER", **trigger_info})
+        elif result["confirmedBreak"] is None:
+            trig = result["trigger"]
+            trig_bar = day_bars[trigger_idx_global]
+            held_above = cur_bar["low"] >= trig_bar["low"] * 0.997
+            advanced = cur_price > trig["price"]
+            if held_above and advanced:
+                bars_dict = {"closes": closes, "highs": [b["high"] for b in seg],
+                              "lows": [b["low"] for b in seg], "volumes": [b["volume"] for b in seg]}
+                range_metrics = compute_tradeable_range_metrics(bars_dict, current=cur_price,
+                                                                   day_high=max(b["high"] for b in seg))
+                score, room = compute_tradeable_range_score(range_metrics)
+                trig_score = trig["components"].get("tradeableRangeScore")
+                result["confirmedBreak"] = {
+                    "barTime": cur_bar["time"], "price": round(cur_price, 2), "elapsedMinutesFromExit": elapsed_min,
+                    "priceAdvancePct": round((cur_price - trig["price"]) / trig["price"] * 100, 2),
+                    "elapsedMinutesFromTrigger": round((cur_bar["time"] - trig_bar["time"]) / 60, 1),
+                    "tradeableRangeScore": score, "roomToMove": room,
+                    "tradeableRangeScoreDecay": round(score - trig_score, 1) if trig_score is not None else None,
+                }
+                result["stages"].append({"stage": "CONFIRMED_BREAK", **result["confirmedBreak"]})
+        elif result["chase"] is None:
+            cb = result["confirmedBreak"]
+            rsi = _rsi(closes) if len(closes) >= 15 else None
+            bars_dict = {"closes": closes, "highs": [b["high"] for b in seg],
+                          "lows": [b["low"] for b in seg], "volumes": [b["volume"] for b in seg]}
+            range_metrics = compute_tradeable_range_metrics(bars_dict, current=cur_price,
+                                                               day_high=max(b["high"] for b in seg))
+            _score, room = compute_tradeable_range_score(range_metrics)
+            rsi_hot = rsi is not None and rsi >= 75
+            room_decayed = room == "LOW" and cb["roomToMove"] != "LOW"
+            if cur_price > cb["price"] and (rsi_hot or room_decayed):
+                result["chase"] = {
+                    "barTime": cur_bar["time"], "price": round(cur_price, 2), "elapsedMinutesFromExit": elapsed_min,
+                    "rsi": round(rsi, 1) if rsi is not None else None, "roomToMove": room,
+                    "reason": "RSI_OVERHEAT" if rsi_hot else "ROOM_TO_MOVE_DECAY",
+                }
+                result["stages"].append({"stage": "CHASE", **result["chase"]})
+    return result
+
+
+def evaluate_reentry_quality(stage_sequence):
+    """REENTRY_QUALITY軸：決済後にTRIGGER相当の再上昇シグナルを検出できたか。「上がったから
+    REENTRYすべきだった」ではなく「その時点までの情報でTRIGGERを検出できたか」を評価する
+    （detect_reentry_stage_sequence自体がバーごとに未来データを使わない設計のため、ここでは
+    その結果を分類するだけ）。"""
+    stage_sequence = stage_sequence or {}
+    dq = stage_sequence.get("dataQuality")
+    if dq != "RECONSTRUCTED_5M":
+        return {"classification": "UNKNOWN", "evidence": {}, "confidence": "LOW", "data_quality": dq or "NO_DATA"}
+    if stage_sequence.get("trigger"):
+        classification = "TRIGGER_DETECTED"
+    else:
+        classification = "NO_TRIGGER_DETECTED"
+    return {
+        "classification": classification,
+        "evidence": {"earlySetup": stage_sequence.get("earlySetup"), "trigger": stage_sequence.get("trigger"),
+                      "confirmedBreak": stage_sequence.get("confirmedBreak"), "chase": stage_sequence.get("chase"),
+                      "postExitBarCount": stage_sequence.get("postExitBarCount")},
+        "confidence": "MEDIUM" if stage_sequence.get("trigger") else "LOW",
+        "data_quality": dq,
+    }
+
+
+def evaluate_trade_quality_axes(ctx, stage_sequence, stop_quality_evidence, initial_stop_price,
+                                 final_stop_price, entry_price, exit_price):
+    """ENTRY_QUALITY / STOP_QUALITY / EXIT_QUALITY / REENTRY_QUALITYの4軸をまとめて返す。
+    各軸は完全に独立（1つの軸の値を他の軸の判定に使わない）。trade_experiences.quality_axes_json
+    へそのまま保存する想定。"""
+    return {
+        "entry_quality": evaluate_entry_quality(ctx),
+        "stop_quality": evaluate_stop_quality(ctx, stop_quality_evidence, initial_stop_price, entry_price),
+        "exit_quality": evaluate_exit_quality(stop_quality_evidence, final_stop_price, exit_price),
+        "reentry_quality": evaluate_reentry_quality(stage_sequence),
+    }
+
+
 def sync_trade_experiences_for_date(database_url, user_id, review_date):
     """15:30自動評価（指示書12・13・21・26・29番）：当日の実トレード（勝ち/負け/同値/損切り/
     利確、全部——勝ちトレードだけの登録は禁止）をtrade_experiencesへ冪等にupsertし、WAITのみで
@@ -13824,6 +14099,10 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
         # 推測せずNoneのまま保存する（指示書7番「不明な情報を推測で埋めない」）。
         market_ctx = reconstruct_trade_market_context(t.get("code"), t.get("market", "JP"), review_date,
                                                         entry_time_iso, exit_time_iso)
+        # Trade Learning Phase C：REENTRY_QUALITY観測用のday_bars/exit_idxは内部連携専用
+        # （DB保存対象のmarket_ctxから即座に取り除く——arraysByCode漏洩と同種の事故防止）。
+        _day_bars_for_reentry = market_ctx.pop("day_bars", None)
+        _exit_idx_for_reentry = market_ctx.pop("exit_idx", None)
         loss_tags = []
         if result_class == "LOSS":
             loss_tags = classify_loss_reasons(gross_pnl_pct, market_ctx, exit_price=exit_price,
@@ -13869,6 +14148,19 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
         # 一切参照・変更しない（完全に別枠の観測用フィールド、未来情報リーク防止）。
         opportunity_windows = market_ctx.get("opportunity_windows")
         opportunity = classify_trade_opportunity(result_class, opportunity_windows)
+
+        # Trade Learning Phase C（2026-09-16新規）：ENTRY_QUALITY/STOP_QUALITY/EXIT_QUALITY/
+        # REENTRY_QUALITYの4軸独立評価。stop_quality_evidence（Phase Bでtrade_historyへ追加済み）
+        # がACTUAL_STOPのトレードのみSTOP_QUALITY/EXIT_QUALITYを評価し、それ以外（6227含む過去
+        # トレード等）はUNKNOWNのまま——推測しない。全軸ともENTRY SCORE・自動売買ルールには
+        # 一切接続しない（観測・保存のみ）。
+        stage_sequence = detect_reentry_stage_sequence(_day_bars_for_reentry, _exit_idx_for_reentry, exit_price)
+        quality_axes = evaluate_trade_quality_axes(
+            market_ctx, stage_sequence,
+            stop_quality_evidence=t.get("stop_quality_evidence"),
+            initial_stop_price=t.get("initial_stop_price"), final_stop_price=t.get("final_stop_price"),
+            entry_price=entry_price, exit_price=exit_price,
+        )
 
         fields = {
             "trade_date": review_date, "symbol": t.get("code"), "stock_name": t.get("name"),
@@ -13923,6 +14215,10 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
                     "entry_unblock_conditions": entry_unblock_conditions,  # 指示書9番
                 } if result_class == "LOSS" else {}),
             },
+            # Trade Learning Phase C（2026-09-16新規）：ENTRY_QUALITY/STOP_QUALITY/EXIT_QUALITY/
+            # REENTRY_QUALITYの4軸独立評価。既存execution_score/entry_avoidability/loss_reason_tags
+            # とは別枠（1つの軸を他の軸の判定に流用しない）。
+            "quality_axes_json": quality_axes,
             "notes": "15:30自動評価による自動登録（sync_trade_experiences_for_date）。",
         }
         try:

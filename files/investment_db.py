@@ -603,6 +603,16 @@ ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS stop_quality_evidence TEXT;
 -- 変更しない、根拠の分類・自由文のみ追加）。
 ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS stop_reason_category TEXT;
 ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS stop_reason_text TEXT;
+
+-- 2026-09-16新規（Trade Learning Phase C：ENTRY/STOP/EXIT/REENTRY QUALITY 4軸独立評価）：
+-- 6227 AIメカテック実例を基準ケースとし、「損切り後に上がった＝STOPが悪かった」という
+-- 結果論の一括学習を避けるため、ENTRY判断のタイミング・STOP幅の構造的妥当性（実STOP記録
+-- ありのトレードのみ、無ければUNKNOWN）・EXIT執行の計画遵守・EXIT後のTRIGGER検出可否を
+-- 完全に独立した4つの軸として保存する（server.py evaluate_trade_quality_axes()）。
+-- 既存execution_score/entry_avoidability/loss_reason_tags等は無変更、別枠のJSONB列として追加
+-- するのみ。本Phaseは観測・保存までで、ENTRY SCOREのweight変更・自動ルール昇格・STOP幅の
+-- 自動変更には一切接続しない。
+ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS quality_axes_json JSONB;
 """
 
 # 2026-09-09新規（ルール学習システム）：投資判断ログ系の他テーブルより後に作成する必要は
@@ -2498,7 +2508,8 @@ def relevant_trade_rules_for(database_url, user_id, categories=None, limit=8):
 
 _TRADE_EXPERIENCE_JSON_COLS = ("wait_reason_json", "entry_reason_json", "exit_reason_json",
                                  "invalidation_reason_json", "pattern_tags_json", "score_breakdown_json",
-                                 "decision_snapshot_json", "post_trade_analysis_json", "rotation_context_json")
+                                 "decision_snapshot_json", "post_trade_analysis_json", "rotation_context_json",
+                                 "quality_axes_json")
 _TRADE_EXPERIENCE_COLS = (
     "trade_date", "symbol", "stock_name", "side", "trade_style", "quantity", "entry_price", "exit_price",
     "entry_time", "exit_time", "gross_pnl", "gross_pnl_pct", "holding_minutes", "pre_entry_state",
@@ -2516,6 +2527,7 @@ _TRADE_EXPERIENCE_COLS = (
     "driver_state_at_exit", "cross_market_score_at_entry",
     "sector_at_entry", "sector_state_at_entry", "sector_flow_score_at_entry",
     "sector_state_at_exit", "sector_flow_score_at_exit", "rotation_context_json",
+    "quality_axes_json",
 )
 
 
