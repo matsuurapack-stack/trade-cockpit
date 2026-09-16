@@ -4722,6 +4722,17 @@ def _score_entry_candidates(database_url, user_id):
           f"marketDataPrefetch={section_ms['marketDataPrefetch']} dbSupportPrefetch={section_ms['dbSupportPrefetch']} "
           f"dailyArraysPrefetch={section_ms['dailyArraysPrefetch']} candidateLoopTotal={section_ms['candidateLoopTotal']} "
           f"snapshotPersistence={section_ms['snapshotPersistence']} other={section_ms['other']}")
+
+    # 金融政策イベント統合 Phase4新規（2026-09-16）：MARKET_EVENT_RISK（銘柄非依存）を分析材料
+    # として追加するだけ——entry_score/entryState/entryReadyTop5の並び順・既存のEVENT_RISK_HIGH
+    # 信号には一切影響しない（指示書「ENTRY SCOREのweightを変更しない」「Entry Gateへの強制
+    # BLOCKもまだ行わない」）。銘柄固有の感応度（②STOCK_EVENT_SENSITIVITY）はPhase5。
+    try:
+        macro = build_active_macro_events(database_url, user_id)
+    except Exception as e:
+        print("  entry-candidates: active macro events取得で例外（無視して続行）", e)
+        macro = {"events": [], "market_event_risk": "LOW"}
+
     return {
         "entryReadyTop5": [{**c, "rank": i + 1} for i, c in enumerate(entry_ready_top5)],
         "watchCandidates": watch_candidates,
@@ -4732,6 +4743,8 @@ def _score_entry_candidates(database_url, user_id):
         "reversalWatchCandidates": reversal_watch,
         "dataQuality": overall_quality,
         "generatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "activeMacroEvents": macro["events"],  # Phase4新規：canonical market_eventsのevent_status付き一覧（銘柄非依存）
+        "marketEventRisk": macro["market_event_risk"],  # Phase4新規：既存classify_event_risk_level/compute_event_risk_for_eventsをそのまま再利用したLOW/MEDIUM/HIGH/EXTREME
         "debug": debug,
     }
 
@@ -14264,6 +14277,149 @@ def compute_event_risk_for_events(events_with_hours):
 def event_risk_lot_multiplier(event_risk_level):
     """指示書8番：イベント前ロット縮小。LOW1.00/MEDIUM0.75/HIGH0.50/EXTREME0.25。"""
     return CHORUCO_EVENT_RISK_LOT_MULTIPLIER.get(event_risk_level, 1.0)
+
+
+# ============================================================
+# MARKET EVENT RISK（金融政策イベント統合 Phase4新規、2026-09-16）。
+#
+# 今買い時TOP5 Phase2/3で作ったcanonical market_events（canonical_event_key/event_time_jst/
+# time_precision付き）を使い、①イベントそのものの市場リスク（MARKET_EVENT_RISK、銘柄非依存）
+# を正確な時間距離で算出する。②銘柄固有の感応度（STOCK_EVENT_SENSITIVITY/RATE_SENSITIVITY、
+# 「高PERだから強く減点」等）はPhase5で別途実装する——今回のスコープ外（指示書の明示的な
+# フェーズ分離、「FOMCが存在する→全銘柄EVENT_RISK」という一律判定を避けるための最重要原則）。
+#
+# 既存のEVENT_RISK_HIGH信号生成（investment_db.upcoming_event_signals()、営業日単位の
+# business_days_until<=1で一律HIGH/CRITICAL扱いにする既存ロジック）・既存の
+# classify_event_risk_level/compute_event_risk_for_events（Chorucoスタイル市場モード用、
+# LOW/MEDIUM/HIGH/EXTREME）はどちらも変更しない——後者はそのまま「リスクレベル判定ロジック」
+# として再利用する（指示書「新しいイベントリスクエンジンを二重実装しないこと」）。ここで新規に
+# 作るのは、canonical_event_keyを使った「イベント状態（UPCOMING/IMMINENT/IN_PROGRESS/
+# RELEASED/POST_EVENT）」と「正確なtime_to_event」の生成部分のみ——既存はbusiness_days_until
+# （日単位整数）しか持たないため、FOMCが翌日にあるだけで終日一律強いペナルティになりがち
+# だった問題への対応（指示書「翌日にあるだけで終日強いペナルティを掛けない」）。
+# ENTRY SCOREのweight・既存のEVENT_RISK_HIGH信号・Entry Gateの強制BLOCKには一切触れない
+# （指示書「Phase4ではまだ変更しない」）——ここで作る値は銘柄分析への追加専用の参考情報。
+# ============================================================
+
+MARKET_EVENT_IMMINENT_HOURS = 1.0  # 発表前この時間以内はIMMINENT（状態生成用の閾値であり、まだ投資ルールではない）
+MARKET_EVENT_JUST_RELEASED_HOURS = 2.0  # 発表後この時間以内はRELEASED（直後の値動きを「発表前提」の判断と混同させない）
+MARKET_EVENT_STATUS_ACTIVE = ("UPCOMING", "IMMINENT", "IN_PROGRESS", "RELEASED")  # market_event_risk集計対象（POST_EVENTは除外＝沈静化後はカウントしない）
+
+
+def compute_market_event_status(event, now_jst=None):
+    """1件のcanonical market_events行（event_date/event_time_jst/time_precision/
+    canonical_event_key等を持つdict、raw_payload.end_dateがあれば複数日イベントとして扱う）
+    から、現在時刻（now_jst省略時は実時刻、テスト・監査用に固定時刻を明示的に渡せる——指示書
+    「同一snapshot時刻で発表後もリスクが変わらない」回帰テストのため）との関係で
+    event_status・time_to_event_hoursを算出する。
+    time_precisionがDATE_ONLY/APPROXIMATEの場合はIMMINENT/RELEASEDのような時刻依存の判定は
+    せず、日単位でUPCOMING/IN_PROGRESS/POST_EVENTのみを返す（指示書「DATE_ONLYや
+    APPROXIMATEをEXACT時刻と同じ精度で扱わない」、推測で時刻精度を作らない）。
+    戻り値：dict（canonical_event_key/market_event_id/title/event_date/event_time_jst/
+    time_precision/time_to_event_hours/event_status/importance）。event_dateが無い等で
+    判定不能ならNone。"""
+    event_date_str = event.get("event_date")
+    if not event_date_str:
+        return None
+    try:
+        event_date = datetime.date.fromisoformat(str(event_date_str)[:10])
+    except (ValueError, TypeError):
+        return None
+    now_jst = now_jst or datetime.datetime.now(_JST)
+    today = now_jst.date()
+
+    raw_payload = event.get("raw_payload")
+    end_date_str = raw_payload.get("end_date") if isinstance(raw_payload, dict) else None
+    end_date = None
+    if end_date_str:
+        try:
+            end_date = datetime.date.fromisoformat(str(end_date_str)[:10])
+        except (ValueError, TypeError):
+            end_date = None
+
+    time_precision = event.get("time_precision") or "DATE_ONLY"
+    event_time_jst = event.get("event_time_jst")
+
+    if end_date and event_date <= today <= end_date:
+        # 複数日イベント（BOJ会合の開催期間そのもの等）：期間中は常にIN_PROGRESS。
+        event_status = "IN_PROGRESS"
+        time_to_event_hours = 0.0
+    elif time_precision == "EXACT" and event_time_jst:
+        try:
+            h, m = event_time_jst.split(":")
+            event_dt = datetime.datetime(event_date.year, event_date.month, event_date.day,
+                                           int(h), int(m), tzinfo=_JST)
+        except (ValueError, TypeError):
+            return None
+        time_to_event_hours = (event_dt - now_jst).total_seconds() / 3600
+        if time_to_event_hours > MARKET_EVENT_IMMINENT_HOURS:
+            event_status = "UPCOMING"
+        elif time_to_event_hours > 0:
+            event_status = "IMMINENT"
+        elif time_to_event_hours > -MARKET_EVENT_JUST_RELEASED_HOURS:
+            event_status = "RELEASED"
+        else:
+            event_status = "POST_EVENT"
+    else:
+        # DATE_ONLY/APPROXIMATE：時刻レベルの判定はしない（推測しない）。日単位のみ。
+        time_to_event_hours = (event_date - today).days * 24.0
+        if event_date > today:
+            event_status = "UPCOMING"
+        elif event_date == today:
+            event_status = "IN_PROGRESS"  # 当日中のどの時点かは不明。安全側（発表前後を断定しない）
+        else:
+            event_status = "POST_EVENT"
+
+    return {
+        "canonical_event_key": event.get("canonical_event_key"),
+        "market_event_id": event.get("id"),
+        "title": event.get("title"),
+        "event_date": str(event_date_str)[:10],
+        "event_time_jst": event_time_jst,
+        "time_precision": time_precision,
+        "time_to_event_hours": round(time_to_event_hours, 2),
+        "event_status": event_status,
+        "importance": event.get("importance"),
+    }
+
+
+def build_active_macro_events(database_url, user_id, now_jst=None, days_back=1, days_ahead=3):
+    """canonical_event_keyを持つmarket_eventsのうち、[今日-days_back, 今日+days_ahead]に
+    該当するものを、現在時刻（now_jst省略時は実時刻）基準のevent_status付きで返す
+    （銘柄非依存、指示書①MARKET_EVENT_RISK専用。②銘柄固有感応度はPhase5）。
+    market_event_risk（LOW/MEDIUM/HIGH/EXTREME）は既存classify_event_risk_level/
+    compute_event_risk_for_events（Chorucoスタイル市場モードで既に使っているロジック）を
+    そのまま再利用する——ここではhours_to_event（正確な値、負値は経過時間として0扱い）を
+    渡すだけで、判定ロジック自体は二重実装しない。POST_EVENT（発表後の沈静化期間を過ぎた
+    もの）は集計対象から除外する。
+    戻り値：{"events": [...], "market_event_risk": "LOW"|"MEDIUM"|"HIGH"|"EXTREME"}"""
+    now_jst = now_jst or datetime.datetime.now(_JST)
+    today = now_jst.date()
+    if investment_db is None or not database_url:
+        return {"events": [], "market_event_risk": "LOW"}
+    try:
+        raw_events = investment_db.list_market_events(
+            database_url, user_id, from_date=(today - datetime.timedelta(days=days_back)).isoformat(),
+            to_date=(today + datetime.timedelta(days=days_ahead)).isoformat())
+    except Exception as e:
+        print("  MarketEventRisk: market_events取得で例外（無視して続行）", e)
+        raw_events = []
+
+    statuses = []
+    for e in raw_events:
+        if not e.get("canonical_event_key"):
+            continue  # Phase4はcanonical化済みイベントのみ対象（手動の経済指標等は既存のupcoming_event_signals経路に委ねる）
+        status = compute_market_event_status(e, now_jst=now_jst)
+        if status:
+            statuses.append(status)
+    statuses.sort(key=lambda s: s["time_to_event_hours"])
+
+    events_with_hours = [{"importance": s["importance"], "title": s["title"],
+                            "hours_to_event": max(0.0, s["time_to_event_hours"])}
+                           for s in statuses if s["event_status"] in MARKET_EVENT_STATUS_ACTIVE]
+    market_event_risk = compute_event_risk_for_events(events_with_hours)
+
+    return {"events": statuses, "market_event_risk": market_event_risk}
 
 
 # ---- SECTOR FLOW（指示書27〜28番） ----
