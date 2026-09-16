@@ -1843,6 +1843,24 @@ STOCK_NAME_NEWS_LIMIT = 25  # 2026-07-14 ユーザー要望により15→25へ�
 # （2026-08-20 ユーザー要望：広告・野球結果混入を避けるため、まず立花証券APIを優先する）。
 STOCK_NAME_NEWS_NQN_MIN = 2
 
+# 2026-09-16新規（指示書「登録銘柄ニュース：4銘柄の一般ニュース完全除外」）：
+# 社名一致によるGoogleニュース検索（企業名検索による一般ニュース）は、_is_promo_news()等の
+# キーワードフィルタだけではスポーツ・芸能・PR記事のノイズを完全に除去できない銘柄がある
+# （実例：2282日本ハム＝プロ野球、1812鹿島＝サッカー、2802味の素＝スポーツ協賛・PR記事、
+# 2801キッコーマン＝同種の一般記事混入）。これら4銘柄はbuild_stock_name_news()の
+# Googleニュース検索（企業名検索）を完全にスキップする（タイトル内容によるフィルタ判定は
+# 行わず、銘柄コード単位で一般ニュース取得対象から除外する）。
+# 対象外の処理（TDnet/公式IR＝build_stock_news()・build_disclosure_news()、株価取得・
+# チャート・ENTRY TOP5・相対強弱・銘柄分析・Smart Import・ポートフォリオ等）には
+# 一切影響させない——このセットはbuild_stock_name_news()内でのみ参照する。
+# 将来対象を追加する場合はこのsetへコード追加するだけでよい。
+STOCK_NAME_NEWS_DISABLED_CODES = {
+    "1812",  # 鹿島
+    "2282",  # 日本ハム
+    "2801",  # キッコーマン
+    "2802",  # 味の素
+}
+
 # 社名一致は広く拾う分、無関係な記事が紛れ込みやすい（判断材料としての価値が薄いため除外する）。
 # ①Amazon「プライムデー」等のセール告知・広告・商品レビュー記事（Amazon/Microsoft/Appleのような
 # 一般名詞に近い社名で特に多い）②楽天グループ（楽天イーグルス）・ソフトバンクグループ
@@ -2061,6 +2079,8 @@ def build_stock_name_news(watchlist):
         market = w.get("market", "JP")
         if not name:
             continue
+        if code in STOCK_NAME_NEWS_DISABLED_CODES:
+            continue  # 指示書：一般ニュース（企業名検索）取得対象から除外。NQN（上のtachibana_items）はそのまま残す
         nqn_n = tachibana_count.get(code, 0)
         if market != "US" and nqn_n >= STOCK_NAME_NEWS_NQN_MIN:
             continue  # NQNで十分な件数が取れている銘柄はGoogleニュースを使わない（ノイズ回避）
