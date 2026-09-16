@@ -1870,6 +1870,47 @@ function lightweightReason(enr){
   return [meta?.label,breakTxt,rsTxt,`前日比${pctTxt}`,reasonTxt].filter(Boolean).join("・");
 }
 
+// 2026-09-16新規（今買い時TOP5と詳細分析判定の整合性修正、指示書1-3・9番）：サーバー側
+// entry_score/entryStateは監視銘柄全体を軽量パイプライン（Stage1/Stage2/5分足スナップショット
+// のみ）でバッチ処理しており、詳細分析（analyze_stock()）が検出するRSI過熱・出来高の裏付け
+// 不足・上値抵抗線接近等のCHASE RISK、およびEntry Conditionsチェックリストの未達を反映して
+// いない（実データで確認：2026-09-16 5019出光興産はTOP5側RSI80.9/entry_conditions5-5で
+// ENTRY_READYだが、analyze_stock()側はentryConditionsMet 4/6・chaseRisk=true「高値圏での
+// 長い陽線の天井」「RSI(81)だけが高く出来高等の裏付けがない」でWAIT）。
+// 一方、監視銘柄一覧・今日の注目TOP5側は既にenrichWatchRow()でこれらを統合済み
+// （2026-09-09「TOP5/監視銘柄一覧のENTRY READYが詳細分析のCHASE RISK／WAIT判定と矛盾する
+// 不具合対応」）。ここではその既存の統合結果（enr.actionStatus/waitReasons/riskReasons）を
+// 「今買い時TOP5」表示にも同じ基準で適用する——新しい判定基準・新しいサーバー計算は追加しない
+// （既存関数の再利用、指示書「既存実装を壊さず」）。
+// ENTRY SCORE・候補順位（rank）自体は一切変更しない——「良い候補（順位・スコア）」と
+// 「今ENTRYしてよいか（状態）」を分離する（指示書2・3番、「候補順位は高いがWAIT」は正常ケース）。
+// 純粋関数（DOM/API非依存）：candidateEntryState（サーバーのc.entryState）とenr
+// （enrichedByCode[c.code]、無ければundefined＝未分析銘柄はオーバーライドしない）を受け取り、
+// {effectiveEntryState, confirmationOverrideReasons, confirmationUnblockConditions}を返す。
+function resolveTop5EntryStateOverride(candidateEntryState,enr){
+  const wasReadyLabel=candidateEntryState==="NOW_BUYABLE"||candidateEntryState==="ENTRY_READY";
+  if(!wasReadyLabel||!enr){
+    return {effectiveEntryState:candidateEntryState,confirmationOverrideReasons:null,confirmationUnblockConditions:null};
+  }
+  if(enr.actionStatus==="RISK"){
+    const riskReasons=enr.riskReasons||[];
+    return {
+      effectiveEntryState:"CHASE_RISK",
+      confirmationOverrideReasons:riskReasons.map(r=>RISK_REASON_META[r]||r),
+      confirmationUnblockConditions:riskReasons.map(r=>RISK_UNBLOCK_CONDITION_META[r]).filter(Boolean),
+    };
+  }
+  if(enr.actionStatus==="WAIT"){
+    const waitReasons=enr.waitReasons||[];
+    return {
+      effectiveEntryState:waitReasons.includes("NEAR_BREAKOUT")?"WAIT_BREAKOUT":"WAIT_PULLBACK",
+      confirmationOverrideReasons:waitReasons.map(r=>WAIT_REASON_META[r]||r),
+      confirmationUnblockConditions:waitReasons.map(r=>WAIT_UNBLOCK_CONDITION_META[r]).filter(Boolean),
+    };
+  }
+  return {effectiveEntryState:candidateEntryState,confirmationOverrideReasons:null,confirmationUnblockConditions:null};
+}
+
 // Status判定（Trade Cockpit v2 Phase1）。ルールベース・軽量計算のみ（サーバー側analyze_stock()は
 // 呼ばない＝279銘柄規模でも重くならないよう、既に画面上にある値〈stockQuotes・sector平均・
 // breakoutLevels〉だけから算出する）。RS Scoreの重み付けは初期値。運用しながら調整する想定。
@@ -2216,6 +2257,29 @@ const WAIT_REASON_META = {
   NO_PULLBACK_YET:            "押し目未形成",
   ENTRY_CONDITIONS_INCOMPLETE:"エントリー条件未達",
   PULLBACK_PENDING:           "押し目待ち",
+};
+// 2026-09-16新規（今買い時TOP5と詳細分析判定の整合性修正、指示書5・9番）：「ENTRYを止めるだけ
+// でなく、何を確認すればENTRY解禁になるか」を各WAIT/RISK理由ごとに提示する。
+const WAIT_UNBLOCK_CONDITION_META = {
+  VWAP_NOT_RECLAIMED: "VWAP回復を確認",
+  RANGE_UNCONFIRMED: "当日安値からの反発（下げ止まり）を確認",
+  NEAR_BREAKOUT: "直近高値を明確に上抜け",
+  SECTOR_WEAK: "セクターRSの改善",
+  MARKET_SOFT: "地合いの落ち着き、または銘柄自身のRSがさらに強まる",
+  NO_PULLBACK_YET: "一度押し目（反落）を形成してから",
+  ENTRY_CONDITIONS_INCOMPLETE: "分析タブのEntry Conditions全項目クリア",
+  PULLBACK_PENDING: "押し目候補ゾーンへの到達",
+};
+const RISK_UNBLOCK_CONDITION_META = {
+  CHASE_UP: "高値からの過熱解消・出来高を伴った押し目形成",
+  VWAP_EXTENDED: "VWAPまで反落・再接近",
+  VOLUME_CRASH: "出来高が落ち着き値動きが安定",
+  FALLING_KNIFE: "下落が止まり反発を確認",
+  CHASE_RISK: "高値追いが解消され押し目を形成",
+  SPIKE_REVERSAL: "反落が一巡し安値を切り上げる",
+  EXTREME_MOVE: "値動きが落ち着く",
+  MARGIN_DANGER: "信用倍率の改善",
+  RSI_HOT: "RSIが過熱水準から低下",
 };
 const TRADE_CANDIDATE_STATUS_OPTIONS=[
   {value:"WATCH",label:"監視"},{value:"WAIT",label:"待機"},
@@ -4881,6 +4945,16 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
   // 市場タブの「朝一分析」コピーも同じ関数で同じTOP5を算出する（二重実装を避ける）。
   const enriched=useMemo(()=>computeEnrichedWatch(items,stockQuotes,metrics,watchlistAll,breakoutLevels,analysisData,marketRiskLabel),
     [items,stockQuotes,metrics,watchlistAll,breakoutLevels,analysisData,marketRiskLabel]);
+  // 今買い時TOP5と詳細分析判定の整合性修正（2026-09-16新規、指示書1-3番）：サーバー側
+  // entry_score/entryStateは監視銘柄全体をバッチ処理する軽量パイプライン（Stage1/Stage2/
+  // 5分足スナップショットのみ）で計算しており、詳細分析（analyze_stock()、RSI過熱・
+  // Entry Conditionsチェックリスト・押し目未形成等のCHASE RISK判定）の結果を反映していない。
+  // 逆に、監視銘柄一覧・今日の注目TOP5側は既にenrichWatchRow()でこれらを統合済み
+  // （2026-09-09「TOP5/監視銘柄一覧のENTRY READYが詳細分析のCHASE RISK／WAIT判定と矛盾する
+  // 不具合対応」、上のenriched参照）。ここではその既存の統合結果（enr.actionStatus/
+  // waitReasons/riskReasons）を「今買い時TOP5」表示にも同じ基準で適用する——新しい判定基準・
+  // 新しいサーバー計算は追加しない（指示書2番「候補順位とENTRY可否は分離」、既存関数の再利用）。
+  const enrichedByCode=useMemo(()=>Object.fromEntries(enriched.map(e=>[e.code,e])),[enriched]);
 
   // v3-4「今日の注目TOP5」：判定不能（rsScore/currentが未取得）な銘柄は無理に順位付けせず除外する。
   // RISK（過熱・急落注意）とWEAK（弱い）は「デイトレ候補」としては出さない（除外）。
@@ -5291,7 +5365,9 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
             ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>現在ENTRY条件を満たす銘柄はありません。</div>
             : <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:entryResult.watchCandidates.length>0?10:0}}>
                 {entryResult.entryReadyTop5.map(c=>{
-                  const stMeta=ENTRY_STATE_META[c.entryState]||{label:c.entryState,color:"var(--inkFaint)"};
+                  const {effectiveEntryState,confirmationOverrideReasons,confirmationUnblockConditions}=
+                    resolveTop5EntryStateOverride(c.entryState,enrichedByCode[c.code]);
+                  const stMeta=ENTRY_STATE_META[effectiveEntryState]||{label:effectiveEntryState,color:"var(--inkFaint)"};
                   const isException=(c.reasons||[]).some(r=>r.includes("逆行耐性例外"));
                   const bd=c.scoreBreakdown||{};
                   const expanded=expandedScoreCode===c.code;
@@ -5327,6 +5403,10 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                       </div>
                       <span style={{fontSize:10,color:"var(--inkFaint)"}}>{expanded?"▲内訳を閉じる":"▼内訳"}</span>
                     </div>
+                    {confirmationOverrideReasons&&confirmationOverrideReasons.length>0 && <div style={{marginTop:4,fontSize:10.5,color:stMeta.color}}>
+                      詳細分析：{confirmationOverrideReasons.join("・")}
+                      {confirmationUnblockConditions&&confirmationUnblockConditions.length>0 && <span style={{color:"var(--inkSoft)"}}>　／　ENTRY解禁：{confirmationUnblockConditions.join("・")}</span>}
+                    </div>}
                     {expanded && <div style={{marginTop:6,paddingTop:6,borderTop:"1px dashed var(--rule)",display:"flex",flexWrap:"wrap",gap:"4px 14px",fontSize:11}}>
                       {ENTRY_SCORE_COMPONENT_META.map(m=><span key={m.key} className="mono">
                         {m.label} {bd[m.key]!=null?bd[m.key]:0}{m.max!=null?`/${m.max}`:""}
@@ -12468,8 +12548,14 @@ function App(){
                                   : a._fetchedAtIso && <FreshnessBadge iso={a._fetchedAtIso} staleMinutes={ANALYSIS_STALE_MINUTES}
                                       title={`この分析結果の取得時刻。サーバーへ送った現在値：${a._currentSent!=null?a._currentSent:"（未送信＝日足終値で算出）"}`}/>}
                               </div>
-                              <span title="総合評価（旧・星評価の後継。シグナル強度とMarket RSから算出）"
-                                style={{fontWeight:800,fontSize:16,color:GRADE_COLOR[grade],border:`1.5px solid ${GRADE_COLOR[grade]}`,borderRadius:4,padding:"1px 8px"}}>{grade}</span>
+                              {/* 2026-09-16新規（指示書6番「A/B/C表示も意味を明示」）：単独の
+                                  文字だけでは何の評価か分からないため、常時見える短いラベルを
+                                  前に添える（tooltipは補足として残す）。 */}
+                              <span style={{display:"flex",alignItems:"center",gap:4}}>
+                                <span style={{fontSize:10.5,color:"var(--inkSoft)"}}>総合評価</span>
+                                <span title="総合評価（旧・星評価の後継。シグナル強度とMarket RSから算出。今買い時TOP5のSCORE68等とは別軸の指標）"
+                                  style={{fontWeight:800,fontSize:16,color:GRADE_COLOR[grade],border:`1.5px solid ${GRADE_COLOR[grade]}`,borderRadius:4,padding:"1px 8px"}}>{grade}</span>
+                              </span>
                             </div>
                             <div style={{marginTop:6,fontWeight:700,fontSize:13,color:sm.color,background:"var(--band)",border:`1px solid ${sm.color}`,borderRadius:4,padding:"5px 9px",display:"inline-block"}}>
                               {sm.label}
