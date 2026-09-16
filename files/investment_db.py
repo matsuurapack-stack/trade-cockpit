@@ -613,6 +613,15 @@ ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS stop_reason_text TEXT;
 -- するのみ。本Phaseは観測・保存までで、ENTRY SCOREのweight変更・自動ルール昇格・STOP幅の
 -- 自動変更には一切接続しない。
 ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS quality_axes_json JSONB;
+
+-- 2026-09-17新規（Smart Import 監視候補銘柄=WATCH_STOCK正式対応）：既存watchlist（SHARED
+-- scope、UNIQUE(user_id,code,market)）をそのまま再利用し、新規テーブルは作らない。tags
+-- （補助情報、confidence判定には使わない）とpriority（監視優先度。import confidenceとは
+-- 別物、STEP3の明示指示）のみ列を追加する。theme/source/added_reasonは既存列をそのまま
+-- 流用する（added_reasonは元々schemaにあったが未使用だった列——ここでSmart Importの
+-- 「監視候補として選定した理由」の保存先として初めて使う）。
+ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS tags JSONB;
+ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS priority TEXT;
 """
 
 # 2026-09-09新規（ルール学習システム）：投資判断ログ系の他テーブルより後に作成する必要は
@@ -9036,7 +9045,9 @@ def list_watchlist(database_url, user_id, market=None):
             return [_watchlist_row_to_camel(r) for r in cur.fetchall()]
 
 
-_WATCHLIST_COLS = ["name", "sector", "kana", "tv_symbol", "theme", "watch", "note", "source", "added_reason"]
+_WATCHLIST_COLS = ["name", "sector", "kana", "tv_symbol", "theme", "watch", "note", "source", "added_reason",
+                    "tags", "priority"]
+_WATCHLIST_JSON_COLS = ("tags",)
 
 
 def _upsert_watchlist_item_conn(conn, user_id, item):
@@ -9048,12 +9059,16 @@ def _upsert_watchlist_item_conn(conn, user_id, item):
     item = {_WATCHLIST_CAMEL_TO_SNAKE.get(k, k): v for k, v in item.items()}
     market = item.get("market") or "JP"
     cols = [c for c in _WATCHLIST_COLS if c in item]
+    values = [item.get(c) for c in cols]
+    wrapped = [json.dumps(v, ensure_ascii=False) if (c in _WATCHLIST_JSON_COLS and v is not None) else v
+               for c, v in zip(cols, values)]
+    placeholders = ["%s::jsonb" if c in _WATCHLIST_JSON_COLS else "%s" for c in cols]
     conn.execute(
         f"INSERT INTO watchlist (user_id, code, market, {', '.join(cols)}) "
-        f"VALUES (%s, %s, %s, {', '.join(['%s'] * len(cols))}) "
+        f"VALUES (%s, %s, %s, {', '.join(placeholders)}) "
         f"ON CONFLICT (user_id, code, market) DO UPDATE SET "
         f"{', '.join(c + ' = EXCLUDED.' + c for c in cols)}, updated_at = now(), active = true",
-        [user_id, item.get("code"), market] + [item.get(c) for c in cols],
+        [user_id, item.get("code"), market] + wrapped,
     )
     return True
 
@@ -9070,6 +9085,72 @@ def upsert_watchlist_item(database_url, user_id, item):
         ok = _upsert_watchlist_item_conn(conn, user_id, item)
         conn.commit()
     return ok
+
+
+def _merge_text_field(existing, new):
+    """Smart Import WATCH_STOCK：既存テキスト値へ新規値を追加・マージする（既存情報を
+    破壊しない、ユーザー明示指示）。既存が空なら新規値をそのまま採用。既存があり新規値が
+    既存に含まれていなければ" / "で連結。既に含まれていれば既存のまま（再importのたびに
+    重複表示が増えるのを防ぐ）。"""
+    existing = (existing or "").strip()
+    new = (new or "").strip()
+    if not new:
+        return existing or None
+    if not existing:
+        return new
+    if new in existing:
+        return existing
+    return f"{existing} / {new}"
+
+
+def upsert_watch_stock_candidate(database_url, user_id, item):
+    """Smart Import WATCH_STOCK（監視候補銘柄）専用のupsert（2026-09-17新規）。既存watchlist
+    （SHARED scope、UNIQUE(user_id,code,market)）をそのまま再利用し、新規テーブルは作らない。
+    「いきなり本番監視銘柄として確定させない」というユーザー要求に合わせ、新規行は
+    watch='候補'（既存の優先/通常/様子見とは別の第4状態）として保存する。
+    既存行がある場合：
+      - watch状態は一切変更しない（ユーザーが既に優先/通常へ昇格させていた場合、候補へ
+        格下げしない）。
+      - theme/added_reason(=reason)/sourceは既存値を破壊せず追加・マージする
+        （_merge_text_field、重複していなければ" / "で連結）。
+      - tagsは既存・新規の和集合（順序維持・重複排除、補助情報のため単純結合でよい）。
+      - priorityは最新の値で上書きする（唯一の値を持つ「現時点の監視優先度」ラベルであり、
+        古い値を保持する意味がないため——他の3項目のような蓄積型マージ対象ではない）。
+    戻り値：{"created": bool, "code": str, "market": str} または失敗時False。"""
+    user_id = _SHARED_SCOPE
+    pool = _get_pool(database_url)
+    if pool is None or not (item or {}).get("code"):
+        return False
+    code = str(item.get("code")).strip()
+    market = item.get("market") or "JP"
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM watchlist WHERE user_id = %s AND code = %s AND market = %s",
+                        [user_id, code, market])
+            existing = cur.fetchone()
+        new_tags = item.get("tags") if isinstance(item.get("tags"), list) else []
+        if existing:
+            existing_tags = existing.get("tags") if isinstance(existing.get("tags"), list) else []
+            merged_tags = existing_tags + [t for t in new_tags if t not in existing_tags]
+            merged = {
+                "name": existing.get("name") or item.get("name"),
+                "theme": _merge_text_field(existing.get("theme"), item.get("theme")),
+                "added_reason": _merge_text_field(existing.get("added_reason"), item.get("reason")),
+                "source": _merge_text_field(existing.get("source"), item.get("source")),
+                "tags": merged_tags or None,
+            }
+            if item.get("priority"):
+                merged["priority"] = item.get("priority")
+        else:
+            merged = {
+                "name": item.get("name"), "theme": item.get("theme"), "added_reason": item.get("reason"),
+                "source": item.get("source"), "tags": new_tags or None, "priority": item.get("priority"),
+                "watch": "候補",
+            }
+        merged["code"], merged["market"] = code, market
+        ok = _upsert_watchlist_item_conn(conn, user_id, merged)
+        conn.commit()
+    return {"created": existing is None, "code": code, "market": market} if ok else False
 
 
 def upsert_watchlist_master_stocks(database_url, user_id, stocks, update_mode="add", source="smart_import_master"):
