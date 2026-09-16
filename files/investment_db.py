@@ -1572,6 +1572,7 @@ def init_schema(database_url):
         conn.execute(_MIGRATE_MARKET_NEWS_CONTEXT_SQL)
         conn.execute(_MIGRATE_MARKET_EVENT_SOURCE_TRACKING_SQL)
         conn.execute(_MIGRATE_EXTERNAL_INTELLIGENCE_CONTEXT_SQL)
+        conn.execute(_MIGRATE_CENTRAL_BANK_EVENT_SYNC_SQL)
         conn.commit()
 
 
@@ -9292,7 +9293,20 @@ def list_auto_signal_events(database_url, user_id, code=None, signal_type=None, 
 _MARKET_EVENT_COLS = ["event_time", "timezone", "country", "event_type", "importance",
                        "affected_markets", "affected_sectors", "affected_stocks", "impact_channels",
                        "source", "source_type", "verification_status", "notes", "raw_payload",
-                       "source_handle", "source_post_id", "source_post_url", "source_published_at"]
+                       "source_handle", "source_post_id", "source_post_url", "source_published_at",
+                       "canonical_event_key", "event_time_jst", "time_precision", "timezone_source"]
+# 金融政策イベント統合（2026-09-16新規）：CATALYST→EVENT同期（server.py
+# promote_central_bank_catalysts_to_market_events）専用の追加列。
+#   canonical_event_key … "FOMC_POLICY_DECISION"等、表記揺れに依らない実イベント識別子
+#     （同一イベントが複数カタリストとして別titleで取り込まれても、この値で同一性判定する）。
+#   event_time_jst       … JSTへ正規化した時刻（"03:00"等）。既存event_time（原タイムゾーンでの
+#     時刻）・timezone（原タイムゾーン名、例"America/New_York"）とは役割を分ける。
+#   time_precision        … "EXACT"|"APPROXIMATE"|"DATE_ONLY"。時刻が不明・曖昧な場合は
+#     推測せずAPPROXIMATE/DATE_ONLYのままにする（time_to_event等の精密計算に誤用させない）。
+#   timezone_source        … event_time_jstの信頼度provenance（例："SMART_IMPORT_ASSUMED_JST"＝
+#     Smart Import由来の値が既にJSTである一貫した経験則はあるが、仕様として保証されたものではない
+#     ことを明示するラベル）。
+_MARKET_EVENT_CENTRAL_BANK_SYNC_COLS = ("canonical_event_key", "event_time_jst", "time_precision", "timezone_source")
 _MARKET_EVENT_JSONB_COLS = {"affected_markets", "affected_sectors", "affected_stocks", "impact_channels", "raw_payload"}
 # X Intelligence Phase3（2026-09-15新規）：X由来イベントのsource追跡専用列。既存の
 # source/source_type（自由記述、"IMAGE|TEXT|MANUAL等"）とは別に、構造化されたX投稿の
@@ -9304,6 +9318,18 @@ ALTER TABLE market_events ADD COLUMN IF NOT EXISTS source_handle TEXT;
 ALTER TABLE market_events ADD COLUMN IF NOT EXISTS source_post_id TEXT;
 ALTER TABLE market_events ADD COLUMN IF NOT EXISTS source_post_url TEXT;
 ALTER TABLE market_events ADD COLUMN IF NOT EXISTS source_published_at TIMESTAMPTZ;
+"""
+
+# 金融政策イベント統合（2026-09-16新規、CATALYST→EVENT同期）：全てNULL許容——このsync機能を
+# 使わない既存イベント（手動登録・social由来等）には一切影響しない（既存の他マイグレーションと
+# 同じ後方互換方針）。
+_MIGRATE_CENTRAL_BANK_EVENT_SYNC_SQL = """
+ALTER TABLE market_events ADD COLUMN IF NOT EXISTS canonical_event_key TEXT;
+ALTER TABLE market_events ADD COLUMN IF NOT EXISTS event_time_jst TEXT;
+ALTER TABLE market_events ADD COLUMN IF NOT EXISTS time_precision TEXT;
+ALTER TABLE market_events ADD COLUMN IF NOT EXISTS timezone_source TEXT;
+CREATE INDEX IF NOT EXISTS idx_market_events_canonical_key
+    ON market_events(user_id, canonical_event_key, event_date) WHERE canonical_event_key IS NOT NULL;
 """
 
 
@@ -9582,6 +9608,44 @@ def import_market_events(database_url, user_id, events):
         conn.commit()
     return {"imported": imported, "updated": updated, "skipped": skipped, "errors": errors,
             "skipped_details": skipped_details, "error_details": error_details}
+
+
+def update_market_event_central_bank_sync(database_url, user_id, event_id, canonical_event_key,
+                                            event_time_jst, time_precision, timezone_source,
+                                            provenance_update, linked_catalyst_ids):
+    """金融政策イベント統合（2026-09-16新規）：CATALYST→EVENT同期で「同一実イベントが既に
+    market_eventsに存在する」と判定した場合に使う部分更新専用関数。title/event_date/
+    event_type等の既存表示用フィールドは変更しない——手動登録・social由来を問わず既存行の
+    見た目を壊さず、canonical_event_key等のメタデータだけを後付けする（指示書「既存のOTHER行
+    へ新規CENTRAL_BANK行を追加して二重化しない、link/updateする」）。
+    raw_payload.linked_catalyst_idsは既存値とunion（重複排除・昇順）してから書き込む——1つの
+    canonical eventに複数catalystが紐づく構造を維持する（source_catalyst_idを単数前提にしない）。
+    戻り値：対象行があり更新できればTrue、無ければFalse。"""
+    # Phase MU-S1：market_eventsはSHARED化済み（import_market_events/list_market_events等と
+    # 同じ扱い）。ここを忘れるとuser_id不一致でSELECTが0件になり、常にFalseを返してしまう。
+    user_id = _SHARED_SCOPE
+    pool = _get_pool(database_url)
+    if pool is None:
+        return False
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT raw_payload FROM market_events WHERE user_id=%s AND id=%s FOR UPDATE",
+                        [user_id, event_id])
+            row = cur.fetchone()
+            if row is None:
+                return False
+            raw_payload = dict(row.get("raw_payload") or {})
+            existing_ids = raw_payload.get("linked_catalyst_ids") or []
+            raw_payload["linked_catalyst_ids"] = sorted(set(existing_ids) | set(linked_catalyst_ids or []))
+            raw_payload.update(provenance_update or {})
+            cur.execute(
+                "UPDATE market_events SET canonical_event_key=%s, event_time_jst=%s, "
+                "time_precision=%s, timezone_source=%s, raw_payload=%s::jsonb, updated_at=now() "
+                "WHERE user_id=%s AND id=%s",
+                [canonical_event_key, event_time_jst, time_precision, timezone_source,
+                 json.dumps(raw_payload, ensure_ascii=False), user_id, event_id])
+        conn.commit()
+    return True
 
 
 def list_market_events(database_url, user_id, from_date=None, to_date=None, limit=200):

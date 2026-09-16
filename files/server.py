@@ -20687,6 +20687,12 @@ def normalize_catalyst(draft, raw_text=None, import_source="unknown"):
     if draft.get("ticker") and not out.get("affected_stocks"):
         out["affected_stocks"] = [draft["ticker"]]
     out.setdefault("category", draft.get("catalyst_type") or "OTHER")
+    # 金融政策イベント統合（2026-09-16新規）：draftに構造化された開催日（Smart Import元JSONの
+    # event_date/dateキー）があれば、news_catalysts.event_date列へそのまま保存する（今後の
+    # 新規データは取込直後からevent_dateが埋まる——event_dateはcatalyst_date（取込日、上で
+    # today()をデフォルト投入している）とは別物であり、event_date確定に使うことはない）。
+    if not out.get("event_date") and (draft.get("event_date") or draft.get("date")):
+        out["event_date"] = draft.get("event_date") or draft.get("date")
     payload = dict(out.get("raw_payload") or {})
     payload.update({"raw_text": raw_text, "import_source": import_source, "smart_import": True})
     out["raw_payload"] = payload
@@ -20708,6 +20714,296 @@ def normalize_event(draft, raw_text=None, import_source="unknown"):
     payload.update({"raw_text": raw_text, "import_source": import_source, "smart_import": True})
     out["raw_payload"] = payload
     return out
+
+
+# ============================================================
+# 金融政策イベント統合（2026-09-16新規）：CATALYST→EVENT同期。
+#
+# 背景：Smart ImportでCENTRAL_BANK系カタリスト（FOMC・日銀等）を貼り付けても、分類段階で
+# category="CATALYST"と判定されるとnews_catalystsにしか保存されず、market_events（イベント
+# タブの表示元）には一切反映されなかった（原因調査で確認。CATALYST/EVENTはSmart Importの
+# 分類段階で完全に分岐し、その後の自動同期経路が存在しなかったのが根本原因）。
+#
+# 実データ較正（news_catalysts中銀関連10件、2026-09-16実施）で判明した事実：
+#   - news_catalysts.event_date列は実運用で常にNULL。catalyst_date列は「取込日」であり
+#     「開催日」ではない（normalize_catalyst()がcatalyst_dateへtoday()をデフォルト投入する
+#     ため、event_dateの代わりに使うと解説記事等も無差別にイベント化されてしまう）。
+#   - 一方、Smart Import時の元JSON（raw_payload.raw_textとして保持されている）には
+#     date/time/end_date/countryが構造化されたまま残っていた——normalize_catalyst()が
+#     draftの未知キーをDB列にマッピングせず捨てていただけで、情報自体は失われていなかった。
+#   - category列は"CENTRAL_BANK"/"central_bank"の大文字小文字が混在（自由文字列、DB側の
+#     enumバリデーションなし）。category単独をpromotion判定に使わない設計にした理由。
+#
+# 方針：
+#   1. 新規Smart Import：normalize_catalyst()が今後はdraftのdate/event_dateを
+#      news_catalysts.event_date列へ保存する（今後は取込直後からバックフィル不要）。
+#   2. 既存データ・新規データ問わず、CATALYST/MARKET_ANALYSIS保存直後に
+#      promote_central_bank_catalysts_to_market_events()を呼び、中央銀行の具体的な
+#      開催予定イベント（政策決定・記者会見等）だけをmarket_eventsへ同期する。
+#      「日銀政策についての解説記事」等は昇格しない（organization keyword一致だけでなく、
+#      決定/会見/結果等のoccurrence-typeキーワードも必須、かつevent_dateを確定できるものだけ）。
+#   3. 同一実イベントの識別はtitleの完全一致に頼らない。canonical_event_key
+#      （"FOMC_POLICY_DECISION"等）+event_dateで同一性判定し、既存market_events（手動登録・
+#      social由来含む）に同じイベントが見つかればリンク（部分更新）、無ければ新規作成する。
+#      候補が複数一致（AMBIGUOUS）の場合は勝手にmergeしない。
+# ============================================================
+
+# (canonical_event_key, canonical_title, country, org_keywords, all_of_keywords, none_of_keywords)。
+# 上から順に評価し、org・all_ofの両方を満たしnone_ofに1つも一致しない最初のルールを採用する。
+# より具体的なルール（結果/会見系）を先に置くことで「決定会合」自体（開催期間そのもの）との
+# 混同を避ける——BOJ_MEETING（会合開催）とBOJ_POLICY_DECISION（結果発表）は別イベントとして
+# 維持する（指示書の明示的な要求）。
+CENTRAL_BANK_EVENT_RULES = [
+    ("FOMC_POLICY_DECISION", "FOMC政策金利・声明", "US",
+     ["FOMC", "FRB", "Fed", "連邦準備制度"],
+     ["政策金利", "声明", "SEP", "ドットチャート", "ドット・プロット", "利上げ", "利下げ", "据え置き", "結果"],
+     ["会見", "記者会見"]),
+    ("FED_CHAIR_PRESS_CONFERENCE", "FRB議長 記者会見", "US",
+     ["FOMC", "FRB", "パウエル", "Fed議長"], ["会見"], []),
+    ("BOJ_POLICY_DECISION", "日銀金融政策決定 結果", "JP",
+     ["日銀", "BOJ"], ["結果"], []),
+    ("BOJ_POLICY_DECISION", "日銀金融政策決定 結果", "JP",
+     ["日銀", "BOJ"], ["決定"], ["会合", "会見"]),
+    ("BOJ_GOVERNOR_PRESS_CONFERENCE", "日銀総裁 記者会見", "JP",
+     ["日銀", "植田", "総裁"], ["会見"], []),
+    ("BOJ_MEETING", "日銀金融政策決定会合", "JP",
+     ["日銀", "BOJ"], ["決定会合"], ["結果", "会見"]),
+    ("ECB_PRESS_CONFERENCE", "ECB総裁 記者会見", "EU",
+     ["ECB", "ラガルド"], ["会見"], []),
+    ("ECB_POLICY_DECISION", "ECB政策金利発表", "EU",
+     ["ECB"], ["政策金利", "結果", "声明"], ["会見"]),
+    ("BOE_PRESS_CONFERENCE", "BOE総裁 記者会見", "UK",
+     ["BOE", "イングランド銀行"], ["会見"], []),
+    ("BOE_POLICY_DECISION", "BOE政策金利発表", "UK",
+     ["BOE", "イングランド銀行"], ["政策金利", "結果", "声明"], ["会見"]),
+]
+
+_EVENT_IMPORTANCE_RANK = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4, "MAX": 5}
+
+
+def classify_central_bank_event(title, summary=None):
+    """title・summaryから中央銀行の具体的な開催イベント（政策決定・記者会見等）を判定する。
+    「organization keyword」と「occurrence-typeキーワード」の両方が必要——category文字列
+    単独には依存しない（実データでcategoryが"CENTRAL_BANK"/"central_bank"と表記揺れして
+    いたため）。「日銀の金融政策についての解説」のような論評記事はoccurrence-typeキーワードを
+    持たないため一致しない（NON_EVENT）。
+    戻り値：(canonical_event_key, canonical_title, country)。一致無しなら(None, None, None)。"""
+    text = f"{title or ''} {summary or ''}"
+    if not text.strip():
+        return None, None, None
+    for key, canonical_title, country, org_kws, all_of, none_of in CENTRAL_BANK_EVENT_RULES:
+        if not any(kw in text for kw in org_kws):
+            continue
+        if not any(kw in text for kw in all_of):
+            continue
+        if any(kw in text for kw in none_of):
+            continue
+        return key, canonical_title, country
+    return None, None, None
+
+
+_CENTRAL_BANK_TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+
+
+def _resolve_central_bank_event_datetime_for_promotion(catalyst_row):
+    """news_catalysts 1行（DBから読んだdict）からevent_date/event_time_jst/end_date/
+    time_precision/date_source/timezone_sourceを解決する（指示書の合意事項：catalyst_dateを
+    直接event_dateへ流用しない）。
+      - 日付：event_date列（今後の新規カタリストはnormalize_catalyst()がここに正しい値を
+        入れる）を優先し、無ければraw_payload.raw_text（Smart Import時の元JSON文字列、既存
+        データ向けbackfill経路）を再パースしてdateキーを採用する。
+      - 時刻・end_date：news_catalystsには時刻列が無いため、event_date列の有無によらず常に
+        raw_payload.raw_textから取得する（無ければ時刻不明のまま）。
+      - 実データ較正で、元JSONのdate/timeが一貫してJSTへ換算済みの値だったことを確認したが
+        （FOMC 2:00pm ET→03:00 JST、BOE正午BST→20:00 JST等、既知の実発表時刻と一致）、これは
+        Smart Import側の仕様として保証されたものではなく経験的な一致のため、timezone_source=
+        "SMART_IMPORT_ASSUMED_JST"（未保証の推定であることを明示するラベル）として保存する。
+      - 時刻が"daytime"等の非数値文字列の場合、具体的な時刻へ変換せずtime_precision=
+        "APPROXIMATE"のまま保持する（time_to_event等の精密計算に誤用させないため）。
+      - どちらの経路でも日付を確定できなければNoneを返し、呼び出し側はpromotionしない
+        （DATE_UNKNOWN、指示書「開催日を確定できないものは推測しない」）。"""
+    raw_payload = catalyst_row.get("raw_payload") or {}
+    raw_text = raw_payload.get("raw_text") if isinstance(raw_payload, dict) else None
+    parsed = None
+    if raw_text:
+        try:
+            parsed = json.loads(raw_text)
+        except Exception:
+            parsed = None
+    parsed = parsed if isinstance(parsed, dict) else {}
+
+    event_date = catalyst_row.get("event_date") or parsed.get("event_date") or parsed.get("date")
+    date_source = "EVENT_DATE_FIELD" if catalyst_row.get("event_date") else (
+        "RAW_PAYLOAD_EXPLICIT" if event_date else None)
+    if not event_date:
+        # 優先順位3：本文中の明示的な相対日付表現（「明日」「9/17」等）を、catalyst_date
+        # （このカタリストが取り込まれた＝確実に分かっている基準日）を起点に解決する
+        # （既存_extract_event_date_from_text()をそのまま再利用、新しい日付解析ロジックは
+        # 作らない）。catalyst_dateそのものをevent_dateとして採用するのではなく、あくまで
+        # 「本文の相対表現を解決するための基準日」としてのみ使う点に注意。
+        reference_date = catalyst_row.get("catalyst_date")
+        if reference_date:
+            text = f"{catalyst_row.get('title') or ''} {catalyst_row.get('summary') or ''}"
+            extracted = _extract_event_date_from_text(text, today_str=str(reference_date))
+            if extracted:
+                event_date = extracted
+                date_source = "RELATIVE_TEXT"
+    if not event_date:
+        return None
+
+    time_val = parsed.get("time")
+    if isinstance(time_val, str) and _CENTRAL_BANK_TIME_RE.match(time_val.strip()):
+        h, m = time_val.strip().split(":")
+        event_time_jst = f"{int(h):02d}:{m}"
+        time_precision = "EXACT"
+        timezone_source = "SMART_IMPORT_ASSUMED_JST"
+    elif time_val:
+        # "daytime"等、時刻として解釈できない値。日付は分かるが時刻は不明のまま保持する
+        # （推測して具体的な時刻を作らない）。
+        event_time_jst = None
+        time_precision = "APPROXIMATE"
+        timezone_source = None
+    else:
+        event_time_jst = None
+        time_precision = "DATE_ONLY"
+        timezone_source = None
+
+    return {"event_date": str(event_date), "event_time_jst": event_time_jst,
+            "end_date": str(parsed["end_date"]) if parsed.get("end_date") else None,
+            "time_precision": time_precision, "date_source": date_source,
+            "timezone_source": timezone_source}
+
+
+def promote_central_bank_catalysts_to_market_events(database_url, user_id, catalyst_rows):
+    """news_catalysts（DBから読んだ行のリスト）のうち、具体的な開催予定を持つ中央銀行イベント
+    （FOMC/日銀/ECB/BOE等の政策決定・記者会見）だけをmarket_eventsへ同期する（指示書Phase2・3）。
+    CATALYST（材料）とEVENT（日時・事前リスク管理）は別レコードのまま——catalyst自体を書き換え
+    たり削除したりしない。
+    同一実イベント（canonical_event_key+event_date、±1日許容）が既存market_events（手動登録・
+    social由来を含む、canonical_event_keyが無い旧行はtitleから再分類して照合）に見つかれば
+    新規作成せずlink（部分更新）し、複数のcatalystが同じ実イベントを指す場合はraw_payload.
+    linked_catalyst_idsへ配列で保持する。候補が複数一致（AMBIGUOUS）の場合は勝手にmergeしない。
+    再実行しても既にlink/作成済みのイベントは同じ行を指すため、market_events件数は増えない
+    （idempotent、canonical_event_key+event_dateで毎回同じ行を引き当てるため）。
+    戻り値：診断dict。"""
+    result = {"processed": 0, "promoted_new": 0, "linked_existing": 0, "skipped_non_event": 0,
+              "skipped_date_unknown": 0, "ambiguous": 0, "errors": 0, "details": []}
+    if investment_db is None or not database_url or not catalyst_rows:
+        return result
+
+    groups = {}  # (canonical_event_key, event_date) -> {canonical_title, country, dt_fields, catalyst_ids, importance}
+    for cat in catalyst_rows:
+        result["processed"] += 1
+        # MARKET_ANALYSIS由来（normalize_market_analysis()がraw_payload.information_kind=
+        # "ANALYSIS"を明示）は分析・意見であり、具体的な開催予定の事実とは別物のため対象外にする
+        # （「FOMC結果を受けて〜という分析」のような文がoccurrence-typeキーワードに誤って一致し、
+        # 論評記事を実イベントとして昇格させてしまうリスクを避ける、指示書「解説記事は昇格
+        # させない」の安全側実装）。
+        if (cat.get("raw_payload") or {}).get("information_kind") == "ANALYSIS":
+            result["skipped_non_event"] += 1
+            continue
+        key, canonical_title, country = classify_central_bank_event(cat.get("title"), cat.get("summary"))
+        if not key:
+            result["skipped_non_event"] += 1
+            continue
+        dt_fields = _resolve_central_bank_event_datetime_for_promotion(cat)
+        if not dt_fields:
+            result["skipped_date_unknown"] += 1
+            result["details"].append({"catalyst_id": cat.get("id"), "title": cat.get("title"),
+                                        "canonical_event_key": key, "reason": "DATE_UNKNOWN"})
+            continue
+        group_key = (key, dt_fields["event_date"])
+        g = groups.setdefault(group_key, {"canonical_title": canonical_title, "country": country,
+                                            "dt_fields": dt_fields, "catalyst_ids": [], "importance": []})
+        if cat.get("id") is not None:
+            g["catalyst_ids"].append(cat["id"])
+        if cat.get("importance"):
+            g["importance"].append(str(cat["importance"]).upper())
+
+    if not groups:
+        return result
+
+    today = datetime.date.today()
+    try:
+        existing_events = investment_db.list_market_events(
+            database_url, user_id, from_date=(today - datetime.timedelta(days=60)).isoformat(),
+            to_date=(today + datetime.timedelta(days=180)).isoformat())
+    except Exception as e:
+        print("  金融政策イベント統合: 既存market_events取得で例外（無視して続行、全件新規判定になる）", e)
+        existing_events = []
+    existing_with_key = []
+    for e in existing_events:
+        e_key = e.get("canonical_event_key")
+        if not e_key:
+            e_key, _t, _c = classify_central_bank_event(e.get("title"))
+        existing_with_key.append((e, e_key))
+
+    for (event_key, event_date), g in groups.items():
+        try:
+            target = datetime.date.fromisoformat(event_date)
+            matches = []
+            for e, e_key in existing_with_key:
+                if e_key != event_key:
+                    continue
+                try:
+                    e_date = datetime.date.fromisoformat(str(e.get("event_date")))
+                except Exception:
+                    continue
+                if abs((e_date - target).days) <= 1:
+                    matches.append((e, e_date == target))
+
+            dt_fields = g["dt_fields"]
+            if len(matches) > 1:
+                result["ambiguous"] += 1
+                result["details"].append({"canonical_event_key": event_key, "event_date": event_date,
+                                            "reason": "AMBIGUOUS",
+                                            "candidate_event_ids": [m[0].get("id") for m in matches],
+                                            "catalyst_ids": g["catalyst_ids"]})
+                continue
+
+            importance = (max(g["importance"], key=lambda x: _EVENT_IMPORTANCE_RANK.get(x, 0))
+                          if g["importance"] else "HIGH")
+
+            if len(matches) == 1:
+                existing_event, exact = matches[0]
+                ok = investment_db.update_market_event_central_bank_sync(
+                    database_url, user_id, existing_event["id"], event_key,
+                    dt_fields.get("event_time_jst"), dt_fields.get("time_precision"),
+                    dt_fields.get("timezone_source"),
+                    {"linked_from": "catalyst_sync", "canonical_event_type": event_key,
+                     "canonical_event_subtype": event_key, "promotion_reason": "MATCHED_EXISTING_EVENT",
+                     "source_time": dt_fields.get("event_time_jst"),
+                     "source_timezone": dt_fields.get("timezone_source"),
+                     "source_time_precision": dt_fields.get("time_precision"),
+                     "source_date_source": dt_fields.get("date_source"),
+                     "match_confidence": "EXACT_MATCH" if exact else "HIGH_CONFIDENCE_MATCH"},
+                    g["catalyst_ids"])
+                result["linked_existing" if ok else "errors"] += 1
+                continue
+
+            new_event = {
+                "event_date": event_date, "title": g["canonical_title"], "event_type": "CENTRAL_BANK",
+                "country": g["country"], "importance": importance, "source": "catalyst_sync",
+                "source_type": "TEXT", "canonical_event_key": event_key,
+                "event_time_jst": dt_fields.get("event_time_jst"),
+                "time_precision": dt_fields.get("time_precision"),
+                "timezone_source": dt_fields.get("timezone_source"),
+                "raw_payload": {"linked_from": "catalyst_sync", "linked_catalyst_ids": g["catalyst_ids"],
+                                 "canonical_event_type": event_key, "canonical_event_subtype": event_key,
+                                 "promotion_reason": "NEW_EVENT_FROM_CATALYST",
+                                 "source_time": dt_fields.get("event_time_jst"),
+                                 "source_timezone": dt_fields.get("timezone_source"),
+                                 "source_time_precision": dt_fields.get("time_precision"),
+                                 "source_date_source": dt_fields.get("date_source")},
+            }
+            if dt_fields.get("end_date"):
+                new_event["raw_payload"]["end_date"] = dt_fields["end_date"]
+            imp = investment_db.import_market_events(database_url, user_id, [new_event])
+            result["promoted_new" if (imp.get("imported") or imp.get("updated")) else "errors"] += 1
+        except Exception as e:
+            result["errors"] += 1
+            print("  金融政策イベント統合: promotion失敗", event_key, event_date, e)
+    return result
 
 
 def normalize_expert_opinion(draft, raw_text=None, import_source="unknown"):
@@ -21425,6 +21721,17 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
         results["EXPERT_OPINION"] = investment_db.import_expert_views(database_url, user_id, buckets["EXPERT_OPINION"])
     if buckets["MARKET_ANALYSIS"]:
         results["MARKET_ANALYSIS"] = investment_db.import_news_catalysts(database_url, user_id, buckets["MARKET_ANALYSIS"])
+    # 金融政策イベント統合（2026-09-16新規）：CATALYST/MARKET_ANALYSISでnews_catalystsへ保存
+    # された直後に、具体的な開催予定を持つ中央銀行イベントだけをmarket_eventsへ同期する。
+    # 対象は現在保存されている全カタリスト（今回保存分に限らない）——既存の未同期カタリストも
+    # Smart Importが動くたびに自動的にbackfillされる（idempotentなので再実行の副作用は無い）。
+    if buckets["CATALYST"] or buckets["MARKET_ANALYSIS"]:
+        try:
+            all_catalysts = investment_db.list_news_catalysts(database_url, user_id, limit=300)
+            results["CENTRAL_BANK_EVENT_SYNC"] = promote_central_bank_catalysts_to_market_events(
+                database_url, user_id, all_catalysts)
+        except Exception as e:
+            print("  SmartImport: 金融政策イベント統合で例外（無視して続行）", e)
     if morning_check_results:
         results["MORNING_MARKET_CHECK"] = {"imported": sum(1 for r in morning_check_results if r["ok"]),
                                             "skipped": sum(1 for r in morning_check_results if not r["ok"]),
