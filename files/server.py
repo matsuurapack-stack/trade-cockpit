@@ -9444,7 +9444,9 @@ def generate_event_market_reactions_for_event(database_url, user_id, event):
         targets.append(("STOCK", t, "RELATED"))
     if event.get("sector"):
         targets.append(("SECTOR", event["sector"], "DIRECT"))
-    if event.get("event_type") in ("ECONOMIC_INDICATOR", "CENTRAL_BANK", "GEOPOLITICS", "PREDICTION_MARKET"):
+    if event.get("event_type") in ("ECONOMIC_INDICATOR", "CENTRAL_BANK", "GEOPOLITICS", "PREDICTION_MARKET",
+                                     MACRO_CANONICAL_EVENT_TYPE, MACRO_CANONICAL_SESSION_EVENT_TYPE,
+                                     MACRO_CANONICAL_PERIOD_EVENT_TYPE):
         targets.append(("MARKET", "NIKKEI225", "DIRECT"))
     if not targets:
         return 0
@@ -9653,9 +9655,428 @@ def _maybe_update_event_after_reaction_safe(database_url, event_id):
         print("  Market Intelligence: reaction後のevent更新で例外（無視して続行）", e)
 
 
+# ============================================================
+# 金融政策イベント統合 Phase5A（2026-09-16新規）：MACRO EVENT OBSERVATION（観測・データ蓄積のみ）。
+#
+# 目的：Sensitivityを判定するのではなく、後でPhase5Bで較正できるデータを貯める。
+# ENTRY SCORE/Entry Gate/ENTRY TOP5順位/LOSS Learning weightには一切触れない（指示書の
+# 明示的な禁止事項）。
+#
+# 設計：canonical market_events（Phase2/3）→ underlying_events（既存の1件だけ橋渡し行を
+# 作る）→ 既存generate_event_market_reactions_for_event()/run_due_event_market_reactions()/
+# _event_reaction_scheduler_loop()（既に5分間隔で稼働中）をそのまま再利用する。新しい
+# テーブル・新しいschedulerは作らない（指示書の明示的な要求）。
+# ============================================================
+
+MACRO_OBSERVATION_MAX_SYMBOLS = 20  # 1イベントあたりの観測銘柄数の安全上限（API負荷対策）
+
+# Level1 MARKET DRIVERS：既存INDEX辞書のシンボルをそのまま使う（新しい取得経路は作らない）。
+# US10Yだけunit="PERCENT_YIELD"（利回り%そのもの）とし、他のPRICE系driverと混同しない
+# （指示書B「US10Yは価格returnではなくyield levelを保存」）。
+MACRO_DRIVER_SYMBOLS = {
+    "NIKKEI_FUT": {"symbol": INDEX["nikkei_fut"], "unit": "PRICE"},
+    "TOPIX": {"symbol": INDEX["topix_etf"], "unit": "PRICE"},
+    "USDJPY": {"symbol": INDEX["usdjpy"], "unit": "PRICE"},
+    "US10Y": {"symbol": INDEX["us10y"], "unit": "PERCENT_YIELD"},
+    "SOX": {"symbol": INDEX["sox"], "unit": "PRICE"},
+    "NASDAQ": {"symbol": INDEX["nasdaq"], "unit": "PRICE"},
+}
+
+# Level2 SECTOR REPRESENTATIVES：TSE33業種名→大カテゴリの対応表のみハードコードする
+# （指示書「代表銘柄を大量にハードコードしない」——実際の銘柄コードはwatchlistから機械的に
+# 選ぶ）。カテゴリごとに1銘柄だけ選ぶため、大きなカテゴリ数にはしない。
+MACRO_SECTOR_CATEGORY_KEYWORDS = {
+    "SEMICONDUCTOR_ELECTRONICS": ["電気機器", "精密機器"],
+    "BANK": ["銀行業"],
+    "INSURANCE": ["保険業"],
+    "AUTO_EXPORTER": ["輸送用機器"],
+    "TRADING_COMPANY": ["卸売業"],
+    "ENERGY": ["鉱業", "石油・石炭製品", "電気・ガス業"],
+    "SAAS_TELECOM": ["情報・通信業"],
+    "OTHER_GROWTH": ["サービス業"],
+}
+
+# 指示書C：sector_priorは方向（上がる/下がる）を持たない、「何に敏感そうか」だけの中立的な
+# 仮説ラベル（POSSIBLE/HIGH/LOW）。売買判定には使わない。カテゴリ→(RATE, FX, GROWTH_LIQUIDITY)
+# のexposure仮説。バージョン管理し、辞書を将来変更しても過去snapshotの仮説を再現できるようにする。
+SECTOR_PRIOR_HYPOTHESIS_VERSION = "v1_2026-09-16"
+SECTOR_EXPOSURE_HYPOTHESIS = {
+    "SEMICONDUCTOR_ELECTRONICS": {"RATE_EXPOSURE_HYPOTHESIS": "HIGH", "FX_EXPOSURE_HYPOTHESIS": "HIGH",
+                                    "GROWTH_LIQUIDITY_EXPOSURE_HYPOTHESIS": "HIGH"},
+    "BANK": {"RATE_EXPOSURE_HYPOTHESIS": "HIGH", "FX_EXPOSURE_HYPOTHESIS": "LOW",
+              "GROWTH_LIQUIDITY_EXPOSURE_HYPOTHESIS": "LOW"},
+    "INSURANCE": {"RATE_EXPOSURE_HYPOTHESIS": "HIGH", "FX_EXPOSURE_HYPOTHESIS": "LOW",
+                   "GROWTH_LIQUIDITY_EXPOSURE_HYPOTHESIS": "LOW"},
+    "AUTO_EXPORTER": {"RATE_EXPOSURE_HYPOTHESIS": "POSSIBLE", "FX_EXPOSURE_HYPOTHESIS": "HIGH",
+                        "GROWTH_LIQUIDITY_EXPOSURE_HYPOTHESIS": "LOW"},
+    "TRADING_COMPANY": {"RATE_EXPOSURE_HYPOTHESIS": "POSSIBLE", "FX_EXPOSURE_HYPOTHESIS": "HIGH",
+                          "GROWTH_LIQUIDITY_EXPOSURE_HYPOTHESIS": "LOW"},
+    "ENERGY": {"RATE_EXPOSURE_HYPOTHESIS": "LOW", "FX_EXPOSURE_HYPOTHESIS": "POSSIBLE",
+                "GROWTH_LIQUIDITY_EXPOSURE_HYPOTHESIS": "LOW"},
+    "SAAS_TELECOM": {"RATE_EXPOSURE_HYPOTHESIS": "POSSIBLE", "FX_EXPOSURE_HYPOTHESIS": "LOW",
+                       "GROWTH_LIQUIDITY_EXPOSURE_HYPOTHESIS": "HIGH"},
+    "OTHER_GROWTH": {"RATE_EXPOSURE_HYPOTHESIS": "POSSIBLE", "FX_EXPOSURE_HYPOTHESIS": "LOW",
+                       "GROWTH_LIQUIDITY_EXPOSURE_HYPOTHESIS": "POSSIBLE"},
+}
+
+# STEP2：precision別のbridge event_type・window profile。EXACT時刻を持つイベント
+# （FOMC/press conference等）は分足window、DATE_ONLY/APPROXIMATE単発イベント（BOJ結果等）は
+# セッション単位のみ、複数日イベント（BOJ会合期間）は期間観測（指示書D「semantic distinction
+# を保持する」）。
+MACRO_CANONICAL_EVENT_TYPE = "MACRO_CANONICAL"
+MACRO_CANONICAL_SESSION_EVENT_TYPE = "MACRO_CANONICAL_SESSION"
+MACRO_CANONICAL_PERIOD_EVENT_TYPE = "MACRO_CANONICAL_PERIOD"
+EVENT_REACTION_WINDOW_MINUTES["15M"] = 15  # 既存5M/30M/1Hに追加するだけ（他typeの挙動は変更しない）
+EVENT_REACTION_WINDOWS_BY_TYPE[MACRO_CANONICAL_EVENT_TYPE] = ("5M", "15M", "30M", "1H", "NEXT_OPEN")
+EVENT_REACTION_WINDOWS_BY_TYPE[MACRO_CANONICAL_SESSION_EVENT_TYPE] = ("CLOSE", "NEXT_OPEN", "NEXT_CLOSE")
+EVENT_REACTION_WINDOWS_BY_TYPE[MACRO_CANONICAL_PERIOD_EVENT_TYPE] = ("CLOSE", "NEXT_CLOSE")
+
+
+def _macro_bridge_event_key(market_event):
+    """canonical market_eventから決定的なunderlying_events.event_keyを作る。表示title
+    （表記揺れがあり得る）をidentityにしない。canonical_event_key・event_date・
+    event_time_jst（EXACT時刻が無ければ"DATEONLY"固定）を使う——再同期しても同じ
+    キーになり、同じ橋渡し行へ収束する（指示書「再同期で同じbridge underlying_eventへ
+    収束することをテストする」）。"""
+    key = market_event.get("canonical_event_key")
+    date = market_event.get("event_date")
+    time_part = market_event.get("event_time_jst") if market_event.get("time_precision") == "EXACT" else "DATEONLY"
+    return f"MACRO:{key}:{date}:{time_part or 'DATEONLY'}"
+
+
+def _macro_bridge_event_type(market_event):
+    """複数日イベント（raw_payload.end_dateあり）はPERIOD、EXACT精度はCANONICAL（分足）、
+    それ以外（DATE_ONLY/APPROXIMATE単発）はSESSION（セッション単位のみ）。"""
+    raw_payload = market_event.get("raw_payload")
+    end_date = raw_payload.get("end_date") if isinstance(raw_payload, dict) else None
+    if end_date and end_date != market_event.get("event_date"):
+        return MACRO_CANONICAL_PERIOD_EVENT_TYPE
+    if market_event.get("time_precision") == "EXACT" and market_event.get("event_time_jst"):
+        return MACRO_CANONICAL_EVENT_TYPE
+    return MACRO_CANONICAL_SESSION_EVENT_TYPE
+
+
+def _macro_bridge_event_at(market_event, bridge_event_type):
+    """underlying_events.event_atを決める。EXACT精度ならJSTの実時刻をそのままUTCへ変換する。
+    DATE_ONLY/APPROXIMATE（SESSION/PERIOD）は、既存resolve_event_market_relevant_at()が
+    event_at=None時にfirst_seen_at（＝同期ジョブがたまたま実行された時刻、イベントの実時刻とは
+    無関係）へフォールバックしてしまう既存挙動を避けるため、event_date当日のJST 00:00を
+    明示的に設定する（「この日のいつか」というDATE_ONLYの意味を保ったまま、first_seen_atの
+    誤用だけを防ぐための意図的なプレースホルダー——real時刻を主張しない。time_precision＝
+    DATE_ONLY/APPROXIMATEは橋渡し行側にも保存するため、下流はこのevent_atを分単位の精度として
+    誤用できない設計にしてある、指示書D「first_seen_atをbaselineに使うのは禁止」への対応）。"""
+    try:
+        event_date = datetime.date.fromisoformat(str(market_event.get("event_date"))[:10])
+    except (ValueError, TypeError):
+        return None
+    if bridge_event_type == MACRO_CANONICAL_EVENT_TYPE:
+        h, m = market_event["event_time_jst"].split(":")
+        return datetime.datetime(event_date.year, event_date.month, event_date.day,
+                                   int(h), int(m), tzinfo=_JST).astimezone(datetime.timezone.utc)
+    return datetime.datetime(event_date.year, event_date.month, event_date.day, 0, 0, tzinfo=_JST) \
+        .astimezone(datetime.timezone.utc)
+
+
+def sync_canonical_market_event_to_underlying_event(database_url, user_id, market_event):
+    """STEP1：canonical market_events 1件から、既存underlying_eventsパイプラインへ流し込む
+    ための橋渡し行を1件だけ作る（無ければ）。新しいテーブルは作らず、既存event_key列を
+    決定的identityとして使い、再実行しても同じ行に収束する（idempotent）。
+    既存のCENTRAL_BANK event_type（X検出等が将来使う可能性）には一切触れず、専用の
+    MACRO_CANONICAL*型を使う（指示書「underlying_events専用部分だけを最小限generalize」）。
+    戻り値：橋渡し行（dict）。DB未設定等で作れない場合はNone。"""
+    if investment_db is None or not database_url:
+        return None
+    bridge_event_type = _macro_bridge_event_type(market_event)
+    event_key = _macro_bridge_event_key(market_event)
+    try:
+        candidates = investment_db.list_underlying_event_candidates(
+            database_url, event_type=bridge_event_type, limit=50)
+    except Exception as e:
+        print("  MacroObservation: 既存bridge行検索で例外", e)
+        candidates = []
+    existing = next((c for c in candidates if c.get("event_key") == event_key), None)
+    if existing:
+        return existing
+    event_at = _macro_bridge_event_at(market_event, bridge_event_type)
+    data = {
+        "event_key": event_key, "event_type": bridge_event_type, "title": market_event.get("title"),
+        "normalized_title": market_event.get("title"), "ticker": None,
+        "sector": None, "country": market_event.get("country"),
+        "event_at": event_at.isoformat() if event_at else None,
+        "primary_source_type": "CENTRAL_BANK_OFFICIAL",
+        "confidence": 0.7, "confidence_level": "SINGLE_RELIABLE_SOURCE",
+        "importance": market_event.get("importance") or "HIGH", "status": "ACTIVE",
+        "raw_source_count": 1, "independent_source_count": 1, "primary_source_confirmed": False,
+        "extended_move": False,  # NOT NULL DEFAULT falseだが、create_underlying_event()は
+        # 未指定キーをNoneのまま明示INSERTするためDB側DEFAULTが効かない（実DB E2Eで検出・修正）。
+        "backfill_source": "canonical_market_events_sync",
+        "numerical_fingerprint_json": {
+            "canonical_event_key": market_event.get("canonical_event_key"),
+            "market_event_id": market_event.get("id"), "time_precision": market_event.get("time_precision"),
+            "event_time_jst": market_event.get("event_time_jst"),
+        },
+    }
+    try:
+        return investment_db.create_underlying_event(database_url, data)
+    except Exception as e:
+        print("  MacroObservation: bridge行作成で例外", e)
+        return None
+
+
+def capture_macro_driver_snapshot():
+    """Level1 MARKET DRIVERS：Nikkei先物/TOPIX/USDJPY/US10Y/SOX/Nasdaqを一括取得する。
+    既存_get_market_snapshot()/_fetch_intraday_or_daily_price()（social signal評価で
+    既に稼働中の取得経路）をそのまま再利用し、新しい取得経路は作らない。US10Yはyield%
+    そのものを保持し、他driverのPRICEと混同しない（指示書B）。
+    戻り値：{driver_key: {"value","unit","observed_at","source","status"}}"""
+    out = {}
+    for key, meta in MACRO_DRIVER_SYMBOLS.items():
+        sym = meta["symbol"]
+        snap = None
+        try:
+            snap = _get_market_snapshot(sym, lambda s=sym: _fetch_intraday_or_daily_price(s))
+        except Exception as e:
+            print("  MacroObservation: driver取得失敗", key, e)
+        if snap and snap.get("price") is not None:
+            out[key] = {"value": snap["price"], "unit": meta["unit"], "observed_at": snap.get("captured_at"),
+                        "source": snap.get("source", "yfinance"), "status": "OK"}
+        else:
+            out[key] = {"value": None, "unit": meta["unit"], "observed_at": None, "source": None, "status": "NO_DATA"}
+    return out
+
+
+def select_sector_representative_stocks(watchlist):
+    """Level2 SECTOR REPRESENTATIVES：watchlist.sector（東証33業種、実データで280/281銘柄
+    取得済み）から、MACRO_SECTOR_CATEGORY_KEYWORDSの各カテゴリごとに1銘柄だけ機械的に選ぶ
+    （銘柄コードのハードコードなし）。該当銘柄が無いカテゴリはスキップする（推測しない）。
+    同一カテゴリ内はcode昇順の先頭を選ぶ（決定的、再現可能）。"""
+    by_sector = {}
+    for w in watchlist or []:
+        sector = w.get("sector")
+        if sector:
+            by_sector.setdefault(sector, []).append(w)
+    reps = []
+    for category, sector_names in MACRO_SECTOR_CATEGORY_KEYWORDS.items():
+        candidates = []
+        for sector_name in sector_names:
+            candidates.extend(by_sector.get(sector_name, []))
+        if not candidates:
+            continue
+        candidates.sort(key=lambda w: w.get("code") or "")
+        chosen = candidates[0]
+        reps.append({"code": chosen.get("code"), "name": chosen.get("name"), "sector": chosen.get("sector"),
+                     "category": category, "level": 2, "reason": ["SECTOR_REPRESENTATIVE"]})
+    return reps
+
+
+def select_user_relevant_stocks(database_url, user_id):
+    """Level3 USER RELEVANT STOCKS：現在ポジション・当日trade_history・ENTRY TOP5
+    （キャッシュ済みがあれば、追加の重いscanは発生させない）を対象にする。重複はdedupし、
+    複数理由がある銘柄はreasonを配列で保持する。"""
+    if investment_db is None or not database_url:
+        return []
+    by_code = {}
+
+    def _add(code, name, reason):
+        if not code:
+            return
+        entry = by_code.setdefault(code, {"code": code, "name": name, "level": 3, "reason": []})
+        if reason not in entry["reason"]:
+            entry["reason"].append(reason)
+
+    try:
+        for p in investment_db.list_portfolio(database_url, user_id):
+            _add(p.get("code"), p.get("name"), "POSITION")
+    except Exception as e:
+        print("  MacroObservation: position取得失敗", e)
+    try:
+        today = _jst_today_date_str()
+        for t in investment_db.list_trade_history(database_url, user_id, limit=200):
+            closed_at = str(t.get("closed_at") or "")
+            if closed_at[:10] == today:
+                _add(t.get("code"), t.get("name"), "TODAY_TRADE")
+    except Exception as e:
+        print("  MacroObservation: trade_history取得失敗", e)
+    try:
+        cached = get_entry_top5_cached(user_id)
+        if cached:
+            for c in cached.get("entryReadyTop5", []):
+                _add(c.get("code"), c.get("name"), "ENTRY_TOP5")
+    except Exception as e:
+        print("  MacroObservation: ENTRY TOP5キャッシュ取得失敗", e)
+    return list(by_code.values())
+
+
+def build_macro_observation_symbol_set(database_url, user_id):
+    """Level2+Level3をdedupして結合し、MACRO_OBSERVATION_MAX_SYMBOLSで安全上限をかける
+    （指示書「API負荷・scheduler処理時間を計測する」）。Level3（ユーザー関連銘柄）は
+    実際に売買対象にしていた銘柄のため優先的に残す（上限超過時はLevel2側から間引く）。"""
+    if investment_db is None or not database_url:
+        return []
+    try:
+        watchlist = investment_db.list_watchlist(database_url, user_id, market="JP")
+    except Exception as e:
+        print("  MacroObservation: watchlist取得失敗", e)
+        watchlist = []
+    level2 = select_sector_representative_stocks(watchlist)
+    level3 = select_user_relevant_stocks(database_url, user_id)
+    by_code = {}
+    for item in level3 + level2:  # level3を先に入れることで、同一codeなら3のreasonが残る
+        code = item.get("code")
+        if code in by_code:
+            existing_reasons = set(by_code[code]["reason"])
+            for r in item["reason"]:
+                if r not in existing_reasons:
+                    by_code[code]["reason"].append(r)
+        else:
+            by_code[code] = item
+    ordered = sorted(by_code.values(), key=lambda x: (0 if "POSITION" in x["reason"] or "TODAY_TRADE" in x["reason"]
+                                                         or "ENTRY_TOP5" in x["reason"] else 1, x.get("code") or ""))
+    return ordered[:MACRO_OBSERVATION_MAX_SYMBOLS]
+
+
+def sector_exposure_hypothesis_for(sector):
+    """指示書C：sectorから中立的なexposure仮説（方向を持たない、何に敏感そうかだけ）を返す。
+    該当カテゴリが無ければ全てNone（推測しない）。sector_prior_versionを併記し、将来辞書を
+    変更しても過去snapshotが「当時どの仮説だったか」を再現できるようにする。"""
+    for category, sector_names in MACRO_SECTOR_CATEGORY_KEYWORDS.items():
+        if sector in sector_names:
+            return {**SECTOR_EXPOSURE_HYPOTHESIS[category], "category": category,
+                    "sector_prior_version": SECTOR_PRIOR_HYPOTHESIS_VERSION}
+    return {"RATE_EXPOSURE_HYPOTHESIS": None, "FX_EXPOSURE_HYPOTHESIS": None,
+             "GROWTH_LIQUIDITY_EXPOSURE_HYPOTHESIS": None, "category": None,
+             "sector_prior_version": SECTOR_PRIOR_HYPOTHESIS_VERSION}
+
+
+def capture_macro_event_baseline_snapshot(database_url, user_id, market_event, bridge_event, now_utc=None):
+    """STEP3・STEP5：Level1 driver + Level2/3銘柄のbaseline（発表前状態）を1回だけ記録する。
+    既にbaselineが記録済みなら何もしない（指示書B「baseline snapshotは後から上書きしない」）。
+    baseline_status：now_utcがイベント発表前ならLIVE_PRE_EVENT、既に発表後（または
+    判定不能）ならBACKFILLED_PRE_EVENT（過去バーからの事後復元、confidenceを分ける、
+    指示書「イベント生成時刻とbaseline取得」）。
+    戻り値：更新後の橋渡し行、または失敗時None。"""
+    if investment_db is None or not database_url or not bridge_event:
+        return None
+    existing_fp = bridge_event.get("numerical_fingerprint_json") or {}
+    if isinstance(existing_fp, dict) and "macro_observation" in existing_fp \
+            and (existing_fp["macro_observation"] or {}).get("baseline_captured_at"):
+        return bridge_event  # 既にbaseline記録済み（上書きしない）
+
+    now_utc = now_utc or datetime.datetime.now(datetime.timezone.utc)
+    status = compute_market_event_status(market_event, now_jst=now_utc.astimezone(_JST))
+    baseline_status = "LIVE_PRE_EVENT" if (status and status["event_status"] in ("UPCOMING", "IMMINENT")) \
+        else "BACKFILLED_PRE_EVENT"
+
+    driver_snapshot = capture_macro_driver_snapshot()
+    symbol_set = build_macro_observation_symbol_set(database_url, user_id)
+    stock_quotes = get_stock_quotes([{"code": s["code"], "market": "JP"} for s in symbol_set]) if symbol_set else {}
+    # sectorはwatchlistを1回だけ取得して引く（銘柄ごとに問い合わせるN+1にしない、実DB E2Eで検出・修正）。
+    sector_by_code = {}
+    if symbol_set:
+        try:
+            sector_by_code = {w.get("code"): w.get("sector")
+                                for w in investment_db.list_watchlist(database_url, user_id, market="JP")}
+        except Exception as e:
+            print("  MacroObservation: watchlist(sector参照)取得失敗", e)
+    stock_snapshots = []
+    for s in symbol_set:
+        q = stock_quotes.get(s["code"])
+        sector = sector_by_code.get(s["code"])
+        stock_snapshots.append({
+            "code": s["code"], "name": s.get("name"), "level": s.get("level"), "reason": s.get("reason"),
+            "sector": sector, "sector_prior": sector_exposure_hypothesis_for(sector),
+            "value": q.get("t") if q else None, "unit": "PRICE",
+            "observed_at": now_utc.isoformat() if q else None, "status": "OK" if q else "NO_DATA",
+        })
+
+    macro_observation = {
+        "baseline_status": baseline_status, "baseline_captured_at": now_utc.isoformat(),
+        "baseline_drivers": driver_snapshot, "baseline_stocks": stock_snapshots,
+        "market_event_risk_at_baseline": (status or {}).get("event_status"),
+    }
+    fp = dict(existing_fp)
+    fp["macro_observation"] = macro_observation
+    try:
+        return investment_db.update_underlying_event(database_url, bridge_event["id"],
+                                                        {"numerical_fingerprint_json": fp})
+    except Exception as e:
+        print("  MacroObservation: baseline書き込みで例外", e)
+        return None
+
+
+def sync_macro_event_observation(database_url, user_id, market_event, now_utc=None):
+    """STEP1〜3・STEP6：1件のcanonical market_eventについて、橋渡し行の作成→baseline
+    snapshot→既存generate_event_market_reactions_for_event()によるreaction window行生成、
+    までを1回で行う（全てidempotent、再実行しても増殖しない）。
+    2026-09-16実DB E2Eで検出した性能問題を修正：reaction行は既存create_event_market_
+    reactions()のON CONFLICT DO NOTHINGでDB書き込みレベルでは重複しないが、
+    generate_event_market_reactions_for_event()自体は呼ぶたびに全target（最大20銘柄+
+    MARKET）分の現在値取得を行う——5分間隔schedulerから毎回呼ぶと、書き込みが無駄になる
+    だけでなく無駄なAPI呼び出しが積み重なる。既にreaction行が存在するbridgeは
+    generate_event_market_reactions_for_event()自体を呼ばない（skip）。"""
+    bridge = sync_canonical_market_event_to_underlying_event(database_url, user_id, market_event)
+    if not bridge:
+        return None
+    bridge = capture_macro_event_baseline_snapshot(database_url, user_id, market_event, bridge, now_utc=now_utc) or bridge
+    try:
+        already_has_reactions = bool(investment_db.list_event_market_reactions_for_event(database_url, bridge["id"]))
+    except Exception as e:
+        print("  MacroObservation: 既存reaction確認で例外（安全側で生成をスキップ）", e)
+        already_has_reactions = True
+    created, symbol_count = 0, 0
+    if not already_has_reactions:
+        # symbol_set選定（watchlist/position/trade_history/ENTRY TOP5キャッシュへのDB参照を
+        # 複数回伴う）は、実際にreaction行を新規生成する場合だけ行う——既に生成済みのbridgeでは
+        # 完全にスキップし、5分ごとのschedulerが無駄なDB参照を積み重ねないようにする。
+        symbol_set = build_macro_observation_symbol_set(database_url, user_id)
+        symbol_count = len(symbol_set)
+        bridge_for_reactions = dict(bridge)
+        bridge_for_reactions["direct_tickers_json"] = [s["code"] for s in symbol_set]
+        try:
+            created = generate_event_market_reactions_for_event(database_url, user_id, bridge_for_reactions)
+        except Exception as e:
+            print("  MacroObservation: reaction window生成で例外", e)
+            created = 0
+    return {"bridge_id": bridge.get("id"), "reactions_created": created, "symbol_count": symbol_count,
+            "skipped_generation": already_has_reactions}
+
+
+def sync_pending_macro_event_observations(database_url, user_id, days_back=1, days_ahead=3):
+    """STEP6：既存_event_reaction_scheduler_loop()から呼ばれる、canonical market_events側の
+    定期同期エントリポイント。近傍のcanonical market_eventsを毎回確認し、まだ橋渡し・
+    baseline・reaction行が無いものだけ処理する（全てidempotentなので重複実行しても安全）。"""
+    result = {"processed": 0, "synced": 0, "errors": 0}
+    if investment_db is None or not database_url:
+        return result
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    today = now_utc.astimezone(_JST).date()
+    try:
+        events = investment_db.list_market_events(
+            database_url, user_id, from_date=(today - datetime.timedelta(days=days_back)).isoformat(),
+            to_date=(today + datetime.timedelta(days=days_ahead)).isoformat())
+    except Exception as e:
+        print("  MacroObservation: market_events取得で例外", e)
+        return result
+    for e in events:
+        if not e.get("canonical_event_key"):
+            continue
+        result["processed"] += 1
+        try:
+            r = sync_macro_event_observation(database_url, user_id, e, now_utc=now_utc)
+            if r:
+                result["synced"] += 1
+        except Exception as ex:
+            result["errors"] += 1
+            print("  MacroObservation: sync失敗", e.get("canonical_event_key"), ex)
+    return result
+
+
 def _event_reaction_scheduler_loop():
     """指示書28番：既存scheduler（にこそくポーリング・social signal評価等）と競合しない
-    独立処理。pending reaction（due_at到来分）だけを5分間隔で処理する。"""
+    独立処理。pending reaction（due_at到来分）だけを5分間隔で処理する。
+    2026-09-16追加（金融政策イベント統合 Phase5A）：同じ5分tickでcanonical market_events側の
+    観測同期（橋渡し行作成・baseline・reaction window生成）も行う——新しいscheduler
+    スレッドは追加しない（指示書の明示的な要求）。"""
     while True:
         _mark_scheduler_tick("event_reaction")
         try:
@@ -9664,6 +10085,10 @@ def _event_reaction_scheduler_loop():
                 result = run_due_event_market_reactions(DATABASE_URL, user_id, limit=50)
                 if result["evaluated"] or result["no_data"]:
                     print(f"  [Market Intelligence] event reaction evaluated={result['evaluated']}件 no_data={result['no_data']}件")
+                macro_result = sync_pending_macro_event_observations(DATABASE_URL, user_id)
+                if macro_result["synced"] or macro_result["errors"]:
+                    print(f"  [MacroObservation] processed={macro_result['processed']} "
+                          f"synced={macro_result['synced']} errors={macro_result['errors']}")
                 _mark_scheduler_success("event_reaction", processed_count=result["evaluated"] + result["no_data"])
             else:
                 _mark_scheduler_success("event_reaction")
