@@ -1213,9 +1213,15 @@ function newsSourceRank(it){
 // Trade Cockpit v3 Phase4（設計案43番）：ニュースのカテゴリ分類。有料AI APIは使わずキーワード
 // 辞書のみ（既存のIMPORTANT_KEYWORDS・STOCK_NAME_NEWS_EXCLUDE_KEYWORDSと同じ方式）。
 // 上から順に判定し、最初にヒットしたカテゴリを採用する。
+// 2026-09-17修正（緊急修正STEP4）：「IR」カテゴリの判定キーワードから裸の"IR"（英大文字2文字）
+// を削除した。t.includes("IR")は部分一致のため、"BE:FIRST"のような無関係な英単語の中間
+// （F-IR-ST）にもヒットし、味の素スタジアムのアーティスト公演記事に「IR」バッジが付く
+// 誤分類が実際に発生した。他のキーワード（適時開示・自己株式取得等）は複数文字の具体的な
+// 用語のため誤爆しにくく、残している。IRバッジ自体の表示判定（isIrContent、下記）は
+// サーバー側の構造化情報（it.sourceType）を優先するよう別途修正済み。
 const NEWS_CATEGORY_KEYWORDS=[
   ["EARNINGS",["決算","上方修正","下方修正","増益","減益","最終利益","純利益","営業利益"]],
-  ["IR",["IR","適時開示","自己株式取得","株式分割","新株予約権","業務提携","M&A","公開買付","TOB","大量保有"]],
+  ["IR",["適時開示","自己株式取得","株式分割","新株予約権","業務提携","M&A","公開買付","TOB","大量保有"]],
   ["FX",["ドル円","為替","円安","円高","USDJPY"]],
   ["COMMODITY",["原油","WTI","金価格","商品先物","天然ガス"]],
   ["POLITICS",["選挙","政権","大統領","首相","国会","規制強化","制裁"]],
@@ -1257,7 +1263,14 @@ function NewsList({items,showName,emptyText,priorityOf}){
       const srcRank=newsSourceRank(it);
       const srcLabel=NEWS_SOURCE_LABELS[srcRank];
       const showSrcBadge=srcRank!==3; // 3=その他国内はノイズになるため表示しない
-      const isIrContent=(category==="IR"||category==="EARNINGS")&&srcRank!==0;
+      // 2026-09-17修正（緊急修正STEP4）：IRバッジの判定はサーバー側の構造化情報
+      // （it.sourceType、classify_source_tier()がTDnet／NQNのAI開示速報120・129だけを
+      // "PRIMARY_DISCLOSURE"/"PRIMARY_IR"として付与する）を優先根拠にする。
+      // classifyNewsCategoryのキーワード一致（IR系複数文字用語・決算系）は補助的にORで残す
+      // （NEWS_CATEGORY_KEYWORDSから裸の"IR"は削除済みのため、以前のような部分一致誤爆
+      // （"BE:FIRST"→"F-IR-ST"）はもう起きない）。
+      const isIrContent=(it.sourceType==="PRIMARY_DISCLOSURE"||it.sourceType==="PRIMARY_IR"
+                          ||category==="IR"||category==="EARNINGS")&&srcRank!==0;
       // 2026-09-09削除（ユーザー要望）：「不要」フィードバックボタンはユーザーに意味が伝わらず
       // 表示価値がないため一覧UIから削除した（v3 Phase4・設計案48番で追加したもの）。
       // バックエンドの/api/news-feedback/save・ログテーブル自体は変更していない（このUIの
@@ -2994,6 +3007,7 @@ const SMART_IMPORT_CATEGORY_META={
   WATCHLIST_MASTER_UPDATE:{icon:"📋",label:"WATCHLIST_UPDATE（監視銘柄更新）",color:"var(--up)"},
   POSITION_UPDATE:{icon:"💼",label:"POSITION UPDATE（保有ポジション）",color:"var(--down)"},
   SOCIAL_IMAGE_ANALYSIS:{icon:"🖼",label:"SOCIAL IMAGE ANALYSIS（X投稿画像解析）",color:"var(--up)"},
+  WATCH_STOCK:{icon:"👁️",label:"WATCH STOCK（監視候補）",color:"var(--up)"},
   UNKNOWN:{icon:"❔",label:"判別不能",color:"var(--inkFaint)"},
 };
 const SMART_IMPORT_CONFIDENCE_META={
@@ -3003,7 +3017,7 @@ const SMART_IMPORT_CONFIDENCE_META={
 // 2026-09-10更新（Phase SI-C）：WATCHLIST_UPDATE/POSITION_UPDATEを追加。
 const SMART_IMPORT_IMPLEMENTED=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
   "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","CHATGPT_LEGACY","WATCHLIST_UPDATE",
-  "WATCHLIST_MASTER_UPDATE","POSITION_UPDATE","SOCIAL_IMAGE_ANALYSIS"];
+  "WATCHLIST_MASTER_UPDATE","POSITION_UPDATE","SOCIAL_IMAGE_ANALYSIS","WATCH_STOCK"];
 
 // 指示書25番（Phase SI-D）：UIテキストを統一表現に寄せる。sourceContextはCatalystタブ等
 // から開いた場合のヒント表示用（指示書12番：分類結果を強制しない、あくまで注記）。
@@ -3014,7 +3028,7 @@ const SMART_IMPORT_SOURCE_CONTEXT_LABEL={
 // TRADE_RULE・POSITION_UPDATE全般・WATCHLIST_UPDATEのREMOVEは除外）。判定はカテゴリ単位
 // （WATCHLIST_UPDATE自体はADD/UPDATEなら安全）＋isSmartImportCandidateSafe()で個別除外する。
 const SMART_IMPORT_SAFE_CATEGORIES=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
-  "MORNING_MARKET_CHECK","INTRADAY_REPORT","WATCHLIST_UPDATE","SOCIAL_IMAGE_ANALYSIS"];
+  "MORNING_MARKET_CHECK","INTRADAY_REPORT","WATCHLIST_UPDATE","SOCIAL_IMAGE_ANALYSIS","WATCH_STOCK"];
 const isSmartImportCandidateSafe=c=>{
   if(!SMART_IMPORT_SAFE_CATEGORIES.includes(c.category))return false;
   if(c.category==="WATCHLIST_UPDATE"&&(c.draft?.action||"").toUpperCase()==="REMOVE")return false;
@@ -3253,6 +3267,18 @@ function SmartImportPanel({onReload,sourceContext=null,onSaved=null,compactMode=
                   対象post_id: {c.draft.post_id||"（不明）"}　保存先: social_market_posts.image_analysis_json（既存投稿への追記のみ、売買スコアには加点しません）
                 </div>
               </>}
+              {c.category==="WATCH_STOCK" && <>
+                {!c.draft.code && <div style={{fontSize:11,color:"var(--down)",fontWeight:700}}>⚠ 銘柄コードを解決できませんでした（自動推定しません）</div>}
+                <div style={{fontSize:13,fontWeight:700,marginBottom:4}}>
+                  [監視候補] {c.draft.code||"（不明）"} {c.draft.name||""}
+                </div>
+                {c.draft.theme && <div style={{fontSize:11.5,color:"var(--inkSoft)",marginBottom:2}}>テーマ: {c.draft.theme}</div>}
+                {c.draft.reason && <div style={{fontSize:11.5,color:"var(--inkSoft)",marginBottom:2,whiteSpace:"pre-wrap"}}>理由: {c.draft.reason}</div>}
+                {c.draft.source && <div style={{fontSize:11.5,color:"var(--inkSoft)",marginBottom:2}}>出典: {c.draft.source}</div>}
+                {Array.isArray(c.draft.tags) && c.draft.tags.length>0 && <div style={{fontSize:11.5,color:"var(--inkSoft)",marginBottom:2}}>タグ: {c.draft.tags.join(" / ")}</div>}
+                {c.draft.priority && <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>監視優先度: {String(c.draft.priority).toUpperCase()}</div>}
+                <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:2}}>保存先: 監視銘柄（候補状態）。既存の監視銘柄と同一コードがあれば重複追加せず、テーマ/理由/出典/タグをマージします。</div>
+              </>}
               {!implemented && <div style={{fontSize:11.5,color:"var(--inkFaint)",whiteSpace:"pre-wrap"}}>{c.raw_text}</div>}
             </div>
           </div>;
@@ -3282,7 +3308,7 @@ function SmartImportPanel({onReload,sourceContext=null,onSaved=null,compactMode=
 }
 const SMART_IMPORT_CATEGORIES_UI=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
   "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","WATCHLIST_UPDATE","WATCHLIST_MASTER_UPDATE",
-  "POSITION_UPDATE","SOCIAL_IMAGE_ANALYSIS","UNKNOWN"];
+  "POSITION_UPDATE","SOCIAL_IMAGE_ANALYSIS","WATCH_STOCK","UNKNOWN"];
 
 function ExpertViewsPanel({views,onReload,onOpenSmartImport}){
   const [pasteText,setPasteText]=useState("");

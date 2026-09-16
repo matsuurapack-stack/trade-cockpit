@@ -1179,14 +1179,24 @@ def assign_event_keys(items):
     return items
 
 
+NQN_DISCLOSURE_CATEGORIES = ("120", "129")  # AI開示速報（決算関連／その他）。100=ニュース（一般）は含めない
+
+
 def _annotate_news_importance(items, is_tdnet=False, is_registered_stock=False):
     """items各要素にimportanceScore/notificationLevel/badges、および指示書1〜6の
     sourceTier/sourceType/related*/eventKeyを付与する（既存フィールドはそのまま、追加のみ
-    ＝既存機能を壊さない）。"""
+    ＝既存機能を壊さない）。
+    2026-09-17追加（緊急修正：IRの誤分類対策）：NQN（立花証券API速報）のうち
+    nqnCategoryが120/129（AI開示速報）の項目は、TDnetと同じ「構造的に信頼できる公式開示」
+    として扱い、classify_source_tier()にis_ir=Trueを渡す（sourceType="PRIMARY_IR"になる）。
+    nqnCategory=="100"（一般ニュース）やGoogleニュース由来の項目には一切適用しない——
+    タイトルの文字列一致（"IR"等）ではなく、NQN側が構造的に付与したカテゴリコードだけを
+    根拠にする（指示書「IR判定はできる限りsource_type等の構造化情報を使う」）。"""
     for it in items:
         item_is_tdnet = is_tdnet or (it.get("source") == "TDnet")
         item_is_registered = is_registered_stock or bool(it.get("code"))
-        tier, source_type = classify_source_tier(it.get("source"), it.get("url"), is_tdnet=item_is_tdnet)
+        item_is_ir = it.get("source") == "NQN" and it.get("nqnCategory") in NQN_DISCLOSURE_CATEGORIES
+        tier, source_type = classify_source_tier(it.get("source"), it.get("url"), is_tdnet=item_is_tdnet, is_ir=item_is_ir)
         result = compute_news_importance(
             it.get("title"), code=it.get("code"), source=it.get("source"),
             is_tdnet=item_is_tdnet, is_registered_stock=item_is_registered, source_tier=tier)
@@ -1852,14 +1862,45 @@ STOCK_NAME_NEWS_NQN_MIN = 2
 # 行わず、銘柄コード単位で一般ニュース取得対象から除外する）。
 # 対象外の処理（TDnet/公式IR＝build_stock_news()・build_disclosure_news()、株価取得・
 # チャート・ENTRY TOP5・相対強弱・銘柄分析・Smart Import・ポートフォリオ等）には
-# 一切影響させない——このセットはbuild_stock_name_news()内でのみ参照する。
-# 将来対象を追加する場合はこのsetへコード追加するだけでよい。
+# 一切影響させない——このセットはbuild_stock_name_news()と、/api/newsハンドラ側の
+# 最終payload安全弁（_filter_general_news_for_disabled_codes、2026-09-17追加）でのみ
+# 参照する。将来対象を追加する場合はこのsetへコード追加するだけでよい。
 STOCK_NAME_NEWS_DISABLED_CODES = {
     "1812",  # 鹿島
     "2282",  # 日本ハム
     "2801",  # キッコーマン
     "2802",  # 味の素
 }
+GENERAL_NEWS_DISABLED_CODES = STOCK_NAME_NEWS_DISABLED_CODES  # 指示書の命名に合わせたエイリアス（同一set）
+
+
+def _is_official_disclosure_news_item(it):
+    """2026-09-17新規（緊急修正STEP2・3・4）：itemが「構造的に信頼できる公式開示」かどうかを、
+    タイトルの文字列一致ではなくsource/sourceType（_annotate_news_importance()が既に
+    classify_source_tier()で付与済みの構造化情報）だけで判定する。
+    - source=="TDnet" → 常にTrue（適時開示システムそのもの）
+    - sourceType が "PRIMARY_DISCLOSURE"（TDnet）または "PRIMARY_IR"（NQNのAI開示速報
+      120/129、_annotate_news_importance()がis_ir=Trueとして分類済み）→ True
+    それ以外（Googleニュース・NQN一般記事100等）はFalse。sourceTypeが未付与（_sort_and_strip
+    を通っていない呼び出し元）の場合はsource/nqnCategoryから直接判定する安全側フォールバック。"""
+    if it.get("source") == "TDnet":
+        return True
+    source_type = it.get("sourceType")
+    if source_type in ("PRIMARY_DISCLOSURE", "PRIMARY_IR"):
+        return True
+    if source_type is None and it.get("source") == "NQN":
+        return it.get("nqnCategory") in NQN_DISCLOSURE_CATEGORIES
+    return False
+
+
+def _filter_general_news_for_disabled_codes(items):
+    """2026-09-17新規（緊急修正STEP2）：登録銘柄ニュースの最終payload生成直前に置く
+    銘柄コードベースの安全弁。build_stock_name_news()側の入口フィルタ（Google News・
+    NQNカテゴリ100の除外）を万一すり抜けた項目があっても、GENERAL_NEWS_DISABLED_CODES
+    対象銘柄かつ_is_official_disclosure_news_item()がFalseの項目はここで最終的に落とす。
+    TDnet/公式IR（_is_official_disclosure_news_item()がTrueの項目）は対象銘柄でも残す。"""
+    return [it for it in items
+            if not (it.get("code") in GENERAL_NEWS_DISABLED_CODES and not _is_official_disclosure_news_item(it))]
 
 # 社名一致は広く拾う分、無関係な記事が紛れ込みやすい（判断材料としての価値が薄いため除外する）。
 # ①Amazon「プライムデー」等のセール告知・広告・商品レビュー記事（Amazon/Microsoft/Appleのような
@@ -2045,7 +2086,13 @@ def _tachibana_stock_news(jp_items):
         ts = _tdnet_date_sort_key(d, hhmm) if len(d) == 8 and hhmm else 0
         for code in matched:
             items.append({"code": code, "name": code_to_name[code], "title": h["headline"], "url": "",
-                           "source": "NQN", "published": published, "_ts": ts})
+                           "source": "NQN", "published": published, "_ts": ts,
+                           # 2026-09-17追加（緊急修正：4銘柄の一般ニュース除外の漏れ対策）：
+                           # NQNのカテゴリ（100=ニュース＝一般記事も含む／120・129=AI開示速報＝
+                           # 公式開示速報）を保持する。カテゴリを捨てて"NQN"とだけ扱っていたため、
+                           # 一般ニュース除外対象銘柄でも120/129と同じ扱いで100（一般記事、
+                           # スポーツ・地域ニュース等を含みうる）まで素通りしていたのが漏れの原因。
+                           "nqnCategory": h.get("category")})
     return items
 
 
@@ -2068,7 +2115,21 @@ def build_stock_name_news(watchlist):
     items = []
 
     # 先にNQNを銘柄コードごとに集計しておき、Googleニュースで補う必要があるか判定する。
-    tachibana_items = _tachibana_stock_news([w for w in wl if w.get("market", "JP") != "US"])
+    #
+    # 2026-09-17緊急修正：STOCK_NAME_NEWS_DISABLED_CODESの4銘柄について、当初はここの
+    # tachibana_itemsを無条件に残す設計にしていた（「NQNはコードベースで元々ノイズが
+    # 少ない」という誤った前提）。しかし実画面でNQNのカテゴリ100（ニュース＝一般記事、
+    # スポーツ・地域ニュース等も含む）がスポーツ選手の怪我・地域行事等を配信しており、
+    # 一般ニュース除外がすり抜けていた（実例：2282日本ハムの「期待外れのドラ1戦士」等）。
+    # NQNのうちAI開示速報（カテゴリ120・129＝公式開示速報）だけは、TDnetと同様に
+    # 「銘柄コードで確実に関連付き文脈で企業の公式開示を伝える」ため対象4銘柄でも残し、
+    # カテゴリ100（一般記事）だけを除外する。
+    tachibana_items_all = _tachibana_stock_news([w for w in wl if w.get("market", "JP") != "US"])
+    tachibana_items = [
+        it for it in tachibana_items_all
+        if it.get("code") not in STOCK_NAME_NEWS_DISABLED_CODES
+        or it.get("nqnCategory") in NQN_DISCLOSURE_CATEGORIES
+    ]
     items += tachibana_items
     tachibana_count = {}
     for it in tachibana_items:
@@ -2080,7 +2141,7 @@ def build_stock_name_news(watchlist):
         if not name:
             continue
         if code in STOCK_NAME_NEWS_DISABLED_CODES:
-            continue  # 指示書：一般ニュース（企業名検索）取得対象から除外。NQN（上のtachibana_items）はそのまま残す
+            continue  # 指示書：一般ニュース（企業名検索）取得対象から除外。NQNの公式開示速報（120/129）は上で残している
         nqn_n = tachibana_count.get(code, 0)
         if market != "US" and nqn_n >= STOCK_NAME_NEWS_NQN_MIN:
             continue  # NQNで十分な件数が取れている銘柄はGoogleニュースを使わない（ノイズ回避）
@@ -20989,7 +21050,7 @@ def _macro_text(items):
 SMART_IMPORT_CATEGORIES = [  # 指示書2番。将来カテゴリ追加時はここへ追加するだけでよい構造
     "CATALYST", "EXPERT_OPINION", "EVENT", "MARKET_ANALYSIS", "MORNING_MARKET_CHECK",
     "INTRADAY_REPORT", "TRADE_RULE", "NEWS", "WATCHLIST_UPDATE", "WATCHLIST_MASTER_UPDATE",
-    "POSITION_UPDATE", "UNKNOWN",
+    "POSITION_UPDATE", "WATCH_STOCK", "UNKNOWN",
 ]
 # Phase SI-B（2026-09-10）で MARKET_ANALYSIS・MORNING_MARKET_CHECK・INTRADAY_REPORT・
 # TRADE_RULEを追加。CHATGPT_LEGACYはSMART_IMPORT_CATEGORIESには含めない内部専用カテゴリ
@@ -20997,19 +21058,23 @@ SMART_IMPORT_CATEGORIES = [  # 指示書2番。将来カテゴリ追加時はこ
 # save_chatgpt_unified_import()へそのまま委譲するための経路。UIのカテゴリ選択肢にも出さない）。
 # Phase SI-C（2026-09-10）でWATCHLIST_UPDATE・POSITION_UPDATEを追加。NEWSは引き続き未実装
 # （既存ニュースタブのRSS取得と役割が重複するため、指示書のスコープではPhase SI-C対象外）。
+# 2026-09-17新規：会社四季報・ChatGPT/Claude・ニュース分析等から取得した「監視候補銘柄」を
+# 正式カテゴリ化（WATCH_STOCK）。UNKNOWN固定で保存できなかった不具合の修正。
 SMART_IMPORT_IMPLEMENTED_CATEGORIES = {
     "CATALYST", "EVENT", "EXPERT_OPINION", "MARKET_ANALYSIS", "MORNING_MARKET_CHECK",
     "INTRADAY_REPORT", "TRADE_RULE", "CHATGPT_LEGACY", "WATCHLIST_UPDATE", "WATCHLIST_MASTER_UPDATE",
-    "POSITION_UPDATE", "SOCIAL_IMAGE_ANALYSIS", "SOCIAL_POST_IMPORT",
+    "POSITION_UPDATE", "SOCIAL_IMAGE_ANALYSIS", "SOCIAL_POST_IMPORT", "WATCH_STOCK",
 }
 # 指示書16番（Phase SI-C）：重要操作（TRADE_RULE・WATCHLIST_UPDATEのREMOVE・POSITION_UPDATE
 # 全般）は「安全な項目のみ選択」の対象外とする。POSITION_UPDATEはカテゴリ全体が対象外
 # （指示書6番：HIGH confidenceでも自動保存禁止、常に確認）。SOCIAL_IMAGE_ANALYSISは既存投稿
 # への追記のみ（売買・ルールに直接影響しない）のため安全側に含める。SOCIAL_POST_IMPORT
 # （X Intelligence Phase1B、2026-09-15新規）も同様に売買・ルールへ直接影響しないため含める。
+# WATCH_STOCK（2026-09-17新規）は既存watchlistを「候補」状態で保存するのみ（実際の売買・
+# ENTRY判断には一切接続しない）ため安全側に含める。
 SMART_IMPORT_SAFE_CATEGORIES_BACKEND = {"CATALYST", "EVENT", "EXPERT_OPINION", "MARKET_ANALYSIS",
                                           "MORNING_MARKET_CHECK", "INTRADAY_REPORT", "SOCIAL_IMAGE_ANALYSIS",
-                                          "SOCIAL_POST_IMPORT"}
+                                          "SOCIAL_POST_IMPORT", "WATCH_STOCK"}
 
 _JSON_CODEBLOCK_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 
@@ -21056,12 +21121,56 @@ def _looks_like_legacy_chatgpt_payload(item):
     return "date" in item and any(isinstance(item.get(k), list) for k in list_keys)
 
 
+# 2026-09-17新規（監視候補銘柄のSmart Import正式対応）：type文字列のゆれをすべて
+# WATCH_STOCKへ正規化する（会社四季報・ChatGPT/Claude・ニュース分析等、供給元によって
+# 呼び方が異なるため）。
+WATCH_STOCK_TYPE_ALIASES = {
+    "watch_stock", "watchlist", "watchlist_stock", "stock_candidate", "watch_candidate",
+    "external_watchlist", "monitor_stock", "monitor_candidate",
+}
+# 日本株コードの妥当性判定。従来の`^[0-9]{4}$`限定ではなく、146A等の英字混在新フォーマットにも
+# 対応する（_watchlist_master_stock_code()と同じ「数値変換せず文字列のまま扱う」方針）。
+# 4桁ちょうど・先頭3桁は数字・最後の1桁は数字または英字（大小問わず）。
+_WATCH_STOCK_CODE_RE = re.compile(r"^[0-9]{3}[0-9A-Za-z]$")
+
+
+def _is_valid_jp_stock_code(code):
+    """WATCH_STOCK判定用の日本株コード妥当性チェック（146A等の新フォーマット対応）。"""
+    return bool(_WATCH_STOCK_CODE_RE.match(str(code or "").strip()))
+
+
+def _classify_watch_stock_item(item):
+    """STEP3：watch_stock候補のconfidence判定。必須＝code+name、推奨＝theme/reason/source
+    （1つ以上あれば最低MEDIUM、3つ揃えばHIGHでもよい）、補助＝tags/priority（confidenceには
+    影響させない）。priority（監視優先度）はここでのimport confidenceとは完全に別物として
+    扱う——STEP3の明示的な指示。"""
+    code, name = item.get("code"), item.get("name")
+    if not code:
+        return "WATCH_STOCK", "LOW", item
+    if not name:
+        return "WATCH_STOCK", "LOW", item
+    has_theme = bool(item.get("theme"))
+    has_reason = bool(item.get("reason"))
+    has_source = bool(item.get("source"))
+    if has_theme and has_reason and has_source:
+        confidence = "HIGH"
+    else:
+        confidence = "MEDIUM"  # code+nameが揃っていれば、推奨項目が0件でもLOW/DEGRADEDにはしない
+    return "WATCH_STOCK", confidence, item
+
+
 def _classify_json_item(item):
     """dict1件をカテゴリへ分類する（フィールド形状ベース、指示書4番STEP2・14番：既知typeを
     最優先）。既存の各schemaのキー名をそのまま使い、新しいschemaは増やさない。"""
     if not isinstance(item, dict):
         return "UNKNOWN", "LOW", {}
     t = str(item.get("type") or "").strip().lower()
+
+    # 2026-09-17新規（STEP1）：type文字列が監視候補銘柄のエイリアスに一致すれば、UNKNOWNへ
+    # 落とさずWATCH_STOCKとして扱う（他の既知typeより先に判定する——WATCH_STOCKは形状が
+    # シンプルで他カテゴリと誤衝突しないため優先度を上げても安全）。
+    if t in WATCH_STOCK_TYPE_ALIASES:
+        return _classify_watch_stock_item(item)
 
     # 指示書14番：既知typeがあれば自然文解析より最優先。type=trading_log等の旧ChatGPT形式は
     # 既存パーサーへ委譲する（指示書1番の優先順位1・2）。
@@ -21122,6 +21231,16 @@ def _classify_json_item(item):
         return "CATALYST", ("HIGH" if item.get("catalyst_date") else "MEDIUM"), item
     if ("event_date" in item or "event" in item) and ("title" in item or "event" in item):
         return "EVENT", ("HIGH" if item.get("event_date") else "MEDIUM"), item
+
+    # 2026-09-17新規（STEP2）：typeが無い/未知でも、株コード＋銘柄名＋補足情報が揃っていれば
+    # 監視候補銘柄としてfallback判定する。他の既知typeの判定（CATALYST/EVENT等の上記分岐）に
+    # 一致しなかった場合のみ到達するため、既存カテゴリの判定を横取りしない。UNKNOWNを何でも
+    # WATCH_STOCKへ昇格させることを防ぐため、条件は厳格に保つ（code妥当性・name必須・
+    # theme/reason/tags/sourceのいずれか1つ以上）。
+    code, name = item.get("code"), item.get("name")
+    if code and name and _is_valid_jp_stock_code(code) \
+            and any(item.get(k) for k in ("theme", "reason", "tags", "source")):
+        return _classify_watch_stock_item(item)
     return "UNKNOWN", "LOW", item
 
 
@@ -21520,6 +21639,13 @@ def classify_content(raw_text, database_url=None, user_id=None):
                 if isinstance(wrapper.get(key), list) and wrapper[key]:
                     items = wrapper[key]
                     break
+            else:
+                # STEP7新規（2026-09-17）：{"stocks":[...]}形式のWATCH_STOCK候補配列を展開する。
+                # ただしtype=="watchlist_master_update"は既存スキーマ内で"stocks"を別の内部
+                # フィールド（1件の中の銘柄配列）として使っているため、wrapper自体にtypeが
+                # 明示されている場合は展開しない（既存カテゴリとの衝突防止）。
+                if not wrapper.get("type") and isinstance(wrapper.get("stocks"), list) and wrapper["stocks"]:
+                    items = wrapper["stocks"]
         candidates = []
         for item in items:
             category, confidence, draft = _classify_json_item(item)
@@ -22104,6 +22230,28 @@ def normalize_watchlist_master_update(draft, raw_text=None, import_source="unkno
             "import_source": import_source}
 
 
+WATCH_STOCK_PRIORITIES = ("high", "medium", "low")
+
+
+def normalize_watch_stock(draft, raw_text=None, import_source="unknown"):
+    """draftをinvestment_db.upsert_watch_stock_candidate()が受け付ける形へ正規化する
+    （2026-09-17新規、監視候補銘柄のSmart Import正式対応）。codeが解決できていなければ
+    Noneを返す（他のnormalize_*と同じ方針：銘柄コードに自信が無ければ保存不可）。
+    146A等の英字混在コードも_watchlist_master_stock_codeと同じく文字列のまま保持する。"""
+    draft = draft or {}
+    code = _watchlist_master_stock_code(draft)
+    if not code:
+        return None
+    tags = draft.get("tags")
+    tags = [str(t).strip() for t in tags if str(t or "").strip()] if isinstance(tags, list) else []
+    priority = str(draft.get("priority") or "").strip().lower()
+    if priority not in WATCH_STOCK_PRIORITIES:
+        priority = None
+    return {"code": code, "market": draft.get("market") or "JP", "name": draft.get("name"),
+            "theme": draft.get("theme"), "reason": draft.get("reason"), "source": draft.get("source"),
+            "tags": tags, "priority": priority, "raw_text": raw_text, "import_source": import_source}
+
+
 def normalize_position_update(database_url, user_id, draft, raw_text=None, import_source="unknown"):
     """draftを既存のadd_position_entry/add_position_exit/upsert_portfolio_item（すべて
     investment_db.py既存関数、平均単価・実現損益の計算ロジックはそこに委譲し重複実装しない、
@@ -22268,6 +22416,7 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
     position_update_results = []
     social_image_analysis_results = []
     social_post_import_results = []
+    watch_stock_results = []
 
     for c in candidates or []:
         category = c.get("category")
@@ -22405,6 +22554,26 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
             except Exception as e:
                 print("  SmartImport: WatchlistUpdate保存失敗", e)
                 watchlist_update_results.append({"ok": False, "reason": str(e)})
+            continue
+
+        if category == "WATCH_STOCK":
+            # 2026-09-17新規：監視候補銘柄。既存watchlist（SHARED scope、UNIQUE(user_id,code,
+            # market)）をそのまま再利用し、新規テーブルは作らない。ただし「いきなり本番監視
+            # 銘柄として確定させない」というユーザー要求に合わせ、investment_db.
+            # upsert_watch_stock_candidate()側でwatch='候補'（既存の優先/通常/様子見とは別の
+            # 第4状態）として保存し、既存行があればtheme/reason/source/tagsを破壊せず
+            # 追加・マージするのみで済ませる（既存watch状態は変更しない）。
+            try:
+                normalized = normalize_watch_stock(draft, raw_text, import_source)
+                if normalized is None:
+                    watch_stock_results.append({"ok": False, "reason": "銘柄コードを解決できないため保存できません"})
+                else:
+                    result = investment_db.upsert_watch_stock_candidate(database_url, user_id, normalized)
+                    watch_stock_results.append({"ok": bool(result), "code": normalized["code"],
+                                                 "created": (result or {}).get("created") if isinstance(result, dict) else None})
+            except Exception as e:
+                print("  SmartImport: WatchStock保存失敗", e)
+                watch_stock_results.append({"ok": False, "reason": str(e)})
             continue
 
         if category == "WATCHLIST_MASTER_UPDATE":
@@ -22649,6 +22818,10 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
         results["SOCIAL_POST_IMPORT"] = {"imported": sum(1 for r in social_post_import_results if r["ok"]),
                                           "skipped": sum(1 for r in social_post_import_results if not r["ok"]),
                                           "details": social_post_import_results}
+    if watch_stock_results:
+        results["WATCH_STOCK"] = {"imported": sum(1 for r in watch_stock_results if r["ok"]),
+                                   "skipped": sum(1 for r in watch_stock_results if not r["ok"]),
+                                   "details": watch_stock_results}
     return {"results": results, "rejected_low_confidence": rejected, "skipped_unimplemented": skipped_unimplemented,
             "skipped_existing_report": skipped_existing_report}
 
@@ -24971,6 +25144,10 @@ class Handler(SimpleHTTPRequestHandler):
             print(f"[取得] ニュース（登録銘柄 {len(watchlist)} 件 ＋ マクロ）…")
             stock = build_stock_news(watchlist)
             stock_name_news = build_stock_name_news(watchlist)
+            # 2026-09-17緊急修正STEP2：最終payload直前の安全弁。build_stock_name_news()側の
+            # 入口フィルタを万一すり抜けた一般ニュースがあっても、GENERAL_NEWS_DISABLED_CODES
+            # 対象銘柄についてはここで最終的に除外する（TDnet/公式IRは構造情報で判定して残す）。
+            stock_name_news = _filter_general_news_for_disabled_codes(stock_name_news)
             disclosure_news = build_disclosure_news(watchlist)
             macro_domestic, macro_overseas = build_macro_news()
             # News Intelligence Phase 2（指示書1・4）：日経中心化のための追加取得を

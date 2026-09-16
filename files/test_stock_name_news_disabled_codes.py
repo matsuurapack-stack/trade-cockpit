@@ -36,18 +36,24 @@ class StockNameNewsDisabledCodesTests(unittest.TestCase):
             server.build_stock_name_news(wl)
         mock_gn.assert_not_called()
 
-    def test_disabled_code_still_gets_nqn_from_tachibana(self):
-        """NQN（立花証券APIの速報、コードベースで既にノイズが少ない）は除外対象外
-        （企業名検索ではないため一般ニュースに該当しない）。"""
+    def test_disabled_code_keeps_nqn_disclosure_category_only(self):
+        """2026-09-17緊急修正：NQNのうちAI開示速報（カテゴリ120/129）は公式開示速報として
+        除外対象外だが、カテゴリ100（一般ニュース、スポーツ・地域記事等を含みうる）は
+        disabled codeについて除外されること（前回修正の漏れの直接原因）。"""
         wl = [make_watchlist_item("2282", "日本ハム")]
-        nqn_item = {"code": "2282", "name": "日本ハム", "title": "日本ハム、通期業績予想を上方修正",
-                     "url": "", "source": "NQN", "published": "09/16 09:00", "_ts": 1}
-        with mock.patch.object(server, "_tachibana_stock_news", return_value=[nqn_item]), \
+        disclosure_item = {"code": "2282", "name": "日本ハム", "title": "日本ハム、通期業績予想を上方修正",
+                             "url": "", "source": "NQN", "published": "09/16 09:00", "_ts": 1,
+                             "nqnCategory": "120"}
+        general_item = {"code": "2282", "name": "日本ハム", "title": "“超逸材”がまさか…日本ハム、期待外れのドラ1戦士",
+                         "url": "", "source": "NQN", "published": "09/16 09:00", "_ts": 2,
+                         "nqnCategory": "100"}
+        with mock.patch.object(server, "_tachibana_stock_news", return_value=[disclosure_item, general_item]), \
              mock.patch.object(server, "google_news") as mock_gn:
             items = server.build_stock_name_news(wl)
         mock_gn.assert_not_called()
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["source"], "NQN")
+        self.assertIn("上方修正", items[0]["title"])  # 開示速報だけが残る、一般記事は落ちる
 
     def test_non_disabled_code_unaffected(self):
         """4. disabledでない銘柄には影響しない（従来通りGoogleニュースを取得する）。"""
@@ -119,7 +125,7 @@ class ExistingNewsBehaviorUnbrokenTests(unittest.TestCase):
     def test_disabled_code_result_still_annotated_and_sorted(self):
         wl = [make_watchlist_item("2282", "日本ハム"), make_watchlist_item("7203", "トヨタ自動車")]
         nqn_item = {"code": "2282", "name": "日本ハム", "title": "日本ハム、通期業績予想を上方修正",
-                     "url": "", "source": "NQN", "published": "09/16 09:00", "_ts": 200}
+                     "url": "", "source": "NQN", "published": "09/16 09:00", "_ts": 200, "nqnCategory": "120"}
         google_item = {"title": "トヨタ自動車、新型EV発表", "url": "https://example.com/1",
                         "source": "日本経済新聞", "published": "09/16 10:00", "_ts": 100}
         with mock.patch.object(server, "_tachibana_stock_news", return_value=[nqn_item]), \
