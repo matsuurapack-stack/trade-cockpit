@@ -13661,6 +13661,41 @@ def build_stock_behavior_summary(database_url, user_id, symbol, current_setup_ta
     return {"profile": profile, "behavior_score": behavior_score}
 
 
+def can_finalize_daily_review(review_date, now_jst=None):
+    """緊急修正（2026-09-16）：FINAL確定可能時刻の一元管理（指示書4番）。scheduler・手動再生成・
+    売却後再生成・position削除後再生成など、daily_reviewをfinalize=Trueで呼ぶ全ての経路が
+    この関数を通す（generate_daily_review_with_learning()の内部で必ず適用されるため、
+    呼び出し側が個別に15:30判定を書く必要はない——指示書4番「個々のendpointで別々に
+    15:30判定を書かない」）。
+    判定基準（既存の東証営業日ユーティリティ・15:30スケジューラの設計をそのまま再利用、
+    新しい時刻を独自に決めていない）：
+      ①review_dateが未来日 → 確定不可
+      ②review_dateが東証営業日でない（土日・祝日・年末年始、is_jp_trading_day()） → 確定不可
+        （休場日はそもそも「持ち越し」概念が成立しない対象外日のため）
+      ③review_date < 今日 → 確定可能（その営業日の大引けは既に終わっている）
+      ④review_date == 今日 → jp_market_close_dt()（15:30固定）以降なら確定可能
+    ③の閾値は既存15:30スケジューラ（_daily_review_scheduler_loop、DAILY_REVIEW_SCHEDULE_HHMM=
+    "15:30"）が発火する時刻そのものと同じにする——スケジューラ自体が既に「15:30〜15:35の間、
+    データ完成を確認しながらリトライする」猶予機構を持っているため（_daily_review_data_
+    looks_complete）、ここでさらに別の猶予を重ねて足すと「データが早く揃った場合は15:30台の
+    早い時点で確定する」という既存の意図された挙動を遅らせてしまう。よってこの関数は
+    「大引け（15:30）を過ぎたか」だけを見る——15:30〜15:35のデータ完成待ちは既存
+    スケジューラ側の責務のまま変更しない。"""
+    try:
+        d = datetime.date.fromisoformat(review_date)
+    except (ValueError, TypeError):
+        return False
+    now_jst = now_jst or datetime.datetime.now(_JST)
+    today_jst = now_jst.date()
+    if d > today_jst:
+        return False
+    if not is_jp_trading_day(d):
+        return False
+    if d < today_jst:
+        return True
+    return now_jst >= jp_market_close_dt(d)
+
+
 def generate_daily_review_with_learning(database_url, user_id, review_date, user_feedback=None, finalize=True):
     """15:30自動評価パイプライン全体（指示書4・28番）：
       当日レビュー生成 → trade experience確定 → stock behavior更新 → pattern statistics更新 →
@@ -13669,8 +13704,14 @@ def generate_daily_review_with_learning(database_url, user_id, review_date, user
     評価関数には一切触れず、その上に積む追加専用の後続ステップ。finalize=Trueの場合のみ
     daily_reviews.is_finalizedを立てる（15:30スケジューラのリトライ中はfinalize=Falseで
     様子見にできる）。
+    緊急修正（2026-09-16）：finalizeが呼び出し側からTrueで渡されても、
+    can_finalize_daily_review()がFalseを返す間（review_dateが未来日・非営業日・当日で
+    大引け前）は絶対にFINAL化しない——場中に「今日の振り返り」を生成・再生成しても
+    PROVISIONAL（is_finalized=False）のまま返す。これにより、場中に保有中のDAYポジションが
+    「持ち越し」として誤確定されることを防ぐ（後述のsession_closed引き継ぎと組み合わせて、
+    持ち越し判定自体も大引け後まで行わない）。
     戻り値：{"review":..., "sync":..., "behaviorUpdated":[...], "patternCandidatesTracked":N,
-             "ruleCandidatesProposed":[...]}。"""
+             "ruleCandidatesProposed":[...], "sessionClosed": bool}。"""
     if investment_db is None or not database_url:
         return None
     # 2026-09-14修正（不具合対応）：土日・祝日・年末年始は「地合い情報が未記録」ではなく
@@ -13681,8 +13722,14 @@ def generate_daily_review_with_learning(database_url, user_id, review_date, user
         is_business_day = is_jp_trading_day(datetime.date.fromisoformat(review_date))
     except (ValueError, TypeError):
         is_business_day = True
+    # 緊急修正（2026-09-16）：session_closed（review_dateの大引けを過ぎたか）を
+    # can_finalize_daily_review()と全く同じ基準で計算し、_check_rule_adherence()の
+    # 持ち越し判定（day_positions）へ渡す。「position exists at review generation time」
+    # だけで持ち越しにしない——大引けを過ぎて初めて持ち越し判定を成立させる（指示書3番）。
+    session_closed = can_finalize_daily_review(review_date)
+    effective_finalize = bool(finalize) and session_closed
     review = investment_db.generate_daily_review(database_url, user_id, review_date, user_feedback=user_feedback,
-                                                   is_business_day=is_business_day)
+                                                   is_business_day=is_business_day, session_closed=session_closed)
 
     sync_result = sync_trade_experiences_for_date(database_url, user_id, review_date)
 
@@ -13729,16 +13776,33 @@ def generate_daily_review_with_learning(database_url, user_id, review_date, user
     except Exception as e:
         print("  daily-review: choruco評価保存で例外（無視して続行）", e)
 
-    if finalize:
+    if effective_finalize:
         try:
             finalized_review = investment_db.mark_daily_review_finalized(database_url, user_id, review_date)
             if finalized_review:
                 review = finalized_review  # 呼び出し元へ返す値をis_finalized/decision_quality等込みの最新状態にする
         except Exception as e:
             print("  daily-review: finalizeマークで例外（無視して続行）", e)
+    elif not session_closed:
+        # 緊急修正（2026-09-16）：大引け前は必ずPROVISIONAL（is_finalized=false）にする。
+        # is_finalizedはmark_daily_review_finalized()でしかtrueにならない一方向のラチェット
+        # だったため、過去に誤って（例：本セッションの検証作業中に手動でfinalize=Trueを渡した
+        # ことで）FINAL化されてしまったレビューが、通常の再生成だけでは戻らないバグがあった。
+        # ここでreset_daily_review_finalized()を呼び自己修復する（指示書8番「場中に生成された
+        # スコアをFINALな学習結果として残さない」を、既存の誤データにも遡って適用する）。
+        if finalize:
+            print(f"  [DailyReview] {user_id} {review_date}：大引け前のためfinalize要求をPROVISIONALへ降格しました")
+        try:
+            reset_review = investment_db.reset_daily_review_finalized(database_url, user_id, review_date)
+            if reset_review:
+                review = reset_review
+                print(f"  [DailyReview] {user_id} {review_date}：誤って確定されていたis_finalizedをfalseへ復元しました")
+        except Exception as e:
+            print("  daily-review: is_finalizedリセットで例外（無視して続行）", e)
 
     return {
         "review": review, "sync": sync_result, "behaviorUpdated": behavior_updated,
+        "sessionClosed": session_closed,
         "patternCandidatesTracked": len(pattern_stats), "ruleCandidatesProposed": rule_candidates_proposed,
         "choruco": choruco_result, "tradeBreakdown": build_trade_breakdown_for_day(today_trades),
     }
@@ -22792,7 +22856,10 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json({"review": result["review"], "sync": result["sync"],
                               "behaviorUpdated": result["behaviorUpdated"],
                               "ruleCandidatesProposed": result["ruleCandidatesProposed"],
-                              "tradeBreakdown": result.get("tradeBreakdown", [])})
+                              "tradeBreakdown": result.get("tradeBreakdown", []),
+                              # 緊急修正（2026-09-16）：場中は必ずFalse。フロントはこれと
+                              # review.is_finalizedを見て「今日の振り返り（場中・暫定）」表示に切り替える。
+                              "sessionClosed": result.get("sessionClosed")})
         elif self.path == "/api/daily-review/feedback":
             # 指示書18・19番：ユーザー感想を保存し、翌日以降の分析（recent_reflections_for）へ
             # 使えるようにする。保存と同時にreflection_tagsを抽出し、その日のスコアも再計算する
@@ -22802,7 +22869,10 @@ class Handler(SimpleHTTPRequestHandler):
             body = self._read_json_body()
             date = body.get("date") or datetime.date.today().isoformat()
             feedback = body.get("feedback") or ""
-            review = investment_db.save_review_user_feedback(DATABASE_URL, self.current_user, date, feedback)
+            # 緊急修正（2026-09-16）：場中に感想を入力してもdaily_reviewの持ち越し判定を
+            # 誤って有効化しない（can_finalize_daily_review()と同じ基準）。
+            review = investment_db.save_review_user_feedback(DATABASE_URL, self.current_user, date, feedback,
+                                                               session_closed=can_finalize_daily_review(date))
             if review is None:
                 self._send_json({"error": "感想の保存に失敗しました"}); return
             self._send_json({"review": review})

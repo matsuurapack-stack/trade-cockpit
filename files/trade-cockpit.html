@@ -9350,14 +9350,25 @@ function DailyReviewPanel(){
     else setFeedbackMsg("保存に失敗しました");
   };
 
+  // 緊急修正（2026-09-16）：場中Daily Review確定・誤持ち越し判定の防止（指示書2・9番）。
+  // review.is_finalizedはサーバー側can_finalize_daily_review()（大引け=15:30基準）で
+  // ゲート済みのため、当日かつis_finalized=falseなら「場中・暫定」表示に切り替える
+  // （FINALとPROVISIONALを明確に分離、新しい時刻判定はフロント側で行わない＝サーバーの
+  // is_finalizedを唯一の真実として使う）。
+  const isProvisionalToday = review && !review.is_finalized && date === todayISO();
   return <div style={{marginTop:18}}>
     <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
-      <div className="sec-head">今日の振り返り</div>
+      <div className="sec-head">
+        {isProvisionalToday ? "🟡 今日の振り返り（場中・暫定）" : review?.is_finalized ? "今日の振り返り（確定）" : "今日の振り返り"}
+      </div>
       <div style={{display:"flex",gap:6,alignItems:"center"}}>
         <input type="date" value={date} onChange={e=>setDate(e.target.value)} style={{fontSize:12,padding:"3px 5px"}}/>
         <button className="action-btn" onClick={generate} disabled={generating}>{generating?"生成中…":review?"再生成":"スコアを生成"}</button>
       </div>
     </div>
+    {isProvisionalToday && <div className="sec-note" style={{color:"var(--accent)",fontWeight:700}}>
+      ※ 取引時間中のためスコア・改善点・持ち越し判定は確定していません（大引け後に自動確定します）
+    </div>}
     <div className="sec-note">ポジション・売買履歴・持ち越し・ルール遵守状況から自動で採点します。利益が出てもルール違反なら減点、損失でも正しい損切りなら高評価になり得ます（「結果」より「判断プロセス」の評価）。</div>
     {/* 指示書10番：15:30振り返り通知のON/OFF設定（音・ポップアップ個別）。初期値は全てON。 */}
     <div style={{display:"flex",gap:12,flexWrap:"wrap",alignItems:"center",fontSize:11.5,color:"var(--inkSoft)",marginTop:6}}>
@@ -9384,8 +9395,8 @@ function DailyReviewPanel(){
       </div>
     : <div style={{marginTop:12}}>
         <div className="card" style={{padding:"14px 16px",textAlign:"center"}}>
-          <div style={{fontSize:12,color:"var(--inkSoft)"}}>今日の投資スコア</div>
-          <div style={{fontSize:36,fontWeight:800,color:scoreColor(review.score_total,100)}}>{review.score_total}<span style={{fontSize:16,fontWeight:400,color:"var(--inkSoft)"}}> / 100</span></div>
+          <div style={{fontSize:12,color:"var(--inkSoft)"}}>今日の投資スコア{isProvisionalToday && <span style={{color:"var(--accent)",fontWeight:700}}>（暫定）</span>}</div>
+          <div style={{fontSize:36,fontWeight:800,color:scoreColor(review.score_total,100)}}>{isProvisionalToday?"暫定 ":""}{review.score_total}<span style={{fontSize:16,fontWeight:400,color:"var(--inkSoft)"}}> / 100</span></div>
           {/* 指示書6・7番：「判断品質」と「結果」を分けて表示する（勝った/負けただけで評価しない）。 */}
           {(review.decision_quality_score!=null||review.trade_result_score!=null) &&
             <div style={{display:"flex",justifyContent:"center",gap:16,marginTop:8,fontSize:11.5,color:"var(--inkSoft)"}}>

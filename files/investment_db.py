@@ -2801,6 +2801,27 @@ def mark_daily_review_finalized(database_url, user_id, review_date):
     return _row_to_json(row) if row else None
 
 
+def reset_daily_review_finalized(database_url, user_id, review_date):
+    """緊急修正（2026-09-16）：is_finalizedはmark_daily_review_finalized()でしかtrueに
+    ならない一方向のラチェットになっており、一度（誤って）FINAL化されると通常の再生成
+    （PROVISIONAL）だけでは戻らないバグがあった。session_closed=False（大引け前）で
+    generate_daily_review_with_learning()が呼ばれた場合、この関数でis_finalizedを
+    強制的にfalseへ戻す——「場中に生成されたスコアをFINALな学習結果として残さない」
+    （指示書8番）を、過去に誤って確定されたレビューに対しても自己修復する形で満たす。
+    行が存在しない場合は何もしない（generate_daily_review()が先に行を作成済みの前提）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE daily_reviews SET is_finalized=false, updated_at=now() "
+                "WHERE user_id=%s AND review_date=%s AND is_finalized=true RETURNING *", [user_id, review_date])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
 def sync_rule_updates_to_trade_rules(database_url, user_id, rule_updates, daily_log_id=None, date=None,
                                        market_condition=None, review_excerpt=None, decision_excerpt=None):
     """save_chatgpt_import()から呼ばれる（指示書4番）。rule_updates（文字列配列 or {rule,status}
@@ -3173,9 +3194,15 @@ def extract_reflection_tags(text):
     return [t for t in order if t in tags] + [t for t in tags if t not in order]
 
 
-def _check_rule_adherence(database_url, user_id, review_date, positions, rules):
+def _check_rule_adherence(database_url, user_id, review_date, positions, rules, session_closed=True):
     """ルール遵守（25点満点）。実データ（保有中ポジション・trade_rules）から機械的に
-    チェックできるものだけを対象にする（指示書14番：単純な損益判定はしない）。"""
+    チェックできるものだけを対象にする（指示書14番：単純な損益判定はしない）。
+    緊急修正（2026-09-16）：session_closed=False（review_dateがまだ大引け前）の間は
+    持ち越し（day_positions）判定を完全にスキップする——
+    `09:30 ENTRY → 13:00保有中 → 14:30 EXIT`のような通常のデイトレを、場中に生成した
+    レビューが「持ち越し原則ルール違反」と誤判定しないため（指示書1・3・6番）。
+    逆指値未設定チェック（3番）はENTRY時点で判断可能な項目のため対象外——持ち越し概念とは
+    無関係、場中でも従来通り評価する。"""
     good, bad = [], []
     score = RULE_ADHERENCE_MAX
     active_rules = [r for r in rules if r["status"] == "ACTIVE"]
@@ -3183,7 +3210,10 @@ def _check_rule_adherence(database_url, user_id, review_date, positions, rules):
 
     # 1) 持ち越し原則なし系ルール：trade_style=DAY（デイトレ）の建玉が保有中＝持ち越し発生。
     #    その銘柄コードを名指しした有効なTEMPORARY例外ルールが無ければ違反とみなす。
-    no_carry_active = any("持ち越し" in r["rule_text"] and "原則" in r["rule_text"] for r in active_rules)
+    #    session_closed=Falseの間（review_dateがまだ大引け前）はこのブロック自体を丸ごと
+    #    スキップする——「保有中＝持ち越し」ではなく「大引けを越えてなお保有中＝持ち越し」
+    #    が正しい定義（指示書3番）。
+    no_carry_active = session_closed and any("持ち越し" in r["rule_text"] and "原則" in r["rule_text"] for r in active_rules)
     if no_carry_active:
         day_positions = [p for p in positions if (p.get("trade_style") or "").upper() == "DAY"]
         for p in day_positions:
@@ -3382,13 +3412,19 @@ def _to_jst_date_str(ts):
         return str(ts)[:10]
 
 
-def generate_daily_review(database_url, user_id, review_date, user_feedback=None, is_business_day=None):
+def generate_daily_review(database_url, user_id, review_date, user_feedback=None, is_business_day=None,
+                           session_closed=True):
     """指示書13〜17番：1日の投資振り返りを自動生成し、1〜100点で評価する。既存の
     ChatGPT取込・trade_rules・portfolio・trade_historyのデータだけを使い、新しい判定
     ロジックを勝手に「賢く」しすぎない（機械的に検証できる項目だけを積み上げる設計）。
     is_business_day：呼び出し元（server.py）がJP祝日カレンダー込みのis_jp_trading_day()で
     正確に判定できるならその結果を渡す。省略時（None）はinvestment_db側で土日だけの簡易判定
     にフォールバックする（祝日カレンダーはserver.py側にしか無いため）。
+    緊急修正（2026-09-16）：session_closed（review_dateの大引けを過ぎたか、server.py
+    can_finalize_daily_review()と同じ基準）。デフォルトTrue＝過去日の再生成等の既存呼び出し
+    パターンとの後方互換のため。当日の場中に呼ばれた場合のみFalseが渡り、
+    _check_rule_adherence()の持ち越し（day_positions）判定を一時的に無効化する
+    （「position exists at review generation time」だけで持ち越しにしない、指示書3番）。
     戻り値: 保存済みdaily_reviewsの1行（camelCase変換済み）。"""
     pool = _get_pool(database_url)
     if pool is None:
@@ -3460,7 +3496,8 @@ def generate_daily_review(database_url, user_id, review_date, user_feedback=None
     effective_feedback = user_feedback if user_feedback is not None else (existing.get("user_feedback") if existing else None)
     reflection_tags = extract_reflection_tags(effective_feedback)
 
-    score_rule, good_rule, bad_rule = _check_rule_adherence(database_url, user_id, review_date, positions_as_of_review, rules)
+    score_rule, good_rule, bad_rule = _check_rule_adherence(database_url, user_id, review_date, positions_as_of_review,
+                                                              rules, session_closed=session_closed)
     score_entry, good_entry, bad_entry = _check_entry_quality(new_positions)
     score_exit, good_exit, bad_exit = _check_exit_quality(exits_today, reflection_tags)
     score_market, good_market, bad_market, market_applicable_max = _check_market_fit(
@@ -3558,9 +3595,12 @@ def temp_rules_expiring_soon(rules, review_date, days=1):
     return out
 
 
-def save_review_user_feedback(database_url, user_id, review_date, feedback, source="manual"):
+def save_review_user_feedback(database_url, user_id, review_date, feedback, source="manual", session_closed=True):
     """日次レビューへユーザー感想を保存する（指示書18番）。該当日のdaily_reviewsが無ければ
-    先に生成してから感想を上書きする（感想入力だけ先に行われるケースに対応）。"""
+    先に生成してから感想を上書きする（感想入力だけ先に行われるケースに対応）。
+    緊急修正（2026-09-16）：session_closed（呼び出し元server.pyがcan_finalize_daily_review()で
+    計算した値）をgenerate_daily_review()へそのまま引き継ぐ——場中にユーザーが感想を入力して
+    このパスがdaily_reviewを再生成しても、持ち越し（day_positions）判定を誤って有効化しない。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
@@ -3569,7 +3609,7 @@ def save_review_user_feedback(database_url, user_id, review_date, feedback, sour
             cur.execute("SELECT id FROM daily_reviews WHERE user_id=%s AND review_date=%s", [user_id, review_date])
             exists = cur.fetchone()
     if not exists:
-        generate_daily_review(database_url, user_id, review_date, user_feedback=feedback)
+        generate_daily_review(database_url, user_id, review_date, user_feedback=feedback, session_closed=session_closed)
     tags = extract_reflection_tags(feedback)
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -3580,7 +3620,7 @@ def save_review_user_feedback(database_url, user_id, review_date, feedback, sour
             saved = cur.fetchone()
         conn.commit()
     # 感想保存後はルール遵守以外の軸（振り返り点・利確損切り点の反省タグ反映）も再計算する
-    return generate_daily_review(database_url, user_id, review_date, user_feedback=feedback)
+    return generate_daily_review(database_url, user_id, review_date, user_feedback=feedback, session_closed=session_closed)
 
 
 def get_daily_review(database_url, user_id, review_date):
