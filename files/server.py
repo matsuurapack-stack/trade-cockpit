@@ -12508,12 +12508,76 @@ LOSS_REASON_TAGS = (
 )
 
 
+def compute_post_entry_opportunity_windows(day_bars, entry_idx, entry_price):
+    """Phase：ENTRY後15/30/60分 Opportunity Learning（2026-09-16新規）。ENTRY時刻を基準に
+    5分足からmfe/mae/実現レンジを窓ごとに算出する純粋関数。ENTRYより前のバー・翌営業日の
+    データは一切参照しない——day_barsは呼び出し元reconstruct_trade_market_context()が
+    既にtrade_date当日分のみへフィルタ済みのものをそのまま受け取るだけ（新しい絞り込みは
+    しない）。窓の終端が当日データの範囲を超える場合（大引け直前ENTRY等でデイトレなら
+    60分観測が物理的に存在しない）はinsufficient_window（推測で埋めない、ユーザー指示）。"""
+    def _window(n_bars):
+        end = entry_idx + n_bars
+        if end >= len(day_bars):
+            return {"mfe_pct": None, "mae_pct": None, "realized_range_pct": None, "status": "insufficient_window"}
+        window = day_bars[entry_idx:end + 1]
+        highs, lows = [b["high"] for b in window], [b["low"] for b in window]
+        mfe, mae = compute_mfe_mae_pct(entry_price, max(highs), min(lows))
+        realized_range = round((max(highs) - min(lows)) / entry_price * 100, 2) if entry_price else None
+        return {"mfe_pct": mfe, "mae_pct": mae, "realized_range_pct": realized_range, "status": "OK"}
+
+    w15, w30, w60 = _window(3), _window(6), _window(12)  # 5分足3/6/12本＝15/30/60分
+    return {
+        "mfe_15m_pct": w15["mfe_pct"], "mae_15m_pct": w15["mae_pct"],
+        "realized_range_15m_pct": w15["realized_range_pct"], "window_15m_status": w15["status"],
+        "mfe_30m_pct": w30["mfe_pct"], "mae_30m_pct": w30["mae_pct"],
+        "realized_range_30m_pct": w30["realized_range_pct"], "window_30m_status": w30["status"],
+        "mfe_60m_pct": w60["mfe_pct"], "mae_60m_pct": w60["mae_pct"],
+        "realized_range_60m_pct": w60["realized_range_pct"], "window_60m_status": w60["status"],
+    }
+
+
+def classify_trade_opportunity(result_class, opportunity_windows):
+    """Phase：ENTRY後15/30/60分 Opportunity Learning。結果損益（勝敗）とは別に、ENTRY後に
+    実際に利益を取れる値幅が存在したかを観測用に分類する（HIGH/NORMAL/LOW_OPPORTUNITY）。
+    固定閾値を売買ルールとして即座に使わない——あくまで観測・集計用（ユーザー明示指示）。
+    最も長い有効窓（60分→30分→15分の優先順）のMFEを代表値にする。
+    exitLeftValueOnTable：損切りだったがMFEは十分あった＝EXIT/利確/ストップ設計側の問題
+    （ENTRY候補選択の問題とは区別する）。
+    insufficientRangeConfirmed：60分経過してもMFE/MAEともにほぼ動いていない＝
+    LOW_OPPORTUNITY/INSUFFICIENT_RANGE（銘柄選択・地合い判断は正しくても値幅が無かった）。"""
+    ow = opportunity_windows or {}
+    best_mfe, best_window = None, None
+    for label, key in (("60m", "mfe_60m_pct"), ("30m", "mfe_30m_pct"), ("15m", "mfe_15m_pct")):
+        if ow.get(f"window_{label}_status") == "OK" and ow.get(key) is not None:
+            best_mfe, best_window = ow[key], label
+            break
+    if best_mfe is None:
+        return {"opportunityClass": "UNKNOWN", "bestMfePct": None, "bestWindow": None,
+                "exitLeftValueOnTable": None, "insufficientRangeConfirmed": None}
+    opportunity_class = "HIGH_OPPORTUNITY" if best_mfe >= 3.0 else ("NORMAL_OPPORTUNITY" if best_mfe >= 1.0 else "LOW_OPPORTUNITY")
+    exit_left_value_on_table = bool(result_class == "LOSS" and best_mfe >= 2.0)
+    mfe_60, mae_60 = ow.get("mfe_60m_pct"), ow.get("mae_60m_pct")
+    insufficient_range_confirmed = bool(
+        ow.get("window_60m_status") == "OK" and mfe_60 is not None and mae_60 is not None
+        and mfe_60 < 0.5 and mae_60 > -0.5)
+    return {"opportunityClass": opportunity_class, "bestMfePct": best_mfe, "bestWindow": best_window,
+            "exitLeftValueOnTable": exit_left_value_on_table,
+            "insufficientRangeConfirmed": insufficient_range_confirmed}
+
+
 def reconstruct_trade_market_context(code, market, trade_date, entry_time_iso, exit_time_iso):
     """指示書1・7番：損切りトレードを「エントリー判断教材」として保存するための市場コンテキスト
     再構築。当日5分足からエントリー/エグジット時点のVWAP位置・当日高安位置・出来高推移・
     RSI/MA・MFE/MAE・エグジット後の値動きを算出する。未来データを混ぜない
     （エントリー時点の指標はエントリーバーまでのデータだけで計算＝後知恵禁止）。
-    取得失敗・データ不足時は該当フィールドをNoneのまま返す（指示書7番、推測しない）。"""
+    取得失敗・データ不足時は該当フィールドをNoneのまま返す（指示書7番、推測しない）。
+    2026-09-16追加（Phase：ENTRY後15/30/60分 Opportunity Learning）：opportunity_windows
+    （ENTRY後15/30/60分のMFE/MAE/実現レンジ）と、c388aeb（値幅余地・反転モメンタム選考）の
+    tradeable_range_score/room_to_move/momentum_state/setup_type/reversal_stateを
+    エントリー時点のデータ（pre_entry bars）だけから再計算して追加する——ENTRY_SCORE本体・
+    ENTRY回避可能性（classify_entry_avoidability、360924c）は一切変更しない、完全に別枠の
+    観測用フィールド（未来情報リーク防止のため、entry_snapshot相当はpre_entry限定・
+    opportunity windowsはpost-entry限定で明確に分離する）。"""
     empty = {
         "vwap_at_entry": None, "above_vwap_at_entry": None, "vwap_at_exit": None,
         "day_open": None, "day_high_so_far_at_entry": None, "day_low_so_far_at_entry": None,
@@ -12527,6 +12591,10 @@ def reconstruct_trade_market_context(code, market, trade_date, entry_time_iso, e
         "max_favorable_excursion_pct": None, "max_adverse_excursion_pct": None,
         "post_exit_max_price": None, "post_exit_min_price": None, "post_exit_direction": None,
         "data_quality": "NO_DATA",
+        # Phase：ENTRY後Opportunity Learning・c388aeb連携（追加専用、既存フィールドは無変更）
+        "opportunity_windows": None, "opportunity": None,
+        "tradeable_range_score": None, "room_to_move": None, "momentum_state": None,
+        "setup_type_at_entry": None, "reversal_state_at_entry": None,
     }
     if yf is None or not code:
         return empty
@@ -12658,6 +12726,42 @@ def reconstruct_trade_market_context(code, market, trade_date, entry_time_iso, e
             result["post_exit_direction"] = "RECOVERED"
         else:
             result["post_exit_direction"] = "FLAT"
+
+    # Phase：ENTRY後15/30/60分 Opportunity Learning（2026-09-16新規）。ENTRY時刻基準・
+    # day_bars（当日のみ）だけを使う——post_exitと違い、EXITタイミングに縛られず
+    # 「そのENTRYにそもそも利益を取れる値幅が存在したか」を見るため、entry_idxから
+    # 15/30/60分後まで（データがあれば、exit_idxを超えていても）評価する。
+    result["opportunity_windows"] = compute_post_entry_opportunity_windows(day_bars, entry_idx, entry_price)
+
+    # c388aeb連携：ENTRY時点（pre_entryバーのみ）でのtradeable_range_score/room_to_move/
+    # momentum_state/setup_type/reversal_stateを再計算する。ここで使うのはpre_entry
+    # （entry_idxまで）だけ——post-entryデータは一切参照しない（未来情報リーク防止）。
+    # 「当日changePct」はこの関数の呼び出し元が前日終値を保持していないため、day_open基準の
+    # 近似値（changeFromOpenPct）で代用する（既知の制約、実際のENTRY TOP5パイプラインは
+    # 前日終値ベースのrow["changePct"]を使うため厳密には一致しない——推測ではなく実在する
+    # 別の指標であることを明示するため別名で保持する）。
+    bars_pre_dict = {"closes": closes_pre, "highs": [b["high"] for b in pre_entry],
+                      "lows": [b["low"] for b in pre_entry], "volumes": vols_pre}
+    change_from_open_pct = round((entry_price - day_open) / day_open * 100, 2) if day_open else None
+    range_metrics_at_entry = compute_tradeable_range_metrics(bars_pre_dict, current=entry_price, day_high=day_high_so_far)
+    tradeable_range_score, room_to_move = compute_tradeable_range_score(range_metrics_at_entry)
+    momentum_state_at_entry = classify_momentum_state(range_metrics_at_entry, change_from_open_pct)
+    reversal_info_at_entry = None
+    if change_from_open_pct is not None and change_from_open_pct <= 0:
+        reversal_info_at_entry = detect_intraday_reversal(bars_pre_dict, entry_price, day_low_so_far)
+    if change_from_open_pct is not None and change_from_open_pct > 0:
+        setup_type_at_entry = "PULLBACK_REENTRY" if momentum_state_at_entry in ("RANGE_COMPRESSION", "MOMENTUM_DECAY") \
+            else "MOMENTUM_CONTINUATION"
+    elif reversal_info_at_entry and reversal_info_at_entry.get("reversalState"):
+        setup_type_at_entry = "REVERSAL_MOMENTUM"
+    else:
+        setup_type_at_entry = None
+    result["tradeable_range_score"] = tradeable_range_score
+    result["room_to_move"] = room_to_move
+    result["momentum_state"] = momentum_state_at_entry
+    result["setup_type_at_entry"] = setup_type_at_entry
+    result["reversal_state_at_entry"] = (reversal_info_at_entry or {}).get("reversalState")
+    result["change_from_open_pct"] = change_from_open_pct
     return result
 
 
@@ -13291,6 +13395,22 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
         entry_snapshot = build_entry_snapshot(t.get("code"), entry_price, entry_time_iso, market_ctx,
                                                market_mode_today=market_mode_today, sector_state_at_entry=sector_state,
                                                nikkei_chg=nikkei_chg_today, database_url=database_url, user_id=user_id)
+        # c388aeb連携（指示書「ENTRY snapshotとの紐付け」）：値幅余地・反転モメンタム選考の
+        # ENTRY時点の値をentry_snapshotへ追加する（pre_entryバーのみから算出済み、
+        # market_ctx側で既に計算済みの値をそのまま添えるだけ）。
+        entry_snapshot = {
+            **entry_snapshot,
+            "tradeable_range_score": market_ctx.get("tradeable_range_score"),
+            "room_to_move": market_ctx.get("room_to_move"),
+            "momentum_state": market_ctx.get("momentum_state"),
+            "setup_type": market_ctx.get("setup_type_at_entry"),
+            "reversal_state": market_ctx.get("reversal_state_at_entry"),
+        }
+        # Phase：ENTRY後15/30/60分 Opportunity Learning（2026-09-16新規）。勝敗を問わず全トレード
+        # 対象（「動かなかったトレードも学習する」）。ENTRY_SCORE本体・entry_avoidability等は
+        # 一切参照・変更しない（完全に別枠の観測用フィールド、未来情報リーク防止）。
+        opportunity_windows = market_ctx.get("opportunity_windows")
+        opportunity = classify_trade_opportunity(result_class, opportunity_windows)
 
         fields = {
             "trade_date": review_date, "symbol": t.get("code"), "stock_name": t.get("name"),
@@ -13329,18 +13449,22 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
                 "entry_setup_type": market_ctx.get("entry_setup_type"),
                 "data_quality": market_ctx.get("data_quality"),
             },
-            "post_trade_analysis_json": ({
-                "loss_reason_tags": loss_tags, "vwap_at_exit": market_ctx.get("vwap_at_exit"),
-                "volume_trend_after_entry": market_ctx.get("volume_trend_after_entry"),
-                "broke_prior_high_then_failed": market_ctx.get("broke_prior_high_then_failed"),
-                "post_exit_direction": market_ctx.get("post_exit_direction"),
-                "entry_avoidability": entry_avoidability,  # 指示書6番：4段階評価
-                # 2026-09-16追加：ENTRY回避可能性とEXIT/RISK問題の分離——どのタグがENTRY時点で
-                # 分かっていた危険信号で、どれがエントリー後の悪化・リスク管理の問題かを明示する。
-                "loss_reason_categories": categorize_loss_reason_tags(loss_tags),
-                "entry_unblock_conditions": entry_unblock_conditions,  # 指示書9番
+            "post_trade_analysis_json": {
+                # Phase：ENTRY後15/30/60分 Opportunity Learning（2026-09-16新規、全トレード共通）。
+                "opportunity_windows": opportunity_windows, "opportunity": opportunity,
                 "data_quality": market_ctx.get("data_quality"),
-            } if result_class == "LOSS" else None),
+                **({
+                    "loss_reason_tags": loss_tags, "vwap_at_exit": market_ctx.get("vwap_at_exit"),
+                    "volume_trend_after_entry": market_ctx.get("volume_trend_after_entry"),
+                    "broke_prior_high_then_failed": market_ctx.get("broke_prior_high_then_failed"),
+                    "post_exit_direction": market_ctx.get("post_exit_direction"),
+                    "entry_avoidability": entry_avoidability,  # 指示書6番：4段階評価
+                    # 2026-09-16追加：ENTRY回避可能性とEXIT/RISK問題の分離——どのタグがENTRY時点で
+                    # 分かっていた危険信号で、どれがエントリー後の悪化・リスク管理の問題かを明示する。
+                    "loss_reason_categories": categorize_loss_reason_tags(loss_tags),
+                    "entry_unblock_conditions": entry_unblock_conditions,  # 指示書9番
+                } if result_class == "LOSS" else {}),
+            },
             "notes": "15:30自動評価による自動登録（sync_trade_experiences_for_date）。",
         }
         try:
@@ -13650,6 +13774,11 @@ def build_trade_breakdown_for_day(day_trades):
             "entryAvoidability": (e.get("post_trade_analysis_json") or {}).get("entry_avoidability"),
             "entryUnblockConditions": (e.get("post_trade_analysis_json") or {}).get("entry_unblock_conditions") or [],
             "lossReasonCategories": (e.get("post_trade_analysis_json") or {}).get("loss_reason_categories"),
+            # Phase：ENTRY後15/30/60分 Opportunity Learning（2026-09-16新規）。勝敗結果とは
+            # 独立に「そもそも利益を取れる値幅が存在したか」を表示する（全トレード対象）。
+            "opportunity": (e.get("post_trade_analysis_json") or {}).get("opportunity"),
+            "opportunityWindows": (e.get("post_trade_analysis_json") or {}).get("opportunity_windows"),
+            "entrySnapshot": (e.get("decision_snapshot_json") or {}).get("entry_snapshot"),
         })
     return trade_breakdown
 

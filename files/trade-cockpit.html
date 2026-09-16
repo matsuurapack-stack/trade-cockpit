@@ -9444,6 +9444,14 @@ function DailyReviewPanel(){
                   次回ENTRY解禁条件：{t.entryUnblockConditions.join("／")}
                 </div>}
               </div>}
+              {/* Phase：ENTRY後15/30/60分 Opportunity Learning（2026-09-16新規）。勝敗結果とは
+                  独立に「そもそも利益を取れる値幅が存在したか」を表示する（LOSS以外にも表示）。 */}
+              {t.opportunity && t.opportunity.opportunityClass!=="UNKNOWN" && <div style={{fontSize:11,color:"var(--inkSoft)",marginTop:4}}>
+                値幅機会：<b>{({HIGH_OPPORTUNITY:"HIGH",NORMAL_OPPORTUNITY:"NORMAL",LOW_OPPORTUNITY:"LOW"})[t.opportunity.opportunityClass]}</b>
+                （{t.opportunity.bestWindow}時点MFE {t.opportunity.bestMfePct>0?"+":""}{t.opportunity.bestMfePct}%）
+                {t.opportunity.exitLeftValueOnTable && <span style={{marginLeft:6,fontWeight:700,color:"var(--accent)"}}>⚠ 利益機会はあったがEXITできなかった可能性（EXIT/ストップ設計側の問題）</span>}
+                {t.opportunity.insufficientRangeConfirmed && <span style={{marginLeft:6,fontWeight:700,color:"var(--inkSoft)"}}>（値幅自体が不足＝INSUFFICIENT_RANGE）</span>}
+              </div>}
             </div>)}
           </div>
         </div>}
