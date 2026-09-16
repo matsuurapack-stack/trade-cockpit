@@ -2061,7 +2061,25 @@ const ENTRY_SCORE_COMPONENT_META = [
   {key:"catalyst",       label:"Catalyst",   max:5},
   {key:"riskEvent",      label:"RiskEvent",  max:null},
   {key:"overheat",       label:"Overheat",   max:null},
+  {key:"experiencePenalty",label:"LOSS学習", max:null},
+  {key:"experienceBonus",label:"経験ボーナス", max:null},
+  // 値幅余地・反転モメンタム選考（2026-09-16新規）：TRADEABLE_RANGE_SCORE由来の小さな加減点。
+  {key:"rangeBonus",     label:"値幅余地",    max:null},
+  {key:"momentumDecayPenalty",label:"減衰",  max:null},
 ];
+// 値幅余地の3区分（HIGH/MID/LOW）の表示ラベル・色。
+const ROOM_TO_MOVE_META = {
+  HIGH: {label:"値幅余地 HIGH", color:"var(--up)"},
+  MID:  {label:"値幅余地 MID",  color:"var(--accent)"},
+  LOW:  {label:"値幅余地 LOW",  color:"var(--down)"},
+  UNKNOWN: {label:"値幅余地 —", color:"var(--inkFaint)"},
+};
+// セットアップタイプ（今買い時TOP5の候補経路、2026-09-16新規、指示書6・9番）。
+const SETUP_TYPE_META = {
+  MOMENTUM_CONTINUATION: {label:"🔥 MOMENTUM", color:"var(--up)"},
+  PULLBACK_REENTRY:       {label:"↘️ PULLBACK", color:"var(--accent)"},
+  REVERSAL_MOMENTUM:      {label:"🔄 REVERSAL", color:"var(--accent)"},
+};
 
 // v3-9（監視銘柄自動登録エンジン）：🐒 MOMENTUM DAY専用バッジ。「買い推奨」ではないことを
 // 徹底するため、Primary/Action Status（enrichWatchRow、SSoT）の判定には一切影響しない完全に
@@ -5398,6 +5416,14 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                       </span>}
                       {c.analysisConfidence==="LOW" && <span style={{fontSize:10,color:"var(--down)"}}>確信度LOW</span>}
                       {isException && <span style={{fontSize:10,fontWeight:700,color:"var(--accent)"}}>⚠逆行耐性例外</span>}
+                      {/* 値幅余地・反転モメンタム選考（2026-09-16新規、指示書9番）：セットアップ
+                          タイプ＋値幅余地区分。「強いけど今から追う対象ではない」を一目で示す。 */}
+                      {c.setupType && SETUP_TYPE_META[c.setupType] && <span style={{fontSize:10,fontWeight:700,whiteSpace:"nowrap",color:SETUP_TYPE_META[c.setupType].color}}>
+                        {SETUP_TYPE_META[c.setupType].label}
+                      </span>}
+                      {c.roomToMove && <span style={{fontSize:10,fontWeight:700,whiteSpace:"nowrap",color:(ROOM_TO_MOVE_META[c.roomToMove]||ROOM_TO_MOVE_META.UNKNOWN).color}}>
+                        {(ROOM_TO_MOVE_META[c.roomToMove]||ROOM_TO_MOVE_META.UNKNOWN).label}
+                      </span>}
                       <div style={{flex:"1 1 140px",minWidth:0,fontSize:11,color:"var(--inkSoft)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
                         {(c.reasons||[]).filter(r=>!r.includes("逆行耐性例外")).join("・")}{c.risks&&c.risks.length>0?"　⚠"+c.risks.join("・"):""}
                       </div>
@@ -5424,6 +5450,27 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                 return <span key={c.code} style={{fontSize:11,padding:"2px 7px",borderRadius:3,border:"1px solid var(--rule)",whiteSpace:"nowrap"}}>
                   {c.code} {c.name} <span className="mono">{c.entryScore}</span> <span style={{color:stMeta.color}}>{stMeta.label}</span>
                 </span>;
+              })}
+            </div>
+          </>}
+          {/* 値幅余地・反転モメンタム選考（2026-09-16新規、指示書4・6番）：前日比マイナス
+              だが当日安値から強く反転している銘柄の新規探索レーン。既存entry_score
+              ランキングとは別の判定基準（反転確認条件の充足数）で選出（「前日比プラスを
+              候補条件にしない」）。 */}
+          {entryResult.reversalCandidates&&entryResult.reversalCandidates.length>0 && <>
+            <div style={{fontSize:11,fontWeight:700,color:"var(--inkSoft)",marginTop:10,marginBottom:4}}>
+              🔄 反転モメンタム候補（前日比マイナスだが当日安値から強く反転）
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:4}}>
+              {entryResult.reversalCandidates.map(c=>{
+                const rev=c.reversalInfo||{};
+                return <div key={c.code} style={{padding:"5px 8px",borderRadius:4,border:"1px solid var(--rule)",fontSize:11}}>
+                  <span style={{fontWeight:700}}>{c.code} {c.name}</span>
+                  <span className="mono" style={{marginLeft:8}}>{c.current!=null?c.current.toLocaleString():"—"}</span>
+                  <span className="mono" style={{marginLeft:6,color:"var(--down)"}}>{c.changePct!=null?c.changePct.toFixed(2)+"%":"—"}</span>
+                  <span style={{marginLeft:8,color:"var(--up)",fontWeight:700}}>安値から+{rev.bounceFromLowPct}%</span>
+                  <span style={{marginLeft:8,color:"var(--inkSoft)"}}>{(rev.reversalReasons||[]).join("・")}</span>
+                </div>;
               })}
             </div>
           </>}

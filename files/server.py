@@ -3388,8 +3388,13 @@ def _intraday_regime_batch_prefetch(symbols, interval="5m", ttl=None):
     事前投入する。戻り値：{"attempted": N, "cached": N, "batches": N, "values": {sym: regime}}
     （diagnostics用。valuesは2026-09-15追加：呼び出し元がscan-local mapを組み立てるための
     実値そのもの）。失敗しても例外を投げない（呼び出し元の本処理は従来通り個別フォールバックで
-    継続できる）。"""
-    stats = {"attempted": 0, "cached": 0, "batches": 0, "values": {}}
+    継続できる）。
+    2026-09-16追加（今買い時TOP5：値幅余地・反転モメンタム選考）：stats["bars"]として
+    {sym: {"closes","highs","lows","volumes"}}も同時に返す——TRADEABLE_RANGE_SCORE/
+    MOMENTUM_STATE/REVERSAL_MOMENTUMの算出に必要な生の5分足配列を、この関数が既に
+    ダウンロード済みのデータからそのまま流用するためで、新しいyf.download呼び出しは
+    一切追加しない（二重取得を避ける）。"""
+    stats = {"attempted": 0, "cached": 0, "batches": 0, "values": {}, "bars": {}}
     if yf is None or not symbols:
         return stats
     uniq = list(dict.fromkeys(symbols))
@@ -3415,6 +3420,8 @@ def _intraday_regime_batch_prefetch(symbols, interval="5m", ttl=None):
                     _cache_set(f"intraday5m:{sym}:{interval}", regime)
                     stats["cached"] += 1
                     stats["values"][sym] = regime
+                if bars is not None:
+                    stats["bars"][sym] = bars
             except Exception:
                 pass  # このシンボルだけ結果に含まれなかった（プレフェッチ失敗時は個別経路へフォールバックするだけ）
     return stats
@@ -3485,6 +3492,7 @@ def prefetch_market_data_for_watchlist(watchlist, include_5m=True):
             diagnostics["cache_hits"] += bstats["cached"]
             diagnostics["errors"] += max(0, bstats["attempted"] - bstats["cached"])
             regime_values = bstats.get("values", {})
+            bars_values = bstats.get("bars", {})
             for w in jp_items:
                 code = w.get("code")
                 sym = _yf_symbol(w)
@@ -3492,6 +3500,9 @@ def prefetch_market_data_for_watchlist(watchlist, include_5m=True):
                 if code in market_data_by_code:
                     market_data_by_code[code]["regime"] = regime
                     market_data_by_code[code]["regimeStatus"] = "ok" if regime is not None else "failed"
+                    # 2026-09-16追加：今買い時TOP5の値幅余地・反転モメンタム選考用の生5分足バー
+                    # （同一batchダウンロードから、新規取得なしで流用）。
+                    market_data_by_code[code]["bars"] = bars_values.get(sym)
         except Exception as e:
             print("  [MarketDataPrefetch] 5分足バッチ取得失敗", e)
             diagnostics["errors"] += 1
@@ -3722,15 +3733,19 @@ ENTRY_STATE_META = {
 
 
 def _entry_score_components(row, stage2, snapshot, auto_rs_current, auto_sector_current, catalysts, event_signals,
-                             entry_risk=None):
+                             entry_risk=None, range_metrics=None, momentum_state=None):
     """entry_score（0-100、内訳の合計をclampしたもの）を配点ごとに算出する。既存の各エンジンが
     既に計算済みの値だけを使い、新しい取得経路は増やさない。データが無い項目は0点（無理に
     加点も減点もしない、「取得できない値は推測しない」の踏襲）。
     配点：Momentum20/VWAP15/5分足構造15/MarketRelative15/Volume10/AUTO_RS10/AUTO_SECTOR5/
-    Catalyst5/RiskEvent-5〜0/Overheat-10〜0/Experience-8〜+3（2026-09-15新規、指示書3・4番）。
+    Catalyst5/RiskEvent-5〜0/Overheat-10〜0/Experience-8〜+3（2026-09-15新規、指示書3・4番）/
+    Range-2〜+3（2026-09-16新規、値幅余地・反転モメンタム選考、指示書1・2・3・7番）。
     entry_risk（compute_entry_risk_assessment()の戻り値）は信頼度MEDIUM/HIGH（サンプル5件以上）
     の時だけ加減点し、サンプル不足（LOW）では一切スコアに影響させない（過去の損切り学習を
-    「過大評価しない」既存方針＝compute_experience_score等と同じキャップ思想を踏襲）。"""
+    「過大評価しない」既存方針＝compute_experience_score等と同じキャップ思想を踏襲）。
+    range_metrics/momentum_stateも同様に「既存スコアへいきなり大きなweightを与えない」
+    （指示書7番）ため、TRADEABLE_RANGE_SCORE（0-10）を0.3倍した小さな加点／MOMENTUM_DECAYの
+    小さな減点のみに留める——実トレードのMFE/MAEとの相関を見てweightを調整する前提の暫定値。"""
     day_change = row.get("changePct")
     market_rs = row.get("marketRS")
     momentum = _scale_score(day_change, 0, 5, 20) if day_change is not None else 0.0
@@ -3782,9 +3797,16 @@ def _entry_score_components(row, stage2, snapshot, auto_rs_current, auto_sector_
         if experience_penalty == 0.0 and good_sim >= 0.5:
             experience_bonus = 3.0
 
+    tradeable_range_score = 0.0
+    range_bonus = 0.0
+    if range_metrics and range_metrics.get("dataQuality") == "OK":
+        tradeable_range_score, _room = compute_tradeable_range_score(range_metrics)
+        range_bonus = round(tradeable_range_score * 0.3, 1)  # 0-10 -> 最大+3（指示書7番、小さめweight）
+    momentum_decay_penalty = -2.0 if momentum_state == "MOMENTUM_DECAY" else 0.0
+
     total = (momentum + vwap_score + structure_score + market_rel_score + volume_score
              + auto_rs_score + auto_sector_score + catalyst_score + risk_event_penalty + overheat_penalty
-             + experience_penalty + experience_bonus)
+             + experience_penalty + experience_bonus + range_bonus + momentum_decay_penalty)
     total = max(0.0, min(100.0, total))
     return {
         "total": round(total, 1),
@@ -3794,12 +3816,14 @@ def _entry_score_components(row, stage2, snapshot, auto_rs_current, auto_sector_
         "catalyst": round(catalyst_score, 1), "riskEvent": round(risk_event_penalty, 1),
         "overheat": round(overheat_penalty, 1),
         "experiencePenalty": round(experience_penalty, 1), "experienceBonus": round(experience_bonus, 1),
+        "rangeBonus": round(range_bonus, 1), "momentumDecayPenalty": round(momentum_decay_penalty, 1),
+        "tradeableRangeScore": round(tradeable_range_score, 1),
         "volumeType": volume_type, "positiveCatalysts": pos_cat[:1], "negativeCatalysts": neg_cat[:1],
     }
 
 
 def _classify_entry_state(entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present, nikkei_chg=None,
-                           entry_risk=None):
+                           entry_risk=None, momentum_state=None):
     """ENTRY_STATE（8種＋PROVISIONAL）をルールベースで決定する（AI不使用、既存AUTO系エンジンと
     同じ方針）。2026-09-10更新（Phase2-C「TOP5選考基準の全面見直し」指示書2・3・24番）：
     「原則プラス銘柄からしか選ばない」ゲートを追加した。当日騰落率がマイナスの銘柄は、以下を
@@ -3855,10 +3879,15 @@ def _classify_entry_state(entry_score, row, stage2, snapshot, data_quality, even
     # 状態遷移だけを止める＝「ENTRYを止めている理由」を呼び出し側がreasonsで明示できるようにする）。
     loss_pattern_block = bool(entry_risk and entry_risk.get("risk_level") == "HIGH"
                                and entry_risk.get("confidence") != "LOW")
+    # 指示書3番：「MOMENTUM_DECAYなのに準備完了にしない」。大幅GU→上昇→高値圏横ばい→値幅縮小
+    # （実例：2026-09-16 5020 ENEOS・4183三井化学）を検出した銘柄は、entry_score自体は
+    # 変更済み（momentumDecayPenalty）だが、状態遷移でも重ねて確認し昇格を止める。
+    momentum_decay_block = momentum_state == "MOMENTUM_DECAY"
+    downgrade_to_watch = loss_pattern_block or momentum_decay_block
     if above_vwap and structure == "higher_highs" and (market_rs is not None and market_rs > 0) and entry_score >= 70:
-        return ("WATCH" if loss_pattern_block else "NOW_BUYABLE"), exception_applied
+        return ("WATCH" if downgrade_to_watch else "NOW_BUYABLE"), exception_applied
     if above_vwap and structure in ("higher_highs", "mixed") and entry_score >= 55:
-        return ("WATCH" if loss_pattern_block else "ENTRY_READY"), exception_applied
+        return ("WATCH" if downgrade_to_watch else "ENTRY_READY"), exception_applied
     if entry_score >= 40 and above_vwap is False:
         return "WAIT_BREAKOUT", exception_applied
     if entry_score >= 40 and above_vwap:
@@ -3866,6 +3895,184 @@ def _classify_entry_state(entry_score, row, stage2, snapshot, data_quality, even
     if entry_score >= 30:
         return "WATCH", exception_applied
     return "WEAK", exception_applied
+
+
+# ============================================================
+# 今買い時TOP5：値幅余地・反転モメンタム選考（2026-09-16新規、ユーザー指示書）。
+# 既存の「強さ（上昇率・VWAP上・5分足高値切り上げ）」評価に、「ENTRY後にどれだけ値幅を
+# 取れるか」という別軸を追加する。新しい市場データ取得経路は増やさない——
+# _score_entry_candidates()が既にバッチ取得している5分足生データ（_intraday_regime_
+# batch_prefetch()を拡張し、regimeと同じダウンロード結果からbarsも一緒にキャッシュへ
+# 事前投入したもの、prefetch_market_data_for_watchlist()経由）をそのまま再利用する。
+# 取得不十分な項目は必ずNone/UNKNOWNのまま返す（指示書「推測しない」、既存方針を踏襲）。
+# ============================================================
+
+def compute_tradeable_range_metrics(bars, current=None, day_high=None):
+    """指示書1番：TRADEABLE_RANGE_SCOREの元になる生の指標（ATR%・直近30/60分レンジ%・
+    直近5本平均レンジ%・VWAPからの距離%・当日高値からの距離%・高値更新の鈍化・レンジの
+    拡大/縮小）を5分足バーから算出する純粋関数。新規の市場データ取得はしない。"""
+    empty = {
+        "atrPct": None, "range30mPct": None, "range60mPct": None, "recentBarAvgRangePct": None,
+        "distanceFromVwapPct": None, "distanceFromDayHighPct": None,
+        "barsSinceNewHigh": None, "rangeTrend": None, "dataQuality": "NO_DATA",
+    }
+    if not bars or len(bars.get("closes") or []) < 6:
+        return empty
+    closes, highs, lows, volumes = bars["closes"], bars["highs"], bars["lows"], bars["volumes"]
+    n = len(closes)
+    cur = current if current is not None else closes[-1]
+    result = dict(empty)
+    result["dataQuality"] = "OK"
+    if not cur:
+        return result
+
+    atr = _atr(highs, lows, closes, period=min(14, n - 1))
+    result["atrPct"] = round(atr / cur * 100, 2) if atr is not None else None
+
+    def _range_pct(nbars):
+        if n < nbars:
+            return None
+        seg_high, seg_low = max(highs[-nbars:]), min(lows[-nbars:])
+        return round((seg_high - seg_low) / cur * 100, 2)
+    result["range30mPct"] = _range_pct(6)   # 5分足6本＝30分
+    result["range60mPct"] = _range_pct(12)  # 5分足12本＝60分
+
+    if n >= 5:
+        avg_range = sum(highs[i] - lows[i] for i in range(n - 5, n)) / 5
+        result["recentBarAvgRangePct"] = round(avg_range / cur * 100, 2)
+
+    total_vol = sum(volumes)
+    vwap = (sum(c * v for c, v in zip(closes, volumes)) / total_vol) if total_vol > 0 else None
+    if vwap:
+        result["distanceFromVwapPct"] = round((cur - vwap) / vwap * 100, 2)
+
+    dh = day_high if day_high is not None else max(highs)
+    if dh:
+        result["distanceFromDayHighPct"] = round((cur - dh) / dh * 100, 2)
+
+    running_max, last_new_high_idx = -1e18, None
+    for i, h in enumerate(highs):
+        if h >= running_max:
+            running_max, last_new_high_idx = h, i
+    result["barsSinceNewHigh"] = (n - 1 - last_new_high_idx) if last_new_high_idx is not None else None
+
+    if n >= 8:
+        mid = n // 2
+        first_avg = sum(highs[i] - lows[i] for i in range(mid)) / mid
+        second_avg = sum(highs[i] - lows[i] for i in range(mid, n)) / (n - mid)
+        if first_avg > 0:
+            ratio = second_avg / first_avg
+            result["rangeTrend"] = "EXPANDING" if ratio >= 1.2 else ("CONTRACTING" if ratio <= 0.7 else "FLAT")
+    return result
+
+
+def compute_tradeable_range_score(range_metrics):
+    """指示書1・7番：TRADEABLE_RANGE_SCORE（0-10、既存ENTRY_SCOREへ「いきなり大きなweightを
+    与えない」ため小さめの配点）と、UI向けのROOM_TO_MOVE区分（HIGH/MID/LOW）。データ不十分
+    時は0点・UNKNOWN（減点はしない、加点しないだけ）。"""
+    if not range_metrics or range_metrics.get("dataQuality") != "OK":
+        return 0.0, "UNKNOWN"
+    score = 0.0
+    atr_pct = range_metrics.get("atrPct")
+    if atr_pct is not None:
+        score += _scale_score(atr_pct, 0.3, 1.5, 4)
+    range30 = range_metrics.get("range30mPct")
+    if range30 is not None:
+        score += _scale_score(range30, 0.5, 2.5, 3)
+    recent_avg = range_metrics.get("recentBarAvgRangePct")
+    if recent_avg is not None:
+        score += _scale_score(recent_avg, 0.1, 0.6, 3)
+    if range_metrics.get("rangeTrend") == "CONTRACTING":
+        score = max(0.0, score - 3)  # 指示書2番：値幅が既に縮小している銘柄は減点
+    score = round(max(0.0, min(10.0, score)), 1)
+    room = "HIGH" if score >= 6.5 else ("MID" if score >= 3.5 else "LOW")
+    return score, room
+
+
+def classify_momentum_state(range_metrics, day_change_pct):
+    """指示書3番：MOMENTUM_ACTIVE/MOMENTUM_REACCELERATING/MOMENTUM_DECAY/RANGE_COMPRESSIONを
+    判定する。「大幅GU→上昇→高値圏横ばい→値幅縮小」（実例：2026-09-16 5020 ENEOS・4183
+    三井化学）を検出する対象は当日プラス銘柄のみ（マイナス銘柄は別関数detect_intraday_
+    reversalで評価する）。取得不十分ならNone（無理に判定しない）。"""
+    if not range_metrics or range_metrics.get("dataQuality") != "OK" or day_change_pct is None or day_change_pct <= 0:
+        return None
+    bars_since_new_high, range_trend = range_metrics.get("barsSinceNewHigh"), range_metrics.get("rangeTrend")
+    if bars_since_new_high is None or range_trend is None:
+        return None
+    if bars_since_new_high <= 2 and range_trend != "CONTRACTING":
+        return "MOMENTUM_REACCELERATING" if range_trend == "EXPANDING" else "MOMENTUM_ACTIVE"
+    if bars_since_new_high >= 6 and range_trend == "CONTRACTING":
+        return "MOMENTUM_DECAY"
+    if range_trend == "CONTRACTING":
+        return "RANGE_COMPRESSION"
+    return "MOMENTUM_ACTIVE"
+
+
+def detect_intraday_reversal(bars, current, day_low):
+    """指示書4・5番：前日比マイナスでも当日安値から強く反転している銘柄を検出する
+    （LOW_REVERSAL候補の判定本体）。既存AUTO_REVERSAL（_reversal_stage2_detail等、日足・
+    複数日ルックバック）と同じ判定思想（安値切り上げ→短期MA回復→VWAP reclaim→出来高再増加→
+    戻り高値break）を当日5分足へ適用する別実装（時間軸が違うため関数を分ける、既存
+    AUTO_REVERSALのロジック・スキャンは無変更）。確認条件が2件未満の「落ちるナイフ」は
+    REVERSAL_CONFIRMEDにしない（指示書5番）。"""
+    empty = {"bounceFromLowPct": None, "reversalState": None, "reversalReasons": [], "dataQuality": "NO_DATA"}
+    if not bars or len(bars.get("closes") or []) < 6 or not day_low:
+        return empty
+    closes, highs, lows, volumes = bars["closes"], bars["highs"], bars["lows"], bars["volumes"]
+    n = len(closes)
+    cur = current if current is not None else closes[-1]
+    result = {"bounceFromLowPct": round((cur - day_low) / day_low * 100, 2), "reversalState": None,
+              "reversalReasons": [], "dataQuality": "OK"}
+    if result["bounceFromLowPct"] < 3.0:
+        return result  # 安値からの戻りが小さすぎる＝反転候補にしない
+
+    low_idx = min(range(n), key=lambda i: lows[i])
+    if low_idx >= n - 1:
+        return result  # 安値が直近バー＝反発がまだ確認できない
+
+    def _sma_at(idx, period=5):
+        return (sum(closes[idx + 1 - period:idx + 1]) / period) if idx + 1 >= period else None
+
+    def _vwap_upto(idx):
+        seg_c, seg_v = closes[:idx + 1], volumes[:idx + 1]
+        tv = sum(seg_v)
+        return (sum(c * v for c, v in zip(seg_c, seg_v)) / tv) if tv > 0 else None
+
+    higher_low = lows[-1] > lows[low_idx]
+    ma_now, ma_at_low = _sma_at(n - 1), _sma_at(low_idx)
+    short_ma_recovery = ma_now is not None and ma_at_low is not None and ma_now > ma_at_low
+    vwap_at_low, vwap_now = _vwap_upto(low_idx), _vwap_upto(n - 1)
+    vwap_reclaim = bool(vwap_at_low is not None and vwap_now is not None
+                         and lows[low_idx] < vwap_at_low and cur >= vwap_now)
+    post_low_idx = list(range(low_idx + 1, n))
+    volume_increase = False
+    if len(post_low_idx) >= 4:
+        half = len(post_low_idx) // 2
+        first_half_vol = sum(volumes[i] for i in post_low_idx[:half]) / half
+        second_half_vol = sum(volumes[i] for i in post_low_idx[half:]) / (len(post_low_idx) - half)
+        volume_increase = second_half_vol > first_half_vol * 1.1
+    resistance_break = False
+    if len(post_low_idx) >= 2:
+        pre_low_high = max(highs[:low_idx + 1])
+        resistance_break = max(highs[i] for i in post_low_idx) > pre_low_high
+
+    reasons = []
+    if higher_low:
+        reasons.append("HIGHER_LOW")
+    if short_ma_recovery:
+        reasons.append("SHORT_MA_RECLAIM")
+    if vwap_reclaim:
+        reasons.append("VWAP_RECLAIM")
+    if volume_increase:
+        reasons.append("VOLUME_INCREASE")
+    if resistance_break:
+        reasons.append("RESISTANCE_BREAK")
+    result["reversalReasons"] = reasons
+    if len(reasons) >= 4:
+        result["reversalState"] = "REVERSAL_CONFIRMED"
+    elif len(reasons) >= 2:
+        result["reversalState"] = "REVERSAL_WATCH"
+    return result
 
 
 ENTRY_TOP5_TIER2_MIN_SCORE = 60
@@ -3918,6 +4125,23 @@ def _select_entry_ready_top5(candidates):
                          if c["entryState"] in ("WAIT_PULLBACK", "WAIT_BREAKOUT", "WATCH")
                          and c["code"] not in top5_codes][:15]
 
+    # 値幅余地・反転モメンタム選考（2026-09-16新規、指示書4・6番）：前日比マイナスの銘柄は
+    # momentumが0点固定のためentry_score自体でtier1〜3に入ることは通常無い（「原則プラス
+    # 銘柄からしか選ばない」既存ゲート、_classify_entry_state参照）。候補経路を複線化する
+    # ため、REVERSAL_CONFIRMED/REVERSAL_WATCHの銘柄をentry_scoreとは別の基準
+    # （反転確認条件の充足数→安値からの戻り率）で独立に選出する——既存tier1〜3のentry_score
+    # ランキングには一切混ぜない（「前日比プラスを候補条件にしない」新規探索の別レーン）。
+    _reversal_rank_key = lambda c: (
+        len((c.get("reversalInfo") or {}).get("reversalReasons") or []),
+        (c.get("reversalInfo") or {}).get("bounceFromLowPct") or 0,
+    )
+    reversal_confirmed = sorted(
+        [c for c in candidates if (c.get("reversalInfo") or {}).get("reversalState") == "REVERSAL_CONFIRMED"],
+        key=_reversal_rank_key, reverse=True)[:5]
+    reversal_watch = sorted(
+        [c for c in candidates if (c.get("reversalInfo") or {}).get("reversalState") == "REVERSAL_WATCH"],
+        key=_reversal_rank_key, reverse=True)[:10]
+
     debug = {
         "scanned": len(candidates),
         "entry_ready": len(tier1),
@@ -3929,8 +4153,9 @@ def _select_entry_ready_top5(candidates):
         "provisional_excluded": len(provisional_excluded),
         "final_candidates": len(entry_ready_top5),
         "rendered": len(entry_ready_top5),
+        "reversal_confirmed": len(reversal_confirmed), "reversal_watch": len(reversal_watch),
     }
-    return entry_ready_top5, watch_candidates, debug
+    return entry_ready_top5, watch_candidates, reversal_confirmed, reversal_watch, debug
 
 
 ENTRY_CANDIDATE_EVENT_LOOKBACK_DAYS = 7  # build_ticker_intelligence_summary()のデフォルトlookback_daysと合わせる
@@ -4101,7 +4326,7 @@ def _score_entry_candidates(database_url, user_id):
     永続化（stock_thesesへの書き込み）はしない副作用フリーな関数にし、呼び出し側
     （generate_morning_market_check）だけが朝TOP5として結果を保存する設計にした（指示書
     22・23番「Current TOP5とMorning TOP5は別物、Morning TOP5は後から書き換えない」）。"""
-    empty = {"entryReadyTop5": [], "watchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None,
+    empty = {"entryReadyTop5": [], "watchCandidates": [], "reversalCandidates": [], "reversalWatchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None,
              "debug": {"scanned": 0, "entry_ready": 0, "active_break": 0, "watch_near_ready": 0,
                        "risk_excluded": 0, "failed_break_excluded": 0, "weak_excluded": 0,
                        "provisional_excluded": 0, "final_candidates": 0, "rendered": 0}}
@@ -4304,13 +4529,32 @@ def _score_entry_candidates(database_url, user_id):
         exp_summary = support.get("tradeExperience")
         entry_risk = (exp_summary or {}).get("entryRisk")
 
+        # 今買い時TOP5：値幅余地・反転モメンタム選考（2026-09-16新規）。prefetched_mdの
+        # "bars"（regimeと同じバッチダウンロードから流用、新規取得なし）からTRADEABLE_
+        # RANGE_SCORE・MOMENTUM_STATE・（マイナス銘柄のみ）REVERSAL_MOMENTUMを算出する。
+        bars = (prefetched_md or {}).get("bars")
+        day_change = row.get("changePct")
+        range_metrics = compute_tradeable_range_metrics(bars, current=row.get("current"), day_high=row.get("high"))
+        tradeable_range_score, room_to_move = compute_tradeable_range_score(range_metrics)
+        momentum_state = classify_momentum_state(range_metrics, day_change)
+        reversal_info = None
+        if day_change is not None and day_change <= 0:
+            reversal_info = detect_intraday_reversal(bars, row.get("current"), row.get("low"))
+        setup_type = None
+        if day_change is not None and day_change > 0:
+            setup_type = "PULLBACK_REENTRY" if momentum_state in ("RANGE_COMPRESSION", "MOMENTUM_DECAY") \
+                else "MOMENTUM_CONTINUATION"
+        elif reversal_info and reversal_info.get("reversalState"):
+            setup_type = "REVERSAL_MOMENTUM"
+
         comp = _entry_score_components(row, stage2, snapshot or {}, auto_rs_current, auto_sector_current, catalysts,
-                                        event_signals, entry_risk=entry_risk)
+                                        event_signals, entry_risk=entry_risk, range_metrics=range_metrics,
+                                        momentum_state=momentum_state)
         neg_cat_present = bool(comp["negativeCatalysts"])
         entry_score = comp["total"]
         entry_state, exception_applied = _classify_entry_state(
             entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present, nikkei_chg,
-            entry_risk=entry_risk)
+            entry_risk=entry_risk, momentum_state=momentum_state)
         resilience = _rs_resilience_tier({"changePct": row.get("changePct"), "marketRS": row.get("marketRS")}, nikkei_chg)
 
         reasons = []
@@ -4340,6 +4584,15 @@ def _score_entry_candidates(database_url, user_id):
         # 指示書4番：「何が似ているのか」「過去何件中何件失敗したか」を具体的に表示する。
         if entry_risk and entry_risk.get("risk_level") in ("HIGH", "MEDIUM") and entry_risk.get("explanation"):
             risks.append(f"⚠ 過去の損切りパターンと類似：{entry_risk['explanation']}")
+        # 値幅余地・反転モメンタム選考（2026-09-16新規、指示書2・3番）。
+        if momentum_state == "MOMENTUM_DECAY":
+            risks.append("値幅縮小（高値圏で伸び悩み、MOMENTUM_DECAY）")
+        elif momentum_state == "MOMENTUM_REACCELERATING":
+            reasons.append("高値更新継続・値幅再拡大（MOMENTUM_REACCELERATING）")
+        if room_to_move == "LOW" and range_metrics.get("dataQuality") == "OK":
+            risks.append("値幅余地LOW（ここから取れる値幅が乏しい可能性）")
+        if reversal_info and reversal_info.get("reversalState") == "REVERSAL_CONFIRMED":
+            reasons.append(f"当日安値から+{reversal_info['bounceFromLowPct']}%反転（{'/'.join(reversal_info['reversalReasons'])}）")
 
         # Market Intelligence Phase9新規（指示書21・38番）：entry_score自体には一切加点も
         # 減点もしない、隣に並べるだけの追加専用表示。
@@ -4367,6 +4620,12 @@ def _score_entry_candidates(database_url, user_id):
             "eventSupport": event_support,
             "experienceScore": experience_score, "experienceSummary": experience_summary, "entryRisk": entry_risk,
             "marketDataCacheStatus": market_data_cache_status,  # "ok"|"stale_cache"|"rate_limited"|"failed"（指示書STEP9）
+            # 値幅余地・反転モメンタム選考（2026-09-16新規）：setupType（MOMENTUM_CONTINUATION/
+            # PULLBACK_REENTRY/REVERSAL_MOMENTUM/None）・roomToMove（HIGH/MID/LOW）・
+            # momentumState・reversalInfoをUI表示用にそのまま添える（entry_score/entryState
+            # 自体は既にcomp/_classify_entry_state側で反映済みのため、ここでは重複加点しない）。
+            "setupType": setup_type, "roomToMove": room_to_move, "momentumState": momentum_state,
+            "rangeMetrics": range_metrics, "reversalInfo": reversal_info,
         })
         per_symbol_ms.append((code, (time.time() - _t_symbol) * 1000))
 
@@ -4379,7 +4638,7 @@ def _score_entry_candidates(database_url, user_id):
     section_ms["sortRank"] = round((time.time() - _t) * 1000)
 
     _t = time.time()
-    entry_ready_top5, watch_candidates, debug = _select_entry_ready_top5(candidates)
+    entry_ready_top5, watch_candidates, reversal_confirmed, reversal_watch, debug = _select_entry_ready_top5(candidates)
     section_ms["top5Selection"] = round((time.time() - _t) * 1000)
     overall_quality = "FULL" if quality_counts["DEGRADED"] == 0 and quality_counts["PARTIAL"] == 0 else (
         "DEGRADED" if quality_counts["FULL"] == 0 else "PARTIAL")
@@ -4446,6 +4705,11 @@ def _score_entry_candidates(database_url, user_id):
     return {
         "entryReadyTop5": [{**c, "rank": i + 1} for i, c in enumerate(entry_ready_top5)],
         "watchCandidates": watch_candidates,
+        # 値幅余地・反転モメンタム選考（2026-09-16新規、指示書4・6番）：前日比マイナスだが
+        # 当日安値から強く反転している銘柄の新規探索レーン。entry_score/entryReadyTop5の
+        # ランキングとは独立（既存の「原則プラス銘柄からしか選ばない」ゲートは変更していない）。
+        "reversalCandidates": [{**c, "rank": i + 1} for i, c in enumerate(reversal_confirmed)],
+        "reversalWatchCandidates": reversal_watch,
         "dataQuality": overall_quality,
         "generatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "debug": debug,
@@ -4546,6 +4810,8 @@ def _apply_entry_top5_staleness(cache_entry):
     return {
         "entryReadyTop5": top5,
         "watchCandidates": cache_entry["watchCandidates"],
+        "reversalCandidates": cache_entry.get("reversalCandidates", []),
+        "reversalWatchCandidates": cache_entry.get("reversalWatchCandidates", []),
         "dataQuality": cache_entry["dataQuality"],
         "generatedAt": cache_entry["generatedAt"],
         "marketDataAt": cache_entry["marketDataAt"],
@@ -4587,6 +4853,8 @@ def _run_entry_top5_scan(database_url, user_id, trigger="AUTO", wait_for_lock=Fa
         cache_entry = {
             "entryReadyTop5": result["entryReadyTop5"],
             "watchCandidates": result["watchCandidates"],
+            "reversalCandidates": result.get("reversalCandidates", []),
+            "reversalWatchCandidates": result.get("reversalWatchCandidates", []),
             "dataQuality": result["dataQuality"],
             "generatedAt": result["generatedAt"],
             "generatedAtEpoch": t1,
@@ -21665,7 +21933,7 @@ class Handler(SimpleHTTPRequestHandler):
             # staleness()で読み取り時に適用する（キャッシュ本体は書き換えない）。
             cache_entry = get_entry_top5_cached(self.current_user) if (investment_db is not None and DATABASE_URL) else None
             if cache_entry is None:
-                self._send_json({"entryReadyTop5": [], "watchCandidates": [], "dataQuality": "DEGRADED",
+                self._send_json({"entryReadyTop5": [], "watchCandidates": [], "reversalCandidates": [], "reversalWatchCandidates": [], "dataQuality": "DEGRADED",
                                   "generatedAt": None, "marketDataAt": None, "watchlistCount": 0, "readyCount": 0,
                                   "scoredCount": 0, "entryReadyCount": 0, "waitCount": 0, "riskCount": 0,
                                   "durationMs": None, "trigger": None, "rankingAgeSec": None,
@@ -21686,9 +21954,9 @@ class Handler(SimpleHTTPRequestHandler):
             if investment_db is not None and DATABASE_URL:
                 cache_entry = _run_entry_top5_scan(DATABASE_URL, self.current_user, trigger="MANUAL", wait_for_lock=True)
                 result = _apply_entry_top5_staleness(cache_entry) if cache_entry else {
-                    "entryReadyTop5": [], "watchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None}
+                    "entryReadyTop5": [], "watchCandidates": [], "reversalCandidates": [], "reversalWatchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None}
             else:
-                result = {"entryReadyTop5": [], "watchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None}
+                result = {"entryReadyTop5": [], "watchCandidates": [], "reversalCandidates": [], "reversalWatchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None}
             print(f"  ENTRY TOP5：{len(result['entryReadyTop5'])}件、Watch候補：{len(result.get('watchCandidates', []))}件"
                   f"（dataQuality={result['dataQuality']}）")
             self._send_json(result)
