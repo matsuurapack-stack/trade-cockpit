@@ -366,11 +366,15 @@ class RegressionExistingUnaffectedTests(unittest.TestCase):
     """指示書「既存ENTRY SCOREやRule Engineを壊さない」の直接確認。"""
 
     def test_entry_score_components_signature_unchanged(self):
+        # 2026-09-16更新：ENTRY_RISK_SCORE（cf528a7）・値幅余地/反転モメンタム選考（c388aeb）で
+        # entry_risk/range_metrics/momentum_stateがオプション引数（デフォルトNone）として追加
+        # された。既存7引数の並び・意味は無変更で、末尾に追加されているだけ（choruco importが
+        # この関数に一切触れていないことの確認という本テストの目的は変わらない）。
         import inspect
         sig = inspect.signature(server._entry_score_components)
         self.assertEqual(list(sig.parameters.keys()),
                           ["row", "stage2", "snapshot", "auto_rs_current", "auto_sector_current",
-                           "catalysts", "event_signals"])
+                           "catalysts", "event_signals", "entry_risk", "range_metrics", "momentum_state"])
 
     def test_classify_entry_state_signature_unchanged(self):
         import inspect
@@ -378,8 +382,11 @@ class RegressionExistingUnaffectedTests(unittest.TestCase):
         self.assertIn("entry_score", sig.parameters)
 
     def test_select_entry_ready_top5_unaffected_by_choruco_import(self):
+        # 2026-09-16更新：値幅余地・反転モメンタム選考（c388aeb）でreversal_confirmed/
+        # reversal_watchが戻り値へ追加された（3要素→5要素）。choruco importがこの関数に
+        # 一切触れていないことの確認という本テストの目的は変わらない。
         candidates = [{"code": "1", "entryState": "ENTRY_READY", "entryScore": 80}]
-        top5, watch, debug = server._select_entry_ready_top5(candidates)
+        top5, watch, reversal_confirmed, reversal_watch, debug = server._select_entry_ready_top5(candidates)
         self.assertEqual(len(top5), 1)
         self.assertEqual(top5[0]["entryScore"], 80)
 

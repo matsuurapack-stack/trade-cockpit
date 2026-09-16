@@ -176,10 +176,12 @@ class IntradayRegimeBatchPrefetchTests(unittest.TestCase):
         self.assertEqual(len(called_chunk), 2)
 
     def test_empty_symbols_returns_zero_stats_without_network(self):
+        # 2026-09-16更新：今買い時TOP5の値幅余地・反転モメンタム選考（c388aeb）で
+        # stats["bars"]（生の5分足配列、TRADEABLE_RANGE_SCORE等の算出に流用）が追加された。
         with mock.patch.object(server, "_download_intraday_chunk") as mock_dl:
             stats = server._intraday_regime_batch_prefetch([], "5m", 90)
         mock_dl.assert_not_called()
-        self.assertEqual(stats, {"attempted": 0, "cached": 0, "batches": 0, "values": {}})
+        self.assertEqual(stats, {"attempted": 0, "cached": 0, "batches": 0, "values": {}, "bars": {}})
 
     def test_download_failure_does_not_raise(self):
         with mock.patch.object(server, "_download_intraday_chunk", side_effect=RuntimeError("boom")):

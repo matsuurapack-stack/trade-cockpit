@@ -22,7 +22,7 @@ class SelectEntryReadyTop5Tests(unittest.TestCase):
 
     def test_one_entry_ready_candidate_shows_one(self):
         candidates = [make_candidate("7203", "ENTRY_READY", 82)]
-        top5, watch, debug = server._select_entry_ready_top5(candidates)
+        top5, watch, reversal_confirmed, reversal_watch, debug = server._select_entry_ready_top5(candidates)
         self.assertEqual(len(top5), 1)
         self.assertEqual(top5[0]["code"], "7203")
         self.assertEqual(debug["entry_ready"], 1)
@@ -31,47 +31,47 @@ class SelectEntryReadyTop5Tests(unittest.TestCase):
 
     def test_three_entry_ready_candidates_shows_three(self):
         candidates = [make_candidate(str(i), "ENTRY_READY", 80 - i) for i in range(3)]
-        top5, watch, debug = server._select_entry_ready_top5(candidates)
+        top5, watch, reversal_confirmed, reversal_watch, debug = server._select_entry_ready_top5(candidates)
         self.assertEqual(len(top5), 3)
         self.assertEqual(debug["entry_ready"], 3)
 
     def test_seven_entry_ready_candidates_shows_top_five_only(self):
         # 呼び出し元でentry_score降順ソート済みという前提（本関数はソートしない）。
         candidates = [make_candidate(str(i), "NOW_BUYABLE", 90 - i) for i in range(7)]
-        top5, watch, debug = server._select_entry_ready_top5(candidates)
+        top5, watch, reversal_confirmed, reversal_watch, debug = server._select_entry_ready_top5(candidates)
         self.assertEqual(len(top5), 5)
         self.assertEqual([c["code"] for c in top5], ["0", "1", "2", "3", "4"])
         self.assertEqual(debug["entry_ready"], 7)
         self.assertEqual(debug["final_candidates"], 5)
 
     def test_zero_candidates_returns_empty_list_not_error(self):
-        top5, watch, debug = server._select_entry_ready_top5([])
+        top5, watch, reversal_confirmed, reversal_watch, debug = server._select_entry_ready_top5([])
         self.assertEqual(top5, [])
         self.assertEqual(debug["scanned"], 0)
         self.assertEqual(debug["final_candidates"], 0)
 
     def test_risk_state_excluded_from_top5(self):
         candidates = [make_candidate("1", "CHASE_RISK", 90), make_candidate("2", "INVALID", 85)]
-        top5, watch, debug = server._select_entry_ready_top5(candidates)
+        top5, watch, reversal_confirmed, reversal_watch, debug = server._select_entry_ready_top5(candidates)
         self.assertEqual(top5, [])
         self.assertEqual(debug["risk_excluded"], 2)
 
     def test_weak_state_excluded_from_top5(self):
         candidates = [make_candidate("1", "WEAK", 20)]
-        top5, watch, debug = server._select_entry_ready_top5(candidates)
+        top5, watch, reversal_confirmed, reversal_watch, debug = server._select_entry_ready_top5(candidates)
         self.assertEqual(top5, [])
         self.assertEqual(debug["weak_excluded"], 1)
 
     def test_provisional_state_excluded_from_top5(self):
         candidates = [make_candidate("1", "PROVISIONAL", 70)]
-        top5, watch, debug = server._select_entry_ready_top5(candidates)
+        top5, watch, reversal_confirmed, reversal_watch, debug = server._select_entry_ready_top5(candidates)
         self.assertEqual(top5, [])
         self.assertEqual(debug["provisional_excluded"], 1)
 
     def test_existing_entry_score_not_modified(self):
         # 指示書9番「既存ENTRY SCORE計算自体は変更しない」。
         candidates = [make_candidate("7203", "ENTRY_READY", 82)]
-        top5, watch, debug = server._select_entry_ready_top5(candidates)
+        top5, watch, reversal_confirmed, reversal_watch, debug = server._select_entry_ready_top5(candidates)
         self.assertEqual(top5[0]["entryScore"], 82)
 
     def test_tier1_entry_ready_prioritized_over_tier2_active_break(self):
@@ -80,26 +80,26 @@ class SelectEntryReadyTop5Tests(unittest.TestCase):
             make_candidate("A", "WAIT_BREAKOUT", 95),  # Tier2（高スコア）
             make_candidate("B", "ENTRY_READY", 55),    # Tier1
         ]
-        top5, watch, debug = server._select_entry_ready_top5(candidates)
+        top5, watch, reversal_confirmed, reversal_watch, debug = server._select_entry_ready_top5(candidates)
         self.assertEqual([c["code"] for c in top5], ["B", "A"])
         self.assertEqual(debug["entry_ready"], 1)
         self.assertEqual(debug["active_break"], 1)
 
     def test_tier2_requires_min_score(self):
         candidates = [make_candidate("A", "WAIT_BREAKOUT", 59)]  # 閾値60未満
-        top5, watch, debug = server._select_entry_ready_top5(candidates)
+        top5, watch, reversal_confirmed, reversal_watch, debug = server._select_entry_ready_top5(candidates)
         self.assertEqual(top5, [])
         self.assertEqual(debug["active_break"], 0)
 
     def test_tier3_watch_near_ready_included_when_pool_thin(self):
         candidates = [make_candidate("A", "WATCH", 50)]  # 閾値45以上
-        top5, watch, debug = server._select_entry_ready_top5(candidates)
+        top5, watch, reversal_confirmed, reversal_watch, debug = server._select_entry_ready_top5(candidates)
         self.assertEqual(len(top5), 1)
         self.assertEqual(debug["watch_near_ready"], 1)
 
     def test_tier3_below_threshold_excluded(self):
         candidates = [make_candidate("A", "WATCH", 30)]  # 閾値45未満
-        top5, watch, debug = server._select_entry_ready_top5(candidates)
+        top5, watch, reversal_confirmed, reversal_watch, debug = server._select_entry_ready_top5(candidates)
         self.assertEqual(top5, [])
         self.assertEqual(debug["watch_near_ready"], 0)
 
@@ -109,7 +109,7 @@ class SelectEntryReadyTop5Tests(unittest.TestCase):
             make_candidate("B", "WAIT_PULLBACK", 65),  # Tier2
             make_candidate("A", "ENTRY_READY", 60),    # Tier1
         ]
-        top5, watch, debug = server._select_entry_ready_top5(candidates)
+        top5, watch, reversal_confirmed, reversal_watch, debug = server._select_entry_ready_top5(candidates)
         self.assertEqual([c["code"] for c in top5], ["A", "B", "C"])
 
     def test_watch_candidates_excludes_top5_codes(self):
@@ -117,7 +117,7 @@ class SelectEntryReadyTop5Tests(unittest.TestCase):
             make_candidate("A", "ENTRY_READY", 80),
             make_candidate("B", "WATCH", 40),
         ]
-        top5, watch, debug = server._select_entry_ready_top5(candidates)
+        top5, watch, reversal_confirmed, reversal_watch, debug = server._select_entry_ready_top5(candidates)
         top5_codes = {c["code"] for c in top5}
         self.assertNotIn("B", top5_codes)  # WATCH<45はTOP5対象外だがwatch_candidatesには残る
         watch_codes = {c["code"] for c in watch}
