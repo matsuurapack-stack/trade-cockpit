@@ -5329,6 +5329,16 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         {watchTargetsDiag && <>
           <div>/api/watchlist応答にisWatchTargetフィールドあり: {watchTargetsDiag.backendHasIsWatchTargetField?"OK":"⚠ 無し（サーバー再起動が必要な可能性）"}</div>
           <div>merge前のローカル件数: {watchTargetsDiag.localCountBeforeMerge} / サーバー件数: {watchTargetsDiag.serverCount} / merge後: {watchTargetsDiag.mergedCount}（{watchTargetsDiag.hydratedAt}）</div>
+          {/* 2026-09-18追記：push（差分のサーバーへの書き戻し）が実際に成功したかをその場で確認する。 */}
+          {watchTargetsDiag.pushPhase==="pushing" && <div>差分のサーバーpush中…</div>}
+          {watchTargetsDiag.pushPhase==="done" && <>
+            <div>push結果：試行{watchTargetsDiag.pushAttempted}件中 成功{watchTargetsDiag.pushSucceeded}件・失敗{watchTargetsDiag.pushFailedCount}件</div>
+            <div>push後の再取得でのサーバー件数: {watchTargetsDiag.serverCountAfterPush??"（取得失敗）"}
+              {watchTargetsDiag.serverCountAfterPush===watchTargetsDiag.mergedCount?" ✅ 一致":" ⚠ merge後の件数と不一致"}</div>
+            {watchTargetsDiag.pushFailedCount>0 && <div style={{color:"var(--down)"}}>
+              失敗例（先頭5件）：{watchTargetsDiag.pushFailedSample.map(f=>`${f.code}(status=${f.status}${f.serverOk===false?",serverOk=false":""}${f.error?","+f.error:""})`).join("・")}
+            </div>}
+          </>}
         </>}
       </div>
       <div style={{fontWeight:700,marginBottom:4}}>指定5銘柄の更新状況（quoteFetchedAt＝frontend stateが最後に新しい値を受け取った時刻）</div>
@@ -11839,10 +11849,21 @@ function App(){
   // 2026-09-17新規（スマホ「監視銘柄」タブ3件表示バグの緊急修正）：watchTargets（このON/OFF
   // 状態）はこれまでブラウザlocalStorageのみで管理され端末ごとに独立していたため、PC/iPhoneで
   // 表示件数が食い違っていた。ユーザー方針「監視銘柄は共有」に合わせ、DB側（watchlistの
-  // is_watch_targetカラム、SHARED scope）へも永続化する（失敗しても画面操作は継続、fire-and-forget）。
+  // is_watch_targetカラム、SHARED scope）へも永続化する（画面操作自体は失敗時も継続する）。
+  // 2026-09-18修正：従来はfetch().catch(()=>{})のみでレスポンスのHTTP status/ok/bodyを一切
+  // 確認していなかったため、サーバーが403/500やok:falseを返しても「失敗した」ことが分からず、
+  // PC localStorage 73件がNeonへ反映されない不具合の原因調査ができなかった。呼び出し元が
+  // 結果を検査できるよう{code,ok,status,serverOk}を返すPromiseへ変更する（挙動は変えず、
+  // 診断のための可観測性だけを追加する）。
   const persistWatchTarget=(code,value,market)=>{
-    fetch("/api/watchlist/watch-target",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({code,market:market||"JP",value})}).catch(()=>{});
+    return fetch("/api/watchlist/watch-target",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({code,market:market||"JP",value})})
+      .then(async r=>{
+        let body=null;
+        try{body=await r.json();}catch(e){}
+        return {code,ok:r.ok,status:r.status,serverOk:body?.ok};
+      })
+      .catch(e=>({code,ok:false,status:0,error:String(e&&e.message||e)}));
   };
 
   // 2026-08-21 ユーザー要望：登録銘柄テーブルの「監視銘柄」ボタン。「監視銘柄」タブでまとめて
@@ -12298,14 +12319,50 @@ function App(){
             const localOnly=localBefore.filter(c=>!serverWatchTargets.includes(c));
             const merged=[...new Set([...serverWatchTargets,...localOnly])];
             setS(p=>({...p,watchlist:jd.items,watchTargets:merged}));
-            localOnly.forEach(c=>persistWatchTarget(c,true));
             setWatchTargetsDiag({
               backendHasIsWatchTargetField:backendHasField,
               localCountBeforeMerge:localBefore.length,
               serverCount:serverWatchTargets.length,
               mergedCount:merged.length,
               hydratedAt:new Date().toISOString(),
+              pushPhase:localOnly.length>0?"pushing":"not_needed",
             });
+            // 2026-09-18修正（運用診断：PC localStorage 73件がNeonへ反映されない不具合の調査）：
+            // 従来はforEachでfire-and-forgetし、push結果を一切見ていなかった。
+            // Promise.allで実際の結果（HTTP status・サーバー側ok）を集計し、push完了後に
+            // /api/watchlistを再取得してNeon側の実際の件数を確認する——ユーザーの期待結果
+            // 「local 73 / server 0 / merged 73 → POST成功 → server 73 → 再fetch →
+            // local 73 / server 73 / merged 73」をこのeffect1回の中で検証できるようにする。
+            if(localOnly.length>0){
+              const pushResults=await Promise.all(localOnly.map(c=>persistWatchTarget(c,true)));
+              const pushSucceeded=pushResults.filter(r=>r.ok&&r.serverOk!==false).length;
+              const pushFailed=pushResults.filter(r=>!(r.ok&&r.serverOk!==false));
+              let serverCountAfterPush=null;
+              try{
+                const rr=await fetch("/api/watchlist?market=JP");
+                if(rr.ok){
+                  const rd=await rr.json();
+                  if(Array.isArray(rd.items)){
+                    const serverAfter=rd.items.filter(w=>w.isWatchTarget).map(w=>w.code);
+                    serverCountAfterPush=serverAfter.length;
+                    // push後のサーバー実値で最終的にもう一度そろえる（成功していればlocalOnlyが
+                    // 丸ごとサーバー側にも現れ、merged自体は変わらないはず——ズレていれば
+                    // pushFailedと合わせて「何件中何件が実際に反映されなかったか」が分かる）。
+                    setS(p=>({...p,watchTargets:[...new Set([...serverAfter,...p.watchTargets])]}));
+                  }
+                }
+              }catch(e){}
+              setWatchTargetsDiag(prev=>({
+                ...prev,
+                pushPhase:"done",
+                pushAttempted:localOnly.length,
+                pushSucceeded,
+                pushFailedCount:pushFailed.length,
+                // 失敗内容を大量に画面へ出さない（診断に必要な先頭5件のみ）。
+                pushFailedSample:pushFailed.slice(0,5).map(r=>({code:r.code,status:r.status,serverOk:r.serverOk,error:r.error})),
+                serverCountAfterPush,
+              }));
+            }
           }
         }
         if(ur.ok){const ud=await ur.json();if(Array.isArray(ud.items))setS(p=>({...p,watchlistUS:ud.items}));}

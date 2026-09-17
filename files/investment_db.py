@@ -9126,20 +9126,25 @@ def upsert_watchlist_item(database_url, user_id, item):
 def set_watch_target(database_url, user_id, code, market, value):
     """「監視銘柄」タブの対象ON/OFF（従来のs.watchTargets）をDB側へ永続化する
     （2026-09-17新規、スマホ3件表示バグの緊急修正）。Phase MU-S1と同じくSHARED scope。
-    対象行が存在しない場合は何もしない（watchlist本体に無い銘柄をwatch targetにはできない）。"""
+    対象行が存在しない場合は何もしない（watchlist本体に無い銘柄をwatch targetにはできない）。
+    2026-09-18修正：従来はUPDATEが実際に何行更新したかを見ず常にTrueを返していたため、
+    code/marketの不一致で0行しか更新されなかった場合でもフロント側は「成功」と誤認していた
+    （運用前確認：PC localStorage 73件がNeonへ反映されない不具合の調査で発覚）。
+    cursor.rowcountを見て、実際に1行以上更新できた場合のみTrueを返す。"""
     user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None or not code:
         return False
     market = market or "JP"
     with pool.connection() as conn:
-        conn.execute(
+        cur = conn.execute(
             "UPDATE watchlist SET is_watch_target = %s, updated_at = now() "
             "WHERE user_id = %s AND code = %s AND market = %s",
             [bool(value), user_id, code, market],
         )
+        matched = cur.rowcount > 0
         conn.commit()
-    return True
+    return matched
 
 
 def _merge_text_field(existing, new):
