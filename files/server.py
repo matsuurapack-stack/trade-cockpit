@@ -106,6 +106,10 @@ EDINET_API_KEY = _SECRETS.get("edinet_api_key", "")
 # 同じDBに接続することでデータを一本化する。接続先はローカルはsecrets.jsonの"database_url"、
 # Renderは環境変数DATABASE_URL（Renderの規約に合わせた名前）のどちらでも読めるようにする。
 DATABASE_URL = os.environ.get("DATABASE_URL") or _SECRETS.get("database_url", "")
+# 2026-09-18新規（運用診断：PC/iPhone間でサーバー再起動漏れ・JSキャッシュ差異を切り分ける
+# ためのビルド識別子）。機能追加のたびに更新する（自動生成はしない、手動で分かりやすい
+# 値にする）。/api/versionで返し、trade-cockpit.html側の同じ文字列と画面上で突き合わせる。
+APP_BUILD_VERSION = "2026-09-18-event-risk-guard-watchtargets-diag"
 # 2026-09-10新規（にこそく@nicosokufx X投稿 自動取得・市場分析連携）：X公式API v2のBearer
 # Token。未設定でもアプリ全体は正常動作し、この機能だけがX_SOURCE_STATUS=DEGRADEDになる
 # （指示書19番）。スクレイピング・ログイン回避等は実装しない（指示書1番、公式APIのみ使用）。
@@ -23346,7 +23350,11 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         if not self._authorized():
             return
-        if self.path.startswith("/api/quotes"):
+        if self.path.startswith("/api/version"):
+            # 2026-09-18新規：PC/iPhone間でサーバー再起動漏れ・古いプロセスが応答している
+            # ことを切り分けるための診断エンドポイント（認証は既存どおり必要）。
+            self._send_json({"build": APP_BUILD_VERSION, "hasWatchTargetSupport": True})
+        elif self.path.startswith("/api/quotes"):
             print("[取得] 指数・為替 …")
             quotes = get_index_quotes()
             now = datetime.datetime.now().strftime("%H:%M:%S")

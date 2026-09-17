@@ -4980,7 +4980,7 @@ function YaamanThemePanel({nextDayThemes,todayThemes,watchlistAll,onAddToWatchli
   </div>;
 }
 
-function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan,newsCatalysts,entryScanning,entryResult,onEntryScan,thesisStats,todayTheses,yaamanNextDayThemes,yaamanTodayThemes,onAddToWatchlist,eventRiskGuard}){
+function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan,newsCatalysts,entryScanning,entryResult,onEntryScan,thesisStats,todayTheses,yaamanNextDayThemes,yaamanTodayThemes,onAddToWatchlist,eventRiskGuard,appVersionInfo,watchTargetsDiag,lastFastQuoteStats}){
   const [expandedScoreCode,setExpandedScoreCode]=useState(null); // スコア内訳の折りたたみ展開（指示書21番）
   const [entryDebugOpen,setEntryDebugOpen]=useState(false); // TOP5表示ロジック修正指示・指示書7番：開発用デバッグ表示（既定は折りたたみ）
 
@@ -5319,6 +5319,18 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
     </div>
 
     {debugUpdatesOpen && <div style={{fontSize:11,background:"var(--panelAlt,#f5f5f5)",border:"1px solid var(--rule)",borderRadius:6,padding:"6px 10px",marginTop:4,marginBottom:8}}>
+      {/* 2026-09-18新規（運用診断：iPhoneがserver watchTargetsを取り込めない不具合調査）：
+          PC/iPhoneを並べて見比べ、backend build・isWatchTarget対応有無・merge集計を
+          その場で突き合わせられるようにする。 */}
+      <div style={{marginBottom:6,paddingBottom:6,borderBottom:"1px dashed var(--rule)"}}>
+        <div style={{fontWeight:700}}>診断：watchTargets同期</div>
+        <div>backend build: <span className="mono">{appVersionInfo?.build||"（未取得）"}</span></div>
+        <div>backend isWatchTarget対応: {appVersionInfo?.hasWatchTargetSupport==null?"（未取得）":(appVersionInfo.hasWatchTargetSupport?"OK":"⚠ 未対応の可能性")}</div>
+        {watchTargetsDiag && <>
+          <div>/api/watchlist応答にisWatchTargetフィールドあり: {watchTargetsDiag.backendHasIsWatchTargetField?"OK":"⚠ 無し（サーバー再起動が必要な可能性）"}</div>
+          <div>merge前のローカル件数: {watchTargetsDiag.localCountBeforeMerge} / サーバー件数: {watchTargetsDiag.serverCount} / merge後: {watchTargetsDiag.mergedCount}（{watchTargetsDiag.hydratedAt}）</div>
+        </>}
+      </div>
       <div style={{fontWeight:700,marginBottom:4}}>指定5銘柄の更新状況（quoteFetchedAt＝frontend stateが最後に新しい値を受け取った時刻）</div>
       {lastFastQuoteStats && <div style={{marginBottom:4,color:"var(--inkSoft)"}}>
         前回FAST poll：requested={lastFastQuoteStats.requested} tachibana={lastFastQuoteStats.tachibana} fallback_cache={lastFastQuoteStats.fallback_cache} fallback_yf={lastFastQuoteStats.fallback_yf} failed={lastFastQuoteStats.failed} ({lastFastQuoteStats.duration_ms}ms)
@@ -12252,6 +12264,15 @@ function App(){
   // バグ。サーバー側watchlist（Neon Postgres、全端末共有）を常に正として取得するよう
   // 移行フラグへの依存を撤廃した。取得失敗時（オフライン等）は今のローカル状態のまま
   // （既存の journal/rules と同じ安全側フォールバック方針を維持）。
+  // 2026-09-18新規（運用診断：iPhoneがserver watchTargetsを取り込めない不具合調査）：
+  // PC/iPhone間でサーバー再起動漏れ・古いプロセスが応答していることを画面上で突き合わせる
+  // ための診断情報。/api/versionはバックエンドのビルド識別子（APP_BUILD_VERSION）を返す
+  // だけの純粋な診断エンドポイントで、この値自体は判定ロジックに一切使わない。
+  const [appVersionInfo,setAppVersionInfo]=useState(null);
+  const [watchTargetsDiag,setWatchTargetsDiag]=useState(null);
+  useEffect(()=>{
+    fetch("/api/version").then(r=>r.ok?r.json():null).then(d=>{if(d)setAppVersionInfo(d);}).catch(()=>{});
+  },[]);
   useEffect(()=>{
     (async()=>{
       try{
@@ -12267,11 +12288,24 @@ function App(){
             // の要件に反する）。そこで「サーバー値∪この端末のローカル値」の和集合を採用し、
             // ローカルにしか無かったコードはこの場でサーバーへも書き戻す（一度書き戻せば
             // 以後はどの端末でもサーバー値だけで揃うようになる、一回限りの自然な収束）。
+            // 2026-09-18追記（運用診断）：isWatchTargetフィールド自体が応答に無い場合
+            // （＝サーバープロセスがこの機能追加より前の古いコードのまま再起動されていない）
+            // を明示的に検知し、診断パネルへ表示する（無言でローカル値のみに戻ってしまうと
+            // 「iPhoneだけ3件のまま」のような不具合の原因が分からなくなるため）。
+            const backendHasField=jd.items.length===0 || jd.items.some(w=>Object.prototype.hasOwnProperty.call(w,"isWatchTarget"));
             const serverWatchTargets=jd.items.filter(w=>w.isWatchTarget).map(w=>w.code);
-            const localOnly=sRef.current.watchTargets.filter(c=>!serverWatchTargets.includes(c));
+            const localBefore=sRef.current.watchTargets;
+            const localOnly=localBefore.filter(c=>!serverWatchTargets.includes(c));
             const merged=[...new Set([...serverWatchTargets,...localOnly])];
             setS(p=>({...p,watchlist:jd.items,watchTargets:merged}));
             localOnly.forEach(c=>persistWatchTarget(c,true));
+            setWatchTargetsDiag({
+              backendHasIsWatchTargetField:backendHasField,
+              localCountBeforeMerge:localBefore.length,
+              serverCount:serverWatchTargets.length,
+              mergedCount:merged.length,
+              hydratedAt:new Date().toISOString(),
+            });
           }
         }
         if(ur.ok){const ud=await ur.json();if(Array.isArray(ud.items))setS(p=>({...p,watchlistUS:ud.items}));}
@@ -12646,6 +12680,7 @@ function App(){
         earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
         onRemove={removeWatchTarget} metrics={s.metrics} watchlistAll={watchlistAll} breakoutLevels={s.breakoutLevels}
         analysisData={s.analysisData} marketRiskLabel={s.marketRisk?.marketRiskLabel} eventRiskGuard={eventRiskGuard}
+        appVersionInfo={appVersionInfo} watchTargetsDiag={watchTargetsDiag} lastFastQuoteStats={lastFastQuoteStats}
         activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)}
         onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}
         momentumScanning={momentumScanning} momentumResult={momentumResult} onMomentumScan={runMomentumScan}
