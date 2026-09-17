@@ -121,6 +121,44 @@ try:
 except Exception:
     USERS = _SECRETS.get("users", {})
 
+# ---- 本番DB書き込み安全ガード（2026-09-18新規、運用前確認：分離環境が本番Neonへ誤って
+# 書き込んでいた事故の再発防止） ----
+# auth_bypass＝usersが空（認証なし）＝分離テスト環境・ローカル検証で使われるモード。
+# このモードで動いているプロセスがtest_database_urlを明示指定していない限り、
+# secrets.json/環境変数のdatabase_urlが本番かどうかをコードから判別する手段が無い
+# （接続先の善し悪しをここで推測しない）ため、安全側に倒して全write操作を拒否する。
+# test_database_urlが明示指定されていれば、それをこのプロセスの実効database_urlとして
+# 採用し（secrets.jsonの値は使わない）、write E2Eを許可する——つまりwrite E2Eが動くのは
+# 必ず専用のテストDBに対してだけ、という構造にする。
+def compute_write_e2e_policy(users, test_database_url, secrets_database_url):
+    """auth_bypass/write_e2e_allowed/effective_database_urlを純粋関数として計算する
+    （テスト容易性のため、モジュールレベルのグローバル状態から分離してある）。
+    戻り値：{"auth_bypass": bool, "write_e2e_allowed": bool, "database_url": str}"""
+    auth_bypass = not users
+    if auth_bypass and test_database_url:
+        return {"auth_bypass": True, "write_e2e_allowed": True, "database_url": test_database_url}
+    if auth_bypass:
+        return {"auth_bypass": True, "write_e2e_allowed": False, "database_url": secrets_database_url}
+    return {"auth_bypass": False, "write_e2e_allowed": True, "database_url": secrets_database_url}
+
+
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL") or ""
+_WRITE_POLICY = compute_write_e2e_policy(USERS, TEST_DATABASE_URL, DATABASE_URL)
+AUTH_BYPASS = _WRITE_POLICY["auth_bypass"]
+WRITE_E2E_ALLOWED = _WRITE_POLICY["write_e2e_allowed"]
+DATABASE_URL = _WRITE_POLICY["database_url"]
+
+
+def _mask_database_url(url):
+    """ログ表示用にパスワードを伏せ、host/dbnameだけを残す（指示書：secretは必ずマスク）。"""
+    if not url:
+        return {"host": None, "dbname": None}
+    try:
+        parsed = urllib.parse.urlparse(url)
+        return {"host": parsed.hostname, "dbname": (parsed.path or "").lstrip("/") or None}
+    except Exception:
+        return {"host": "(parse error)", "dbname": None}
+
 try:
     import yfinance as yf
 except ImportError:
@@ -24474,6 +24512,14 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         if not self._authorized():
             return
+        # 本番DB書き込み安全ガード（2026-09-18新規、運用前確認：分離テスト環境が本番Neonへ
+        # 誤って書き込んでいた事故の再発防止）。全POST（＝この実装の唯一の書き込み経路——
+        # PUT/PATCH/DELETEハンドラは存在しない）のrouting入口で一括ガードする。エンドポイント
+        # ごとの個別対応にはしない（新規write endpointを追加しても自動的に保護される）。
+        if not WRITE_E2E_ALLOWED:
+            self._send_json({"error": "write操作は無効化されています（auth bypassモードでTEST_DATABASE_URL未設定のため、"
+                                        "本番DBへの誤書き込みを防ぐために全POSTを拒否しています）。"}, status=403)
+            return
         # ---- 投資判断ログ（2026-09-02新規、同日中にマルチユーザー化）：daily_log・stock_judgments ----
         # 全てself.current_user（_authorized()がBasic認証のユーザー名から設定。USERS未設定時は
         # "local"固定）をuser_idとして渡し、他ユーザーのデータに触れないようDB側でもスコープする。
@@ -25665,6 +25711,12 @@ def open_browser():
 
 
 def main():
+    # 本番DB書き込み安全ガード（2026-09-18新規）：起動時に接続先環境をログ表示する
+    # （host/dbnameのみ、パスワード等secretは表示しない）。
+    _db_info = _mask_database_url(DATABASE_URL)
+    print(f"[環境] environment={'auth_bypass(test)' if AUTH_BYPASS else 'authenticated(production)'} "
+          f"db_host={_db_info['host']} db_name={_db_info['dbname']} "
+          f"write_e2e={'ENABLED' if WRITE_E2E_ALLOWED else 'DISABLED（TEST_DATABASE_URL未設定のためPOST等の書き込みを拒否します）'}")
     if yf is None or feedparser is None:
         print("必要なライブラリが見つかりません。setup.bat を先に実行してください。")
         if not IS_CLOUD:
