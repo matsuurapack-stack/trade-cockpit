@@ -1866,10 +1866,12 @@ STOCK_NAME_NEWS_NQN_MIN = 2
 # 最終payload安全弁（_filter_general_news_for_disabled_codes、2026-09-17追加）でのみ
 # 参照する。将来対象を追加する場合はこのsetへコード追加するだけでよい。
 STOCK_NAME_NEWS_DISABLED_CODES = {
+    "1332",  # ニッスイ
     "1812",  # 鹿島
     "2282",  # 日本ハム
     "2801",  # キッコーマン
     "2802",  # 味の素
+    "2871",  # ニチレイ
 }
 GENERAL_NEWS_DISABLED_CODES = STOCK_NAME_NEWS_DISABLED_CODES  # 指示書の命名に合わせたエイリアス（同一set）
 

@@ -208,5 +208,51 @@ class DedupeStillWorksAfterFilterTests(unittest.TestCase):
         self.assertEqual(result[0]["code"], "7203")
 
 
+class SixCodeExpansionTests(unittest.TestCase):
+    """2026-09-17追加：一般ニュース完全除外を4銘柄→6銘柄（1332ニッスイ・2871ニチレイを
+    追加）へ拡張したことの確認。既存4銘柄と完全に同じ仕様（一般ニュースOFF・TDnet/
+    公式IR ON）であることを検証する。"""
+
+    def test_disabled_codes_now_six(self):
+        self.assertEqual(server.STOCK_NAME_NEWS_DISABLED_CODES,
+                          {"1332", "1812", "2282", "2801", "2802", "2871"})
+        # 指示書「重複した除外リストを増やさないこと」：GENERAL_NEWS_DISABLED_CODESは
+        # 別のsetではなく同一オブジェクトのエイリアスであること。
+        self.assertIs(server.GENERAL_NEWS_DISABLED_CODES, server.STOCK_NAME_NEWS_DISABLED_CODES)
+
+    def test_1332_nissui_general_news_dropped(self):
+        """1332 ニッスイ + 一般ニュース → DROP。"""
+        items = [{"code": "1332", "source": "日本食糧新聞・電子版", "sourceType": "AGGREGATOR",
+                   "title": "水産練り製品特集：ニッスイ ビール好適の新かにかま登場"}]
+        self.assertEqual(server._filter_general_news_for_disabled_codes(items), [])
+
+    def test_1332_nissui_tdnet_kept(self):
+        """1332 ニッスイ + TDnet → KEEP。"""
+        items = [{"code": "1332", "source": "TDnet", "title": "業績予想の修正に関するお知らせ"}]
+        result = server._filter_general_news_for_disabled_codes(items)
+        self.assertEqual(len(result), 1)
+
+    def test_2871_nichirei_general_news_dropped(self):
+        """2871 ニチレイ + 一般ニュース → DROP。"""
+        items = [{"code": "2871", "source": "PR TIMES", "sourceType": "AGGREGATOR",
+                   "title": "ニチレイフーズの原材料検査における新技術活用事例を公開"}]
+        self.assertEqual(server._filter_general_news_for_disabled_codes(items), [])
+
+    def test_2871_nichirei_verified_official_ir_kept(self):
+        """2871 ニチレイ + verified official IR（NQN開示速報） → KEEP。"""
+        items = [{"code": "2871", "source": "NQN", "sourceType": "PRIMARY_IR", "nqnCategory": "120",
+                   "title": "ニチレイ、自己株式取得に関するお知らせ"}]
+        result = server._filter_general_news_for_disabled_codes(items)
+        self.assertEqual(len(result), 1)
+
+    def test_build_stock_name_news_skips_google_for_new_codes_too(self):
+        wl = [make_watchlist_item("1332", "ニッスイ"), make_watchlist_item("2871", "ニチレイ")]
+        with mock.patch.object(server, "_tachibana_stock_news", return_value=[]), \
+             mock.patch.object(server, "google_news") as mock_gn:
+            items = server.build_stock_name_news(wl)
+        mock_gn.assert_not_called()
+        self.assertEqual(items, [])
+
+
 if __name__ == "__main__":
     unittest.main()

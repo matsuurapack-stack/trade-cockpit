@@ -1210,6 +1210,22 @@ function newsSourceRank(it){
   return 3;
 }
 
+// 2026-09-17新規（緊急修正STEP7）：登録銘柄ニュースの一般ニュース完全除外の
+// frontend側最終安全弁。server.pyのGENERAL_NEWS_DISABLED_CODES／
+// _is_official_disclosure_news_item()／_filter_general_news_for_disabled_codes()と
+// 同じ対象銘柄・同じ判定基準をクライアント側にも独立して持たせ、「server側で除外され、
+// frontend側でも防御される」二重構造にする（万一server側の安全弁をすり抜けても、
+// フロント側でも最終的に弾く）。IR判定はタイトルの文字列一致ではなく、サーバーが
+// 構造化情報から付与するit.source／it.sourceTypeだけを根拠にする。
+const GENERAL_NEWS_DISABLED_CODES=new Set(["1332","1812","2282","2801","2802","2871"]);
+const isOfficialDisclosureNewsItem=(it)=>{
+  if(it?.source==="TDnet")return true;
+  if(it?.sourceType==="PRIMARY_DISCLOSURE"||it?.sourceType==="PRIMARY_IR")return true;
+  return false;
+};
+const filterGeneralNewsForDisabledCodes=(list)=>(list||[]).filter(
+  it=>!(GENERAL_NEWS_DISABLED_CODES.has(it?.code)&&!isOfficialDisclosureNewsItem(it)));
+
 // Trade Cockpit v3 Phase4（設計案43番）：ニュースのカテゴリ分類。有料AI APIは使わずキーワード
 // 辞書のみ（既存のIMPORTANT_KEYWORDS・STOCK_NAME_NEWS_EXCLUDE_KEYWORDSと同じ方式）。
 // 上から順に判定し、最初にヒットしたカテゴリを採用する。
@@ -10592,7 +10608,7 @@ function App(){
       if(nr.ok){const nd=await nr.json();
         setS(p=>({...p,
           stockNewsList:Array.isArray(nd.stockNews)?nd.stockNews:p.stockNewsList,
-          stockNameNewsList:Array.isArray(nd.stockNameNews)?nd.stockNameNews:p.stockNameNewsList,
+          stockNameNewsList:Array.isArray(nd.stockNameNews)?filterGeneralNewsForDisabledCodes(nd.stockNameNews):p.stockNameNewsList,
           disclosureNewsList:Array.isArray(nd.disclosureNews)?nd.disclosureNews:p.disclosureNewsList,
           macroNewsList:Array.isArray(nd.macroNews)?nd.macroNews:p.macroNewsList,
           macroNewsDomestic:Array.isArray(nd.macroNewsDomestic)?nd.macroNewsDomestic:p.macroNewsDomestic,
@@ -10604,7 +10620,7 @@ function App(){
       if(nru.ok){const ndu=await nru.json();
         setS(p=>({...p,
           usStockNewsList:Array.isArray(ndu.stockNews)?ndu.stockNews:p.usStockNewsList,
-          usStockNameNewsList:Array.isArray(ndu.stockNameNews)?ndu.stockNameNews:p.usStockNameNewsList,
+          usStockNameNewsList:Array.isArray(ndu.stockNameNews)?filterGeneralNewsForDisabledCodes(ndu.stockNameNews):p.usStockNameNewsList,
           usDisclosureNewsList:Array.isArray(ndu.disclosureNews)?ndu.disclosureNews:p.usDisclosureNewsList}));}
     }catch(e){}
     setNewsMsg(nowHHMM()+" 自動更新");
