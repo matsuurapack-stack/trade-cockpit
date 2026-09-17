@@ -3816,7 +3816,7 @@ ENTRY_STATE_META = {
 
 
 def _entry_score_components(row, stage2, snapshot, auto_rs_current, auto_sector_current, catalysts, event_signals,
-                             entry_risk=None, range_metrics=None, momentum_state=None):
+                             entry_risk=None, range_metrics=None, momentum_state=None, event_guard=None):
     """entry_score（0-100、内訳の合計をclampしたもの）を配点ごとに算出する。既存の各エンジンが
     既に計算済みの値だけを使い、新しい取得経路は増やさない。データが無い項目は0点（無理に
     加点も減点もしない、「取得できない値は推測しない」の踏襲）。
@@ -3852,11 +3852,18 @@ def _entry_score_components(row, stage2, snapshot, auto_rs_current, auto_sector_
     neg_cat = [c for c in (catalysts or []) if c.get("sentiment") == "negative" and c.get("freshness") in ("LIVE", "CURRENT")]
     catalyst_score = 5.0 if pos_cat else 0.0
 
-    risk_event_penalty = 0.0
-    if "EVENT_RISK_HIGH" in (event_signals or []):
-        risk_event_penalty = -5.0
+    # Event Risk Guard（2026-09-17新規）：event_guardが渡された場合は0-100スコアを0〜-15の
+    # 連続値へスケールする（既存の固定-5.0より精度が高いが「小さめweight」方針は維持）。
+    # event_guardが無い呼び出し元（analyze_stock()等、Event Risk Guard未配線の経路）は
+    # 従来どおりevent_signalsのブール判定にフォールバックする（後方互換）。
+    if event_guard is not None:
+        risk_event_penalty = -min(15.0, (event_guard.get("score") or 0.0) * 0.15)
+    else:
+        risk_event_penalty = 0.0
+        if "EVENT_RISK_HIGH" in (event_signals or []):
+            risk_event_penalty = -5.0
     if neg_cat:
-        risk_event_penalty = -5.0
+        risk_event_penalty = min(risk_event_penalty, -5.0)
 
     overheat_penalty = 0.0
     if volume_type == "CLIMAX_UP":
@@ -3906,7 +3913,7 @@ def _entry_score_components(row, stage2, snapshot, auto_rs_current, auto_sector_
 
 
 def _classify_entry_state(entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present, nikkei_chg=None,
-                           entry_risk=None, momentum_state=None):
+                           entry_risk=None, momentum_state=None, event_guard=None):
     """ENTRY_STATE（8種＋PROVISIONAL）をルールベースで決定する（AI不使用、既存AUTO系エンジンと
     同じ方針）。2026-09-10更新（Phase2-C「TOP5選考基準の全面見直し」指示書2・3・24番）：
     「原則プラス銘柄からしか選ばない」ゲートを追加した。当日騰落率がマイナスの銘柄は、以下を
@@ -3957,6 +3964,15 @@ def _classify_entry_state(entry_score, row, stage2, snapshot, data_quality, even
         return "WEAK", exception_applied
     if "EVENT_RISK_HIGH" in (event_signals or []) and entry_score < 60:
         return "WATCH", exception_applied
+    # Event Risk Guard（2026-09-17新規、PHASE 5「確認前に買わない」＋PHASE 8「確認後は昇格
+    # 可能」）：event_guardのlevelがHIGHの場合、寄り後の確認材料（VWAP維持＋高値更新の
+    # 5分足構造）が揃わない限りNOW_BUYABLE/ENTRY_READYへの昇格をブロックしWATCHに留める。
+    # 確認材料が揃っていれば通常どおりの判定を継続させる（完全除外ではない）。
+    if event_guard and event_guard.get("level") == "HIGH":
+        confirmed = (above_vwap and structure == "higher_highs"
+                     and bool(stage2 and stage2.get("aboveRecentHigh")))
+        if not confirmed:
+            return "WATCH", exception_applied
     # 指示書4番：過去の損切りパターンとの類似度が高く信頼できるサンプル数がある場合は、
     # NOW_BUYABLE/ENTRY_READYへの昇格をWATCHに留める（entry_score自体は変更しない、
     # 状態遷移だけを止める＝「ENTRYを止めている理由」を呼び出し側がreasonsで明示できるようにする）。
@@ -4433,6 +4449,31 @@ def _score_entry_candidates(database_url, user_id):
     stage1_rows = stage1.get("rows", {})
     nikkei_chg = stage1.get("nikkeiChangePct")
 
+    # Event Risk Guard（2026-09-17新規、PHASE 8）：market_event_risk（銘柄非依存、
+    # build_active_macro_eventsを既存どおり再利用）＋「連続重要イベント」加点を1回だけ計算し、
+    # 以下のcandidateループ全体で使い回す。market_gu_pctは日経の当日騰落率で代用する
+    # （寄り時点の厳密なgap計算にはstage1が持たない始値が必要なため、Phase Aでは既知の
+    # nikkei_chgを近似値として使う——過大評価しないようSEQUENTIAL_MAJOR_EVENTS加点条件の
+    # 一部としてのみ使い、単独ではスコアに影響させない）。
+    try:
+        macro = build_active_macro_events(database_url, user_id)
+    except Exception as e:
+        print("  entry-candidates: active macro events取得で例外（無視して続行）", e)
+        macro = {"events": [], "market_event_risk": "LOW"}
+    try:
+        prior_day_events = investment_db.list_market_events(
+            database_url, user_id,
+            from_date=(datetime.datetime.now(_JST).date() - datetime.timedelta(days=1)).isoformat(),
+            to_date=(datetime.datetime.now(_JST).date() - datetime.timedelta(days=1)).isoformat())
+        prior_day_events = [compute_market_event_status(e, now_jst=datetime.datetime.now(_JST))
+                             for e in prior_day_events if e.get("canonical_event_key")]
+        prior_day_events = [s for s in prior_day_events if s]
+    except Exception as e:
+        print("  entry-candidates: Event Risk Guard前日イベント取得で例外（無視して続行）", e)
+        prior_day_events = []
+    event_guard_market = compute_event_risk_guard_market(macro, prior_day_events=prior_day_events, market_gu_pct=nikkei_chg)
+    event_risk_by_code = {}
+
     _t = time.time()
     auto_rs_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_RS_CURRENT", market="JP")
     auto_sector_current = investment_db.get_codes_with_auto_tag(database_url, user_id, "AUTO_SECTOR_LEADER_CURRENT", market="JP")
@@ -4630,14 +4671,23 @@ def _score_entry_candidates(database_url, user_id):
         elif reversal_info and reversal_info.get("reversalState"):
             setup_type = "REVERSAL_MOMENTUM"
 
+        # Event Risk Guard（2026-09-17新規）：市場共通分（event_guard_market）＋この銘柄固有分
+        # （GU/高値圏/VWAP乖離/関連銘柄イベント/確認材料の減点）を合算する。stage2/snapshotは
+        # このループが既に取得済みの値をそのまま使い、新規の取得経路は追加しない。
+        related_events = compute_related_events_for_stock(w, macro.get("events", []))
+        event_guard = compute_event_risk_guard_for_symbol(
+            code, event_guard_market, row, stage2, snapshot or {}, watchlist_row=w,
+            todays_related_events=related_events)
+        event_risk_by_code[code] = event_guard
+
         comp = _entry_score_components(row, stage2, snapshot or {}, auto_rs_current, auto_sector_current, catalysts,
                                         event_signals, entry_risk=entry_risk, range_metrics=range_metrics,
-                                        momentum_state=momentum_state)
+                                        momentum_state=momentum_state, event_guard=event_guard)
         neg_cat_present = bool(comp["negativeCatalysts"])
         entry_score = comp["total"]
         entry_state, exception_applied = _classify_entry_state(
             entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present, nikkei_chg,
-            entry_risk=entry_risk, momentum_state=momentum_state)
+            entry_risk=entry_risk, momentum_state=momentum_state, event_guard=event_guard)
         resilience = _rs_resilience_tier({"changePct": row.get("changePct"), "marketRS": row.get("marketRS")}, nikkei_chg)
 
         reasons = []
@@ -4709,6 +4759,8 @@ def _score_entry_candidates(database_url, user_id):
             # 自体は既にcomp/_classify_entry_state側で反映済みのため、ここでは重複加点しない）。
             "setupType": setup_type, "roomToMove": room_to_move, "momentumState": momentum_state,
             "rangeMetrics": range_metrics, "reversalInfo": reversal_info,
+            "eventRiskLevel": event_guard["level"], "eventRiskScore": event_guard["score"],
+            "eventRiskReasons": event_guard["reasons"],
         })
         per_symbol_ms.append((code, (time.time() - _t_symbol) * 1000))
 
@@ -4786,15 +4838,8 @@ def _score_entry_candidates(database_url, user_id):
           f"dailyArraysPrefetch={section_ms['dailyArraysPrefetch']} candidateLoopTotal={section_ms['candidateLoopTotal']} "
           f"snapshotPersistence={section_ms['snapshotPersistence']} other={section_ms['other']}")
 
-    # 金融政策イベント統合 Phase4新規（2026-09-16）：MARKET_EVENT_RISK（銘柄非依存）を分析材料
-    # として追加するだけ——entry_score/entryState/entryReadyTop5の並び順・既存のEVENT_RISK_HIGH
-    # 信号には一切影響しない（指示書「ENTRY SCOREのweightを変更しない」「Entry Gateへの強制
-    # BLOCKもまだ行わない」）。銘柄固有の感応度（②STOCK_EVENT_SENSITIVITY）はPhase5。
-    try:
-        macro = build_active_macro_events(database_url, user_id)
-    except Exception as e:
-        print("  entry-candidates: active macro events取得で例外（無視して続行）", e)
-        macro = {"events": [], "market_event_risk": "LOW"}
+    # 金融政策イベント統合 Phase4新規（2026-09-16）：MARKET_EVENT_RISK（銘柄非依存）は
+    # macro変数として関数冒頭で既に取得済み（Event Risk Guardの市場共通分と共用するため）。
 
     return {
         "entryReadyTop5": [{**c, "rank": i + 1} for i, c in enumerate(entry_ready_top5)],
@@ -4808,6 +4853,18 @@ def _score_entry_candidates(database_url, user_id):
         "generatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "activeMacroEvents": macro["events"],  # Phase4新規：canonical market_eventsのevent_status付き一覧（銘柄非依存）
         "marketEventRisk": macro["market_event_risk"],  # Phase4新規：既存classify_event_risk_level/compute_event_risk_for_eventsをそのまま再利用したLOW/MEDIUM/HIGH/EXTREME
+        # Event Risk Guard（2026-09-17新規、PHASE 7-8）：市場共通分＋監視銘柄全件（top5に
+        # 入らなかった銘柄も含む）ごとのスコア。/api/event-risk-guardがこれをそのまま再利用する。
+        "eventRiskGuard": {
+            "market": {"score": event_guard_market["score"],
+                       "level": classify_event_guard_level(event_guard_market["score"]),
+                       "reasons": event_guard_market["reasons"]},
+            "byCode": event_risk_by_code,
+            # PHASE 12-13（2026-09-17新規）：本日と類似イベント条件での過去の反省。市場全体で
+            # 1回だけ検索し、EVENT HIGH/MEDIUMの銘柄カードで共通して参照する（全文は毎回出さず
+            # 「過去学習ルール適用」程度の折りたたみ表示、フロント側で展開）。
+            "similarReflections": find_similar_past_reflections_for_today(database_url, user_id, macro),
+        },
         "debug": debug,
     }
 
@@ -4817,6 +4874,14 @@ def compute_entry_ready_candidates(database_url, user_id):
     candidates()をそのまま返すだけで、stock_thesesへの永続化は行わない（永続化は朝TOP5＝
     generate_morning_entry_top5+persist_morning_thesesの専任、指示書22・23番）。"""
     return _score_entry_candidates(database_url, user_id)
+
+
+def compute_event_risk_guard_for_watchlist(database_url, user_id):
+    """/api/event-risk-guard用（PHASE 7-8：監視銘柄・TOP5画面のEVENTバッジ表示）。新しい
+    重い取得ループは作らず、_score_entry_candidates()が同じスキャンの中で既に計算している
+    eventRiskGuard（市場共通分＋監視銘柄全件のbyCodeスコア）をそのまま返す。"""
+    result = _score_entry_candidates(database_url, user_id)
+    return result.get("eventRiskGuard") or {"market": {"score": 0, "level": "LOW", "reasons": []}, "byCode": {}}
 
 
 # ============================================================
@@ -14062,16 +14127,52 @@ def evaluate_reentry_quality(stage_sequence):
     }
 
 
+def evaluate_event_quality(ctx, event_risk_at_entry):
+    """EVENT_QUALITY軸（2026-09-17新規、Event Risk Guard＋トレード反省メモ Phase A）：
+    エントリー時点でイベントリスクが高かったにも関わらず、寄り後の確認材料（VWAP維持＋
+    5分足反転構造）が無いままエントリーしていないかを判定する。「損切りは良かったが、
+    入った判断は悪かった」を独立して評価できるようにする軸——他の4軸と同じく結果（勝敗）は
+    一切見ない。
+    後知恵バイアス禁止（PHASE 15）を機構的に保証するため、ctx（reconstruct_trade_market_
+    context()が返すentry_time時点のスナップショット、5分足の過去データのみから再構築済み）
+    に記録されている値だけを使い、現在のstockQuotes/現在のVWAP/現在のstage2は一切参照
+    しない。ctxに確認材料の記録が無い（dq!=RECONSTRUCTED_5M）場合はGOOD/POORのどちらにも
+    倒さずUNKNOWNとする。event_risk_at_entryがHIGH/EXTREMEでない日はN/A
+    （イベントリスクが無い日にPOORを付けない）。"""
+    ctx = ctx or {}
+    if event_risk_at_entry not in ("HIGH", "EXTREME"):
+        return {"classification": "N/A", "evidence": [], "confidence": "LOW",
+                "data_quality": ctx.get("data_quality") or "NO_DATA", "event_risk_at_entry": event_risk_at_entry}
+    dq = ctx.get("data_quality")
+    if not dq or dq == "NO_DATA":
+        return {"classification": "UNKNOWN", "evidence": [], "confidence": "LOW",
+                "data_quality": dq or "NO_DATA", "event_risk_at_entry": event_risk_at_entry}
+    above_vwap = ctx.get("above_vwap_at_entry")
+    trend = ctx.get("trend_5m_before_entry")
+    confirmed = above_vwap is True and trend == "UP"
+    evidence = []
+    if above_vwap is not True:
+        evidence.append("VWAP未回復でのエントリー")
+    if trend != "UP":
+        evidence.append("5分足反転未確認でのエントリー")
+    return {
+        "classification": "GOOD" if confirmed else "POOR", "evidence": evidence,
+        "confidence": "MEDIUM" if dq == "RECONSTRUCTED_5M" else "LOW", "data_quality": dq,
+        "event_risk_at_entry": event_risk_at_entry,
+    }
+
+
 def evaluate_trade_quality_axes(ctx, stage_sequence, stop_quality_evidence, initial_stop_price,
-                                 final_stop_price, entry_price, exit_price):
-    """ENTRY_QUALITY / STOP_QUALITY / EXIT_QUALITY / REENTRY_QUALITYの4軸をまとめて返す。
-    各軸は完全に独立（1つの軸の値を他の軸の判定に使わない）。trade_experiences.quality_axes_json
-    へそのまま保存する想定。"""
+                                 final_stop_price, entry_price, exit_price, event_risk_at_entry=None):
+    """ENTRY_QUALITY / STOP_QUALITY / EXIT_QUALITY / REENTRY_QUALITY / EVENT_QUALITYの5軸を
+    まとめて返す。各軸は完全に独立（1つの軸の値を他の軸の判定に使わない）。
+    trade_experiences.quality_axes_jsonへそのまま保存する想定。"""
     return {
         "entry_quality": evaluate_entry_quality(ctx),
         "stop_quality": evaluate_stop_quality(ctx, stop_quality_evidence, initial_stop_price, entry_price),
         "exit_quality": evaluate_exit_quality(stop_quality_evidence, final_stop_price, exit_price),
         "reentry_quality": evaluate_reentry_quality(stage_sequence),
+        "event_quality": evaluate_event_quality(ctx, event_risk_at_entry),
     }
 
 
@@ -14216,13 +14317,15 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
         # REENTRY_QUALITYの4軸独立評価。stop_quality_evidence（Phase Bでtrade_historyへ追加済み）
         # がACTUAL_STOPのトレードのみSTOP_QUALITY/EXIT_QUALITYを評価し、それ以外（6227含む過去
         # トレード等）はUNKNOWNのまま——推測しない。全軸ともENTRY SCORE・自動売買ルールには
-        # 一切接続しない（観測・保存のみ）。
+        # 一切接続しない（観測・保存のみ）。EVENT_QUALITY（2026-09-17新規）はevent_risk_today
+        # （この同期処理の冒頭で計算済みの当日代表値、他のmarket_mode_today等と同じ既知の
+        # 制約——「エントリー時点の厳密な値」ではなく「その日の引け後に見た代表値」）を使う。
         stage_sequence = detect_reentry_stage_sequence(_day_bars_for_reentry, _exit_idx_for_reentry, exit_price)
         quality_axes = evaluate_trade_quality_axes(
             market_ctx, stage_sequence,
             stop_quality_evidence=t.get("stop_quality_evidence"),
             initial_stop_price=t.get("initial_stop_price"), final_stop_price=t.get("final_stop_price"),
-            entry_price=entry_price, exit_price=exit_price,
+            entry_price=entry_price, exit_price=exit_price, event_risk_at_entry=event_risk_today,
         )
 
         fields = {
@@ -14660,6 +14763,9 @@ def build_trade_breakdown_for_day(day_trades):
             "opportunity": (e.get("post_trade_analysis_json") or {}).get("opportunity"),
             "opportunityWindows": (e.get("post_trade_analysis_json") or {}).get("opportunity_windows"),
             "entrySnapshot": (e.get("decision_snapshot_json") or {}).get("entry_snapshot"),
+            # Trade Learning Phase C（2026-09-16、観測・保存のみでUI未接続だった）＋
+            # EVENT_QUALITY（2026-09-17新規）：5軸独立評価を初めてUIへ表示する。
+            "qualityAxes": e.get("quality_axes_json"),
         })
     return trade_breakdown
 
@@ -15204,6 +15310,192 @@ def build_active_macro_events(database_url, user_id, now_jst=None, days_back=1, 
     market_event_risk = compute_event_risk_for_events(events_with_hours)
 
     return {"events": statuses, "market_event_risk": market_event_risk}
+
+
+# ---- TRADE REFLECTIONS（2026-09-17新規、Event Risk Guard＋トレード反省メモ Phase A） ----
+# 「今日の反省・気づき」の自由記述からcategory/tags/event_types/lesson/future_ruleをルール
+# ベースで抽出する。完全な自然言語理解は目指さない（外部LLM APIは今回のスコープ外）——
+# キーワード辞書と文分割ヒューリスティックのみ。高度な構造化が必要な場合はChatGPTで生成した
+# JSONをSmart Import（TRADE_REFLECTION型）から取り込む経路を別途用意する。
+REFLECTION_TAG_KEYWORDS = {
+    # マクロイベント（PHASE 2）
+    "FOMC": ["FOMC", "米利上げ", "米利下げ", "FRB"],
+    "BOJ": ["日銀政策決定会合", "日銀会合", "日銀", "BOJ", "日銀総裁"],
+    "ECB": ["ECB"], "BOE": ["BOE"],
+    "CPI": ["CPI", "消費者物価"], "PPI": ["PPI", "生産者物価"],
+    "EMPLOYMENT": ["雇用統計", "NFP"], "GDP": ["GDP速報", "GDP"],
+    # 個別株・関連銘柄イベント
+    "EARNINGS": ["決算", "業績修正", "決算説明会"],
+    "TOB": ["TOB", "公開買付"], "BUYBACK": ["自社株買い"],
+    # 今回の学習テーマ
+    "OVERCONFIDENCE": ["楽観", "大丈夫そう", "安全と判断", "強気に過ぎ", "楽観視"],
+    "OPENING_FADE": ["寄り天", "寄り付き直後の失速", "初動失速"],
+    "EVENT_RISK": ["イベントリスク", "イベント警戒", "重要イベント"],
+    "BREAKEVEN_STOP": ["建値", "逆指値", "撤退ライン"],
+    "PROFIT_PROTECTION": ["利益保護", "含み益を守る"],
+    "GAP_UP": ["GU", "ギャップアップ", "窓開け"],
+}
+_REFLECTION_EVENT_TYPE_TAGS = ("FOMC", "BOJ", "ECB", "BOE", "CPI", "PPI", "EMPLOYMENT", "GDP")
+_REFLECTION_EVENT_CATEGORY_TAGS = _REFLECTION_EVENT_TYPE_TAGS + ("EVENT_RISK", "OPENING_FADE", "GAP_UP")
+REFLECTION_LESSON_MARKERS = ["べきだった", "べきでした", "警戒すべき", "甘かった", "足りなかった", "見誤った"]
+REFLECTION_FUTURE_RULE_MARKERS = ["検討する", "見直す", "引き上げる", "WAIT", "確認後", "避ける", "優先する"]
+
+
+def structure_trade_reflection(text):
+    """reflection_text（自由記述）からcategory/tags/event_types/lesson/future_ruleを
+    ルールベースで抽出する。タグが1件も無ければconfidence=LOW（呼び出し側はそのまま
+    保存してよい——「判別できない」ことを隠さない、既存Smart Importの「後で編集できる」
+    思想を踏襲）。"""
+    text = text or ""
+    tags = [tag for tag, kws in REFLECTION_TAG_KEYWORDS.items() if any(k in text for k in kws)]
+    event_types = [t for t in tags if t in _REFLECTION_EVENT_TYPE_TAGS]
+    category = []
+    if any(t in tags for t in _REFLECTION_EVENT_CATEGORY_TAGS):
+        category.append("EVENT")
+    if any(k in text for k in ("入った", "エントリー", "買った")):
+        category.append("ENTRY")
+    if any(k in text for k in ("損切り", "撤退", "売った")):
+        category.append("EXIT")
+    sentences = [s for s in re.split(r"[。\n]", text) if s.strip()]
+    lesson = "。".join(s.strip() for s in sentences if any(m in s for m in REFLECTION_LESSON_MARKERS)) or None
+    future_rule = "。".join(s.strip() for s in sentences if any(m in s for m in REFLECTION_FUTURE_RULE_MARKERS)) or None
+    return {
+        "tags": tags, "event_types": event_types, "category": category or ["OTHER"],
+        "lesson": lesson, "future_rule": future_rule, "confidence": "MEDIUM" if tags else "LOW",
+    }
+
+
+# ---- EVENT RISK GUARD（2026-09-17新規、Event Risk Guard Phase A） ----
+# 既存のbuild_active_macro_events/compute_market_event_status/compute_event_risk_for_events
+# （銘柄非依存のマクロイベント判定、上のMARKET EVENT RISK Phase4）をそのまま土台にする。
+# 新しいイベント判定基盤は作らない——ここは「銘柄固有の寄り天/初動失速リスク」という
+# Phase4が意図的に据え置いた部分（"銘柄固有感応度はPhase5"）を埋めるだけ。
+EVENT_GUARD_LEVEL_THRESHOLDS = {"MEDIUM": 30, "HIGH": 50}
+
+
+def classify_event_guard_level(score):
+    if score >= EVENT_GUARD_LEVEL_THRESHOLDS["HIGH"]:
+        return "HIGH"
+    if score >= EVENT_GUARD_LEVEL_THRESHOLDS["MEDIUM"]:
+        return "MEDIUM"
+    return "LOW"
+
+
+def compute_event_risk_guard_market(active_macro_events, prior_day_events=None, market_gu_pct=None):
+    """market_event_risk（銘柄非依存）＋「連続重要イベント」の加点から、市場共通の加点分と
+    reasonsを返す。全銘柄で使い回す（1回だけ計算）。
+    単なる「イベント当日」だけでは常にHIGHにしない——前日に重要イベントがRELEASED済みで、
+    かつ本日も別の重要イベントがIMMINENT/IN_PROGRESS（または24h以内）で、かつ市場がGUして
+    いる、という「連続重要イベント」パターンにだけSEQUENTIAL_MAJOR_EVENTSの追加加点を与える
+    （2026-09-17実例＝FOMC翌日+日銀当日+日経GUを確実にHIGH域へ入れるための設計）。"""
+    score, reasons = 0.0, []
+    events = (active_macro_events or {}).get("events", [])
+    today_imminent = [e for e in events if e.get("event_status") in ("IMMINENT", "IN_PROGRESS")]
+    today_upcoming_soon = [e for e in events if e.get("event_status") == "UPCOMING"
+                             and e.get("time_to_event_hours") is not None and e["time_to_event_hours"] < 24]
+    if today_imminent:
+        score += 20.0
+        reasons.append("本日イベント当日")
+    elif today_upcoming_soon:
+        score += 15.0
+        reasons.append("重要イベント結果待ち")
+    prior_released = [e for e in (prior_day_events or []) if e.get("event_status") == "RELEASED"
+                        and e.get("importance") in ("HIGH", "EXTREME")]
+    if prior_released and (today_imminent or today_upcoming_soon) and market_gu_pct is not None and market_gu_pct >= 0.3:
+        score += 20.0
+        reasons.append("SEQUENTIAL_MAJOR_EVENTS（前日重要イベント通過後に別の重要イベント＋市場GU）")
+    return {"score": score, "reasons": reasons}
+
+
+def compute_event_risk_guard_for_symbol(code, market_component, row, stage2, snapshot,
+                                          watchlist_row=None, todays_related_events=None, sector_gu_pct=None):
+    """市場共通分（market_component、compute_event_risk_guard_marketの戻り値）＋銘柄固有分を
+    合算し0-100にclampして返す。未来情報は使わない——rowはstockQuotes（この時点の値）、
+    stage2/snapshotはentry-candidatesパイプラインが同じタイミングで既に使っている値を
+    そのまま再利用する（新規の重い取得経路は増やさない）。"""
+    score = market_component["score"]
+    reasons = list(market_component["reasons"])
+    day_open, prev_close = (row or {}).get("open"), (row or {}).get("p")
+    if day_open is not None and prev_close:
+        gu_pct = (day_open - prev_close) / prev_close * 100
+        if gu_pct >= 0.5:
+            score += 10.0
+            reasons.append(f"GUスタート(+{gu_pct:.1f}%)")
+    if stage2 and stage2.get("aboveRecentHigh") and (stage2.get("distanceFromHighPct") if stage2.get("distanceFromHighPct") is not None else 99) < 2:
+        score += 5.0
+        reasons.append("日足高値圏")
+    snap = snapshot or {}
+    vwap = snap.get("vwap")
+    cur = (row or {}).get("t")
+    if vwap and cur:
+        dev = abs(cur - vwap) / vwap * 100
+        if dev >= 2:
+            score += 10.0
+            reasons.append("VWAP乖離大")
+    if todays_related_events:
+        score += 10.0
+        reasons.append(f"関連銘柄イベント当日（{','.join(todays_related_events)}）")
+    if sector_gu_pct is not None and sector_gu_pct >= 0.5:
+        score += 5.0
+        reasons.append("セクター全体GU")
+    # 減点（寄り後の確認材料。VWAP維持だけを理由に大きく減点しない＝レビュー指摘3と同じ思想）
+    if snap.get("aboveVwap") and snap.get("fiveMinStructure") == "higher_highs":
+        score -= 10.0
+        reasons.append("VWAP維持+高値更新（確認済み）")
+    if stage2 and stage2.get("volumeType") == "POSITIVE_VOLUME":
+        score -= 5.0
+        reasons.append("出来高継続")
+    score = max(0.0, min(100.0, score))
+    return {"score": round(score, 1), "level": classify_event_guard_level(score), "reasons": reasons}
+
+
+def compute_related_events_for_stock(watchlist_row, todays_events):
+    """関連銘柄イベント判定（PHASE 2「関連銘柄イベント」）。新しいグラフ推論エンジンは作らず、
+    market_events.affected_stocks/affected_sectorsとwatchlist行のcode/sector/themeの単純な
+    重なりチェックのみ（Phase B以降で高度化する前提の最小実装）。"""
+    if not watchlist_row or not todays_events:
+        return []
+    code = watchlist_row.get("code")
+    sector = watchlist_row.get("sector")
+    theme = watchlist_row.get("theme") or ""
+    hits = []
+    for e in todays_events:
+        affected_stocks = e.get("affected_stocks") or []
+        affected_sectors = e.get("affected_sectors") or []
+        if code in affected_stocks or sector in affected_sectors or (theme and any(t in theme for t in affected_sectors)):
+            hits.append(e.get("title") or e.get("event_type") or "関連イベント")
+    return hits
+
+
+def extract_event_types_from_titles(events):
+    """本日のmarket_eventsのtitleから、trade_reflectionsのevent_types語彙（FOMC/BOJ等、
+    REFLECTION_TAG_KEYWORDS）と同じキーワード辞書で種別を推定する（PHASE 12-13、
+    「過去の反省」参照用。二重の語彙は作らずstructure_trade_reflection()と同じ辞書を再利用）。"""
+    types = set()
+    for e in (events or []):
+        title = e.get("title") or ""
+        for tag in _REFLECTION_EVENT_TYPE_TAGS:
+            if any(k in title for k in REFLECTION_TAG_KEYWORDS.get(tag, [])):
+                types.add(tag)
+    return list(types)
+
+
+def find_similar_past_reflections_for_today(database_url, user_id, active_macro_events):
+    """PHASE 12-13の最小実装：本日のマクロイベント種別＋EVENT_RISKタグで過去の反省を検索する。
+    find_similar_reflections()のノイズ防止条件（event_type一致+タグ1個以上追加一致、または
+    タグ一致数2以上）を満たすため、EVENT_RISKを常時タグ候補として渡す（このタグは
+    structure_trade_reflection()がイベント関連の反省へ機械的に付与するため、event_type一致と
+    組み合わせれば意味のある一致になる）。"""
+    if investment_db is None or not database_url:
+        return []
+    event_types = extract_event_types_from_titles((active_macro_events or {}).get("events", []))
+    if not event_types:
+        return []
+    try:
+        return investment_db.find_similar_reflections(database_url, user_id, event_types=event_types, tags=["EVENT_RISK"])
+    except Exception as e:
+        print("  Event Risk Guard: 過去の反省検索で例外（無視して続行）", e)
+        return []
 
 
 # ---- SECTOR FLOW（指示書27〜28番） ----
@@ -21052,7 +21344,7 @@ def _macro_text(items):
 SMART_IMPORT_CATEGORIES = [  # 指示書2番。将来カテゴリ追加時はここへ追加するだけでよい構造
     "CATALYST", "EXPERT_OPINION", "EVENT", "MARKET_ANALYSIS", "MORNING_MARKET_CHECK",
     "INTRADAY_REPORT", "TRADE_RULE", "NEWS", "WATCHLIST_UPDATE", "WATCHLIST_MASTER_UPDATE",
-    "POSITION_UPDATE", "WATCH_STOCK", "UNKNOWN",
+    "POSITION_UPDATE", "WATCH_STOCK", "TRADE_REFLECTION", "UNKNOWN",
 ]
 # Phase SI-B（2026-09-10）で MARKET_ANALYSIS・MORNING_MARKET_CHECK・INTRADAY_REPORT・
 # TRADE_RULEを追加。CHATGPT_LEGACYはSMART_IMPORT_CATEGORIESには含めない内部専用カテゴリ
@@ -21065,7 +21357,7 @@ SMART_IMPORT_CATEGORIES = [  # 指示書2番。将来カテゴリ追加時はこ
 SMART_IMPORT_IMPLEMENTED_CATEGORIES = {
     "CATALYST", "EVENT", "EXPERT_OPINION", "MARKET_ANALYSIS", "MORNING_MARKET_CHECK",
     "INTRADAY_REPORT", "TRADE_RULE", "CHATGPT_LEGACY", "WATCHLIST_UPDATE", "WATCHLIST_MASTER_UPDATE",
-    "POSITION_UPDATE", "SOCIAL_IMAGE_ANALYSIS", "SOCIAL_POST_IMPORT", "WATCH_STOCK",
+    "POSITION_UPDATE", "SOCIAL_IMAGE_ANALYSIS", "SOCIAL_POST_IMPORT", "WATCH_STOCK", "TRADE_REFLECTION",
 }
 # 指示書16番（Phase SI-C）：重要操作（TRADE_RULE・WATCHLIST_UPDATEのREMOVE・POSITION_UPDATE
 # 全般）は「安全な項目のみ選択」の対象外とする。POSITION_UPDATEはカテゴリ全体が対象外
@@ -21073,10 +21365,11 @@ SMART_IMPORT_IMPLEMENTED_CATEGORIES = {
 # への追記のみ（売買・ルールに直接影響しない）のため安全側に含める。SOCIAL_POST_IMPORT
 # （X Intelligence Phase1B、2026-09-15新規）も同様に売買・ルールへ直接影響しないため含める。
 # WATCH_STOCK（2026-09-17新規）は既存watchlistを「候補」状態で保存するのみ（実際の売買・
-# ENTRY判断には一切接続しない）ため安全側に含める。
+# ENTRY判断には一切接続しない）ため安全側に含める。TRADE_REFLECTION（2026-09-17新規）も
+# 反省メモの保存のみで売買・ルールに直接影響しないため安全側に含める。
 SMART_IMPORT_SAFE_CATEGORIES_BACKEND = {"CATALYST", "EVENT", "EXPERT_OPINION", "MARKET_ANALYSIS",
                                           "MORNING_MARKET_CHECK", "INTRADAY_REPORT", "SOCIAL_IMAGE_ANALYSIS",
-                                          "SOCIAL_POST_IMPORT", "WATCH_STOCK"}
+                                          "SOCIAL_POST_IMPORT", "WATCH_STOCK", "TRADE_REFLECTION"}
 
 _JSON_CODEBLOCK_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 
@@ -21189,6 +21482,14 @@ def _classify_json_item(item):
         return "MARKET_ANALYSIS", "HIGH", item
     if t == "trade_rule":
         return "TRADE_RULE", "HIGH", item
+    if t in ("trade_reflection", "reflection", "trading_reflection"):
+        # 2026-09-17新規（Event Risk Guard＋トレード反省メモ Phase A）：ChatGPT等で構造化した
+        # 反省JSONの取り込み。reflection_textが無ければ保存できないためLOW、既にlesson/
+        # future_ruleまで構造化済みならHIGH（このまま保存でき、ルールベース抽出は不要）。
+        if not item.get("reflection_text") and not item.get("reflectionText"):
+            return "TRADE_REFLECTION", "LOW", item
+        confidence = "HIGH" if (item.get("lesson") and item.get("future_rule")) else "MEDIUM"
+        return "TRADE_REFLECTION", confidence, item
     if t == "watchlist_update":
         # 指示書2番（Phase SI-C）：REMOVEは重要操作のためconfidenceを上げすぎない（UIの既定
         # 未選択はaction自体で別途判定するが、ここでも情報として下げておく）。
@@ -22254,6 +22555,33 @@ def normalize_watch_stock(draft, raw_text=None, import_source="unknown"):
             "tags": tags, "priority": priority, "raw_text": raw_text, "import_source": import_source}
 
 
+def normalize_trade_reflection(draft, raw_text=None, import_source="unknown"):
+    """draftをinvestment_db.create_trade_reflection()が受け付ける形へ正規化する
+    （2026-09-17新規、Event Risk Guard＋トレード反省メモ Phase A）。lesson/future_rule/tags/
+    event_types/categoryがJSON側に無ければstructure_trade_reflection()で補完する——
+    ルールベース構造化とChatGPT貼り付け経路を同じ保存経路へ統合する（重複実装を避ける）。"""
+    draft = draft or {}
+    text = draft.get("reflection_text") or draft.get("reflectionText")
+    if not text:
+        return None
+    structured = structure_trade_reflection(text)
+    tags = draft.get("tags") if isinstance(draft.get("tags"), list) else structured["tags"]
+    event_types = draft.get("event_types") if isinstance(draft.get("event_types"), list) else structured["event_types"]
+    category = draft.get("categories") or draft.get("category")
+    category = category if isinstance(category, list) else structured["category"]
+    return {
+        "trade_date": draft.get("trade_date") or draft.get("tradeDate"),
+        "stock_code": draft.get("stock_code") or draft.get("stockCode"),
+        "trade_id": draft.get("trade_id") or draft.get("tradeId"),
+        "category": category, "reflection_text": text,
+        "lesson": draft.get("lesson") or structured["lesson"],
+        "future_rule": draft.get("future_rule") or structured["future_rule"],
+        "tags": tags, "event_types": event_types,
+        "confidence": draft.get("confidence") or structured["confidence"],
+        "source": "smart_import_chatgpt",  # このnormalize_*はSmart Import経路からのみ呼ばれる
+    }
+
+
 def normalize_position_update(database_url, user_id, draft, raw_text=None, import_source="unknown"):
     """draftを既存のadd_position_entry/add_position_exit/upsert_portfolio_item（すべて
     investment_db.py既存関数、平均単価・実現損益の計算ロジックはそこに委譲し重複実装しない、
@@ -22419,6 +22747,7 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
     social_image_analysis_results = []
     social_post_import_results = []
     watch_stock_results = []
+    trade_reflection_results = []
 
     for c in candidates or []:
         category = c.get("category")
@@ -22576,6 +22905,22 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
             except Exception as e:
                 print("  SmartImport: WatchStock保存失敗", e)
                 watch_stock_results.append({"ok": False, "reason": str(e)})
+            continue
+
+        if category == "TRADE_REFLECTION":
+            # 2026-09-17新規（Event Risk Guard＋トレード反省メモ Phase A）：ChatGPTで構造化した
+            # 反省JSONの貼り付け経路。lesson/future_rule/tags/event_types/categoryがJSON側に
+            # 無ければnormalize_trade_reflection内でstructure_trade_reflection()により補完する。
+            try:
+                normalized = normalize_trade_reflection(draft, raw_text, import_source)
+                if normalized is None:
+                    trade_reflection_results.append({"ok": False, "reason": "reflection_textが必要です"})
+                else:
+                    saved = investment_db.create_trade_reflection(database_url, user_id, normalized)
+                    trade_reflection_results.append({"ok": bool(saved), "id": (saved or {}).get("id")})
+            except Exception as e:
+                print("  SmartImport: TradeReflection保存失敗", e)
+                trade_reflection_results.append({"ok": False, "reason": str(e)})
             continue
 
         if category == "WATCHLIST_MASTER_UPDATE":
@@ -22824,6 +23169,10 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
         results["WATCH_STOCK"] = {"imported": sum(1 for r in watch_stock_results if r["ok"]),
                                    "skipped": sum(1 for r in watch_stock_results if not r["ok"]),
                                    "details": watch_stock_results}
+    if trade_reflection_results:
+        results["TRADE_REFLECTION"] = {"imported": sum(1 for r in trade_reflection_results if r["ok"]),
+                                        "skipped": sum(1 for r in trade_reflection_results if not r["ok"]),
+                                        "details": trade_reflection_results}
     return {"results": results, "rejected_low_confidence": rejected, "skipped_unimplemented": skipped_unimplemented,
             "skipped_existing_report": skipped_existing_report}
 
@@ -23952,6 +24301,19 @@ class Handler(SimpleHTTPRequestHandler):
             # v3-2新規：portfolio（保有株、localStorageに無かった新規機能）
             items = investment_db.list_portfolio(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"items": items})
+        elif self.path.startswith("/api/trade-reflections"):
+            # 2026-09-17新規（Event Risk Guard＋トレード反省メモ Phase A）：「今日の反省・気づき」一覧。
+            qs = urllib.parse.urlparse(self.path).query
+            q = urllib.parse.parse_qs(qs)
+            items = investment_db.list_trade_reflections(
+                DATABASE_URL, self.current_user, limit=int(q.get("limit", ["60"])[0]),
+                event_type=q.get("event_type", [None])[0], tag=q.get("tag", [None])[0],
+                category=q.get("category", [None])[0]) if (investment_db is not None and DATABASE_URL) else []
+            self._send_json({"items": items})
+        elif self.path.startswith("/api/event-risk-guard"):
+            # 2026-09-17新規：監視銘柄JP全件のEvent Risk Guardスコアを返す（PHASE 7-8のUI表示用）。
+            result = compute_event_risk_guard_for_watchlist(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else {"market": {"score": 0, "level": "LOW", "reasons": []}, "byCode": {}}
+            self._send_json(result)
         elif self.path.startswith("/api/trade-history"):
             # 2026-09-07新規：売却確定で自動記録される取引履歴（journalとは別、機械的な実現損益ログ）。
             trades = investment_db.list_trade_history(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
@@ -24682,6 +25044,32 @@ class Handler(SimpleHTTPRequestHandler):
             body = self._read_json_body()
             fid = investment_db.create_news_feedback(DATABASE_URL, self.current_user, body)
             self._send_json({"id": fid} if fid is not None else {"error": "titleが必要です"})
+        # ---- trade_reflections（2026-09-17新規、Event Risk Guard＋トレード反省メモ Phase A） ----
+        elif self.path == "/api/trade-reflections/save":
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            if not (body or {}).get("reflectionText") and not (body or {}).get("reflection_text"):
+                self._send_json({"error": "reflection_textが必要です"})
+                return
+            structured = structure_trade_reflection(body.get("reflectionText") or body.get("reflection_text"))
+            # ユーザーが既に入力済みのcategory/tags/event_types/lesson/future_ruleがあれば
+            # そちらを優先し、無い項目だけルールベース抽出結果で補う（自動構造化を鵜呑みに
+            # しない、PHASE 9「編集できる」要件）。
+            merged = {**structured, **{k: v for k, v in body.items() if v not in (None, [], "")}}
+            saved = investment_db.create_trade_reflection(DATABASE_URL, self.current_user, merged)
+            self._send_json({"item": saved} if saved else {"error": "保存に失敗しました"})
+        elif self.path.startswith("/api/trade-reflections/") and self.path.endswith("/update"):
+            if not self._investment_db_ready():
+                return
+            try:
+                reflection_id = int(self.path.split("/")[3])
+            except (IndexError, ValueError):
+                self._send_json({"error": "不正なIDです"})
+                return
+            body = self._read_json_body()
+            saved = investment_db.update_trade_reflection(DATABASE_URL, self.current_user, reflection_id, body)
+            self._send_json({"item": saved} if saved else {"error": "更新に失敗しました"})
         elif self.path == "/api/watchlist-import/save":
             # ChatGPTスクリーンショット監視銘柄取り込み履歴（2026-09-02新規、Trade Cockpit v3 Phase5）。
             # v3-2以降、watchlist本体もNeonが正になったが、ここは引き続き取り込み履歴・重複防止専用。

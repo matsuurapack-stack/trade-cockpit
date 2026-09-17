@@ -295,13 +295,15 @@ class RegressionCrossMarketAndChorucoUnaffectedTests(unittest.TestCase):
     def test_entry_score_components_unchanged(self):
         # 2026-09-16更新：ENTRY_RISK_SCORE（cf528a7）・値幅余地/反転モメンタム選考（c388aeb）で
         # entry_risk/range_metrics/momentum_stateがオプション引数（デフォルトNone）として追加
-        # された。既存7引数の並び・意味は無変更で末尾に追加されているだけ（Sector Rotationが
+        # された。2026-09-17更新：Event Risk Guardでevent_guardがさらに末尾追加された。
+        # 既存7引数の並び・意味は無変更で末尾に追加されているだけ（Sector Rotationが
         # この関数に一切触れていないことの確認という本テストの目的は変わらない）。
         import inspect
         sig = inspect.signature(server._entry_score_components)
         self.assertEqual(list(sig.parameters.keys()),
                           ["row", "stage2", "snapshot", "auto_rs_current", "auto_sector_current",
-                           "catalysts", "event_signals", "entry_risk", "range_metrics", "momentum_state"])
+                           "catalysts", "event_signals", "entry_risk", "range_metrics", "momentum_state",
+                           "event_guard"])
 
 
 if __name__ == "__main__":

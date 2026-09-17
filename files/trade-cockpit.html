@@ -1735,7 +1735,7 @@ function themeRelativeStrength(w,stockQuotes,metrics){
 // Trade Cockpit v3-3 Step4（UI統一）：Status/BREAK判定ロジックを共通関数化。元はWatchTargetsPanel
 // 内のuseMemoに閉じていたが、日本市場/アメリカ市場タブ（SectorWatchlist）でも同じ判定を使う
 // ために切り出した。軽量計算のみ（サーバー側analyze_stock()は呼ばない）。
-function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysisData,marketRiskLabel){
+function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysisData,marketRiskLabel,eventRiskGuard){
   const qt=stockQuotes[w.code]||{};
   const ct=num(qt.t),p=num(qt.p);
   const pct=(ct!=null&&p!=null&&p)?(ct-p)/p*100:null;
@@ -1879,7 +1879,11 @@ function enrichWatchRow(w,stockQuotes,marketPct,sectorAvg,breakoutLevels,analysi
 
   // TOP5表示ロジック修正指示（2026-09-12）：「今日の注目TOP5」のマイナス銘柄例外判定
   // （isResilienceExceptionCandidate）で「地合いが悪いか」を見るためmarketPctを持ち回す。
-  return {...w,pct,marketRS,sectorRS,rsScore,volRatio,status,breakType,breakQuality,actionStatus,riskReasons,waitReasons,marketPct};
+  // Event Risk Guard（2026-09-17新規、PHASE 7）：/api/event-risk-guardのbyCode[w.code]を
+  // そのまま添えるだけ（新規計算はしない）。未取得時はLOW/未評価扱い（ノイズを増やさない）。
+  const eventRisk=eventRiskGuard?.byCode?.[w.code];
+  return {...w,pct,marketRS,sectorRS,rsScore,volRatio,status,breakType,breakQuality,actionStatus,riskReasons,waitReasons,marketPct,
+    eventRiskLevel:eventRisk?.level||"LOW",eventRiskScore:eventRisk?.score??null,eventRiskReasons:eventRisk?.reasons||[]};
 }
 
 // v3-4（監視銘柄タブ「今日の注目TOP5」用）：enrichWatchRow()の軽量出力（rsScore/status/
@@ -3046,6 +3050,7 @@ const SMART_IMPORT_CATEGORY_META={
   POSITION_UPDATE:{icon:"💼",label:"POSITION UPDATE（保有ポジション）",color:"var(--down)"},
   SOCIAL_IMAGE_ANALYSIS:{icon:"🖼",label:"SOCIAL IMAGE ANALYSIS（X投稿画像解析）",color:"var(--up)"},
   WATCH_STOCK:{icon:"👁️",label:"WATCH STOCK（監視候補）",color:"var(--up)"},
+  TRADE_REFLECTION:{icon:"📝",label:"TRADE REFLECTION（反省メモ）",color:"var(--up)"},
   UNKNOWN:{icon:"❔",label:"判別不能",color:"var(--inkFaint)"},
 };
 const SMART_IMPORT_CONFIDENCE_META={
@@ -3055,7 +3060,7 @@ const SMART_IMPORT_CONFIDENCE_META={
 // 2026-09-10更新（Phase SI-C）：WATCHLIST_UPDATE/POSITION_UPDATEを追加。
 const SMART_IMPORT_IMPLEMENTED=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
   "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","CHATGPT_LEGACY","WATCHLIST_UPDATE",
-  "WATCHLIST_MASTER_UPDATE","POSITION_UPDATE","SOCIAL_IMAGE_ANALYSIS","WATCH_STOCK"];
+  "WATCHLIST_MASTER_UPDATE","POSITION_UPDATE","SOCIAL_IMAGE_ANALYSIS","WATCH_STOCK","TRADE_REFLECTION"];
 
 // 指示書25番（Phase SI-D）：UIテキストを統一表現に寄せる。sourceContextはCatalystタブ等
 // から開いた場合のヒント表示用（指示書12番：分類結果を強制しない、あくまで注記）。
@@ -3066,7 +3071,7 @@ const SMART_IMPORT_SOURCE_CONTEXT_LABEL={
 // TRADE_RULE・POSITION_UPDATE全般・WATCHLIST_UPDATEのREMOVEは除外）。判定はカテゴリ単位
 // （WATCHLIST_UPDATE自体はADD/UPDATEなら安全）＋isSmartImportCandidateSafe()で個別除外する。
 const SMART_IMPORT_SAFE_CATEGORIES=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
-  "MORNING_MARKET_CHECK","INTRADAY_REPORT","WATCHLIST_UPDATE","SOCIAL_IMAGE_ANALYSIS","WATCH_STOCK"];
+  "MORNING_MARKET_CHECK","INTRADAY_REPORT","WATCHLIST_UPDATE","SOCIAL_IMAGE_ANALYSIS","WATCH_STOCK","TRADE_REFLECTION"];
 const isSmartImportCandidateSafe=c=>{
   if(!SMART_IMPORT_SAFE_CATEGORIES.includes(c.category))return false;
   if(c.category==="WATCHLIST_UPDATE"&&(c.draft?.action||"").toUpperCase()==="REMOVE")return false;
@@ -3317,6 +3322,15 @@ function SmartImportPanel({onReload,sourceContext=null,onSaved=null,compactMode=
                 {c.draft.priority && <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>監視優先度: {String(c.draft.priority).toUpperCase()}</div>}
                 <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:2}}>保存先: 監視銘柄（候補状態）。既存の監視銘柄と同一コードがあれば重複追加せず、テーマ/理由/出典/タグをマージします。</div>
               </>}
+              {c.category==="TRADE_REFLECTION" && <>
+                {!c.draft.reflection_text && <div style={{fontSize:11,color:"var(--down)",fontWeight:700}}>⚠ reflection_textが無いため保存できません</div>}
+                <div style={{fontSize:12.5,whiteSpace:"pre-wrap",marginBottom:4}}>{c.draft.reflection_text}</div>
+                {c.draft.lesson && <div style={{fontSize:11.5,color:"var(--inkSoft)",marginBottom:2}}>教訓: {c.draft.lesson}</div>}
+                {c.draft.future_rule && <div style={{fontSize:11.5,color:"var(--inkSoft)",marginBottom:2}}>次回ルール: {c.draft.future_rule}</div>}
+                {Array.isArray(c.draft.tags) && c.draft.tags.length>0 && <div style={{fontSize:11.5,color:"var(--inkSoft)",marginBottom:2}}>タグ: {c.draft.tags.join(" / ")}</div>}
+                {Array.isArray(c.draft.event_types) && c.draft.event_types.length>0 && <div style={{fontSize:11.5,color:"var(--inkSoft)"}}>イベント種別: {c.draft.event_types.join(" / ")}</div>}
+                <div style={{fontSize:11,color:"var(--inkFaint)",marginTop:2}}>保存先: trade_reflections（反省メモ）。lesson/future_rule/tags/event_typesが未指定なら自動抽出します。</div>
+              </>}
               {!implemented && <div style={{fontSize:11.5,color:"var(--inkFaint)",whiteSpace:"pre-wrap"}}>{c.raw_text}</div>}
             </div>
           </div>;
@@ -3346,7 +3360,7 @@ function SmartImportPanel({onReload,sourceContext=null,onSaved=null,compactMode=
 }
 const SMART_IMPORT_CATEGORIES_UI=["CATALYST","EVENT","EXPERT_OPINION","MARKET_ANALYSIS",
   "MORNING_MARKET_CHECK","INTRADAY_REPORT","TRADE_RULE","WATCHLIST_UPDATE","WATCHLIST_MASTER_UPDATE",
-  "POSITION_UPDATE","SOCIAL_IMAGE_ANALYSIS","WATCH_STOCK","UNKNOWN"];
+  "POSITION_UPDATE","SOCIAL_IMAGE_ANALYSIS","WATCH_STOCK","TRADE_REFLECTION","UNKNOWN"];
 
 function ExpertViewsPanel({views,onReload,onOpenSmartImport}){
   const [pasteText,setPasteText]=useState("");
@@ -4100,13 +4114,13 @@ function AssessmentCard({assessment:a,marginBadge,marginRatio,enr,sectorRank}){
 // v3-4（ChatGPT連携の再配置）：監視銘柄タブ（WatchTargetsPanel）専用だった「今日の注目TOP5」の
 // enrichWatchRow→選定ロジックを共通関数として切り出す。市場タブの「朝一分析」コピーにも同じ
 // TOP5をそのまま使い回すため（計算内容は完全に同一、二重実装を避ける）。
-function computeEnrichedWatch(items,stockQuotes,metrics,watchlistAll,breakoutLevels,analysisData,marketRiskLabel){
+function computeEnrichedWatch(items,stockQuotes,metrics,watchlistAll,breakoutLevels,analysisData,marketRiskLabel,eventRiskGuard){
   const m=metrics?.nikkei;
   const mt=m?num(m.t):null,mp=m?num(m.p):null;
   const marketPct=(mt!=null&&mp!=null&&mp)?(mt-mp)/mp*100:null;
   const groups=groupStocks(watchlistAll||[],stockQuotes,w=>w.sector);
   const sectorAvgMap=Object.fromEntries(groups.map(g=>[g.key,g.avgPct]));
-  return items.map(w=>enrichWatchRow(w,stockQuotes,marketPct,sectorAvgMap[w.sector],breakoutLevels,analysisData,marketRiskLabel));
+  return items.map(w=>enrichWatchRow(w,stockQuotes,marketPct,sectorAvgMap[w.sector],breakoutLevels,analysisData,marketRiskLabel,eventRiskGuard));
 }
 // v3-6：RISK（actionStatus==="RISK"）とWEAK（Primary Status）は「デイトレ候補」としては出さない。
 // TOP5表示ロジック修正指示（2026-09-12）：「今日の注目TOP5」は原則 前日比>0 の銘柄のみ
@@ -4128,12 +4142,16 @@ function isResilienceExceptionCandidate(w){
   const strongVsSector=w.sectorRS!=null&&w.sectorRS>=1.5;
   return marketSelloff&&smallDecline&&strongVsMarket&&strongVsSector&&w.status!=="WEAK";
 }
+const EVENT_RISK_SORT_ORDER={LOW:0,MEDIUM:1,HIGH:2};
 function rankTop5(enriched,stockQuotes){
   const withData=[...enriched].filter(w=>w.rsScore!=null&&num(stockQuotes[w.code]?.t)!=null&&w.status!=="WEAK"&&w.actionStatus!=="RISK");
   const positive=withData.filter(w=>w.pct!=null&&w.pct>0);
   const exceptions=withData.filter(w=>isResilienceExceptionCandidate(w)).map(w=>({...w,isResilienceException:true}));
+  // Event Risk Guard（2026-09-17新規、PHASE 8）：完全除外はしない。Status/RS Scoreが並んだ
+  // 場合のタイブレークとしてeventRiskLevelの低い方を優先する程度の軽い調整のみ。
   return [...positive,...exceptions]
-    .sort((a,b)=>PRIMARY_STATUS_META[a.status].order-PRIMARY_STATUS_META[b.status].order||(b.rsScore-a.rsScore))
+    .sort((a,b)=>PRIMARY_STATUS_META[a.status].order-PRIMARY_STATUS_META[b.status].order||(b.rsScore-a.rsScore)
+      ||((EVENT_RISK_SORT_ORDER[a.eventRiskLevel]??0)-(EVENT_RISK_SORT_ORDER[b.eventRiskLevel]??0)))
     .slice(0,5);
 }
 // 指示書7番：0件時にどの条件で候補が落ちたのかを追えるようにするデバッグ集計。
@@ -4962,7 +4980,7 @@ function YaamanThemePanel({nextDayThemes,todayThemes,watchlistAll,onAddToWatchli
   </div>;
 }
 
-function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan,newsCatalysts,entryScanning,entryResult,onEntryScan,thesisStats,todayTheses,yaamanNextDayThemes,yaamanTodayThemes,onAddToWatchlist}){
+function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan,newsCatalysts,entryScanning,entryResult,onEntryScan,thesisStats,todayTheses,yaamanNextDayThemes,yaamanTodayThemes,onAddToWatchlist,eventRiskGuard}){
   const [expandedScoreCode,setExpandedScoreCode]=useState(null); // スコア内訳の折りたたみ展開（指示書21番）
   const [entryDebugOpen,setEntryDebugOpen]=useState(false); // TOP5表示ロジック修正指示・指示書7番：開発用デバッグ表示（既定は折りたたみ）
 
@@ -5025,8 +5043,8 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
   // v3-4：市場（日経平均）・セクター平均に対する差分→enrichWatchRow→TOP5選定は
   // computeEnrichedWatch/rankTop5（共通ヘルパー、本ファイル上部で定義）に切り出し済み。
   // 市場タブの「朝一分析」コピーも同じ関数で同じTOP5を算出する（二重実装を避ける）。
-  const enriched=useMemo(()=>computeEnrichedWatch(items,stockQuotes,metrics,watchlistAll,breakoutLevels,analysisData,marketRiskLabel),
-    [items,stockQuotes,metrics,watchlistAll,breakoutLevels,analysisData,marketRiskLabel]);
+  const enriched=useMemo(()=>computeEnrichedWatch(items,stockQuotes,metrics,watchlistAll,breakoutLevels,analysisData,marketRiskLabel,eventRiskGuard),
+    [items,stockQuotes,metrics,watchlistAll,breakoutLevels,analysisData,marketRiskLabel,eventRiskGuard]);
   // 今買い時TOP5と詳細分析判定の整合性修正（2026-09-16新規、指示書1-3番）：サーバー側
   // entry_score/entryStateは監視銘柄全体をバッチ処理する軽量パイプライン（Stage1/Stage2/
   // 5分足スナップショットのみ）で計算しており、詳細分析（analyze_stock()、RSI過熱・
@@ -5488,6 +5506,13 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                       {c.roomToMove && <span style={{fontSize:10,fontWeight:700,whiteSpace:"nowrap",color:(ROOM_TO_MOVE_META[c.roomToMove]||ROOM_TO_MOVE_META.UNKNOWN).color}}>
                         {(ROOM_TO_MOVE_META[c.roomToMove]||ROOM_TO_MOVE_META.UNKNOWN).label}
                       </span>}
+                      {/* Event Risk Guard（2026-09-17新規、PHASE 8）：entry_score自体は既に
+                          server側で反映済み（riskEvent内訳）、ここは追加表示のみ。LOWは非表示。 */}
+                      {c.eventRiskLevel&&c.eventRiskLevel!=="LOW" && <span style={{fontSize:10,fontWeight:700,whiteSpace:"nowrap",
+                          color:c.eventRiskLevel==="HIGH"?"var(--down)":"var(--warn)"}}
+                          title={(c.eventRiskReasons||[]).join("・")}>
+                        {c.eventRiskLevel==="HIGH"?"🔴 EVENT HIGH":"🟠 EVENT MEDIUM"}
+                      </span>}
                       <div style={{flex:"1 1 140px",minWidth:0,fontSize:11,color:"var(--inkSoft)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
                         {(c.reasons||[]).filter(r=>!r.includes("逆行耐性例外")).join("・")}{c.risks&&c.risks.length>0?"　⚠"+c.risks.join("・"):""}
                       </div>
@@ -5818,6 +5843,12 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
               <td style={{whiteSpace:"nowrap",overflow:"hidden",borderLeft:`3px solid ${meta.color}`,paddingRight:10}} title={statusTitle}>
                 <div style={{fontWeight:700,fontSize:11.5,color:meta.color,whiteSpace:"nowrap"}}>{meta.icon} {meta.label}</div>
                 {actionMeta.label && <div style={{fontWeight:700,fontSize:10.5,color:actionMeta.color,whiteSpace:"nowrap",marginTop:1}}>{actionMeta.icon} {actionMeta.label}</div>}
+                {/* Event Risk Guard（2026-09-17新規、PHASE 7）：LOWは表示しない（ノイズを増やさない）。 */}
+                {w.eventRiskLevel&&w.eventRiskLevel!=="LOW" && <div style={{fontWeight:700,fontSize:10.5,
+                    color:w.eventRiskLevel==="HIGH"?"var(--down)":"var(--warn)",whiteSpace:"nowrap",marginTop:1}}
+                    title={w.eventRiskReasons?.join("・")}>
+                  {w.eventRiskLevel==="HIGH"?"🔴 EVENT HIGH":"🟠 EVENT MEDIUM"}
+                </div>}
                 {(()=>{const mb=deriveMomentumBadge(w);if(!mb)return null;
                   return <div style={{fontWeight:700,fontSize:10,color:mb.meta.color,whiteSpace:"nowrap",marginTop:1}}
                     title={`MOMENTUM_SCORE ${mb.score}${mb.stuckLimitUp?"／登録時点でS高張り付き":""}（本日限定・買い推奨ではありません）`}>
@@ -5929,8 +5960,27 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
               <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:6,alignItems:"center"}}>
                 <span style={{fontWeight:700,fontSize:11.5,color:meta.color}}>{meta.icon} {meta.label}</span>
                 {actionMeta.label && <span style={{fontWeight:700,fontSize:11,color:actionMeta.color}}>{actionMeta.icon} {actionMeta.label}</span>}
+                {w.eventRiskLevel&&w.eventRiskLevel!=="LOW" && <span style={{fontWeight:700,fontSize:11,
+                    color:w.eventRiskLevel==="HIGH"?"var(--down)":"var(--warn)"}}
+                    title={w.eventRiskReasons?.join("・")}>
+                  {w.eventRiskLevel==="HIGH"?"🔴 EVENT HIGH":"🟠 EVENT MEDIUM"}
+                </span>}
                 <span className="mono" style={{fontWeight:700,fontSize:12,color:rsFg,marginLeft:"auto"}}>RS {w.rsScore!=null?w.rsScore:"—"}</span>
               </div>
+              {w.eventRiskLevel==="HIGH" && <div style={{fontSize:10.5,color:"var(--down)",marginTop:3}}>
+                イベントリスク高。寄り付き直後の新規買いは避ける（9:00〜9:30 WAIT。VWAP維持＋高値更新確認後）
+              </div>}
+              {/* PHASE 12-13（2026-09-17新規）：過去の反省。全文は毎回出さず件数のみ、
+                  クリックで展開（詳細表示はイベント種別・銘柄カード単位では絞り込まない
+                  最小実装＝market全体で1回検索した結果を共通表示）。 */}
+              {w.eventRiskLevel&&w.eventRiskLevel!=="LOW"&&eventRiskGuard?.similarReflections?.length>0 &&
+                <details style={{marginTop:3,fontSize:10.5,color:"var(--inkSoft)"}} onClick={e=>e.stopPropagation()}>
+                  <summary style={{cursor:"pointer"}}>⚠️ 過去の反省あり（{eventRiskGuard.similarReflections.length}件）</summary>
+                  {eventRiskGuard.similarReflections.map(r=>
+                    <div key={r.id} style={{marginTop:2,paddingLeft:6,borderLeft:"2px solid var(--rule)"}}>
+                      {r.tradeDate}：{r.lesson||r.reflectionText}
+                    </div>)}
+                </details>}
               {(mb||bb||rb||sb||pb||rvb||vlb) && <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:4}}>
                 {mb && <span style={{fontSize:10.5,fontWeight:700,color:mb.meta.color}}>{mb.meta.icon} {mb.meta.label}</span>}
                 {bb && <span style={{fontSize:10.5,fontWeight:700,color:bb.meta.color}}>{bb.meta.icon} {bb.meta.label}</span>}
@@ -6115,6 +6165,9 @@ const POSITION_STATUS_META={
   CAUTION:{label:"CAUTION",icon:"⚠",color:"var(--down)"},
   TAKE_PROFIT:{label:"TAKE PROFIT",icon:"💰",color:"var(--up)"},
   TRAIL:{label:"TRAIL",icon:"📈",color:"var(--up)"},
+  // Event Risk Guard（2026-09-17新規、PHASE 6）：建値保護（第1段階）／利益トレーリング（第2段階）。
+  EVENT_BREAKEVEN:{label:"EVENT PROTECT（建値）",icon:"🛡",color:"var(--up)"},
+  EVENT_TRAIL:{label:"EVENT PROTECT（利益）",icon:"🛡",color:"var(--up)"},
   HOLD_STRONG:{label:"HOLD STRONG",icon:"💪",color:"var(--up)"},
   HOLD:{label:"HOLD",icon:"🤝",color:"var(--inkSoft)"},
 };
@@ -6169,7 +6222,9 @@ function evaluateSpreadWarning(ask,bid,current){
   return spreadPct>=0.5?{spreadPct:Math.round(spreadPct*100)/100}:null;
 }
 
-function derivePositionStatus({avgPrice,tradeStyle,current,currentStop,initialStop,target1,positionFlags,pnlPct,indicators,enrStatus,ask,bid}){
+const EVENT_BREAKEVEN_START_PCT={DAY:1.0,SWING:1.5};  // 建値保護候補を出し始める含み益%
+const EVENT_TRAIL_START_PCT={DAY:2.5,SWING:4.0};      // 利益トレーリング候補に切り替える含み益%
+function derivePositionStatus({avgPrice,tradeStyle,current,currentStop,initialStop,target1,positionFlags,pnlPct,indicators,enrStatus,ask,bid,eventRiskLevel}){
   const reasons=[];
   // 1. EXIT RULE（2026-09-10更新：全トレードスタイル共通・絶対最優先。自信度・材料・
   //    チャート・ファンダ・ニュース・AI分析結果等いかなる他の判定材料でも上書きしない。
@@ -6216,6 +6271,27 @@ function derivePositionStatus({avgPrice,tradeStyle,current,currentStop,initialSt
   // 5. 警戒シグナル1つ：CAUTION（注視）
   if(warnCount>=1)return {status:"CAUTION",reasons};
 
+  // 5.5. EVENT PROTECT（2026-09-17新規、PHASE 6）：イベントHIGHの日に含み益が出た場合、
+  //    通常のトレーリング開始しきい値（TRAIL_START_PCT）より早いタイミングで利益保護を
+  //    提案する。「建値保護」（第1段階：まず買値付近へ）と「利益トレーリング」（第2段階：
+  //    さらに伸びた場合のみATR/直近値幅ベースで引き上げ）を分け、VWAPが高いというだけで
+  //    逆指値候補を過度に引き上げない（レビュー指摘3）。自動注文はしない、候補表示のみ。
+  if(eventRiskLevel==="HIGH"&&pnlPct!=null){
+    if(pnlPct>=(EVENT_TRAIL_START_PCT[tradeStyle]??3)){
+      const width=calcTrailingWidth(tradeStyle,current,indicators?.atr14);
+      if(current!=null&&width!=null){
+        const floor=Math.max(avgPrice,current-width);
+        return {status:"EVENT_TRAIL",
+          reasons:["🛡 利益保護候補（ATR/直近値幅ベースのトレーリング）",`含み益${pnlPct.toFixed(1)}%`],
+          suggestedTrailingStop:Math.round(floor*100)/100};
+      }
+    }
+    if(pnlPct>=(EVENT_BREAKEVEN_START_PCT[tradeStyle]??1)){
+      return {status:"EVENT_BREAKEVEN",
+        reasons:["🛡 建値保護候補（イベントHIGH日）","買値付近への逆指値引上げを検討"],
+        suggestedTrailingStop:avgPrice};
+    }
+  }
   // 6. トレーリング（Step7）：現在SLを手動で利益保護・追随中に設定済み（既存のderiveTrailingStatus）、
   //    またはDAY/SWING別のしきい値を超える含み益に達していれば、トレーリング開始の目安として提案する。
   //    ATR14（indicators.atr14、既存の分析結果を再利用）から算出したトレーリング幅ぶんだけ現在値
@@ -6956,7 +7032,7 @@ function PositionLiveDetail({item,onOpenExit,posFlags,posIndicators,enrStatus,on
   </div>;
 }
 
-function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEvents,newsCatalysts,expertViews,candidatesJP,candidatesUS,onAddToWatchlist,onOpenChart}){
+function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEvents,newsCatalysts,expertViews,candidatesJP,candidatesUS,onAddToWatchlist,onOpenChart,eventRiskGuard}){
   const [items,setItems]=useState([]);
   const [loading,setLoading]=useState(true);
   // 2026-09-10新規（損切りルール是正・最優先修正）：EXIT RULE（-8%）到達を検知したら
@@ -7454,7 +7530,7 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
               const posResult=derivePositionStatus({avgPrice:it.average_price,tradeStyle:it.trade_style,
                 current,currentStop:it.current_stop,initialStop:it.initial_stop,target1:it.target_1,
                 positionFlags:posFlags,pnlPct,indicators:posIndicators,enrStatus:enr?.status,
-                ask:boardAsk,bid:boardBid});
+                ask:boardAsk,bid:boardBid,eventRiskLevel:eventRiskGuard?.byCode?.[it.code]?.level});
               const posMeta=POSITION_STATUS_META[posResult.status];
               // v3-8 Step8（UIカード再設計）：表示順を「取引タイプ→ポジションStatus→取得値/現在値/
               // 損益→HARD STOP/現在SL→Trailing/利確候補→チャート・出来高警戒（Statusの理由として
@@ -9527,6 +9603,27 @@ function DailyReviewPanel(){
                   次回ENTRY解禁条件：{t.entryUnblockConditions.join("／")}
                 </div>}
               </div>}
+              {/* Trade Learning Phase C（2026-09-16、観測・保存のみでUI未接続だった）＋
+                  EVENT_QUALITY（2026-09-17新規）：ENTRY/STOP/EXIT/REENTRY/EVENTの5軸独立評価。
+                  勝敗結果とは無関係に表示する（LOSS以外にも表示、「損切りは良かったが入った
+                  判断は悪かった」を分けて示す）。 */}
+              {t.qualityAxes && <div style={{marginTop:4,display:"flex",flexWrap:"wrap",gap:6}}>
+                {[["entry_quality","エントリー環境判断"],["stop_quality","損切り幅設計"],
+                  ["exit_quality","決済執行"],["reentry_quality","再エントリー判断"],
+                  ["event_quality","イベント認識"]].map(([key,label])=>{
+                  const axis=t.qualityAxes[key];
+                  if(!axis||axis.classification==="UNKNOWN")return null;
+                  const cls=axis.classification;
+                  const color=cls==="N/A"?"var(--inkFaint)":
+                    (["GOOD_TIMING","GOOD","TRIGGER_DETECTED"].includes(cls)?"var(--up)":
+                     (["QUESTIONABLE_TIMING","CHASE_OR_LATE_ENTRY","POOR"].includes(cls)?"var(--down)":"var(--inkSoft)"));
+                  return <span key={key} style={{fontSize:10.5,fontWeight:700,color,border:`1px solid ${color}`,
+                      borderRadius:3,padding:"1px 6px"}}
+                      title={(axis.evidence&&(Array.isArray(axis.evidence)?axis.evidence.join("・"):JSON.stringify(axis.evidence)))||""}>
+                    {label}：{cls}
+                  </span>;
+                })}
+              </div>}
               {/* Phase：ENTRY後15/30/60分 Opportunity Learning（2026-09-16新規）。勝敗結果とは
                   独立に「そもそも利益を取れる値幅が存在したか」を表示する（LOSS以外にも表示）。 */}
               {t.opportunity && t.opportunity.opportunityClass!=="UNKNOWN" && <div style={{fontSize:11,color:"var(--inkSoft)",marginTop:4}}>
@@ -10976,6 +11073,16 @@ function App(){
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
 
+  // Event Risk Guard（2026-09-17新規、PHASE 7-8）：監視銘柄・TOP5のEVENTバッジ表示用。
+  // /api/entry-candidatesと同じ計算過程を再利用するAPIのため、marketRiskと同様に永続化
+  // せずlocal state（この画面セッション中のみ）として保持する。
+  const [eventRiskGuard,setEventRiskGuard]=useState({market:{score:0,level:"LOW",reasons:[]},byCode:{}});
+  const fetchEventRiskGuard=useCallback(()=>{
+    fetch("/api/event-risk-guard").then(r=>r.ok?r.json():null)
+      .then(d=>{if(d&&d.byCode)setEventRiskGuard(d);}).catch(()=>{});
+  },[]);
+  useEffect(()=>{fetchEventRiskGuard();},[fetchEventRiskGuard]);
+
   // 2026-09-08新規（後場レビューJSON対応：SECTOR_REGIME・MORNING_TO_AFTERNOON_REGIME_CHANGE）。
   // SECTOR_PROXY_METRICS（現状は半導体ETF200Aのみ、server.py参照）のRISK_ON/MIXED/RISK_OFFを
   // 取得する。marketRiskとは異なり日中に変化し得るため1日1回ではなく数分おきに再取得する
@@ -11174,6 +11281,38 @@ function App(){
     return {code,market:s.analysisTargetMarkets[code]||"JP",name:s.analysisData[code]?.name||code};
   },[allWatch,s.analysisTargetMarkets,s.analysisData]);
   const analysisItems=useMemo(()=>s.analysisTargets.map(resolveAnalysisItem),[s.analysisTargets,resolveAnalysisItem]);
+
+  // 2026-09-17新規（Event Risk Guard＋トレード反省メモ Phase A、PHASE 9）：「今日の反省・
+  // 気づき」。自由記述で保存すると、サーバー側のルールベース構造化（structure_trade_
+  // reflection）でcategory/tags/event_types/lesson/future_ruleが自動抽出される。
+  const [reflectionDraft,setReflectionDraft]=useState("");
+  const [reflectionSaving,setReflectionSaving]=useState(false);
+  const [reflections,setReflections]=useState([]);
+  const [reflectionEditId,setReflectionEditId]=useState(null);
+  const [reflectionEditDraft,setReflectionEditDraft]=useState(null);
+  const loadReflections=useCallback(()=>{
+    fetch("/api/trade-reflections?limit=5").then(r=>r.ok?r.json():null)
+      .then(d=>{if(d&&Array.isArray(d.items))setReflections(d.items);}).catch(()=>{});
+  },[]);
+  useEffect(()=>{loadReflections();},[loadReflections]);
+  const saveReflection=()=>{
+    if(!reflectionDraft.trim())return;
+    setReflectionSaving(true);
+    fetch("/api/trade-reflections/save",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({reflection_text:reflectionDraft.trim()})})
+      .then(r=>r.json()).then(d=>{
+        if(d&&d.item){setReflectionDraft("");loadReflections();}
+      }).finally(()=>setReflectionSaving(false));
+  };
+  const startEditReflection=(item)=>{setReflectionEditId(item.id);setReflectionEditDraft({...item});};
+  const saveEditReflection=()=>{
+    if(!reflectionEditId||!reflectionEditDraft)return;
+    fetch(`/api/trade-reflections/${reflectionEditId}/update`,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({reflection_text:reflectionEditDraft.reflectionText,lesson:reflectionEditDraft.lesson,
+        future_rule:reflectionEditDraft.futureRule})})
+      .then(r=>r.json()).then(()=>{setReflectionEditId(null);setReflectionEditDraft(null);loadReflections();});
+  };
+
   // 2026-09-14新規（トレード分析STALE不具合修正・可視化）：分析タブ上部に「取得時刻・鮮度・
   // 更新状態」を表示するための集計。個別カードのFreshnessBadge（1件ずつ）とは別に、
   // タブ全体としてひと目で分かるサマリーを出す。
@@ -11208,9 +11347,9 @@ function App(){
   // 分析対象銘柄にも適用し、Primary Status／Action Statusを二重ロジックにせず共有する
   // （「一覧ではHOT+WAIT、分析画面では別判定」という矛盾を防ぐ）。code→enrichWatchRow結果のMap。
   const analysisEnrichedMap=useMemo(()=>{
-    const enriched=computeEnrichedWatch(analysisItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData,s.marketRisk?.marketRiskLabel);
+    const enriched=computeEnrichedWatch(analysisItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData,s.marketRisk?.marketRiskLabel,eventRiskGuard);
     return new Map(enriched.map(e=>[e.code,e]));
-  },[analysisItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData,s.marketRisk]);
+  },[analysisItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData,s.marketRisk,eventRiskGuard]);
   // v3-6 Step2（銘柄分析画面にセクター情報を追加）：既存groupStocks()（セクター別平均騰落率・
   // 合計売買代金、日次モニターの「本日の注目セクター」等で既に使っている共通関数）をそのまま
   // 再利用し、セクター別の当日騰落率で順位付けする（新規計算・新規リクエストなし）。
@@ -11227,9 +11366,9 @@ function App(){
   // v3-4（ChatGPT連携の再配置）：市場タブ「朝一分析」に監視銘柄TOP5を含めるため、監視銘柄タブと
   // 同じcomputeEnrichedWatch/rankTop5（共通ヘルパー）でApp側でも同じTOP5を算出しておく。
   const todayTop5=useMemo(()=>{
-    const enriched=computeEnrichedWatch(watchTargetItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData,s.marketRisk?.marketRiskLabel);
+    const enriched=computeEnrichedWatch(watchTargetItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData,s.marketRisk?.marketRiskLabel,eventRiskGuard);
     return rankTop5(enriched,s.stockQuotes);
-  },[watchTargetItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData,s.marketRisk]);
+  },[watchTargetItems,s.stockQuotes,s.metrics,watchlistAll,s.breakoutLevels,s.analysisData,s.marketRisk,eventRiskGuard]);
   // 投資判断ログの「新規ログ」下書きに自動で入れる値。金利・為替・原油は日次モニターの直近取得値
   // （s.metrics）、市場全体の地合い・米国市場は直近の銘柄分析結果（analyze_stock共通の_market_environment）
   // から、セクター強弱はgroupStocks()の売買代金上位から組み立てる。いずれも編集可能な「下書き」であり、
@@ -12499,7 +12638,7 @@ function App(){
         analysisTargets={s.analysisTargets} onToggleAnalysis={toggleAnalysisTarget} onOpenAnalysis={openAnalysisFor}
         earningsTargets={s.earningsTargets} onToggleEarnings={toggleEarningsTarget}
         onRemove={removeWatchTarget} metrics={s.metrics} watchlistAll={watchlistAll} breakoutLevels={s.breakoutLevels}
-        analysisData={s.analysisData} marketRiskLabel={s.marketRisk?.marketRiskLabel}
+        analysisData={s.analysisData} marketRiskLabel={s.marketRisk?.marketRiskLabel} eventRiskGuard={eventRiskGuard}
         activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)}
         onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}
         momentumScanning={momentumScanning} momentumResult={momentumResult} onMomentumScan={runMomentumScan}
@@ -12986,6 +13125,57 @@ function App(){
                 })}
               </div>
             </div>}
+
+        {/* 2026-09-17新規（Event Risk Guard＋トレード反省メモ Phase A、PHASE 9）：
+            「今日の反省・気づき」。保存すると自動でcategory/tags/event_types/lesson/
+            future_ruleがルールベース抽出される（完全な自然言語理解は目指さない）。 */}
+        <div className="card" style={{padding:"10px 12px",marginTop:16}}>
+          <b style={{fontSize:12.5}}>📝 今日の反省・気づき</b>
+          <textarea value={reflectionDraft} onChange={e=>setReflectionDraft(e.target.value)}
+            placeholder="例：FOMC後に上昇したことで地合いを楽観視し、翌日の日銀会合当日にエントリーしてしまった…"
+            style={{width:"100%",minHeight:70,marginTop:6,fontSize:12.5,padding:6,boxSizing:"border-box",
+              border:"1px solid var(--rule)",borderRadius:4,background:"var(--paper)",color:"var(--ink)"}}/>
+          <div style={{marginTop:6}}>
+            <button className="action-btn" onClick={saveReflection} disabled={reflectionSaving||!reflectionDraft.trim()}>
+              {reflectionSaving?"保存中…":"反省を保存"}
+            </button>
+          </div>
+          {reflections.length>0 && <div style={{marginTop:10,display:"flex",flexDirection:"column",gap:8}}>
+            {reflections.map(item=>
+              <div key={item.id} style={{border:"1px solid var(--rule)",borderRadius:4,padding:"6px 8px",fontSize:11.5}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <span className="mono" style={{color:"var(--inkFaint)"}}>{item.tradeDate}</span>
+                  <button className="iconbtn" onClick={()=>reflectionEditId===item.id?setReflectionEditId(null):startEditReflection(item)}>
+                    {reflectionEditId===item.id?"閉じる":"編集"}
+                  </button>
+                </div>
+                {reflectionEditId===item.id
+                  ? <div style={{marginTop:4,display:"flex",flexDirection:"column",gap:4}}>
+                      <textarea value={reflectionEditDraft?.reflectionText||""}
+                        onChange={e=>setReflectionEditDraft(p=>({...p,reflectionText:e.target.value}))}
+                        style={{width:"100%",minHeight:50,fontSize:11.5,padding:4,boxSizing:"border-box",
+                          border:"1px solid var(--rule)",borderRadius:4,background:"var(--paper)",color:"var(--ink)"}}/>
+                      <input value={reflectionEditDraft?.lesson||""} placeholder="lesson（教訓）"
+                        onChange={e=>setReflectionEditDraft(p=>({...p,lesson:e.target.value}))}
+                        style={{width:"100%",fontSize:11.5,padding:4,boxSizing:"border-box",
+                          border:"1px solid var(--rule)",borderRadius:4,background:"var(--paper)",color:"var(--ink)"}}/>
+                      <input value={reflectionEditDraft?.futureRule||""} placeholder="future_rule（次回ルール）"
+                        onChange={e=>setReflectionEditDraft(p=>({...p,futureRule:e.target.value}))}
+                        style={{width:"100%",fontSize:11.5,padding:4,boxSizing:"border-box",
+                          border:"1px solid var(--rule)",borderRadius:4,background:"var(--paper)",color:"var(--ink)"}}/>
+                      <button className="action-btn" onClick={saveEditReflection}>保存する</button>
+                    </div>
+                  : <>
+                      <div style={{marginTop:2,whiteSpace:"pre-wrap"}}>{item.reflectionText}</div>
+                      {item.tags&&item.tags.length>0 && <div style={{marginTop:4,display:"flex",flexWrap:"wrap",gap:4}}>
+                        {item.tags.map(t=><span key={t} className="chip" style={{fontSize:9.5}}>{t}</span>)}
+                      </div>}
+                      {item.lesson && <div style={{marginTop:4,color:"var(--inkSoft)"}}>教訓：{item.lesson}</div>}
+                      {item.futureRule && <div style={{marginTop:2,color:"var(--inkSoft)"}}>次回ルール：{item.futureRule}</div>}
+                    </>}
+              </div>)}
+          </div>}
+        </div>
       </div>}
 
       {/* ===== 記録（17章：売買記録・トレードジャーナル） ===== */}
@@ -13173,7 +13363,7 @@ function App(){
         <div className="sec-head">ポジション</div>
         <div className="sec-note">保有中の建玉のみを表示します。売買記録・振り返りは「記録」タブへ。</div>
         <PortfolioPanel stockQuotes={s.stockQuotes} analysisData={s.analysisData} analysisEnrichedMap={analysisEnrichedMap} marketEvents={marketEvents} newsCatalysts={newsCatalysts} expertViews={expertViews}
-          candidatesJP={masterJP} candidatesUS={masterUS} onAddToWatchlist={addToWatchlistDirect}
+          candidatesJP={masterJP} candidatesUS={masterUS} onAddToWatchlist={addToWatchlistDirect} eventRiskGuard={eventRiskGuard}
           onOpenChart={it=>setChartModal({symbol:it.market==="JP"?"TSE:"+it.code:it.code,name:it.name,code:it.code,market:it.market})}/>
       </div>}
 

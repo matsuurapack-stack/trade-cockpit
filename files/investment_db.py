@@ -712,6 +712,32 @@ CREATE INDEX IF NOT EXISTS idx_trade_rules_visibility ON trade_rules(visibility)
 CREATE INDEX IF NOT EXISTS idx_trade_playbooks_visibility ON trade_playbooks(visibility);
 """
 
+# 2026-09-17新規（Event Risk Guard＋トレード反省メモ、Phase A）：「今日の反省・気づき」の
+# 自由記述メモを保存する独立テーブル。trade_experiences（自動生成される損益ベースの分析）とは
+# 別物——反省は結果と無関係にユーザーが自発的に書くものなので、trade_idはNULL可の緩い紐付け
+# にとどめる（無理にトレードへ1:1で結びつけない）。「監視銘柄・ニュース・イベント・分析などは
+# 共有」方針にならい、trade_rules等と同じくSHARED scopeで保存する。
+_SCHEMA_TRADE_REFLECTIONS_SQL = """
+CREATE TABLE IF NOT EXISTS trade_reflections (
+    id              SERIAL PRIMARY KEY,
+    user_id         TEXT NOT NULL,
+    trade_date      DATE NOT NULL,
+    stock_code      TEXT,
+    trade_id        INTEGER,
+    category        JSONB,             -- ["EVENT","ENTRY"] 等、複数可
+    reflection_text TEXT NOT NULL,
+    lesson          TEXT,
+    future_rule     TEXT,
+    tags            JSONB,             -- ["FOMC","BOJ","OPENING_FADE",...]
+    event_types     JSONB,             -- ["FOMC","BOJ"]
+    confidence      TEXT,              -- HIGH|MEDIUM|LOW（構造化の確からしさ）
+    source          TEXT NOT NULL DEFAULT 'manual',  -- manual|smart_import_chatgpt
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_trade_reflections_user_date ON trade_reflections(user_id, trade_date DESC);
+"""
+
 # ============================================================
 # Trade Experience Learning（2026-09-11新規）：日々の実トレードから、ユーザー固有の
 # 「勝ちパターン・負けパターン・WAIT条件・利確条件」を蓄積し、ENTRY TOP5・トレード分析・
@@ -1624,6 +1650,7 @@ def init_schema(database_url):
         conn.execute(_MIGRATE_MARKET_EVENT_SOURCE_TRACKING_SQL)
         conn.execute(_MIGRATE_EXTERNAL_INTELLIGENCE_CONTEXT_SQL)
         conn.execute(_MIGRATE_CENTRAL_BANK_EVENT_SYNC_SQL)
+        conn.execute(_SCHEMA_TRADE_REFLECTIONS_SQL)
         conn.commit()
 
 
@@ -9179,6 +9206,141 @@ def upsert_watch_stock_candidate(database_url, user_id, item):
         ok = _upsert_watchlist_item_conn(conn, user_id, merged)
         conn.commit()
     return {"created": existing is None, "code": code, "market": market} if ok else False
+
+
+# ---- trade_reflections（2026-09-17新規、Event Risk Guard＋トレード反省メモ Phase A） ----
+# 「監視銘柄・ニュース・イベント・分析などは共有」方針にならいSHARED scope。trade_rulesと
+# 同じ書き味のCRUDのみ（新しい汎用ORM層は作らない）。
+
+_TRADE_REFLECTION_CAMEL_TO_SNAKE = {
+    "tradeDate": "trade_date", "stockCode": "stock_code", "tradeId": "trade_id",
+    "reflectionText": "reflection_text", "futureRule": "future_rule", "eventTypes": "event_types",
+}
+_TRADE_REFLECTION_SNAKE_TO_CAMEL = {v: k for k, v in _TRADE_REFLECTION_CAMEL_TO_SNAKE.items()}
+_TRADE_REFLECTION_JSON_COLS = ("category", "tags", "event_types")
+_TRADE_REFLECTION_WRITABLE_COLS = ["trade_date", "stock_code", "trade_id", "category", "reflection_text",
+                                    "lesson", "future_rule", "tags", "event_types", "confidence", "source"]
+
+
+def _trade_reflection_row_to_camel(row):
+    d = _row_to_json(row)
+    d.pop("user_id", None)
+    return {_TRADE_REFLECTION_SNAKE_TO_CAMEL.get(k, k): v for k, v in d.items()}
+
+
+def create_trade_reflection(database_url, user_id, item):
+    """反省1件をINSERTする（上書き更新はupdate_trade_reflection側の役割、ここは常に新規行）。
+    Phase MU-S1と同じくSHARED scope。戻り値は保存済み行（camelCase）、失敗時はNone。"""
+    user_id = _SHARED_SCOPE
+    pool = _get_pool(database_url)
+    if pool is None or not (item or {}).get("reflection_text"):
+        return None
+    item = {_TRADE_REFLECTION_CAMEL_TO_SNAKE.get(k, k): v for k, v in (item or {}).items()}
+    cols = [c for c in _TRADE_REFLECTION_WRITABLE_COLS if c in item and item.get(c) is not None]
+    if "trade_date" not in cols:
+        item["trade_date"] = datetime.date.today().isoformat()
+        cols.append("trade_date")
+    if "source" not in cols:
+        item["source"] = "manual"
+        cols.append("source")
+    values = [item.get(c) for c in cols]
+    wrapped = [json.dumps(v, ensure_ascii=False) if (c in _TRADE_REFLECTION_JSON_COLS and v is not None) else v
+               for c, v in zip(cols, values)]
+    placeholders = ["%s::jsonb" if c in _TRADE_REFLECTION_JSON_COLS else "%s" for c in cols]
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"INSERT INTO trade_reflections (user_id, {', '.join(cols)}) "
+                f"VALUES (%s, {', '.join(placeholders)}) RETURNING *",
+                [user_id] + wrapped,
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return _trade_reflection_row_to_camel(row) if row else None
+
+
+def update_trade_reflection(database_url, user_id, reflection_id, patch):
+    """既存反省の編集（PHASE 3の「編集」要件）。渡されたフィールドだけを更新する。"""
+    user_id = _SHARED_SCOPE
+    pool = _get_pool(database_url)
+    if pool is None or not reflection_id:
+        return None
+    patch = {_TRADE_REFLECTION_CAMEL_TO_SNAKE.get(k, k): v for k, v in (patch or {}).items()}
+    cols = [c for c in _TRADE_REFLECTION_WRITABLE_COLS if c in patch]
+    if not cols:
+        return None
+    values = [patch.get(c) for c in cols]
+    wrapped = [json.dumps(v, ensure_ascii=False) if (c in _TRADE_REFLECTION_JSON_COLS and v is not None) else v
+               for c, v in zip(cols, values)]
+    set_clause = ", ".join(
+        f"{c} = %s::jsonb" if c in _TRADE_REFLECTION_JSON_COLS else f"{c} = %s" for c in cols)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"UPDATE trade_reflections SET {set_clause}, updated_at = now() "
+                f"WHERE id = %s AND user_id = %s RETURNING *",
+                wrapped + [reflection_id, user_id],
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return _trade_reflection_row_to_camel(row) if row else None
+
+
+def list_trade_reflections(database_url, user_id, limit=60, event_type=None, tag=None, category=None):
+    """一覧・フィルタ取得（trade_date降順）。event_type/tag/categoryはJSONB配列内の1件一致で絞り込む。"""
+    user_id = _SHARED_SCOPE
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = ["user_id = %s"], [user_id]
+    if event_type:
+        where.append("event_types @> %s::jsonb")
+        params.append(json.dumps([event_type]))
+    if tag:
+        where.append("tags @> %s::jsonb")
+        params.append(json.dumps([tag]))
+    if category:
+        where.append("category @> %s::jsonb")
+        params.append(json.dumps([category]))
+    params.append(limit)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT * FROM trade_reflections WHERE {' AND '.join(where)} "
+                f"ORDER BY trade_date DESC, created_at DESC LIMIT %s", params)
+            return [_trade_reflection_row_to_camel(r) for r in cur.fetchall()]
+
+
+def find_similar_reflections(database_url, user_id, event_types=None, tags=None, limit=5):
+    """PHASE 13「同じ失敗を検知」の最小実装。ベクトル類似ではなくタグ/イベント種別の重なりで
+    判定する。ノイズ警告を防ぐため、タグ1個一致だけでは類似とみなさない——
+    (event_typesが1つ以上一致 AND tagsが1個以上追加一致) OR (tagsの一致数が2個以上)
+    を満たす行だけを返す（Phase A規模のデータ量なのでSQLは広めに引いてPython側でフィルタする）。"""
+    user_id = _SHARED_SCOPE
+    pool = _get_pool(database_url)
+    if pool is None or (not event_types and not tags):
+        return []
+    event_types = set(event_types or [])
+    tags = set(tags or [])
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM trade_reflections WHERE user_id = %s "
+                "AND (event_types IS NOT NULL OR tags IS NOT NULL) "
+                "ORDER BY trade_date DESC LIMIT 200", [user_id])
+            rows = cur.fetchall()
+    results = []
+    for r in rows:
+        row_event_types = set(r.get("event_types") or [])
+        row_tags = set(r.get("tags") or [])
+        event_overlap = event_types & row_event_types
+        tag_overlap = tags & row_tags
+        matches = (len(event_overlap) >= 1 and len(tag_overlap) >= 1) or len(tag_overlap) >= 2
+        if matches:
+            results.append(_trade_reflection_row_to_camel(r))
+        if len(results) >= limit:
+            break
+    return results
 
 
 def upsert_watchlist_master_stocks(database_url, user_id, stocks, update_mode="add", source="smart_import_master"):
