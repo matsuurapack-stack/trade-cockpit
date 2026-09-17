@@ -123,8 +123,11 @@ class NormalizeTradeReflectionTests(unittest.TestCase):
 
 
 class _FakeCursor:
-    def __init__(self, fetchone_result=None, fetchall_result=None):
+    def __init__(self, fetchone_result=None, fetchall_result=None, fetchone_results=None):
+        # fetchone_results: 呼び出し順に消費するキュー（dedupチェック→INSERT、の2回呼び出しに対応）。
+        # 指定が無ければfetchone_resultを毎回返す（既存テストとの後方互換）。
         self._fetchone_result = fetchone_result
+        self._fetchone_queue = list(fetchone_results) if fetchone_results is not None else None
         self._fetchall_result = fetchall_result or []
         self.executed = []
 
@@ -138,6 +141,8 @@ class _FakeCursor:
         self.executed.append((sql, params))
 
     def fetchone(self):
+        if self._fetchone_queue is not None:
+            return self._fetchone_queue.pop(0) if self._fetchone_queue else None
         return self._fetchone_result
 
     def fetchall(self):
@@ -178,7 +183,8 @@ class CreateTradeReflectionDbTests(unittest.TestCase):
     def test_create_forces_shared_scope_and_serializes_json_cols(self):
         saved_row = {"id": 1, "trade_date": "2026-09-17", "reflection_text": USER_2026_09_17_TEXT,
                      "tags": ["FOMC", "BOJ"], "category": ["EVENT"], "event_types": ["FOMC", "BOJ"]}
-        cursor = _FakeCursor(fetchone_result=saved_row)
+        # fetchoneは2回呼ばれる：①重複チェックSELECT（既存なし=None）②INSERT RETURNINGの結果
+        cursor = _FakeCursor(fetchone_results=[None, saved_row])
         conn = _FakeConn(cursor)
         pool = _FakePool(conn)
         with mock.patch.object(investment_db, "_get_pool", return_value=pool):
@@ -187,9 +193,25 @@ class CreateTradeReflectionDbTests(unittest.TestCase):
                 {"reflection_text": USER_2026_09_17_TEXT, "tags": ["FOMC", "BOJ"], "category": ["EVENT"]})
         self.assertIsNotNone(result)
         self.assertTrue(conn.committed)
-        insert_sql, insert_params = cursor.executed[0]
-        self.assertIn("trade_reflections", insert_sql)
+        insert_sql, insert_params = cursor.executed[-1]  # 最後の実行文=INSERT（先頭は重複チェックSELECT）
+        self.assertIn("INSERT INTO trade_reflections", insert_sql)
         self.assertEqual(insert_params[0], investment_db._SHARED_SCOPE)  # user_idは強制的にSHARED
+
+    def test_duplicate_same_date_and_text_returns_existing_without_insert(self):
+        # 2026-09-17追記：同一trade_date＋完全一致reflection_textの再保存は新規行を作らない。
+        existing_row = {"id": 1, "trade_date": "2026-09-17", "reflection_text": USER_2026_09_17_TEXT,
+                         "tags": ["FOMC"], "category": ["EVENT"], "event_types": ["FOMC"]}
+        cursor = _FakeCursor(fetchone_results=[existing_row])
+        conn = _FakeConn(cursor)
+        pool = _FakePool(conn)
+        with mock.patch.object(investment_db, "_get_pool", return_value=pool):
+            result = investment_db.create_trade_reflection(
+                "dummy_url", "matsuura",
+                {"trade_date": "2026-09-17", "reflection_text": USER_2026_09_17_TEXT})
+        self.assertEqual(result["id"], 1)
+        self.assertFalse(conn.committed)  # INSERTを実行していない＝コミットもしていない
+        self.assertEqual(len(cursor.executed), 1)  # 重複チェックSELECTのみ、INSERTは実行されない
+        self.assertNotIn("INSERT", cursor.executed[0][0])
 
     def test_create_without_reflection_text_returns_none(self):
         with mock.patch.object(investment_db, "_get_pool", return_value=_FakePool(_FakeConn(_FakeCursor()))):

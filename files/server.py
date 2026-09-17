@@ -4818,6 +4818,16 @@ def _score_entry_candidates(database_url, user_id):
     # （watchlist_count/intraday_ready相当）。既存のscanned等の集計ロジックには一切影響しない。
     debug["watchlistCount"] = len(watchlist)
     debug["readyCount"] = snapshot_ready_count
+    # Event Risk Guard（2026-09-17新規）：運用確認用の要約（HIGH/MEDIUM/LOW件数とmarket分）。
+    # byCode自体（全銘柄分のscore/level/reasons）はeventRiskGuard.byCodeに既に含まれているため、
+    # ここは「今どれだけHIGH/MEDIUMが発火しているか」をひと目で確認できる集計のみ追加する。
+    debug["eventRiskGuardDiagnostics"] = {
+        "marketScore": event_guard_market["score"], "marketLevel": classify_event_guard_level(event_guard_market["score"]),
+        "marketReasons": event_guard_market["reasons"],
+        "highCount": sum(1 for v in event_risk_by_code.values() if v["level"] == "HIGH"),
+        "mediumCount": sum(1 for v in event_risk_by_code.values() if v["level"] == "MEDIUM"),
+        "lowCount": sum(1 for v in event_risk_by_code.values() if v["level"] == "LOW"),
+    }
     debug["qualityCounts"] = quality_counts
     debug["dailyArraysScanLocalHit"] = daily_arrays_scan_local_hit  # scan-local daily arrays reuse：TTLを経由せずprefetch結果をそのまま使った件数
     debug["dailyArraysFallbackCount"] = daily_arrays_fallback_count  # 同上：scan-local mapに無くグローバルキャッシュへフォールバックした件数

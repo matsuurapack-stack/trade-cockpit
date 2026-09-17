@@ -5456,6 +5456,13 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
         <span>weak_excluded: {entryResult.debug?.weak_excluded??"—"}</span>
         <span>provisional_excluded: {entryResult.debug?.provisional_excluded??"—"}</span>
         <span>final_candidates: {entryResult.debug?.final_candidates??"—"}</span>
+        {/* Event Risk Guard（2026-09-17新規）：運用確認用。次回実際の重要イベント日に
+            HIGH/MEDIUMが発火しているかをここで確認できる。 */}
+        <span>event_risk_market: {entryResult.debug?.eventRiskGuardDiagnostics?.marketLevel??"—"}
+          ({entryResult.debug?.eventRiskGuardDiagnostics?.marketScore??"—"})</span>
+        <span>event_risk_HIGH: {entryResult.debug?.eventRiskGuardDiagnostics?.highCount??"—"}</span>
+        <span>event_risk_MEDIUM: {entryResult.debug?.eventRiskGuardDiagnostics?.mediumCount??"—"}</span>
+        <span>event_risk_LOW: {entryResult.debug?.eventRiskGuardDiagnostics?.lowCount??"—"}</span>
       </div>}
       {!entryResult
         ? <div style={{fontSize:12,color:"var(--inkFaint)"}}>「今買い時TOP5を更新」を押すと、監視銘柄の中から現在最もエントリー条件が整っている候補をENTRY SCOREで算出します。</div>

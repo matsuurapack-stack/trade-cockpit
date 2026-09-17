@@ -9230,7 +9230,11 @@ def _trade_reflection_row_to_camel(row):
 
 def create_trade_reflection(database_url, user_id, item):
     """反省1件をINSERTする（上書き更新はupdate_trade_reflection側の役割、ここは常に新規行）。
-    Phase MU-S1と同じくSHARED scope。戻り値は保存済み行（camelCase）、失敗時はNone。"""
+    Phase MU-S1と同じくSHARED scope。戻り値は保存済み行（camelCase）、失敗時はNone。
+    2026-09-17追記（運用前確認・重複防止）：同一trade_date＋完全一致するreflection_textの
+    行が既にあれば、新規INSERTせず既存行をそのまま返す（手動保存の二重クリック・同一内容の
+    Smart Import再取り込み等による重複を防ぐ、最小実装——文面が違う場合は別トレードの
+    反省として扱い、あえて重複判定しない）。"""
     user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None or not (item or {}).get("reflection_text"):
@@ -9250,6 +9254,14 @@ def create_trade_reflection(database_url, user_id, item):
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
+                "SELECT * FROM trade_reflections WHERE user_id = %s AND trade_date = %s AND reflection_text = %s "
+                "ORDER BY id LIMIT 1",
+                [user_id, item["trade_date"], item["reflection_text"]],
+            )
+            existing = cur.fetchone()
+            if existing:
+                return _trade_reflection_row_to_camel(existing)
+            cur.execute(
                 f"INSERT INTO trade_reflections (user_id, {', '.join(cols)}) "
                 f"VALUES (%s, {', '.join(placeholders)}) RETURNING *",
                 [user_id] + wrapped,
@@ -9257,6 +9269,18 @@ def create_trade_reflection(database_url, user_id, item):
             row = cur.fetchone()
         conn.commit()
     return _trade_reflection_row_to_camel(row) if row else None
+
+
+def delete_trade_reflection(database_url, user_id, reflection_id):
+    """反省1件の削除（運用前確認・重複整理用に新設。2026-09-17）。"""
+    user_id = _SHARED_SCOPE
+    pool = _get_pool(database_url)
+    if pool is None or not reflection_id:
+        return False
+    with pool.connection() as conn:
+        conn.execute("DELETE FROM trade_reflections WHERE id = %s AND user_id = %s", [reflection_id, user_id])
+        conn.commit()
+    return True
 
 
 def update_trade_reflection(database_url, user_id, reflection_id, patch):
