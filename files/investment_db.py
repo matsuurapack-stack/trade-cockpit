@@ -622,6 +622,15 @@ ALTER TABLE trade_experiences ADD COLUMN IF NOT EXISTS quality_axes_json JSONB;
 -- 「監視候補として選定した理由」の保存先として初めて使う）。
 ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS tags JSONB;
 ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS priority TEXT;
+
+-- 2026-09-17新規（スマホ「監視銘柄」タブ3件表示バグの緊急修正）：「監視銘柄」タブが実際に
+-- 表示する対象（従来のs.watchTargets、行の「監視銘柄」ボタンでON/OFFする銘柄コード一覧）は
+-- これまでブラウザlocalStorageのみで管理されており、端末ごとに独立していた（PC側では長期間
+-- クリックを積み重ねて多数ONになっていたが、iPhoneでは初回のため数件しかONになっておらず
+-- 「3件しか出ない」ように見えていた）。ユーザー方針「ポジションだけ非共有、監視銘柄・
+-- ニュース・イベント・分析などは共有」に合わせ、このON/OFF状態もwatchlist本体と同じSHARED
+-- scopeのDB列として永続化し、PC/iPhone/他端末で同一集合になるようにする。
+ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS is_watch_target BOOLEAN NOT NULL DEFAULT false;
 """
 
 # 2026-09-09新規（ルール学習システム）：投資判断ログ系の他テーブルより後に作成する必要は
@@ -9017,7 +9026,7 @@ def list_watchlist_imports(database_url, user_id, limit=30):
 # Truthにする） ----
 # フロントのcamelCaseキー（tvSymbol）とDB列（tv_symbol）の変換のみここで吸収する。
 
-_WATCHLIST_CAMEL_TO_SNAKE = {"tvSymbol": "tv_symbol"}
+_WATCHLIST_CAMEL_TO_SNAKE = {"tvSymbol": "tv_symbol", "isWatchTarget": "is_watch_target"}
 _WATCHLIST_SNAKE_TO_CAMEL = {v: k for k, v in _WATCHLIST_CAMEL_TO_SNAKE.items()}
 
 
@@ -9085,6 +9094,25 @@ def upsert_watchlist_item(database_url, user_id, item):
         ok = _upsert_watchlist_item_conn(conn, user_id, item)
         conn.commit()
     return ok
+
+
+def set_watch_target(database_url, user_id, code, market, value):
+    """「監視銘柄」タブの対象ON/OFF（従来のs.watchTargets）をDB側へ永続化する
+    （2026-09-17新規、スマホ3件表示バグの緊急修正）。Phase MU-S1と同じくSHARED scope。
+    対象行が存在しない場合は何もしない（watchlist本体に無い銘柄をwatch targetにはできない）。"""
+    user_id = _SHARED_SCOPE
+    pool = _get_pool(database_url)
+    if pool is None or not code:
+        return False
+    market = market or "JP"
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE watchlist SET is_watch_target = %s, updated_at = now() "
+            "WHERE user_id = %s AND code = %s AND market = %s",
+            [bool(value), user_id, code, market],
+        )
+        conn.commit()
+    return True
 
 
 def _merge_text_field(existing, new):

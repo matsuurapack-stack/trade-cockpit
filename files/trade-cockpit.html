@@ -146,10 +146,15 @@ td{padding:7px 10px;vertical-align:middle}
 .news-item:last-child{border-bottom:none}
 .news-item:hover{background:var(--band)}
 .news-item:hover .news-title{color:var(--accent);text-decoration:underline}
+/* 2026-09-17新規（スマホ表示崩れ緊急修正）：重要／優先度／出典／IR／カテゴリ／銘柄コードの
+   各バッジをまとめる1つのグループ。PC幅ではこれまでどおり.news-item内で横一列に並ぶ
+   （このラッパー自体もdisplay:flexのため見た目は不変）。狭い画面向けの挙動は下の
+   @media(max-width:600px)でこのグループごとflex-basis:100%にして専用の1行へ回す。 */
+.news-badges{display:flex;flex-wrap:wrap;align-items:center}
 .news-tag{flex:none;font-size:11px;font-weight:700;color:var(--accent);background:var(--paperAlt);
   border:1px solid var(--rule);border-radius:3px;padding:1px 6px;white-space:nowrap}
 .news-body{flex:1;min-width:0}
-.news-title{font-size:14px;line-height:1.5}
+.news-title{font-size:14px;line-height:1.5;overflow-wrap:break-word}
 .news-summary{display:block;font-size:12px;line-height:1.5;color:var(--inkSoft);margin-top:4px}
 .news-meta{display:block;font-size:11px;color:var(--inkFaint);margin-top:3px}
 .news-empty{font-size:12px;color:var(--inkSoft);padding:16px 4px}
@@ -188,6 +193,14 @@ body{padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bot
   /* ポジション新規登録フォーム：固定px幅グリッドのままだと横スクロールが発生するため
      2カラムに畳む（STEP8、STEP1監査で発見）。 */
   .position-add-grid-1,.position-add-grid-2{grid-template-columns:1fr 1fr !important}
+  /* ニュースカード：PC横並び（バッジ列+本文列+サムネ列）のままだと本文が極端に細くなり
+     日本語タイトルが1〜3文字単位で折り返される緊急不具合があったため、スマホでは
+     バッジ行→本文行の縦積みに切り替え、装飾サムネは非表示にする
+     （2026-09-17新規（スマホ表示崩れ緊急修正））。 */
+  .news-item{flex-wrap:wrap}
+  .news-badges{flex:1 1 100%}
+  .news-body{flex:1 1 100%;min-width:0}
+  .news-thumb{display:none}
 }
 @media (max-width:430px){
   .position-add-grid-1,.position-add-grid-2{grid-template-columns:1fr !important}
@@ -1291,16 +1304,25 @@ function NewsList({items,showName,emptyText,priorityOf}){
       // 表示価値がないため一覧UIから削除した（v3 Phase4・設計案48番で追加したもの）。
       // バックエンドの/api/news-feedback/save・ログテーブル自体は変更していない（このUIの
       // 削除に伴い現状呼び出し元は無くなったが、他機能への影響を避けるためサーバー側は無変更）。
+      // 2026-09-17緊急修正（スマホ表示崩れ）：バッジ類（重要／優先度／出典／IR／追加バッジ／
+      // カテゴリ／銘柄コード）を1つのnews-badgesグループへまとめた。従来は.news-item（横一列
+      // flex）の直接の子として並んでいたため、狭い画面幅ではこれらのflex:none要素が横幅の
+      // 大半を消費し、残りのnews-body（タイトル）がごく僅かな幅（実機で数文字ごとに折り返す
+      // レベル）へ押し込まれていた。news-badgesを1つの塊にしてCSS側でflex-basis:100%を
+      // 与えることで、狭い画面ではバッジ行→タイトル行の2行構成へ自動的に切り替わる
+      // （PC幅では見た目に影響しない、下記CSS参照）。
       return <Tag key={i} className={"news-item"+(important?" important":"")} {...linkProps}>
-        {important&&<span className="news-alert-badge">⚠ 重要</span>}
-        {prio<5&&<span className="chip" style={{fontSize:10,marginRight:4}}>{NEWS_PRIORITY_LABELS[prio]}</span>}
-        {showSrcBadge&&<span className="chip" style={{fontSize:9.5,marginRight:4,fontWeight:700,
-          color:srcRank===0?"var(--up)":"var(--inkSoft)",borderColor:srcRank===0?"var(--up)":undefined}}>{srcLabel}</span>}
-        {isIrContent&&<span className="chip" style={{fontSize:9.5,marginRight:4,color:"var(--inkSoft)"}}>IR</span>}
-        {extraBadges.map(b=><span key={b} className="chip" style={{fontSize:9.5,marginRight:4,fontWeight:700,
-          color:"var(--down)",borderColor:"var(--down)"}}>{b}</span>)}
-        <span className="chip" style={{fontSize:9.5,marginRight:4,color:"var(--inkFaint)"}}>{category}</span>
-        {showName&&it.code&&<span className="news-tag">{it.code}</span>}
+        <span className="news-badges">
+          {important&&<span className="news-alert-badge">⚠ 重要</span>}
+          {prio<5&&<span className="chip" style={{fontSize:10,marginRight:4}}>{NEWS_PRIORITY_LABELS[prio]}</span>}
+          {showSrcBadge&&<span className="chip" style={{fontSize:9.5,marginRight:4,fontWeight:700,
+            color:srcRank===0?"var(--up)":"var(--inkSoft)",borderColor:srcRank===0?"var(--up)":undefined}}>{srcLabel}</span>}
+          {isIrContent&&<span className="chip" style={{fontSize:9.5,marginRight:4,color:"var(--inkSoft)"}}>IR</span>}
+          {extraBadges.map(b=><span key={b} className="chip" style={{fontSize:9.5,marginRight:4,fontWeight:700,
+            color:"var(--down)",borderColor:"var(--down)"}}>{b}</span>)}
+          <span className="chip" style={{fontSize:9.5,marginRight:4,color:"var(--inkFaint)"}}>{category}</span>
+          {showName&&it.code&&<span className="news-tag">{it.code}</span>}
+        </span>
         <span className="news-body">
           <span className="news-title" style={important?{color:"var(--accent)",fontWeight:700}:undefined}>{it.title}</span>
           {it.summary&&<span className="news-summary">{it.summary}</span>}
@@ -10543,6 +10565,15 @@ function App(){
   const toggleTheme=()=>setTheme(t=>t==="dark"?"light":"dark");
   // v3-4（UI/UX再設計）：ホーム画面を「監視銘柄」に変更（旧「日次モニター」から）。
   const [tab,setTab]=useState("watch");
+  // 2026-09-17新規（スマホ表示崩れ緊急修正 3.）：第1階層タブバー（.tabs-main）はグループ数が
+  // 増えて画面幅を超えるとoverflow-x:autoで横スクロールする設計（意図通り、CSS変更不要）。
+  // ただしタブ切り替え時に自動でスクロール位置を追従させる仕組みが無く、スクロールした状態で
+  // 別のグループへ切り替えると選択中タブが画面外に隠れたままになり得た。切り替えるたびに
+  // 選択中タブ（.tab.on）を可視領域へ自動スクロールする。
+  useEffect(()=>{
+    const active=document.querySelector(".tabs-main .tab.on");
+    if(active)active.scrollIntoView({inline:"nearest",block:"nearest"});
+  },[tab]);
   const [newsSubTab,setNewsSubTab]=useState("summary"); // 9-1章：ニュースタブのサブ切り替え
   const NEWS_PAGE_SIZE=15; // 「もっと見る」：初期表示件数・1クリックあたりの追加表示件数
   const [newsShowCount,setNewsShowCount]=useState(NEWS_PAGE_SIZE); // サブタブごとにリセットする表示件数
@@ -11042,7 +11073,11 @@ function App(){
   // （追加・変更・削除）を検出してNeonへ書き込む。localStorage（s.watchlist）はUI表示用の
   // キャッシュとして引き続き使うが、正データはNeon。
   const syncWatchlistToNeon=(prevList,nextList,market)=>{
-    if(!s.watchlistMigrated)return; // watchlistの一括移行が済むまでは個別同期もしない（移行前にNeonへ半端な状態を書き込まないため）
+    // 2026-09-17緊急修正：watchlistMigratedフラグ（端末localStorage内、一度も「移行」ボタンを
+    // 押していない端末ではfalseのまま）への依存を撤廃した。監視銘柄はNeon Postgresが常に
+    // 正データという既存方針のため、追加・削除は端末を問わず常にサーバーへ同期する
+    // （上の起動時取得と対になる修正、どちらか一方だけ直すと「読めるが書けない／書けるが
+    // 読めない」の非対称なバグが残るため両方直す）。
     const prevByCode=new Map(prevList.map(w=>[w.code,w]));
     const nextByCode=new Map(nextList.map(w=>[w.code,w]));
     nextList.forEach(w=>{
@@ -11520,6 +11555,7 @@ function App(){
     breakoutAlerts.forEach(item=>{
       if(s.watchTargets.includes(item.code))return;
       setS(p=>p.watchTargets.includes(item.code)?p:{...p,watchTargets:[...p.watchTargets,item.code]});
+      persistWatchTarget(item.code,true);
       notifyDesktop(`▲ ${item.name} ${item.code}：出来高ブレイクアウト→監視銘柄に追加`,
         `直近3か月高値${item.highLookback.toLocaleString()}を出来高${item.volRatio.toFixed(1)}倍で上抜け`);
     });
@@ -11642,14 +11678,28 @@ function App(){
     setTab("earnings");
   };
 
+  // 2026-09-17新規（スマホ「監視銘柄」タブ3件表示バグの緊急修正）：watchTargets（このON/OFF
+  // 状態）はこれまでブラウザlocalStorageのみで管理され端末ごとに独立していたため、PC/iPhoneで
+  // 表示件数が食い違っていた。ユーザー方針「監視銘柄は共有」に合わせ、DB側（watchlistの
+  // is_watch_targetカラム、SHARED scope）へも永続化する（失敗しても画面操作は継続、fire-and-forget）。
+  const persistWatchTarget=(code,value,market)=>{
+    fetch("/api/watchlist/watch-target",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({code,market:market||"JP",value})}).catch(()=>{});
+  };
+
   // 2026-08-21 ユーザー要望：登録銘柄テーブルの「監視銘柄」ボタン。「監視銘柄」タブでまとめて
   // 確認する対象銘柄を上限なく手動選択する（旧「本日優先」＝5分おき自動スキャン機能はここで撤去）。
   const toggleWatchTarget=(code)=>{
+    const adding=!s.watchTargets.includes(code);
     setS(p=>p.watchTargets.includes(code)
       ?{...p,watchTargets:p.watchTargets.filter(c=>c!==code)}
       :{...p,watchTargets:[...p.watchTargets,code]});
+    persistWatchTarget(code,adding);
   };
-  const removeWatchTarget=(code)=>setS(p=>({...p,watchTargets:p.watchTargets.filter(c=>c!==code)}));
+  const removeWatchTarget=(code)=>{
+    setS(p=>({...p,watchTargets:p.watchTargets.filter(c=>c!==code)}));
+    persistWatchTarget(code,false);
+  };
 
   // v3-9（監視銘柄自動登録エンジン）：🐒 MOMENTUM DAY。既存の「リアルタイムデータを反映」ボタンと
   // 同じ考え方で、ユーザーが明示的にクリックしたときだけサーバー側で東証全体スキャン（Stage1→
@@ -11675,6 +11725,7 @@ function App(){
             const registeredCodes=(d.registered||[]).map(x=>x.code);
             setS(p=>({...p,watchlist:jd.items,
               watchTargets:[...new Set([...p.watchTargets,...registeredCodes])]}));
+            registeredCodes.forEach(c=>persistWatchTarget(c,true));
           }
         }
       }
@@ -11701,6 +11752,7 @@ function App(){
             const registeredCodes=(d.registered||[]).map(x=>x.code);
             setS(p=>({...p,watchlist:jd.items,
               watchTargets:[...new Set([...p.watchTargets,...registeredCodes])]}));
+            registeredCodes.forEach(c=>persistWatchTarget(c,true));
           }
         }
       }
@@ -11727,6 +11779,7 @@ function App(){
             const registeredCodes=(d.registered||[]).map(x=>x.code);
             setS(p=>({...p,watchlist:jd.items,
               watchTargets:[...new Set([...p.watchTargets,...registeredCodes])]}));
+            registeredCodes.forEach(c=>persistWatchTarget(c,true));
           }
         }
       }
@@ -11752,6 +11805,7 @@ function App(){
             const registeredCodes=(d.registered||[]).map(x=>x.code);
             setS(p=>({...p,watchlist:jd.items,
               watchTargets:[...new Set([...p.watchTargets,...registeredCodes])]}));
+            registeredCodes.forEach(c=>persistWatchTarget(c,true));
           }
         }
       }
@@ -11778,6 +11832,7 @@ function App(){
             const registeredCodes=(d.registered||[]).map(x=>x.code);
             setS(p=>({...p,watchlist:jd.items,
               watchTargets:[...new Set([...p.watchTargets,...registeredCodes])]}));
+            registeredCodes.forEach(c=>persistWatchTarget(c,true));
           }
         }
       }
@@ -11805,6 +11860,7 @@ function App(){
             const registeredCodes=(d.registered||[]).map(x=>x.code);
             setS(p=>({...p,watchlist:jd.items,
               watchTargets:[...new Set([...p.watchTargets,...registeredCodes])]}));
+            registeredCodes.forEach(c=>persistWatchTarget(c,true));
           }
         }
       }
@@ -11832,6 +11888,7 @@ function App(){
             const registeredCodes=(d.registered||[]).map(x=>x.code);
             setS(p=>({...p,watchlist:jd.items,
               watchTargets:[...new Set([...p.watchTargets,...registeredCodes])]}));
+            registeredCodes.forEach(c=>persistWatchTarget(c,true));
           }
         }
       }
@@ -12039,19 +12096,43 @@ function App(){
     setMigratingWatchlist(false);
   };
 
-  // 移行済みなら起動時にNeonのwatchlistを取得して上書きする（他端末・ChatGPT Import等での
-  // 変更を反映するため）。取得失敗時は今のローカル状態のまま（既存の journal/rules と同じ方針）。
+  // 2026-09-17緊急修正：起動時に必ずNeonのwatchlistを取得して上書きする（他端末・
+  // ChatGPT Import等での変更を反映するため）。従来はs.investmentLogMigrated&&
+  // s.watchlistMigrated（いずれも端末localStorage内のフラグ）がtrueの場合だけ取得していた
+  // ため、「移行」ボタンを一度も押していない端末（例：普段PCだけで操作しiPhoneでは初回の
+  // 数銘柄しか登録していなかった端末）は永久にサーバー取得が走らず、その端末の古いローカル
+  // watchlist（実例：3銘柄のみ）を表示し続けていた——監視銘柄は「ポジションだけ非共有、
+  // それ以外は共有」の既存方針のはずが、端末単位のlocalStorageが実質のSSoTになっていた
+  // バグ。サーバー側watchlist（Neon Postgres、全端末共有）を常に正として取得するよう
+  // 移行フラグへの依存を撤廃した。取得失敗時（オフライン等）は今のローカル状態のまま
+  // （既存の journal/rules と同じ安全側フォールバック方針を維持）。
   useEffect(()=>{
-    if(!s.investmentLogMigrated||!s.watchlistMigrated)return;
     (async()=>{
       try{
         const [jr,ur]=await Promise.all([fetch("/api/watchlist?market=JP"),fetch("/api/watchlist?market=US")]);
-        if(jr.ok){const jd=await jr.json();if(Array.isArray(jd.items))setS(p=>({...p,watchlist:jd.items}));}
+        if(jr.ok){
+          const jd=await jr.json();
+          if(Array.isArray(jd.items)){
+            // 2026-09-17新規：「監視銘柄」タブのON/OFF状態（watchTargets）もwatchlist本体と
+            // 同じis_watch_target列でサーバー側に永続化されたため、ここでもサーバー値を正として
+            // 反映する。ただし、この列は今回新設したばかりでサーバー側はまだ空（false）のため、
+            // 単純にサーバー値で上書きすると、今まで端末localStorageだけに積み上がっていた
+            // PC側の選択（例：56銘柄）が初回アクセス時に消えてしまう（既存PC機能を壊さない、
+            // の要件に反する）。そこで「サーバー値∪この端末のローカル値」の和集合を採用し、
+            // ローカルにしか無かったコードはこの場でサーバーへも書き戻す（一度書き戻せば
+            // 以後はどの端末でもサーバー値だけで揃うようになる、一回限りの自然な収束）。
+            const serverWatchTargets=jd.items.filter(w=>w.isWatchTarget).map(w=>w.code);
+            const localOnly=sRef.current.watchTargets.filter(c=>!serverWatchTargets.includes(c));
+            const merged=[...new Set([...serverWatchTargets,...localOnly])];
+            setS(p=>({...p,watchlist:jd.items,watchTargets:merged}));
+            localOnly.forEach(c=>persistWatchTarget(c,true));
+          }
+        }
         if(ur.ok){const ud=await ur.json();if(Array.isArray(ud.items))setS(p=>({...p,watchlistUS:ud.items}));}
       }catch(e){}
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[s.investmentLogMigrated,s.watchlistMigrated]);
+  },[]);
 
   const saveJournalEntry=()=>{
     if(!journalDraft)return;

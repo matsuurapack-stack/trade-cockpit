@@ -24705,6 +24705,17 @@ class Handler(SimpleHTTPRequestHandler):
             body = self._read_json_body()
             investment_db.delete_watchlist_item(DATABASE_URL, self.current_user, body.get("code"), body.get("market"))
             self._send_json({"ok": True})
+        elif self.path == "/api/watchlist/watch-target":
+            # 2026-09-17新規（スマホ「監視銘柄」タブ3件表示バグの緊急修正）：従来
+            # ブラウザlocalStorageのみで管理していた「監視銘柄」タブのON/OFF状態
+            # （旧s.watchTargets）をDB側（SHARED scope）へ永続化し、PC/iPhone/他端末で
+            # 同一集合になるようにする。body: {"code":str,"market":str,"value":bool}
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            ok = investment_db.set_watch_target(
+                DATABASE_URL, self.current_user, body.get("code"), body.get("market"), body.get("value"))
+            self._send_json({"ok": ok})
         elif self.path == "/api/market-events/import":
             # v3-9続き（PHASE 3 EVENT/EARNINGS INTELLIGENCE）：ChatGPTで画像→JSON化したイベント
             # 一覧を貼り付けてimportする。body: {"events": [{event_date,title,...}, ...]}。
