@@ -4980,7 +4980,7 @@ function YaamanThemePanel({nextDayThemes,todayThemes,watchlistAll,onAddToWatchli
   </div>;
 }
 
-function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan,newsCatalysts,entryScanning,entryResult,onEntryScan,thesisStats,todayTheses,yaamanNextDayThemes,yaamanTodayThemes,onAddToWatchlist,eventRiskGuard,appVersionInfo,watchTargetsDiag,lastFastQuoteStats}){
+function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,onOpenAnalysis,earningsTargets,onToggleEarnings,onRemove,onOpenChart,metrics,watchlistAll,breakoutLevels,activeRules,analysisData,marketRiskLabel,momentumScanning,momentumResult,onMomentumScan,breakScanning,breakResult,onBreakScan,rsScanning,rsScanResult,onRsScan,sectorLeaderScanning,sectorLeaderResult,onSectorLeaderScan,pullbackScanning,pullbackResult,onPullbackScan,reversalScanning,reversalResult,onReversalScan,volumeScanning,volumeResult,onVolumeScan,newsCatalysts,entryScanning,entryResult,onEntryScan,thesisStats,todayTheses,yaamanNextDayThemes,yaamanTodayThemes,onAddToWatchlist,eventRiskGuard,appVersionInfo,watchTargetsDiag,lastFastQuoteStats,onRemoveOrphanedWatchTargets}){
   const [expandedScoreCode,setExpandedScoreCode]=useState(null); // スコア内訳の折りたたみ展開（指示書21番）
   const [entryDebugOpen,setEntryDebugOpen]=useState(false); // TOP5表示ロジック修正指示・指示書7番：開発用デバッグ表示（既定は折りたたみ）
 
@@ -5335,9 +5335,24 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
             <div>push結果：試行{watchTargetsDiag.pushAttempted}件中 成功{watchTargetsDiag.pushSucceeded}件・失敗{watchTargetsDiag.pushFailedCount}件</div>
             <div>push後の再取得でのサーバー件数: {watchTargetsDiag.serverCountAfterPush??"（取得失敗）"}
               {watchTargetsDiag.serverCountAfterPush===watchTargetsDiag.mergedCount?" ✅ 一致":" ⚠ merge後の件数と不一致"}</div>
-            {watchTargetsDiag.pushFailedCount>0 && <div style={{color:"var(--down)"}}>
-              失敗例（先頭5件）：{watchTargetsDiag.pushFailedSample.map(f=>`${f.code}(status=${f.status}${f.serverOk===false?",serverOk=false":""}${f.error?","+f.error:""})`).join("・")}
-            </div>}
+            {watchTargetsDiag.pushFailedCount>0 && (()=>{
+              const notInMaster=watchTargetsDiag.pushFailedSample.filter(f=>f.classification==="A_not_in_jp_master");
+              const inMasterButFailed=watchTargetsDiag.pushFailedSample.filter(f=>f.classification==="B_in_master_but_failed");
+              return <div style={{color:"var(--down)"}}>
+                {notInMaster.length>0 && <div style={{marginTop:2}}>
+                  A: JP監視銘柄マスターに存在しない（{notInMaster.length}件、旧localStorage残骸の可能性）：
+                  <span className="mono">{notInMaster.map(f=>f.code).join("・")}</span>
+                  <button className="iconbtn" style={{marginLeft:6}}
+                    onClick={()=>{if(confirm(`${notInMaster.length}件をローカルの監視対象から削除します（監視銘柄マスター自体からは削除しません）。よろしいですか？`))onRemoveOrphanedWatchTargets?.(notInMaster.map(f=>f.code));}}>
+                    このローカル残骸を削除
+                  </button>
+                </div>}
+                {inMasterButFailed.length>0 && <div style={{marginTop:2}}>
+                  B: マスターには存在するがpush失敗（{inMasterButFailed.length}件、要調査）：
+                  <span className="mono">{inMasterButFailed.map(f=>`${f.code}(${f.masterName||"?"},status=${f.status})`).join("・")}</span>
+                </div>}
+              </div>;
+            })()}
           </>}
         </>}
       </div>
@@ -11879,6 +11894,14 @@ function App(){
     setS(p=>({...p,watchTargets:p.watchTargets.filter(c=>c!==code)}));
     persistWatchTarget(code,false);
   };
+  // 2026-09-18新規（差分10件の分類調査）：push失敗のうちwatchlistマスターに存在しない
+  // （classification==="A_not_in_jp_master"）コードは、監視銘柄マスターから削除済み／
+  // 過去の古いlocalStorage残骸の可能性が高い。分類結果を確認したユーザーが能動的に
+  // クリックしたときだけローカルから一括削除する（自動削除はしない）。
+  const removeOrphanedWatchTargets=(codes)=>{
+    setS(p=>({...p,watchTargets:p.watchTargets.filter(c=>!codes.includes(c))}));
+    codes.forEach(c=>persistWatchTarget(c,false));
+  };
 
   // v3-9（監視銘柄自動登録エンジン）：🐒 MOMENTUM DAY。既存の「リアルタイムデータを反映」ボタンと
   // 同じ考え方で、ユーザーが明示的にクリックしたときだけサーバー側で東証全体スキャン（Stage1→
@@ -12337,6 +12360,18 @@ function App(){
               const pushResults=await Promise.all(localOnly.map(c=>persistWatchTarget(c,true)));
               const pushSucceeded=pushResults.filter(r=>r.ok&&r.serverOk!==false).length;
               const pushFailed=pushResults.filter(r=>!(r.ok&&r.serverOk!==false));
+              // 2026-09-18追記（差分10件の分類調査）：失敗したcodeがこの時点のwatchlist
+              // マスター（jd.items、直前に取得済みのJP一覧。新規APIコールは増やさない）に
+              // 実在するかをこの場で突き合わせる。無ければ「A: masterに存在しない
+              // （旧localStorage残骸の可能性）」、あれば「B: masterにはあるがpush失敗
+              // （market不一致等、コード側の要調査）」に分類する。
+              const jpMasterByCode=new Map(jd.items.map(w=>[w.code,w]));
+              const pushFailedClassified=pushFailed.map(r=>{
+                const inMaster=jpMasterByCode.get(r.code);
+                return {code:r.code,status:r.status,serverOk:r.serverOk,error:r.error,
+                  classification:inMaster?"B_in_master_but_failed":"A_not_in_jp_master",
+                  masterName:inMaster?.name||null};
+              });
               let serverCountAfterPush=null;
               try{
                 const rr=await fetch("/api/watchlist?market=JP");
@@ -12358,8 +12393,7 @@ function App(){
                 pushAttempted:localOnly.length,
                 pushSucceeded,
                 pushFailedCount:pushFailed.length,
-                // 失敗内容を大量に画面へ出さない（診断に必要な先頭5件のみ）。
-                pushFailedSample:pushFailed.slice(0,5).map(r=>({code:r.code,status:r.status,serverOk:r.serverOk,error:r.error})),
+                pushFailedSample:pushFailedClassified,  // 全件表示（10件程度なら画面を圧迫しない）
                 serverCountAfterPush,
               }));
             }
@@ -12738,6 +12772,7 @@ function App(){
         onRemove={removeWatchTarget} metrics={s.metrics} watchlistAll={watchlistAll} breakoutLevels={s.breakoutLevels}
         analysisData={s.analysisData} marketRiskLabel={s.marketRisk?.marketRiskLabel} eventRiskGuard={eventRiskGuard}
         appVersionInfo={appVersionInfo} watchTargetsDiag={watchTargetsDiag} lastFastQuoteStats={lastFastQuoteStats}
+        onRemoveOrphanedWatchTargets={removeOrphanedWatchTargets}
         activeRules={s.myRules.filter(r=>r.active).map(r=>r.text)}
         onOpenChart={w=>setChartModal({symbol:w.tvSymbol,name:w.name,code:w.code,market:w.market})}
         momentumScanning={momentumScanning} momentumResult={momentumResult} onMomentumScan={runMomentumScan}
