@@ -631,6 +631,51 @@ ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS priority TEXT;
 -- ニュース・イベント・分析などは共有」に合わせ、このON/OFF状態もwatchlist本体と同じSHARED
 -- scopeのDB列として永続化し、PC/iPhone/他端末で同一集合になるようにする。
 ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS is_watch_target BOOLEAN NOT NULL DEFAULT false;
+
+-- 2026-09-24新規（Smart Import 入力原本の永続化）：Smart Importに貼り付けた元データ（自然文・JSON）
+-- を「解析結果（EVENT等の各行）」とは別に、Import単位で1行だけ保存する。従来は解析結果の1行
+-- （carrier行）が原文を抱えていたため、その行を消すと再解析できなくなっていた。source_hash
+-- （入力全文のSHA-256）でユーザー内の重複保存を防ぐ（UNIQUE(user_id, source_hash)）。
+-- 解析結果側（market_events等）は raw_payload.source_hash / source_id で原本を参照するだけ。
+CREATE TABLE IF NOT EXISTS smart_import_sources (
+    id               SERIAL PRIMARY KEY,
+    user_id          TEXT NOT NULL,
+    source_hash      TEXT NOT NULL,
+    input_type       TEXT NOT NULL,            -- TEXT | JSON
+    original_text    TEXT NOT NULL,            -- 貼り付けられた全文（切り詰めなし）
+    original_payload JSONB,                    -- JSONとして解釈できた場合のパース結果
+    wrapper_context  JSONB,
+    source_type      TEXT,
+    import_count     INTEGER NOT NULL DEFAULT 1,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, source_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_smart_import_sources_user ON smart_import_sources(user_id, created_at DESC);
+
+-- 2026-09-24追記：原本の利用状況管理。PREVIEW＝分類プレビューのみ（解析結果へ未使用）、
+-- CONFIRMED＝smart_import_confirm()が保存を完了し解析結果へ使われた。同一本文の再Importでも
+-- CONFIRMEDを戻さない。PREVIEWのまま一定期間経過した原本を将来cleanupできるよう(status,created_at)
+-- にindexを持つ（自動削除は未実装）。
+ALTER TABLE smart_import_sources ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'PREVIEW';
+ALTER TABLE smart_import_sources ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_smart_import_sources_status ON smart_import_sources(status, created_at);
+
+-- 2026-09-24新規：ユーザーが明示的に削除したEVENTのtombstone。再解析（原本からの再導出）が
+-- 意図的に削除されたイベントを再作成しないための記録。ユーザー操作による削除経路
+-- （/api/market-events/delete）だけが作成し、内部delete・E2E・再構築では作らない。
+-- market_eventsはSHARED scopeでUNIQUE(event_date,title)のため、同じキーで一意にする。
+CREATE TABLE IF NOT EXISTS smart_import_event_tombstones (
+    id           SERIAL PRIMARY KEY,
+    event_date   DATE NOT NULL,
+    title        TEXT NOT NULL,
+    source_hash  TEXT,
+    source_id    INTEGER,
+    deleted_by   TEXT,
+    reason       TEXT,
+    deleted_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (event_date, title)
+);
 """
 
 # 2026-09-09新規（ルール学習システム）：投資判断ログ系の他テーブルより後に作成する必要は
@@ -9696,6 +9741,12 @@ def _normalize_market_event(ev):
         legacy_time = ev.get("time_jst") or ev.get("event_time_jst")
         if legacy_time:
             ev["event_time"] = legacy_time
+    # STEP11新規（振り返り：Smart Importイベント連携、2026-09-23）：セクター影響/銘柄感応度
+    # （watch/watch_targets、例：PCEならUS10Y・USDJPY・NASDAQ・SOX等）を、既存の
+    # affected_markets列（分析コンテキストが既に参照する想定の列）へ受け渡す。イベントの
+    # 有無だけで自動的に弱気にする判定ロジックはここでは一切作らない（値を保存するのみ）。
+    if not ev.get("affected_markets") and (ev.get("watch") or ev.get("watch_targets")):
+        ev["affected_markets"] = ev.get("watch") or ev.get("watch_targets")
 
     # X Intelligence Phase3（2026-09-15新規）：X由来イベント（_detect_events_from_social_text/
     # _normalize_image_economic_eventsが生成するraw_payload={"source_handle":...,
@@ -9927,6 +9978,17 @@ def import_market_events(database_url, user_id, events):
                 # 全て失敗してしまう＝この対策が無いと確認できた実際の落とし穴）。
                 with conn.transaction():
                     is_insert = _upsert_market_event_conn(conn, user_id, norm)
+                    # 明示的なimport（Smart Import確定・手動登録）は「このイベントを残したい」という
+                    # ユーザー意思のため、過去の削除tombstoneを解除する。再解析はtombstone済みの
+                    # イベントをそもそもここへ渡さない（server.py _reanalyze_core）。
+                    if is_insert is not None:
+                        try:
+                            with conn.transaction():
+                                conn.execute("DELETE FROM smart_import_event_tombstones "
+                                             "WHERE event_date = %s AND title = %s",
+                                             [norm.get("event_date"), norm.get("title")])
+                        except Exception:
+                            pass  # tombstone表が未作成の環境でもimport自体は成功させる
             except Exception as e:
                 errors += 1
                 if len(error_details) < _DETAIL_LIMIT:
@@ -10008,15 +10070,55 @@ def list_market_events(database_url, user_id, from_date=None, to_date=None, limi
             return [_row_to_json(r) for r in cur.fetchall()]
 
 
-def delete_market_event(database_url, user_id, event_id):
+def delete_market_event(database_url, user_id, event_id, user_initiated=False, reason=None):
+    """market_eventsの1行を削除する。user_initiated=True（ユーザー操作の明示削除、HTTP
+    /api/market-events/deleteのみ）の場合に限り、Smart Import再解析が同じイベントを再作成しない
+    ためのtombstone（smart_import_event_tombstones）を残す。既定のFalse（内部delete・E2E・再構築
+    等）ではtombstoneを作らないため、再解析で復元できる。"""
     # Phase MU-S1：market_eventsはSHARED化済み。
+    caller = user_id
     user_id = _SHARED_SCOPE
     pool = _get_pool(database_url)
     if pool is None:
         return
     with pool.connection() as conn:
+        if user_initiated:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT event_date, title, raw_payload FROM market_events "
+                            "WHERE user_id = %s AND id = %s", [user_id, event_id])
+                row = cur.fetchone()
+            if row:
+                payload = row.get("raw_payload") if isinstance(row.get("raw_payload"), dict) else {}
+                conn.execute(
+                    "INSERT INTO smart_import_event_tombstones (event_date, title, source_hash, source_id, "
+                    "deleted_by, reason) VALUES (%s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (event_date, title) DO UPDATE SET deleted_at = now(), "
+                    "source_hash = EXCLUDED.source_hash, source_id = EXCLUDED.source_id, "
+                    "deleted_by = EXCLUDED.deleted_by, reason = EXCLUDED.reason",
+                    [row["event_date"], row["title"], payload.get("source_hash"), payload.get("source_id"),
+                     caller, reason])
         conn.execute("DELETE FROM market_events WHERE user_id = %s AND id = %s", [user_id, event_id])
         conn.commit()
+
+
+def list_event_tombstones(database_url, start_date=None, end_date=None):
+    """ユーザーが明示削除したEVENTのtombstone一覧（event_date範囲は両端含む）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = [], []
+    if start_date:
+        where.append("event_date >= %s")
+        params.append(start_date)
+    if end_date:
+        where.append("event_date <= %s")
+        params.append(end_date)
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SELECT * FROM smart_import_event_tombstones {clause} ORDER BY event_date", params)
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
 
 
 # v3-9続き（2026-09-05・PHASE 4 NEWS/CATALYST INTELLIGENCE）：news_catalysts。market_eventsと
@@ -10516,6 +10618,96 @@ def add_position_exit(database_url, user_id, code, market, exit_price, shares):
     trade_json = _row_to_json(trade)
     trade_json.pop("user_id", None)
     return {"trade": trade_json, "remainingShares": 0 if closed else new_remaining, "closed": closed}
+
+
+# ---- Smart Import 入力原本（2026-09-24新規） ----
+def save_smart_import_source(database_url, user_id, source_hash, input_type, original_text,
+                              original_payload=None, wrapper_context=None, source_type=None):
+    """Smart Importの入力原本を保存する（UNIQUE(user_id, source_hash)でUPSERT）。同じ本文の再Import
+    は行を増やさず、import_countとupdated_atだけ更新する。既存行がoriginal_payload/
+    wrapper_context/source_typeを持たない場合のみ補完する（既にある値は上書きしない）。
+    戻り値：source id。DB未設定・失敗時はNone（呼び出し側は例外を握りつぶして続行できる）。"""
+    pool = _get_pool(database_url)
+    if pool is None or not source_hash or original_text is None:
+        return None
+    payload_json = json.dumps(original_payload, ensure_ascii=False) if original_payload is not None else None
+    wrapper_json = json.dumps(wrapper_context, ensure_ascii=False) if wrapper_context else None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "INSERT INTO smart_import_sources (user_id, source_hash, input_type, original_text, "
+                "original_payload, wrapper_context, source_type) "
+                "VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s) "
+                "ON CONFLICT (user_id, source_hash) DO UPDATE SET "
+                "import_count = smart_import_sources.import_count + 1, updated_at = now(), "
+                "original_payload = COALESCE(smart_import_sources.original_payload, EXCLUDED.original_payload), "
+                "wrapper_context = COALESCE(smart_import_sources.wrapper_context, EXCLUDED.wrapper_context), "
+                "source_type = COALESCE(smart_import_sources.source_type, EXCLUDED.source_type) "
+                "RETURNING id",
+                [user_id, source_hash, input_type, original_text, payload_json, wrapper_json, source_type])
+            row = cur.fetchone()
+        conn.commit()
+    return row["id"] if row else None
+
+
+def get_smart_import_source(database_url, user_id, source_hash):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM smart_import_sources WHERE user_id = %s AND source_hash = %s",
+                        [user_id, source_hash])
+            row = cur.fetchone()
+    return _row_to_json(row) if row else None
+
+
+def mark_smart_import_sources_confirmed(database_url, user_id, source_hashes):
+    """smart_import_confirm()が保存を完了した原本をCONFIRMEDにする（confirmed_atは最初の1回のみ）。
+    CONFIRMED済みへ再度呼んでも状態は変わらない。戻り値：更新行数。"""
+    pool = _get_pool(database_url)
+    hashes = [h for h in (source_hashes or []) if h]
+    if pool is None or not hashes:
+        return 0
+    with pool.connection() as conn:
+        cur = conn.execute(
+            "UPDATE smart_import_sources SET status = 'CONFIRMED', confirmed_at = COALESCE(confirmed_at, now()), "
+            "updated_at = now() WHERE user_id = %s AND source_hash = ANY(%s) AND status <> 'CONFIRMED'",
+            [user_id, hashes])
+        conn.commit()
+        return cur.rowcount
+
+
+def list_unconfirmed_smart_import_sources(database_url, older_than_days=30, user_id=None, limit=1000):
+    """PREVIEWのまま一定日数を超えた原本（将来のcleanup候補）を返す。参照のみで削除はしない
+    （自動削除は未実装）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where = "status = 'PREVIEW' AND created_at < now() - make_interval(days => %s)"
+    params = [int(older_than_days)]
+    if user_id:
+        where += " AND user_id = %s"
+        params.append(user_id)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SELECT id, user_id, source_hash, input_type, status, created_at, import_count "
+                        f"FROM smart_import_sources WHERE {where} ORDER BY created_at LIMIT %s", params + [limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
+
+
+def list_smart_import_sources(database_url, user_id=None, limit=1000):
+    """user_idを指定するとそのユーザーの原本のみ、None指定なら全ユーザー分（再解析backfill用）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = ("WHERE user_id = %s", [user_id]) if user_id else ("", [])
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SELECT * FROM smart_import_sources {where} ORDER BY id LIMIT %s", params + [limit])
+            rows = cur.fetchall()
+    return [_row_to_json(r) for r in rows]
 
 
 def list_trade_history(database_url, user_id, limit=200):

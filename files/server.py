@@ -7,6 +7,8 @@
 """
 import io
 import os
+import hashlib
+import collections
 import re
 import difflib
 import json
@@ -21972,7 +21974,7 @@ def _classify_market_narrative(raw_text):
             "raw_text": text[:800], "draft": {"summary": text, "market_regime": market_regime}}
 
 
-def classify_content(raw_text, database_url=None, user_id=None):
+def _classify_content_impl(raw_text, database_url=None, user_id=None):
     """SmartImportEngineの入口（指示書4番の全STEP）。1回の貼り付けに複数種類の情報が
     あっても対応し、1入力＝1レコードに固定しない（指示書5番）。database_url/user_idは
     Phase SI-C（WATCHLIST_UPDATE/POSITION_UPDATE）の銘柄コード解決に使う（省略時は
@@ -21987,25 +21989,71 @@ def classify_content(raw_text, database_url=None, user_id=None):
     parsed = _extract_json_candidates(raw_text)
     if parsed is not None:
         items = parsed if isinstance(parsed, list) else [parsed]
+        # 再解析用（2026-09-24新規）：wrapperから展開した場合の展開前の元要素・wrapper文脈。
+        # 保存用original_payloadと表示用raw_text（プレビュー）を分離する。
+        originals, wrapper_context = None, None
         # {"catalysts":[...]}/{"events":[...]}/{"expert_views":[...]}等の既存ラッパー形式も吸収する
         if len(items) == 1 and isinstance(items[0], dict):
             wrapper = items[0]
-            for key in ("catalysts", "events", "market_events", "expert_views", "views"):
-                if isinstance(wrapper.get(key), list) and wrapper[key]:
-                    items = wrapper[key]
-                    break
+            # STEP1/2新規（2026-09-23、Smart Import→イベント連携）：
+            # {"type":"market_event_calendar","key_events":[...],"earnings_watch":[...]}形式。
+            # key_events[]・earnings_watch[]を、既存EVENT正規化パイプラインへそのまま渡せる
+            # 個別event型dictへ展開する（wrapper自体を1件の参考資料として保存するだけで終わらせず、
+            # 件数分のイベントレコードを生成する）。既存のcatalysts/events/...ラッパー展開ループ
+            # （下のelse節、1キーだけ選んでbreakする設計）では、key_events＋earnings_watchを
+            # 同時に持つ形に対応できないため専用に扱う。
+            key_events = wrapper.get("key_events")
+            earnings_watch = wrapper.get("earnings_watch")
+            if wrapper.get("type") == "market_event_calendar" \
+                    or isinstance(key_events, list) or isinstance(earnings_watch, list):
+                items = []
+                originals = []
+                for ev in (key_events or []):
+                    if isinstance(ev, dict):
+                        items.append({**ev, "type": "event", "event": ev.get("event") or ev.get("title")})
+                        originals.append(ev)
+                for ev in (earnings_watch or []):
+                    if not isinstance(ev, dict):
+                        continue
+                    originals.append(ev)
+                    title = ev.get("title") or ev.get("event") or ev.get("company") or ev.get("name")
+                    # STEP12：決算はevent_type=EARNINGSを明示する（タイトルのキーワード一致に
+                    # 頼らない——「◯◯、通期業績予想を上方修正」のようにevent_type推定の語彙
+                    # （決算というキーワード自体が無い）が効かない場合があるため）。
+                    normalized_ev = {**ev, "type": "event", "event": title, "event_type": "EARNINGS"}
+                    code = ev.get("code") or ev.get("stock_code") or ev.get("ticker")
+                    if code:
+                        normalized_ev["affected_stocks"] = [code]
+                    items.append(normalized_ev)
+                wrapper_context = {k: v for k, v in wrapper.items() if not isinstance(v, list)}
+                wrapper_context["_expanded_from"] = [k for k in ("key_events", "earnings_watch")
+                                                       if isinstance(wrapper.get(k), list)]
             else:
-                # STEP7新規（2026-09-17）：{"stocks":[...]}形式のWATCH_STOCK候補配列を展開する。
-                # ただしtype=="watchlist_master_update"は既存スキーマ内で"stocks"を別の内部
-                # フィールド（1件の中の銘柄配列）として使っているため、wrapper自体にtypeが
-                # 明示されている場合は展開しない（既存カテゴリとの衝突防止）。
-                if not wrapper.get("type") and isinstance(wrapper.get("stocks"), list) and wrapper["stocks"]:
-                    items = wrapper["stocks"]
+                for key in ("catalysts", "events", "market_events", "expert_views", "views"):
+                    if isinstance(wrapper.get(key), list) and wrapper[key]:
+                        items = wrapper[key]
+                        wrapper_context = {k: v for k, v in wrapper.items() if not isinstance(v, list)}
+                        wrapper_context["_expanded_from"] = [key]
+                        break
+                else:
+                    # STEP7新規（2026-09-17）：{"stocks":[...]}形式のWATCH_STOCK候補配列を展開する。
+                    # ただしtype=="watchlist_master_update"は既存スキーマ内で"stocks"を別の内部
+                    # フィールド（1件の中の銘柄配列）として使っているため、wrapper自体にtypeが
+                    # 明示されている場合は展開しない（既存カテゴリとの衝突防止）。
+                    if not wrapper.get("type") and isinstance(wrapper.get("stocks"), list) and wrapper["stocks"]:
+                        items = wrapper["stocks"]
         candidates = []
-        for item in items:
+        for idx, item in enumerate(items):
             category, confidence, draft = _classify_json_item(item)
-            candidates.append({"category": category, "confidence": confidence, "source_kind": "json",
-                                "raw_text": json.dumps(item, ensure_ascii=False)[:500], "draft": draft})
+            # raw_textは表示用プレビュー（500文字で短縮、UI確認用）。完全な元データは
+            # original_payload（展開前の元要素、無ければitem）として別に保持する——「保存」と
+            # 「表示用truncate」を分離し、将来の再解析・backfillに備える。
+            cand = {"category": category, "confidence": confidence, "source_kind": "json",
+                    "raw_text": json.dumps(item, ensure_ascii=False)[:500], "draft": draft,
+                    "original_payload": originals[idx] if originals and idx < len(originals) else item}
+            if wrapper_context:
+                cand["wrapper_context"] = wrapper_context
+            candidates.append(cand)
         if candidates:
             return candidates
     # JSONとして解釈できない、または要素0件→自然文解析（指示書3・30番：エラーにしない）
@@ -22034,6 +22082,284 @@ def classify_content(raw_text, database_url=None, user_id=None):
         candidates.append({"category": "UNKNOWN", "confidence": "LOW", "source_kind": "natural_text",
                             "raw_text": raw_text[:500], "draft": {}})
     return candidates
+
+
+# Smart Import 入力原本の永続化（2026-09-24）。原本（自然文・JSON）は解析結果（EVENT等）とは別に
+# smart_import_sourcesへImport単位で1行保存し、解析結果側はsource_hash/source_idで参照するだけにする
+# （解析結果の特定行が原文を抱える構造を廃止）。以下のメモリキャッシュは「DB保存が一時的に
+# 失敗した場合の退避」専用で、cache missが原本消失に直結しないようDB保存を主とする。
+_SMART_IMPORT_TEXT_CACHE = collections.OrderedDict()
+_SMART_IMPORT_TEXT_CACHE_LOCK = threading.Lock()
+_SMART_IMPORT_TEXT_CACHE_MAX = 32
+_SMART_IMPORT_TEXT_CACHE_TTL_SEC = 6 * 3600
+
+
+def _compute_source_hash(text):
+    """入力原本のhash（前後空白のみ正規化した全文のSHA-256）。自然文・JSON共通。"""
+    return hashlib.sha256((text or "").strip().encode("utf-8")).hexdigest()
+
+
+def _remember_original_text(text, source_hash=None):
+    h = source_hash or _compute_source_hash(text)
+    now = time.time()
+    with _SMART_IMPORT_TEXT_CACHE_LOCK:
+        _SMART_IMPORT_TEXT_CACHE[h] = (now, text)
+        _SMART_IMPORT_TEXT_CACHE.move_to_end(h)
+        while len(_SMART_IMPORT_TEXT_CACHE) > _SMART_IMPORT_TEXT_CACHE_MAX:
+            _SMART_IMPORT_TEXT_CACHE.popitem(last=False)
+    return h
+
+
+def _recall_original_text(h):
+    with _SMART_IMPORT_TEXT_CACHE_LOCK:
+        entry = _SMART_IMPORT_TEXT_CACHE.get(h)
+    if not entry or time.time() - entry[0] > _SMART_IMPORT_TEXT_CACHE_TTL_SEC:
+        return None
+    return entry[1]
+
+
+def _persist_smart_import_source(database_url, user_id, text, candidates):
+    """入力原本をDBへ保存し、source idを返す（失敗時None、例外は握りつぶす——分類自体は継続）。"""
+    if investment_db is None or not database_url or not user_id:
+        return None
+    try:
+        is_json = any(c.get("source_kind") == "json" for c in candidates)
+        parsed = _extract_json_candidates(text) if is_json else None
+        wrapper_context = next((c.get("wrapper_context") for c in candidates if c.get("wrapper_context")), None)
+        source_type = (parsed.get("type") if isinstance(parsed, dict) else None)
+        return investment_db.save_smart_import_source(
+            database_url, user_id, _compute_source_hash(text), "JSON" if is_json else "TEXT", text,
+            original_payload=parsed if is_json else None, wrapper_context=wrapper_context, source_type=source_type)
+    except Exception as e:
+        print("  SmartImport: 入力原本の保存で例外（メモリ退避のみで続行）", e)
+        return None
+
+
+def classify_content(raw_text, database_url=None, user_id=None):
+    """SmartImportEngineの入口。実処理は_classify_content_impl()。入力全文を先にDBへ原本保存し
+    （smart_import_sources、自然文・JSON共通）、各候補にはsource_hash/source_idだけを持たせる
+    （本文を候補ごとにUI/APIへ複製しない）。DB保存に失敗した場合のみメモリキャッシュへ退避する。"""
+    candidates = _classify_content_impl(raw_text, database_url, user_id)
+    text = (raw_text or "").strip()
+    if not text:
+        return candidates
+    source_hash = _compute_source_hash(text)
+    source_id = _persist_smart_import_source(database_url, user_id, text, candidates)
+    if source_id is None:
+        _remember_original_text(text, source_hash)
+    for c in candidates:
+        c["source_hash"] = source_hash
+        c["source_id"] = source_id
+        c["source_input_length"] = len(text)
+    return candidates
+
+
+def _attach_original_payload(normalized, candidate, carried=None, source_ids=None):
+    """解析結果（raw_payload、JSONB）へ、原本への参照（source_hash/source_id）と、JSON要素単位の
+    元データ（original_payload・wrapper_context）を付ける。原本本文そのものは
+    smart_import_sourcesにあり、ここへは複製しない。DBへ原本を保存できなかった場合
+    （source_idが無い）に限り、退避として最初の1行にだけoriginal_textを持たせる（縮退経路）。"""
+    if not isinstance(normalized, dict):
+        return normalized
+    payload = normalized.get("raw_payload")
+    if not isinstance(payload, dict):
+        return normalized
+    if candidate.get("original_payload") is not None:
+        payload["original_payload"] = candidate["original_payload"]
+    if candidate.get("wrapper_context"):
+        payload["wrapper_context"] = candidate["wrapper_context"]
+    h = candidate.get("source_hash")
+    if h:
+        payload["source_hash"] = h
+        payload["source_input_length"] = candidate.get("source_input_length")
+        sid = candidate.get("source_id") or (source_ids or {}).get(h)
+        if sid:
+            payload["source_id"] = sid
+        else:
+            key = (h, candidate.get("category"))
+            if carried is not None and key not in carried:
+                carried.add(key)
+                text = _recall_original_text(h)
+                if text is not None:
+                    payload["original_text"] = text
+                else:
+                    payload["original_text_missing"] = True
+    return normalized
+
+
+_REANALYSIS_COMPARE_COLS = ("event_time", "country", "event_type", "importance", "affected_markets",
+                             "affected_sectors", "affected_stocks", "impact_channels", "canonical_event_key",
+                             "event_time_jst", "time_precision", "timezone_source")
+
+
+def _reanalysis_norm(v):
+    return None if v in ("", [], {}) else v
+
+
+def _reanalyze_core(database_url, user_id, dry_run, category, start_date, end_date, limit, max_errors,
+                    include_event_rows):
+    """再解析の共通実装。原本（smart_import_sources）を起点に最新のclassify→normalizeを行い、既存
+    market_eventsと実データ差分を比較してcreated/updated/unchangedを決める。include_event_rows=True
+    の場合は、原本を参照しない旧形式のEVENT行（original_payload持ち／original_text持ちcarrier行）も
+    救済対象にし、どちらも復元できない行はskipped_no_original_payloadに計上する。"""
+    result = {"scanned": 0, "reanalyzed": 0, "created": 0, "updated": 0, "unchanged": 0,
+              "skipped_no_original_payload": 0, "skipped_unsupported_category": 0,
+              "skipped_user_deleted": 0, "failed": 0, "errors": [], "dry_run": dry_run}
+
+    def _err(ref, reason):
+        result["failed"] += 1
+        if len(result["errors"]) < max_errors:
+            result["errors"].append({"id": ref, "reason": reason})
+
+    if investment_db is None or not database_url:
+        return result
+    if category and str(category).upper() != "EVENT":
+        result["skipped_unsupported_category"] = 1
+        result["errors"].append({"id": None, "reason": f"category={category}は再解析未対応（対応：EVENT）"})
+        return result
+
+    rows = investment_db.list_market_events(database_url, user_id, from_date=start_date, to_date=end_date,
+                                             limit=limit)
+    existing = {(str(r.get("event_date"))[:10], r.get("title")): r for r in rows}
+    derived = {}  # (event_date,title) -> (event, origin)
+
+    def _derive(source_text, origin_payload, origin_key):
+        for cand in _classify_content_impl(source_text):
+            if cand.get("category") != "EVENT":
+                continue
+            ev = normalize_event(cand["draft"], origin_payload.get("raw_text"),
+                                 origin_payload.get("import_source") or "reanalysis")
+            if ev is None or not ev.get("event_date"):
+                continue
+            ref = dict(origin_payload)
+            ref["_origin"] = origin_key
+            for k in ("original_payload", "wrapper_context"):
+                if cand.get(k) is not None:
+                    ref[k] = cand[k]
+            derived[(str(ev["event_date"])[:10], ev.get("title"))] = (ev, ref)
+
+    # 1) 原本起点（入力原本が残っていれば、解析結果EVENTが全て消えていても復元できる）
+    source_hashes = set()
+    for src in investment_db.list_smart_import_sources(database_url, user_id, limit=limit):
+        result["scanned"] += 1
+        source_hashes.add(src.get("source_hash"))
+        try:
+            text = src.get("original_text") or ""
+            _derive(text, {"raw_text": None, "import_source": "reanalysis", "smart_import": True,
+                           "source_hash": src.get("source_hash"), "source_id": src.get("id"),
+                           "source_input_length": len(text)}, ("source", src.get("id")))
+        except Exception as e:
+            _err(f"source:{src.get('id')}", f"{type(e).__name__}: {e}")
+
+    # 2) 旧形式のEVENT行（原本テーブル導入前）。原本を参照する行は上の原本起点で処理済み。
+    if include_event_rows:
+        handled_hashes = set()
+        legacy_texts = {}
+        smart_rows = [r for r in rows if isinstance(r.get("raw_payload"), dict)
+                      and r["raw_payload"].get("smart_import")]
+        for r in smart_rows:
+            pl = r["raw_payload"]
+            h = pl.get("source_hash") or pl.get("source_input_hash")
+            if h and pl.get("original_text"):
+                legacy_texts[h] = pl["original_text"]
+        for r in smart_rows:
+            pl = r["raw_payload"]
+            h = pl.get("source_hash") or pl.get("source_input_hash")
+            if h and h in source_hashes:
+                continue  # 原本起点で処理済み
+            result["scanned"] += 1
+            try:
+                if pl.get("original_payload") is not None:
+                    _derive(json.dumps(pl["original_payload"], ensure_ascii=False), pl, ("row", r.get("id")))
+                elif h and h in legacy_texts:
+                    if h in handled_hashes:
+                        continue
+                    handled_hashes.add(h)
+                    _derive(legacy_texts[h], pl, ("row", r.get("id")))
+                else:
+                    result["skipped_no_original_payload"] += 1
+            except Exception as e:
+                _err(r.get("id"), f"{type(e).__name__}: {e}")
+
+    # ユーザーが明示削除したEVENT（tombstone）は再作成しない。内部delete・再構築ではtombstoneは
+    # 作られないため、それらは通常どおり復元される。
+    # tombstoneを取得できない場合はfail-closed：ユーザーの明示削除を誤って復活させないため、
+    # EVENTのcreated/updated（dry_runの見込み計上を含む）を一切行わず、そのEVENTを導出した
+    # 原本（source）単位でfailedに計上する（tombstone取得は全体で1回だが、影響を受けたsource
+    # ごとに原因を特定できるようerrorsへsource_idを残す）。通常のSmart Import確定は別経路で影響しない。
+    try:
+        tombstones = {(str(t.get("event_date"))[:10], t.get("title"))
+                      for t in investment_db.list_event_tombstones(database_url, start_date, end_date)}
+    except Exception as e:
+        print("  再解析: tombstone取得に失敗したため、該当sourceの再解析を中止します（fail-closed）", e)
+        affected = []
+        for _key, (_ev, origin) in derived.items():
+            if origin.get("_origin") not in affected:
+                affected.append(origin.get("_origin"))
+        for kind, ref_id in affected:
+            result["failed"] += 1
+            if len(result["errors"]) < max_errors:
+                entry = {"reason": "failed to load event tombstones"}
+                entry["source_id" if kind == "source" else "id"] = ref_id
+                result["errors"].append(entry)
+        return result
+    to_write = []
+    for key, (ev, origin) in derived.items():
+        if key in tombstones:
+            result["skipped_user_deleted"] += 1
+            continue
+        if start_date and key[0] < str(start_date)[:10]:
+            continue
+        if end_date and key[0] > str(end_date)[:10]:
+            continue
+        old = existing.get(key)
+        if old is None:
+            result["created"] += 1
+            pl = {"raw_text": origin.get("raw_text"), "import_source": "reanalysis", "smart_import": True}
+            for k in ("source_hash", "source_id", "source_input_length", "source_input_hash",
+                      "wrapper_context", "original_payload"):
+                if origin.get(k) is not None:
+                    pl[k] = origin[k]
+            ev["raw_payload"] = pl
+            to_write.append(ev)
+            continue
+        changed = any(_reanalysis_norm(ev.get(c)) != _reanalysis_norm(old.get(c)) for c in _REANALYSIS_COMPARE_COLS)
+        if not changed:
+            result["unchanged"] += 1
+            continue
+        result["updated"] += 1
+        for c in ("verification_status", "source", "source_type", "notes", "raw_payload"):
+            ev[c] = old.get(c)  # 人が直した値・出典・既存の元データ参照は保持
+        to_write.append(ev)
+    result["reanalyzed"] = result["created"] + result["updated"] + result["unchanged"]
+    if not dry_run and to_write:
+        try:
+            investment_db.import_market_events(database_url, user_id, to_write)
+        except Exception as e:
+            _err(None, f"import_market_events: {type(e).__name__}: {e}")
+    return result
+
+
+def reanalyze_smart_import_sources(database_url, user_id=None, dry_run=True, category=None,
+                                     start_date=None, end_date=None, limit=1000, max_errors=20):
+    """入力原本（smart_import_sources）だけを起点に再解析する。解析結果EVENTが全て消えていても、
+    原本が残っていれば最新のclassify→normalizeで復元できる。dry_run/created/updated/unchanged/
+    skipped/failed/errors上限/日付・categoryフィルタ/idempotencyは_reanalyze_core共通。
+    手修正済みのverification_status/source/source_type/notesは上書きしない。"""
+    return _reanalyze_core(database_url, user_id, dry_run, category, start_date, end_date, limit,
+                           max_errors, include_event_rows=False)
+
+
+def reanalyze_smart_import_events(database_url, user_id=None, dry_run=True, category=None,
+                                    start_date=None, end_date=None, limit=1000, max_errors=20):
+    """保存済みSmart Import由来のmarket_eventsを最新ロジックで再解析する。原則として入力原本
+    （smart_import_sources）から再導出し、原本テーブル導入前の旧形式行（original_payload持ち／
+    original_text持ちcarrier行）も救済する。どちらも無い行は推測せずskipped_no_original_payload。
+    仕様は_reanalyze_core（dry_run・idempotency・unchanged時は書き込まない等）を参照。
+    戻り値：{scanned, reanalyzed, created, updated, unchanged, skipped_no_original_payload,
+    skipped_unsupported_category, failed, errors[max_errors件まで], dry_run}。"""
+    return _reanalyze_core(database_url, user_id, dry_run, category, start_date, end_date, limit,
+                           max_errors, include_event_rows=True)
 
 
 def normalize_catalyst(draft, raw_text=None, import_source="unknown"):
@@ -22073,6 +22399,27 @@ def normalize_event(draft, raw_text=None, import_source="unknown"):
         return None
     out = investment_db._normalize_market_event(draft) if investment_db else dict(draft)
     out["title"] = title
+    # STEP3/STEP9新規（2026-09-23、Smart Import→イベント連携）：event_type/canonical_event_key
+    # が呼び出し側（key_eventsのearnings_watch分岐等）で既に明示されていればそちらを優先し
+    # （既存の「標準キーが既にある場合は上書きしない」方針を踏襲）、無い/OTHERのままなら
+    # タイトルから推定する。canonical_event_keyが付けば、Phase4のbuild_active_macro_events
+    # （canonical_event_key必須のフィルタ、既存ロジック無変更）へも自動的に乗るようになる。
+    # "event"は_classify_json_item()向けのtype判定マーカーが_normalize_market_event()の
+    # legacy互換マッピング（type→event_type）経由でそのまま漏れ込んだ値であり、実際の
+    # event_typeとしては無意味なため、未分類（OTHER相当）として扱いキーワード推定を試みる。
+    if not out.get("event_type") or out.get("event_type") in ("OTHER", "event"):
+        inferred_type, canonical_key = classify_market_event_type_and_key(title)
+        if inferred_type != "OTHER":
+            out["event_type"] = inferred_type
+        if canonical_key and not out.get("canonical_event_key"):
+            out["canonical_event_key"] = canonical_key
+            out["time_precision"] = out.get("time_precision") or ("EXACT" if out.get("event_time") else "DATE_ONLY")
+            if out.get("event_time") and not out.get("event_time_jst"):
+                # Smart Import側の値は既にJSTである経験則はあるが仕様として保証されていないため
+                # timezone_source="SMART_IMPORT_ASSUMED_JST"を明示する
+                # （_resolve_central_bank_event_datetime_for_promotionと同じラベル、既存方針踏襲）。
+                out["event_time_jst"] = out["event_time"]
+                out["timezone_source"] = out.get("timezone_source") or "SMART_IMPORT_ASSUMED_JST"
     payload = dict(out.get("raw_payload") or {})
     payload.update({"raw_text": raw_text, "import_source": import_source, "smart_import": True})
     out["raw_payload"] = payload
@@ -22163,6 +22510,52 @@ def classify_central_bank_event(title, summary=None):
             continue
         return key, canonical_title, country
     return None, None, None
+
+
+# STEP3（振り返り：Smart Importイベント連携、2026-09-23新規）：event_typeマッピング。
+# 中央銀行系は既存classify_central_bank_event()をそのまま再利用し、同じ実イベントに別の
+# canonical_event_keyを割り当てる二重管理を避ける。canonical_event_keyを与えるのは
+# CENTRAL_BANK/INDICATOR（再現性のある定期発表で、Phase4のMARKET_EVENT_RISK＝銘柄非依存の
+# 市場全体リスクへ乗せる価値がある）のみ——EARNINGS/MARKET_HOLIDAY/GEOPOLITICALは個別性が
+# 高く、canonical識別子を強制しない（build_active_macro_eventsの既存スコープ「銘柄固有感応度は
+# Phase5」に合わせる。canonical_event_key無しでもget_entry_candidate_support_context経由の
+# 銘柄分析コンテキストには渡る——そちらはcanonical_event_key必須にしていない）。
+MARKET_EVENT_INDICATOR_RULES = [
+    ("US_JOLTS", ["JOLTS", "雇用動態調査"]),
+    ("US_ADP_EMPLOYMENT", ["ADP雇用統計", "ADP"]),
+    ("US_PCE_DEFLATOR", ["PCEデフレーター", "PCE"]),
+    ("US_NONFARM_PAYROLLS", ["雇用統計", "NFP", "非農業部門"]),
+    ("ISM_PMI", ["ISM"]),
+    ("PMI", ["PMI"]),
+    ("CPI", ["CPI", "消費者物価"]),
+    ("GDP", ["GDP"]),
+    ("HOUSING_INDICATOR", ["住宅着工", "住宅販売", "住宅指標"]),
+    ("DURABLE_GOODS", ["耐久財"]),
+    ("CONSUMER_CONFIDENCE", ["消費者信頼感", "消費者マインド"]),
+]
+MARKET_EVENT_EARNINGS_KEYWORDS = ["決算"]
+MARKET_EVENT_HOLIDAY_KEYWORDS = ["休場"]
+MARKET_EVENT_GEOPOLITICAL_KEYWORDS = ["地政学"]
+
+
+def classify_market_event_type_and_key(title):
+    """STEP3のevent_typeマッピング。戻り値：(event_type, canonical_event_key_or_None)。
+    一致無しは("OTHER", None)（既存event_type未指定時のDBデフォルト'OTHER'と一致させる、
+    推測で分類しない）。"""
+    text = title or ""
+    cb_key, _cb_title, _cb_country = classify_central_bank_event(text)
+    if cb_key:
+        return "CENTRAL_BANK", cb_key
+    for key, keywords in MARKET_EVENT_INDICATOR_RULES:
+        if any(kw in text for kw in keywords):
+            return "INDICATOR", key
+    if any(kw in text for kw in MARKET_EVENT_EARNINGS_KEYWORDS):
+        return "EARNINGS", None
+    if any(kw in text for kw in MARKET_EVENT_HOLIDAY_KEYWORDS):
+        return "MARKET_HOLIDAY", None
+    if any(kw in text for kw in MARKET_EVENT_GEOPOLITICAL_KEYWORDS):
+        return "GEOPOLITICAL", None
+    return "OTHER", None
 
 
 _CENTRAL_BANK_TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
@@ -22801,6 +23194,21 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
     watch_stock_results = []
     trade_reflection_results = []
 
+    original_text_carried = set()
+    # 分類時にDB保存できなかった原本（source_idなし）は、メモリ退避分をここでDBへ再保存する
+    # （分類時にDB保存済みなら、キャッシュが無くても影響しない）。
+    source_ids = {}
+    for c in candidates or []:
+        h = c.get("source_hash")
+        if h and not c.get("source_id") and h not in source_ids:
+            text = _recall_original_text(h)
+            sid = None
+            if text is not None and investment_db is not None and database_url and user_id:
+                try:
+                    sid = investment_db.save_smart_import_source(database_url, user_id, h, "TEXT", text)
+                except Exception as e:
+                    print("  SmartImport: 原本の再保存で例外", e)
+            source_ids[h] = sid
     for c in candidates or []:
         category = c.get("category")
         if category not in SMART_IMPORT_IMPLEMENTED_CATEGORIES:
@@ -22827,6 +23235,7 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
                 print("  SmartImport: 正規化失敗", category, e)
                 normalized = None
             if normalized is not None:
+                _attach_original_payload(normalized, c, original_text_carried, source_ids)
                 buckets[category].append(normalized)
             continue
 
@@ -23225,6 +23634,17 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
         results["TRADE_REFLECTION"] = {"imported": sum(1 for r in trade_reflection_results if r["ok"]),
                                         "skipped": sum(1 for r in trade_reflection_results if not r["ok"]),
                                         "details": trade_reflection_results}
+    # 保存が実際に完了した場合のみ、使われた入力原本をCONFIRMEDにする（PREVIEWのまま残る原本は
+    # 将来のcleanup候補。同一原本の再Importでもstatusは戻らない＝DB側でCONFIRMED済みは更新しない）。
+    try:
+        saved_any = any(isinstance(r, dict) and ((r.get("imported") or 0) + (r.get("updated") or 0)) > 0
+                        for r in results.values())
+        if saved_any and investment_db is not None and database_url and user_id:
+            used = {c.get("source_hash") for c in (candidates or []) if c.get("source_hash")}
+            if used:
+                investment_db.mark_smart_import_sources_confirmed(database_url, user_id, sorted(used))
+    except Exception as e:
+        print("  SmartImport: 原本のCONFIRMED更新で例外（保存結果には影響しない）", e)
     return {"results": results, "rejected_low_confidence": rejected, "skipped_unimplemented": skipped_unimplemented,
             "skipped_existing_report": skipped_existing_report}
 
@@ -25186,7 +25606,8 @@ class Handler(SimpleHTTPRequestHandler):
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
-            investment_db.delete_market_event(DATABASE_URL, self.current_user, body.get("id"))
+            investment_db.delete_market_event(DATABASE_URL, self.current_user, body.get("id"),
+                                             user_initiated=True, reason="user_delete_api")
             self._send_json({"ok": True})
         elif self.path == "/api/news-catalysts/import":
             # v3-9続き（PHASE 4 NEWS/CATALYST INTELLIGENCE）：ChatGPT等で構造化したカタリスト
