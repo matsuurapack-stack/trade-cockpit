@@ -13637,6 +13637,50 @@ def build_entry_snapshot(code, entry_price, entry_time_iso, market_ctx, market_m
     }
 
 
+# ---- 保有中撤退判断支援アラート Phase A（2026-09-18新規） ----
+# THESIS_BREAK_*判定用の9条件語彙。build_entry_snapshot()と違い「過去の再構築」ではなく
+# 「今この瞬間」の状態を取るため、_score_entry_candidates()と同じ軽量関数
+# （_intraday_stock_snapshot・run_momentum_stage1・_volume_stage2_detail）だけを使い、
+# 新しい取得経路・新しい分足取得は増やさない。
+def capture_entry_thesis_snapshot(code, market="JP"):
+    """ポジション新規建て時点の判断根拠を、既存のentry-candidatesパイプラインが使っている
+    のと同じ軽量関数だけから構築する。米国株（market!="JP"）や途中で取得失敗した場合は
+    Noneを返し、呼び出し側は「根拠データ無し」として保存する（推測で埋めない、指示書の
+    "取得できない値は推測しない"方針を踏襲）。"""
+    if market != "JP":
+        return None
+    try:
+        stage1 = run_momentum_stage1()
+        row = (stage1.get("rows") or {}).get(code)
+        if not row or row.get("current") is None:
+            return None
+        snapshot = _intraday_stock_snapshot({"code": code, "market": market})
+        stage2 = _volume_stage2_detail(code, row)
+        day_change = row.get("changePct")
+        market_rs = row.get("marketRS")
+        sector_rs = row.get("sectorRS")
+        above_vwap = snapshot.get("aboveVwap") if snapshot else None
+        structure = snapshot.get("fiveMinStructure") if snapshot else None
+        volume_type = _volume_type(stage2, row) if stage2 else None
+        return {
+            "trend_up": (day_change > 0) if day_change is not None else None,
+            "volume_expanding": (volume_type == "POSITIVE_VOLUME") if volume_type else None,
+            "above_vwap": above_vwap,
+            "market_supportive": (market_rs >= 0) if market_rs is not None else None,
+            "sector_supportive": (sector_rs >= 0) if sector_rs is not None else None,
+            "breakout_detected": bool(stage2 and stage2.get("aboveRecentHigh")),
+            "momentum_positive": (structure in ("higher_highs", "mixed")) if structure else None,
+            "vwap": snapshot.get("vwap") if snapshot else None,
+            "rs_score": market_rs,
+            "day_high_at_entry": row.get("high"),
+            "market_regime": None,  # Phase B候補：market_mode_todayの文字列化
+            "captured_at": datetime.datetime.now(_JST).isoformat(),
+        }
+    except Exception as e:
+        print("  capture_entry_thesis_snapshot: 例外（無視して続行、根拠データ無しで保存継続）", code, e)
+        return None
+
+
 def compute_entry_risk_assessment(similar_result):
     """指示書3番：GOOD_ENTRY_SIMILARITY / LOSS_PATTERN_SIMILARITY / ENTRY_RISK_SCOREを算出する。
     既存find_similar_trade_experiences()が返すsimilar_result（symbol一致＋タグ/特徴量類似度）を
@@ -15388,6 +15432,13 @@ REFLECTION_TAG_KEYWORDS = {
     "BREAKEVEN_STOP": ["建値", "逆指値", "撤退ライン"],
     "PROFIT_PROTECTION": ["利益保護", "含み益を守る"],
     "GAP_UP": ["GU", "ギャップアップ", "窓開け"],
+    # 保有中撤退判断支援アラート Phase A（2026-09-18新規）：利益消失・期待保有・根拠崩壊・
+    # 撤退判断遅れ。position由来のアラート（deriveExitDecisionAlert）とfind_similar_
+    # reflections()を同じタグ語彙でつなぐための追加（既存のマッチングロジックは無変更）。
+    "PROFIT_GIVEBACK": ["利益消失", "利益が消え", "含み益が消え", "戻す", "建値まで戻"],
+    "HOPE_HOLDING": ["期待保有", "戻るかもしれない", "期待で保有", "期待して持ち続け"],
+    "THESIS_BREAK": ["根拠が崩れ", "根拠崩壊", "エントリー根拠"],
+    "LATE_EXIT": ["撤退判断が遅れ", "判断遅延", "損切り遅れ", "利確遅れ", "撤退が遅れ"],
 }
 _REFLECTION_EVENT_TYPE_TAGS = ("FOMC", "BOJ", "ECB", "BOE", "CPI", "PPI", "EMPLOYMENT", "GDP")
 _REFLECTION_EVENT_CATEGORY_TAGS = _REFLECTION_EVENT_TYPE_TAGS + ("EVENT_RISK", "OPENING_FADE", "GAP_UP")
@@ -15549,6 +15600,75 @@ def find_similar_past_reflections_for_today(database_url, user_id, active_macro_
         return investment_db.find_similar_reflections(database_url, user_id, event_types=event_types, tags=["EVENT_RISK"])
     except Exception as e:
         print("  Event Risk Guard: 過去の反省検索で例外（無視して続行）", e)
+        return []
+
+
+def build_position_alert_tags(alert):
+    """保有中撤退判断支援アラート Phase A（PHASE17、2026-09-18新規）：フロント側の
+    deriveExitDecisionAlert()が返すalert（{profitGivebackPct,isHopeHolding,
+    brokenConditions,tier}）から、find_similar_reflections()のタグ語彙へマッピングする。
+    find_similar_reflections自体は変更しない、呼び出し元を増やすだけ（既存のノイズ防止条件
+    "タグ2個以上一致"を満たすよう、意味のあるタグを2つ以上返すことを狙う設計）。"""
+    alert = alert or {}
+    tags = []
+    giveback = alert.get("profitGivebackPct")
+    if giveback is not None and giveback >= 50:
+        tags.append("PROFIT_GIVEBACK")
+    if alert.get("isHopeHolding"):
+        tags.append("HOPE_HOLDING")
+    if len(alert.get("brokenConditions") or []) >= 2:
+        tags.append("THESIS_BREAK")
+    if alert.get("tier") in ("HIGH", "CRITICAL"):
+        tags.append("LATE_EXIT")
+    return tags
+
+
+EXIT_DECISION_ALERT_SEED_RULES = [
+    {"rule_text": "一度十分な含み益が出た後、最大利益の70%以上を失い、エントリー根拠が2項目以上崩れた場合は、"
+                  "逆指値まで粘らず同値〜微益撤退を優先する。",
+     "category": "EXIT", "rule_name": "利益消失後の同値撤退", "priority": "HIGH"},
+    {"rule_text": "エントリー根拠が崩れた後に『戻るかもしれない』という期待のみで保有を継続しない。",
+     "category": "BEHAVIOR", "rule_name": "期待保有禁止", "priority": "HIGH"},
+    {"rule_text": "同値撤退または撤退再確認の判断が出た後、価格ではなく判断遅延を監視し、"
+                  "一定時間を超えた場合は再警告する。",
+     "category": "EXECUTION", "rule_name": "判断から執行までの遅延防止", "priority": "HIGH"},
+]
+
+
+def seed_exit_decision_alert_learning_rules(database_url, user_id, source_date="2026-09-18"):
+    """保有中撤退判断支援アラート Phase A（PHASE31、2026-09-18新規）：今回の実運用から導いた
+    3件のLearning Ruleを登録する。upsert_trade_rule_from_text()（既存関数）をそのまま呼ぶだけ
+    ——rule_key（正規化済みテキスト）で重複判定されるため、再実行しても2件目以降は新規行を
+    作らずevidence_countが加算されるだけ（冪等）。trade_rulesにpriority列は無いため、
+    source_json（既存のsource_info引数）へメタ情報として保持する。confidenceは初期MEDIUM
+    ——1回の実例だけでHIGHにしない（既存の「サンプル不足を過大評価しない」方針）。"""
+    if investment_db is None or not database_url:
+        return []
+    results = []
+    for spec in EXIT_DECISION_ALERT_SEED_RULES:
+        source_info = {"type": "exit_decision_alert_phase_a", "date": source_date,
+                        "rule_name": spec["rule_name"], "priority": spec["priority"]}
+        result = investment_db.upsert_trade_rule_from_text(
+            database_url, user_id, spec["rule_text"], source_info=source_info,
+            category=spec["category"], rule_type="TESTING", initial_status="TESTING",
+            initial_confidence="MEDIUM", created_from="exit_decision_alert_phase_a_seed",
+            seen_date=source_date)
+        results.append({"ruleName": spec["rule_name"], "result": result})
+    return results
+
+
+def find_similar_reflections_for_position(database_url, user_id, alert):
+    """PHASE17：現在の保有中アラート状態と類似する過去の反省を検索する（HIGH/CRITICAL時のみ
+    呼ぶ想定、フロント側でオンデマンド呼び出し）。find_similar_reflections()自体は無変更。"""
+    if investment_db is None or not database_url:
+        return []
+    tags = build_position_alert_tags(alert)
+    if not tags:
+        return []
+    try:
+        return investment_db.find_similar_reflections(database_url, user_id, tags=tags)
+    except Exception as e:
+        print("  保有中撤退アラート: 類似反省検索で例外（無視して続行）", e)
         return []
 
 
@@ -23416,9 +23536,18 @@ def smart_import_confirm(database_url, user_id, candidates, import_source="unkno
                 else:
                     code, action = normalized["code"], normalized["action"]
                     if action in ("OPEN", "ADD"):
+                        # 2026-09-18追記（保有中撤退判断支援アラート Phase A）：Smart Import経由の
+                        # 建玉登録でも直接APIハンドラと同じ根拠キャプチャを行う（重複実装を避け
+                        # 同じ関数を呼ぶだけ）。失敗してもポジション登録自体はブロックしない。
+                        smart_import_entry_thesis = None
+                        try:
+                            smart_import_entry_thesis = capture_entry_thesis_snapshot(code, "JP")
+                        except Exception as e:
+                            print("  SmartImport: entry_thesis取得で例外（無視して続行）", e)
                         updated = investment_db.add_position_entry(
                             database_url, user_id, code, normalized.get("name"), "JP",
-                            normalized["entry_price"], normalized["quantity"], normalized.get("trade_style"))
+                            normalized["entry_price"], normalized["quantity"], normalized.get("trade_style"),
+                            entry_thesis=smart_import_entry_thesis)
                         if updated is not None and normalized.get("stop_price") is not None:
                             investment_db.upsert_portfolio_item(database_url, user_id,
                                 {"code": code, "market": "JP", "current_stop": normalized["stop_price"]})
@@ -24777,6 +24906,21 @@ class Handler(SimpleHTTPRequestHandler):
             # v3-2新規：portfolio（保有株、localStorageに無かった新規機能）
             items = investment_db.list_portfolio(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"items": items})
+        elif self.path.startswith("/api/trade-reflections/similar-for-position"):
+            # 2026-09-18新規（保有中撤退判断支援アラート Phase A、PHASE17）：フロント側
+            # deriveExitDecisionAlert()が計算した現在のアラート状態を引数で受け取り、
+            # find_similar_reflections()をそのまま呼ぶ（HIGH/CRITICAL時のオンデマンド呼び出し
+            # を想定、毎ポーリングでは呼ばない）。
+            qs = urllib.parse.urlparse(self.path).query
+            q = urllib.parse.parse_qs(qs)
+            alert = {
+                "tier": q.get("tier", [None])[0],
+                "isHopeHolding": q.get("hopeHolding", ["false"])[0] == "true",
+                "profitGivebackPct": float(q["giveback"][0]) if q.get("giveback") else None,
+                "brokenConditions": ["x"] * int(q.get("brokenCount", ["0"])[0]),
+            }
+            items = find_similar_reflections_for_position(DATABASE_URL, self.current_user, alert)
+            self._send_json({"items": items})
         elif self.path.startswith("/api/trade-reflections"):
             # 2026-09-17新規（Event Risk Guard＋トレード反省メモ Phase A）：「今日の反省・気づき」一覧。
             qs = urllib.parse.urlparse(self.path).query
@@ -25892,9 +26036,18 @@ class Handler(SimpleHTTPRequestHandler):
             if not self._investment_db_ready():
                 return
             body = self._read_json_body()
+            # 2026-09-18追記（保有中撤退判断支援アラート Phase A）：ENTRY時点の判断根拠を
+            # 同じリクエスト内で1回だけ取得する。取得失敗してもポジション登録自体はブロック
+            # しない（try/except、根拠データ無しのまま保存継続）。
+            entry_thesis = None
+            try:
+                entry_thesis = capture_entry_thesis_snapshot(body.get("code"), body.get("market") or "JP")
+            except Exception as e:
+                print("  /api/portfolio/add-entry: entry_thesis取得で例外（無視して続行）", e)
             updated = investment_db.add_position_entry(
                 DATABASE_URL, self.current_user, body.get("code"), body.get("name"),
-                body.get("market") or "JP", body.get("price"), body.get("shares"), body.get("trade_style"))
+                body.get("market") or "JP", body.get("price"), body.get("shares"), body.get("trade_style"),
+                entry_thesis=entry_thesis)
             if updated is None:
                 self._send_json({"error": "買値・枚数は正の数で指定してください"})
                 return
@@ -25910,6 +26063,16 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception:
                 pass
             self._send_json({"position": updated})
+        elif self.path == "/api/portfolio/peak-update":
+            # 2026-09-18新規（保有中撤退判断支援アラート Phase A）：high-water mark（最大含み益）
+            # の更新。フロント側が既存のstockQuotes変化での再評価ループの中で「改善した時だけ」
+            # 呼ぶ想定だが、サーバー側でも悪化方向への上書きを防ぐ（investment_db側のWHERE句）。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            result = investment_db.update_position_peak(
+                DATABASE_URL, self.current_user, body.get("id"), body.get("peakPrice"), body.get("peakPnlPct"))
+            self._send_json({"ok": result is not None, "peak": result})
         elif self.path == "/api/portfolio/exit":
             # 2026-09-07新規：保有カードの「売却」確定から呼ぶ。実現損益を計算しtrade_historyへ
             # 記録、全株売却ならportfolioの行を削除する（取引履歴は削除しない）。

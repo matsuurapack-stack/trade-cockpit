@@ -6360,6 +6360,91 @@ function derivePositionStatus({avgPrice,tradeStyle,current,currentStop,initialSt
   // 8. デフォルト（通常保有継続）
   return {status:"HOLD",reasons:[]};
 }
+// ---- 保有中撤退判断支援アラート Phase A（2026-09-18新規） ----
+// 「判断を代行する」のではなく「ユーザーが既に持っている正しい判断を、迷う前に実行できる
+// ようにする」。既存のderivePositionStatus()（EXIT RULE -8%等、絶対最優先）は一切変更せず、
+// この新しいアラート階層はUI層で「追加」表示するだけに留める。
+const THESIS_DIMENSION_LABELS={trend_up:"上昇トレンド",volume_expanding:"出来高拡大",above_vwap:"VWAP上",
+  market_supportive:"地合い順風",sector_supportive:"セクター順風",breakout_detected:"ブレイク継続",
+  momentum_positive:"モメンタム良好"};
+// entry_thesis_json（server.py capture_entry_thesis_snapshot()）と同じ7次元を、既にPortfolio
+// Panelが持っているenr（enrichWatchRow結果）・posIndicatorsだけから再構築する（新規APIコールなし）。
+function evaluateCurrentThesis({posIndicators,enr,current}){
+  if(!enr)return null;
+  return {
+    trend_up: enr.pct!=null?enr.pct>0:null,
+    volume_expanding: enr.volRatio!=null?enr.volRatio>=1.2:null,
+    above_vwap: (posIndicators?.vwap!=null&&current!=null)?current>posIndicators.vwap:null,
+    market_supportive: enr.marketRS!=null?enr.marketRS>=0:null,
+    sector_supportive: enr.sectorRS!=null?enr.sectorRS>=0:null,
+    breakout_detected: enr.breakType!=null,
+    momentum_positive: enr.rsScore!=null?enr.rsScore>=50:null,
+  };
+}
+// エントリー時点でtrueだった条件が、今falseになっている項目だけをTHESIS_BREAKとして数える
+// （entry時点で既にfalse/nullだった項目は「崩壊」ではなく「元々成立していなかった」なので
+// 数えない）。
+function evaluateThesisBreak(entryThesis,currentThesis){
+  if(!entryThesis||!currentThesis)return [];
+  return Object.keys(THESIS_DIMENSION_LABELS).filter(key=>entryThesis[key]===true&&currentThesis[key]===false);
+}
+
+const PROFIT_GIVEBACK_MIN_PEAK_PCT=0.4;      // これ未満のpeakでは利益消失率を評価しない（指示書PHASE3）
+const BREAKEVEN_CANDIDATE_MIN_PEAK_PCT=0.8;  // 同値撤退候補の最低条件（指示書PHASE4）
+const HOPE_HOLDING_MIN_GIVEBACK_PCT=70;      // HOPE HOLDING判定の利益消失率下限（指示書PHASE5）
+// PHASE13（イベント日補正）：既存のEvent Risk Guard（eventRiskLevel）がHIGH/MEDIUMの日は、
+// 「高値更新なし」を通常より早く問題視する（例：通常5分→イベント日2.5分）。新しいイベント
+// 判定は作らず、既存eventRiskGuardをそのまま使う。
+const NO_NEW_HIGH_MINUTES={NORMAL:5,EVENT:2.5};
+
+// PHASE6：INFO/WARNING/HIGH/CRITICALの4段階。ルールベースのif-else（AI不使用）——既存の
+// _classify_entry_state相当の設計思想（小さく・条件を重ねてから昇格）を踏襲する。
+function deriveExitDecisionAlert({pnlPct,peakPnlPct,peakAt,brokenConditions,eventRiskLevel,now}){
+  now=now||Date.now();
+  const minutesSinceHigh=peakAt?(now-new Date(peakAt).getTime())/60000:null;
+  const noNewHighThresholdMin=(eventRiskLevel==="HIGH"||eventRiskLevel==="MEDIUM")?NO_NEW_HIGH_MINUTES.EVENT:NO_NEW_HIGH_MINUTES.NORMAL;
+  const noNewHighLongEnough=minutesSinceHigh!=null&&minutesSinceHigh>=noNewHighThresholdMin;
+  const brokenCount=(brokenConditions||[]).length;
+
+  let profitGivebackPct=null;
+  if(peakPnlPct!=null&&peakPnlPct>=PROFIT_GIVEBACK_MIN_PEAK_PCT&&pnlPct!=null){
+    profitGivebackPct=Math.max(0,Math.min(100,(peakPnlPct-pnlPct)/peakPnlPct*100));
+  }
+
+  // PHASE4：同値撤退候補。
+  const isBreakevenExitCandidate=!!(peakPnlPct!=null&&peakPnlPct>=BREAKEVEN_CANDIDATE_MIN_PEAK_PCT
+    &&pnlPct!=null&&pnlPct<=0.2&&noNewHighLongEnough&&brokenCount>=2);
+
+  // PHASE5：HOPE HOLDING（「戻るかもしれない」という期待のみでの保有継続）。SELL命令ではない
+  // ——action_typeはRECHECK_EXIT（既存の設計方針どおり、判断はユーザーに委ねる）。
+  const isHopeHolding=!!(brokenCount>=2&&noNewHighLongEnough
+    &&profitGivebackPct!=null&&profitGivebackPct>=HOPE_HOLDING_MIN_GIVEBACK_PCT
+    &&pnlPct!=null&&Math.abs(pnlPct)<0.3);
+
+  const reasons=[];
+  if(noNewHighLongEnough)reasons.push(`直近高値更新なし${Math.round(minutesSinceHigh)}分`);
+  if(brokenCount>0)reasons.push(`エントリー根拠${brokenCount}項目崩壊`);
+  if(profitGivebackPct!=null&&profitGivebackPct>=50)reasons.push(`利益消失${Math.round(profitGivebackPct)}%`);
+
+  let tier=null;
+  if(profitGivebackPct!=null&&profitGivebackPct>=85&&pnlPct!=null&&Math.abs(pnlPct)<0.3&&brokenCount>=3){
+    tier="CRITICAL";
+  }else if(isHopeHolding||isBreakevenExitCandidate||(profitGivebackPct!=null&&profitGivebackPct>=70&&brokenCount>=2)){
+    tier="HIGH";
+  }else if(brokenCount>=2||(profitGivebackPct!=null&&profitGivebackPct>=50)){
+    tier="WARNING";
+  }else if(noNewHighLongEnough||brokenCount>=1){
+    tier="INFO";
+  }
+
+  return {tier,reasons,brokenConditions:brokenConditions||[],profitGivebackPct,
+    isBreakevenExitCandidate,isHopeHolding,minutesSinceHigh,actionType:"RECHECK_EXIT"};
+}
+const EXIT_ALERT_TIER_META={
+  INFO:{label:"INFO",color:"var(--inkSoft)"}, WARNING:{label:"WARNING",color:"var(--warn)"},
+  HIGH:{label:"HIGH",color:"var(--down)"}, CRITICAL:{label:"CRITICAL",color:"var(--down)"},
+};
+
 // current_stopが未設定ならOFF。initial_stopのままなら「初期SL」。average_priceと一致すれば
 // 「建値」。average_priceより上に上げてあれば「利益保護」、さらに現在値との乖離が小さい
 // （値幅を詰めて追随中とみなせる目安として3%以内）場合は「トレーリング」とする。完全自動売買は
@@ -7107,6 +7192,88 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[items,stockQuotes]);
+
+  // ---- 保有中撤退判断支援アラート Phase A（2026-09-18新規） ----
+  // 「判断を代行する」のではなく「ユーザーが既に持っている正しい判断を、迷う前に実行できる
+  // ようにする」。既存のEXIT RULE効果（上）とは独立に動く——EXIT RULE（-8%絶対優先）は
+  // 一切変更しない。既存のstockQuotes変化トリガーの効果（新しいintervalは作らない）を
+  // そのまま踏襲する。
+  const [positionAlertSettings]=useState(()=>{
+    try{const raw=localStorage.getItem("positionAlertSettings");
+      return raw?{enabled:true,sound:true,...JSON.parse(raw)}:{enabled:true,sound:true};
+    }catch(e){return {enabled:true,sound:true};}
+  });
+  const peakCacheRef=useRef({});          // key -> {peakPnlPct,peakPrice,peakAt}（サーバー値で初期化、以後クライアントが正）
+  const exitAlertNotifiedRef=useRef({});  // key+tier -> 最終通知timestamp（5分間再通知しない、既存chorucoNoticeSuppressRefと同じ形）
+  const [positionAlerts,setPositionAlerts]=useState({}); // key -> {tier,reasons,...}
+  useEffect(()=>{
+    if(!positionAlertSettings.enabled)return;
+    const nextAlerts={};
+    items.forEach(it=>{
+      const key=it.code+(it.market||"JP");
+      const current=num(stockQuotes?.[it.code]?.t);
+      const {pct:pnlPct}=calcUnrealizedPnl(it.average_price,it.quantity,current);
+      if(pnlPct==null)return;
+      // PHASE1：high-water mark（最大含み益）追跡。改善した時だけローカルstate更新→非同期push
+      // （サーバー側もWHERE句で悪化方向への上書きを防ぐ、update_position_peak参照）。
+      const cached=peakCacheRef.current[key]||
+        {peakPnlPct:it.peak_pnl_pct??null,peakPrice:it.peak_price??null,peakAt:it.peak_updated_at??null};
+      if(cached.peakPnlPct==null||pnlPct>cached.peakPnlPct){
+        const improved={peakPnlPct:pnlPct,peakPrice:current,peakAt:new Date().toISOString()};
+        peakCacheRef.current[key]=improved;
+        fetch("/api/portfolio/peak-update",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({id:it.id,peakPrice:current,peakPnlPct:pnlPct})}).catch(()=>{});
+      }else{
+        peakCacheRef.current[key]=cached;
+      }
+      const peak=peakCacheRef.current[key];
+      // PHASE2：現在の根拠を既存の分析結果（enr・posIndicators、新規APIコールなし）から
+      // 再構築し、entry_thesis_json（無ければ根拠データ無し＝崩壊0件のまま）と比較する。
+      const enr=analysisEnrichedMap?.get(it.code);
+      const posIndicators=analysisData?.[it.code]?.indicators;
+      const currentThesis=evaluateCurrentThesis({posIndicators,enr,current});
+      const brokenConditions=it.entry_thesis_json?evaluateThesisBreak(it.entry_thesis_json,currentThesis):[];
+      // PHASE13：既存Event Risk GuardのeventRiskLevelをそのまま使う（新しいイベント判定は作らない）。
+      const eventRiskLevel=eventRiskGuard?.byCode?.[it.code]?.level;
+      const alert=deriveExitDecisionAlert({pnlPct,peakPnlPct:peak.peakPnlPct,peakAt:peak.peakAt,brokenConditions,eventRiskLevel});
+      nextAlerts[key]=alert;
+      // PHASE9：PC通知（HIGH/CRITICALのみ、tierをキーに含めた5分dedup＝悪化時は即再通知）。
+      if(alert.tier==="HIGH"||alert.tier==="CRITICAL"){
+        const notifyKey=key+"_"+alert.tier;
+        const last=exitAlertNotifiedRef.current[notifyKey];
+        if(!last||Date.now()-last>=5*60000){
+          exitAlertNotifiedRef.current[notifyKey]=Date.now();
+          if(positionAlertSettings.sound)playMorningCheckChime(true);
+          if(typeof Notification!=="undefined"&&Notification.permission==="granted"){
+            try{new Notification(`${alert.tier==="CRITICAL"?"🔴":"⚠"} 撤退判断アラート`,
+              {body:`${it.name} ${it.code}：${alert.reasons.join("・")}`});}catch(e){}
+          }
+        }
+      }
+    });
+    setPositionAlerts(nextAlerts);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[items,stockQuotes,analysisEnrichedMap,analysisData,eventRiskGuard,positionAlertSettings.enabled]);
+  // PHASE17（HIGH/CRITICAL時のみオンデマンド取得、毎ポーリングでは呼ばない）：過去類似失敗。
+  const [similarFailures,setSimilarFailures]=useState({}); // key -> [{id,tradeDate,lesson,reflectionText}]
+  const fetchSimilarFailures=useCallback((key,alert)=>{
+    const params=new URLSearchParams({tier:alert.tier||"",
+      hopeHolding:String(!!alert.isHopeHolding),
+      giveback:alert.profitGivebackPct!=null?String(alert.profitGivebackPct):"",
+      brokenCount:String((alert.brokenConditions||[]).length)});
+    fetch("/api/trade-reflections/similar-for-position?"+params.toString()).then(r=>r.ok?r.json():null)
+      .then(d=>{if(d&&Array.isArray(d.items))setSimilarFailures(prev=>({...prev,[key]:d.items}));}).catch(()=>{});
+  },[]);
+  useEffect(()=>{
+    Object.entries(positionAlerts).forEach(([key,alert])=>{
+      if((alert.tier==="HIGH"||alert.tier==="CRITICAL")&&similarFailures[key]===undefined){
+        setSimilarFailures(prev=>({...prev,[key]:null})); // 取得中マーカー（二重fetch防止）
+        fetchSimilarFailures(key,alert);
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[positionAlerts]);
+
   // v3-8（ポジション管理ロジック再設計 Step1）：取引タイプ（DAY/SWING）を新規登録時に必須化。
   // SWINGの-10% HARD STOP等、取引タイプに応じた判断ロジックの起点となるフィールドのため。
   const emptyDraft={code:"",name:"",market:"JP",quantity:"",average_price:"",acquired_at:"",memo:"",
@@ -7428,6 +7595,31 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
       <div style={{fontSize:10.5,color:"var(--inkSoft)",marginTop:4}}>投資判断がまだ有効でも一旦撤退してください。再エントリーは新しいトレードとして判断します。</div>
       <div style={{fontSize:10.5,color:"var(--inkFaint)",marginTop:4}}>クリックで閉じる</div>
     </div>}
+    {/* PHASE8（2026-09-18新規、保有中撤退判断支援アラート）：HIGH以上の保有が1件でもあれば
+        画面上部に固定表示する。クリックで該当カードへスクロール（EXIT RULEの固定ポップアップ
+        とは別枠——こちらは常時表示のサマリー、EXIT RULEは個別トースト）。 */}
+    {(()=>{
+      const urgent=items.filter(it=>{
+        const t=positionAlerts[it.code+(it.market||"JP")]?.tier;
+        return t==="HIGH"||t==="CRITICAL";
+      });
+      if(urgent.length===0)return null;
+      return <div style={{position:"sticky",top:0,zIndex:20,background:"var(--card)",
+          border:"2px solid var(--down)",borderRadius:6,padding:"8px 12px",marginBottom:10}}>
+        <div style={{fontWeight:800,fontSize:12.5,color:"var(--down)"}}>⚠ 保有中ポジション注意</div>
+        <div style={{fontSize:11.5,marginTop:2}}>{urgent.length}銘柄でエントリー根拠が崩れています。</div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:8,marginTop:4}}>
+          {urgent.map(it=>{
+            const alert=positionAlerts[it.code+(it.market||"JP")];
+            return <span key={it.code} style={{fontSize:11,cursor:"pointer",textDecoration:"underline",color:"var(--down)"}}
+                onClick={()=>document.getElementById("position-card-"+it.code+(it.market||"JP"))?.scrollIntoView({behavior:"smooth",block:"center"})}>
+              {it.code} {it.name}
+              {alert?.profitGivebackPct!=null&&` 利益消失${Math.round(alert.profitGivebackPct)}%`}
+            </span>;
+          })}
+        </div>
+      </div>;
+    })()}
     {/* v3-9続き（2026-09-07）：通算実現損益。含み損益（下の保有カード）とは完全に別枠で表示する
         （実現損益＝売却済みの累積、通算実現損益にはこの含み損益を含めない、というユーザー指示）。 */}
     <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:10}}>
@@ -7581,7 +7773,7 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
               // 既に列挙）→判断理由→操作」に統一。既存のENTRY READY等（enr、銘柄分析用の参考情報）
               // は主役にせず、末尾に小さく添えるだけにする。ロジック自体（derivePositionStatus等）は
               // 変更しない、表示順のみの並び替え。
-              return <div key={it.code+it.market} style={{border:"1px solid var(--rule)",borderRadius:5,padding:"10px 12px",background:"var(--bg)"}}>
+              return <div key={it.code+it.market} id={"position-card-"+it.code+(it.market||"JP")} style={{border:"1px solid var(--rule)",borderRadius:5,padding:"10px 12px",background:"var(--bg)"}}>
                 {/* ① 取引タイプ（ヘッダー：銘柄名・コード・DAY/SWING切替・削除） */}
                 <div style={{display:"flex",alignItems:"baseline",gap:8}}>
                   <span style={{fontWeight:800,fontSize:13.5}}>{it.name||it.code}</span>
@@ -7620,6 +7812,39 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
                   {pnlAmount!=null?`${pnlAmount>0?"+":""}${Math.round(pnlAmount).toLocaleString()}円`:"—"}
                   {pnlPct!=null && <span style={{fontSize:12,fontWeight:700,marginLeft:6}}>({pnlPct>0?"+":""}{pnlPct.toFixed(2)}%)</span>}
                 </div>
+
+                {/* PHASE7（2026-09-18新規、保有中撤退判断支援アラート）：最大含み益・ENTRY
+                    THESIS・撤退警戒度・過去類似失敗を常時表示する。EXIT RULE（下）を上書き
+                    しない、あくまで追加情報。 */}
+                {(()=>{
+                  const alertKey=it.code+(it.market||"JP");
+                  const alert=positionAlerts[alertKey];
+                  if(!alert)return null;
+                  const tierMeta=alert.tier?EXIT_ALERT_TIER_META[alert.tier]:null;
+                  const thesisTotal=it.entry_thesis_json?Object.keys(THESIS_DIMENSION_LABELS).length:null;
+                  const thesisOk=it.entry_thesis_json?thesisTotal-alert.brokenConditions.length:null;
+                  const failures=similarFailures[alertKey];
+                  return <div style={{marginTop:6,fontSize:11,color:"var(--inkSoft)"}}>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:"2px 10px"}}>
+                      {peakCacheRef.current[alertKey]?.peakPnlPct!=null && <span>最大含み益 +{peakCacheRef.current[alertKey].peakPnlPct.toFixed(2)}%</span>}
+                      {alert.profitGivebackPct!=null && <span>利益消失 {Math.round(alert.profitGivebackPct)}%</span>}
+                      {thesisTotal!=null && <span>ENTRY THESIS {thesisOk}/{thesisTotal}</span>}
+                      {tierMeta && <span style={{fontWeight:800,color:tierMeta.color,border:`1px solid ${tierMeta.color}`,borderRadius:3,padding:"0 6px"}}>
+                        撤退警戒度 {tierMeta.label}
+                      </span>}
+                    </div>
+                    {alert.reasons.length>0 && <div style={{marginTop:2}}>{alert.reasons.join("・")}</div>}
+                    {alert.isHopeHolding && <div style={{marginTop:2,fontWeight:700,color:"var(--down)"}}>
+                      ⚠ HOPE HOLDING DETECTED：根拠より期待で保有している可能性があります。現在の保有理由を再確認してください。
+                    </div>}
+                    {alert.isBreakevenExitCandidate && <div style={{marginTop:2,fontWeight:700,color:"var(--down)"}}>
+                      🔴 同値撤退候補：期待で持つ状態に移行している可能性があります。撤退判断を再確認してください。
+                    </div>}
+                    {failures && failures.length>0 && <div style={{marginTop:2,color:"var(--inkFaint)"}}>
+                      過去類似失敗：{failures.map(f=>`${f.tradeDate}${f.lesson?"「"+f.lesson+"」":""}`).join("／")}
+                    </div>}
+                  </div>;
+                })()}
 
                 {/* ④ EXIT RULE／現在SL（2026-09-10更新：全トレードスタイル共通-8%ルール） */}
                 {riskMeta && <div style={{marginTop:8,padding:"6px 9px",

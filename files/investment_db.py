@@ -783,6 +783,20 @@ CREATE TABLE IF NOT EXISTS trade_reflections (
 CREATE INDEX IF NOT EXISTS idx_trade_reflections_user_date ON trade_reflections(user_id, trade_date DESC);
 """
 
+# 2026-09-18新規（保有中撤退判断支援アラート Phase A）：エントリー時点の判断根拠
+# （entry_thesis_json）と、保有中の最高値/最大含み益（high-water mark）をportfolio自体に
+# 持たせる。従来portfolioは現在のストップ/目標値だけを持ち、「なぜ入ったか」「一度どこまで
+# 伸びたか」を保持していなかったため、利益消失率・根拠崩壊件数を計算できなかった。
+# 新規テーブルは作らず、既存portfolio（ユーザースコープ＝非共有、既存方針どおり）に列を
+# 追加するだけに留める。既存行（この列がNULLの過去ポジション）は「根拠データ無し」として
+# 扱い、崩壊件数等を推測で埋めない。
+_MIGRATE_PORTFOLIO_EXIT_ALERTS_SQL = """
+ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS entry_thesis_json JSONB;
+ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS peak_price NUMERIC;
+ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS peak_pnl_pct NUMERIC;
+ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS peak_updated_at TIMESTAMPTZ;
+"""
+
 # ============================================================
 # Trade Experience Learning（2026-09-11新規）：日々の実トレードから、ユーザー固有の
 # 「勝ちパターン・負けパターン・WAIT条件・利確条件」を蓄積し、ENTRY TOP5・トレード分析・
@@ -1696,6 +1710,7 @@ def init_schema(database_url):
         conn.execute(_MIGRATE_EXTERNAL_INTELLIGENCE_CONTEXT_SQL)
         conn.execute(_MIGRATE_CENTRAL_BANK_EVENT_SYNC_SQL)
         conn.execute(_SCHEMA_TRADE_REFLECTIONS_SQL)
+        conn.execute(_MIGRATE_PORTFOLIO_EXIT_ALERTS_SQL)
         conn.commit()
 
 
@@ -10477,10 +10492,14 @@ def delete_portfolio_item(database_url, user_id, code, market=None):
 # 売却はtrade_history（新設）へ1行記録し、全株売却でportfolioの行自体を削除する
 # （trade_historyは削除しない＝取引履歴は消さない、というユーザー指示）。
 
-def add_position_entry(database_url, user_id, code, name, market, price, shares, trade_style=None):
+def add_position_entry(database_url, user_id, code, name, market, price, shares, trade_style=None, entry_thesis=None):
     """買い/買い増し。既存ポジション（同一user_id・code・market）があれば加重平均で合算し、
     無ければ新規作成する。price/sharesは正の数であることをここでも確認する（不正な値は保存
-    しない）。戻り値：更新後のportfolio 1行（dict）、または失敗時None。"""
+    しない）。戻り値：更新後のportfolio 1行（dict）、または失敗時None。
+    2026-09-18追記（保有中撤退判断支援アラート Phase A）：entry_thesis（dict、呼び出し側が
+    capture_entry_thesis_snapshot()で作成済み）を渡すと、まだentry_thesis_jsonを持たない
+    行（新規作成時、または既存行でNULLのまま＝この機能追加より前に建てたポジション）にだけ
+    書き込む。買い増し時に既存の根拠を上書きしない（最初になぜ入ったかを保持する）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
@@ -10494,6 +10513,7 @@ def add_position_entry(database_url, user_id, code, name, market, price, shares,
     market = market or "JP"
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
     entry = {"price": price, "shares": shares, "timestamp": now_iso}
+    thesis_json = json.dumps(entry_thesis, ensure_ascii=False) if entry_thesis else None
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -10507,17 +10527,25 @@ def add_position_entry(database_url, user_id, code, name, market, price, shares,
             new_qty = old_qty + shares
             new_avg = ((old_avg * old_qty) + (price * shares)) / new_qty if new_qty else price
             entries = list(row.get("entries") or []) + [entry]
-            conn.execute(
-                "UPDATE portfolio SET quantity = %s, average_price = %s, entries = %s::jsonb, updated_at = now() "
-                "WHERE user_id = %s AND code = %s AND market = %s",
-                [new_qty, new_avg, json.dumps(entries, ensure_ascii=False), user_id, code, market],
-            )
+            if row.get("entry_thesis_json") is None and thesis_json is not None:
+                conn.execute(
+                    "UPDATE portfolio SET quantity = %s, average_price = %s, entries = %s::jsonb, "
+                    "entry_thesis_json = %s::jsonb, updated_at = now() "
+                    "WHERE user_id = %s AND code = %s AND market = %s",
+                    [new_qty, new_avg, json.dumps(entries, ensure_ascii=False), thesis_json, user_id, code, market],
+                )
+            else:
+                conn.execute(
+                    "UPDATE portfolio SET quantity = %s, average_price = %s, entries = %s::jsonb, updated_at = now() "
+                    "WHERE user_id = %s AND code = %s AND market = %s",
+                    [new_qty, new_avg, json.dumps(entries, ensure_ascii=False), user_id, code, market],
+                )
         else:
             conn.execute(
                 "INSERT INTO portfolio (user_id, code, name, market, quantity, average_price, "
-                "trade_style, entries, active, acquired_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, true, now())",
-                [user_id, code, name, market, shares, price, trade_style, json.dumps([entry], ensure_ascii=False)],
+                "trade_style, entries, active, acquired_at, entry_thesis_json) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, true, now(), %s::jsonb)",
+                [user_id, code, name, market, shares, price, trade_style, json.dumps([entry], ensure_ascii=False), thesis_json],
             )
         conn.commit()
         with conn.cursor(row_factory=dict_row) as cur:
@@ -10528,6 +10556,30 @@ def add_position_entry(database_url, user_id, code, name, market, price, shares,
     d = _row_to_json(updated)
     d.pop("user_id", None)
     return d
+
+
+def update_position_peak(database_url, user_id, position_id, peak_price, peak_pnl_pct):
+    """保有中ポジション支援アラート Phase A（2026-09-18新規）：high-water mark（最大含み益）
+    の更新。「改善した時だけ更新」をSQL側のWHERE句でも保証する（フロント側の楽観的更新が
+    多少ズレても、サーバー側で悪化方向への上書きは起きない）。戻り値：更新後の
+    {peakPrice,peakPnlPct}、対象行が無い/改善しなかった場合はNone。"""
+    pool = _get_pool(database_url)
+    if pool is None or not position_id or peak_pnl_pct is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE portfolio SET peak_price = %s, peak_pnl_pct = %s, peak_updated_at = now() "
+                "WHERE id = %s AND user_id = %s "
+                "AND (peak_pnl_pct IS NULL OR peak_pnl_pct < %s) "
+                "RETURNING peak_price, peak_pnl_pct",
+                [peak_price, peak_pnl_pct, position_id, user_id, peak_pnl_pct],
+            )
+            row = cur.fetchone()
+        conn.commit()
+    if not row:
+        return None
+    return {"peakPrice": row["peak_price"], "peakPnlPct": row["peak_pnl_pct"]}
 
 
 # 2026-09-07新規（通算実現損益を税引後ベースへ変更）：上場株式の譲渡益にかかる税率
