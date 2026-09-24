@@ -5562,6 +5562,25 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                       </div>
                       <span style={{fontSize:10,color:"var(--inkFaint)"}}>{expanded?"▲内訳を閉じる":"▼内訳"}</span>
                     </div>
+                    {/* 買付余力ベース評価（2026-09-24新規）：余力設定済みの時だけ表示 */}
+                    {c.minimumPurchaseAmount!=null && c.buyable!==undefined && c.buyable!==null && <div style={{marginTop:4,display:"flex",flexWrap:"wrap",gap:"2px 12px",fontSize:10.5}} className="mono">
+                      <span style={{fontWeight:800,color:"var(--accent)"}}>{c.capitalStatus||"BUY_NOW"}</span>
+                      <span>必要資金 {c.minimumPurchaseAmount.toLocaleString()}円</span>
+                      <span>余力 {c.cashAvailable!=null?c.cashAvailable.toLocaleString():"—"}円</span>
+                      {c.cashRemainingAfterBuy!=null && <span>購入後余力 {c.cashRemainingAfterBuy.toLocaleString()}円</span>}
+                      {c.cashUsageRatio!=null && <span>余力使用率 {Math.round(c.cashUsageRatio*100)}%</span>}
+                      {c.capitalEfficiencyScore!=null && <span>資金効率 {c.capitalEfficiencyScore}</span>}
+                      {(c.capitalFlags||[]).includes("CAPITAL_CONCENTRATION_RISK") && <span style={{fontWeight:800,color:c.capitalConcentrationRisk==="STRONG"?"var(--down)":"var(--warn)"}}>
+                        {c.capitalConcentrationRisk==="STRONG"?"🔴":"🟠"} CAPITAL_CONCENTRATION_RISK（{c.capitalConcentrationRisk==="STRONG"?"強警告":"注意"}）
+                      </span>}
+                    </div>}
+                    {c.ipoInfo && <div style={{marginTop:4,display:"flex",flexWrap:"wrap",gap:"2px 12px",fontSize:10.5}} className="mono">
+                      <span style={{fontWeight:800,color:"var(--accent)"}}>IPO {c.ipoInfo.stage}</span>
+                      {c.ipoInfo.fundamental&&c.ipoInfo.fundamental.ipo_fundamental_score!=null && <span>IPO FUNDAMENTAL {c.ipoInfo.fundamental.ipo_fundamental_score}</span>}
+                      {c.ipoInfo.fundamental&&c.ipoInfo.fundamental.supply_demand_score!=null && <span>IPO SUPPLY DEMAND {c.ipoInfo.fundamental.supply_demand_score}</span>}
+                      {c.ipoInfo.ipoTotalScore!=null && <span>IPO総合 {c.ipoInfo.ipoTotalScore}</span>}
+                      {c.ipoInfo.priceVsOfferPct!=null && <span>公開価格比 {c.ipoInfo.priceVsOfferPct>0?"+":""}{c.ipoInfo.priceVsOfferPct}%</span>}
+                    </div>}
                     {confirmationOverrideReasons&&confirmationOverrideReasons.length>0 && <div style={{marginTop:4,fontSize:10.5,color:stMeta.color}}>
                       詳細分析：{confirmationOverrideReasons.join("・")}
                       {confirmationUnblockConditions&&confirmationUnblockConditions.length>0 && <span style={{color:"var(--inkSoft)"}}>　／　ENTRY解禁：{confirmationUnblockConditions.join("・")}</span>}
@@ -5575,6 +5594,33 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                   </div>;
                 })}
               </div>}
+          {entryResult.capital&&entryResult.capital.applied && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:6}}>
+            現在の買付余力 <span className="mono" style={{fontWeight:800}}>{Math.round(entryResult.capital.cashAvailable).toLocaleString()}円</span>
+            ／ 余力不足で除外：{entryResult.capital.notBuyableCount}銘柄
+          </div>}
+          {entryResult.capital&&entryResult.capital.combinations&&entryResult.capital.combinations.length>0 && <div style={{fontSize:11,marginBottom:8}}>
+            <div style={{fontWeight:700,color:"var(--inkSoft)",marginBottom:2}}>同時に持てる組み合わせ（余力内・集中リスク考慮）</div>
+            {entryResult.capital.combinations.map((cb,i)=><div key={i} className="mono">
+              {cb.codes.join(" + ")}　合計 {cb.totalAmount.toLocaleString()}円　残余力 {cb.cashRemaining.toLocaleString()}円
+              {cb.concentrationRisk && <span style={{color:"var(--warn)"}}>　集中:{cb.concentrationRisk}</span>}
+            </div>)}
+          </div>}
+          {entryResult.capital&&entryResult.capital.notBuyableNotable&&entryResult.capital.notBuyableNotable.length>0 && <div style={{marginBottom:8}}>
+            <div style={{fontSize:11,fontWeight:700,color:"var(--inkSoft)",marginBottom:4}}>余力不足だが注目（NOT_BUYABLE・TOP5には含めない）</div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+              {entryResult.capital.notBuyableNotable.map(c=><span key={c.code} style={{fontSize:11,padding:"2px 7px",borderRadius:3,border:"1px dashed var(--rule)",whiteSpace:"nowrap"}}>
+                {c.code} {c.name} <span className="mono">SCORE {c.entryScore}</span> <span className="mono">必要資金 {c.minimumPurchaseAmount.toLocaleString()}円</span> <span style={{color:"var(--down)"}}>余力不足</span>
+              </span>)}
+            </div>
+          </div>}
+          {entryResult.shadowRecheck&&entryResult.shadowRecheck.length>0 && <div style={{marginBottom:8}}>
+            <div style={{fontSize:11,fontWeight:700,color:"var(--accent)",marginBottom:4}}>👁 再注目候補（監視解除後の内部追跡で再上昇を検出）</div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+              {entryResult.shadowRecheck.map(c=><span key={c.code} style={{fontSize:11,padding:"2px 7px",borderRadius:3,border:"1px solid var(--accent)",whiteSpace:"nowrap"}}>
+                {c.code} {c.name||""} {c.kind} <span className="mono">{c.price!=null?c.price.toLocaleString():"—"}円{c.changePct!=null?`（${c.changePct>0?"+":""}${c.changePct}%）`:""}</span> {c.reasons.join("・")}
+              </span>)}
+            </div>
+          </div>}
           {entryResult.watchCandidates.length>0 && <>
             <div style={{fontSize:11,fontWeight:700,color:"var(--inkSoft)",marginBottom:4}}>監視候補（BREAKOUT待ち・押し目待ち・反転待ち等、まだENTRY READYではない）</div>
             <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
@@ -7372,6 +7418,31 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
     }catch(e){}
   };
   useEffect(()=>{loadTotals();loadTrades();},[]);
+  // 買付余力（2026-09-24新規）：ユーザーが手動設定した値（MANUAL最優先）。保存後は
+  // "cash-updated"イベントで今買い時TOP5側（別コンポーネント）が即時に再取得する。
+  const [cashInfo,setCashInfo]=useState(null);
+  const [editingCash,setEditingCash]=useState(false);
+  const [cashDraft,setCashDraft]=useState("");
+  const [cashError,setCashError]=useState("");
+  const loadCash=async()=>{
+    try{
+      const r=await fetch("/api/portfolio/cash");
+      if(r.ok)setCashInfo(await r.json());
+    }catch(e){}
+  };
+  useEffect(()=>{loadCash();},[]);
+  const saveCash=async()=>{
+    const v=Number(String(cashDraft).replace(/[,，\s円]/g,""));
+    if(!isFinite(v)||v<0||cashDraft===""){setCashError("0以上の数値を入力してください");return;}
+    try{
+      const r=await fetch("/api/portfolio/cash",{method:"PUT",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({cash_available:v})});
+      if(!r.ok){setCashError("保存に失敗しました");return;}
+      setCashInfo(await r.json());
+      setEditingCash(false);setCashError("");
+      window.dispatchEvent(new CustomEvent("cash-updated"));
+    }catch(e){setCashError("保存に失敗しました");}
+  };
   // v3-9追加（2026-09-07・ユーザーフィードバック）：入力ミス修正のため、通常時は編集不可
   // 表示のまま「修正」を押した時だけ入力欄を出し、確定前に「初期通算損益を変更すると通算損益が
   // 再計算されます」という確認を必ず挟む（trade_history自体は一切変更しない・再計算対象は
@@ -7628,6 +7699,32 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
         </div>
       </div>;
     })()}
+    {/* 買付余力（2026-09-24新規）：今買い時TOP5・注目候補の「実際に買える銘柄」判定に使う手動設定値。 */}
+    <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:10}}>
+      <div style={{fontSize:11,color:"var(--inkSoft)"}}>買付余力（手動設定・TOP5の「買える銘柄」判定に使用）</div>
+      {editingCash
+        ? <div style={{display:"flex",gap:8,alignItems:"center",marginTop:4,flexWrap:"wrap"}}>
+            <input type="number" autoFocus value={cashDraft} onChange={e=>setCashDraft(e.target.value)}
+              placeholder="例：700000" style={{fontSize:15,padding:"5px 8px",border:"1px solid var(--rule)",borderRadius:4,background:"var(--bg)",color:"var(--ink)",width:160}}/>
+            <button className="action-btn" onClick={saveCash}>保存</button>
+            <button className="ghost" onClick={()=>{setEditingCash(false);setCashError("");}}>キャンセル</button>
+            {cashError && <span style={{fontSize:11,color:"var(--down)"}}>{cashError}</span>}
+          </div>
+        : <div style={{display:"flex",alignItems:"baseline",gap:10,marginTop:2,flexWrap:"wrap"}}>
+            <span className="mono" style={{fontSize:22,fontWeight:800}}>
+              {cashInfo&&cashInfo.cash_available!=null?Math.round(cashInfo.cash_available).toLocaleString()+"円":"未設定"}
+            </span>
+            <button className="iconbtn" style={{fontSize:11}}
+              onClick={()=>{setCashDraft(cashInfo&&cashInfo.cash_available!=null?String(Math.round(cashInfo.cash_available)):"");setEditingCash(true);}}>編集</button>
+            {cashInfo&&cashInfo.updated_at && <span style={{fontSize:10.5,color:"var(--inkFaint)"}}>
+              最終更新：{new Date(cashInfo.updated_at).toLocaleString("ja-JP",{timeZone:"Asia/Tokyo",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"})}
+              （{cashInfo.source==="AUTO"?"自動":"手動"}）
+            </span>}
+            {cashInfo&&cashInfo.auto_reference!=null&&cashInfo.source==="MANUAL" && <span style={{fontSize:10.5,color:"var(--inkFaint)"}}>
+              自動計算の参考値：{Math.round(cashInfo.auto_reference).toLocaleString()}円
+            </span>}
+          </div>}
+    </div>
     {/* v3-9続き（2026-09-07）：通算実現損益。含み損益（下の保有カード）とは完全に別枠で表示する
         （実現損益＝売却済みの累積、通算実現損益にはこの含み損益を含めない、というユーザー指示）。 */}
     <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:10}}>
@@ -12391,7 +12488,11 @@ function App(){
     };
     fetchLive();
     const id=setInterval(()=>{if(isJstMarketHours())fetchLive();},45*1000);
-    return()=>clearInterval(id);
+    // 買付余力を手動変更した直後は、サーバー側でキャッシュ済み候補から即時再ランキングされる
+    // ため、次のポーリングを待たずに再取得する（2026-09-24新規）。
+    const onCash=()=>{setTimeout(fetchLive,300);};
+    window.addEventListener("cash-updated",onCash);
+    return()=>{clearInterval(id);window.removeEventListener("cash-updated",onCash);};
   },[]);
 
   // 売買記録（トレードジャーナル）：銘柄分析カードの「記録に追加」ボタンから、そのカードの

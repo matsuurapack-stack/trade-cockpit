@@ -694,6 +694,53 @@ CREATE TABLE IF NOT EXISTS smart_import_event_tombstones (
     deleted_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (event_date, title)
 );
+
+-- 2026-09-24新規（買付余力ベース候補評価）：ユーザー手動設定の買付余力。1ユーザー1行
+-- （UNIQUE(user_id)のUPSERTで増殖させない）。sourceはMANUAL最優先、auto_referenceは自動計算の参考値。
+CREATE TABLE IF NOT EXISTS portfolio_cash_balance (
+    id              SERIAL PRIMARY KEY,
+    user_id         TEXT NOT NULL UNIQUE,
+    cash_available  NUMERIC NOT NULL,
+    currency        TEXT NOT NULL DEFAULT 'JPY',
+    source          TEXT NOT NULL DEFAULT 'MANUAL',
+    auto_reference  NUMERIC,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- IPO銘柄メタ情報＋監視段階（WATCH_LOW/WATCH/BUY_CANDIDATE）。akippa事例：朝の下落で監視解除→
+-- ストップ高の機会損失。IPO後20営業日は完全削除せず段階として残す。
+CREATE TABLE IF NOT EXISTS ipo_stocks (
+    id                 SERIAL PRIMARY KEY,
+    user_id            TEXT NOT NULL,
+    code               TEXT NOT NULL,
+    name               TEXT,
+    listing_date       DATE,
+    offer_price        NUMERIC,
+    first_price        NUMERIC,
+    fundamentals_json  JSONB,
+    watch_stage        TEXT NOT NULL DEFAULT 'WATCH_LOW',
+    stage_reason       TEXT,
+    stage_updated_at   TIMESTAMPTZ,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, code)
+);
+
+-- 監視解除後も内部追跡する銘柄（UIには通常出さない）。kind別に期限（IPO20/MATERIAL3/SURGE2営業日）。
+CREATE TABLE IF NOT EXISTS shadow_watch (
+    id                 SERIAL PRIMARY KEY,
+    user_id            TEXT NOT NULL,
+    code               TEXT NOT NULL,
+    name               TEXT,
+    kind               TEXT NOT NULL,
+    reason             TEXT,
+    started_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    until_date         DATE NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'ACTIVE',
+    last_checked_at    TIMESTAMPTZ,
+    last_trigger_json  JSONB,
+    UNIQUE (user_id, code)
+);
 """
 
 # 2026-09-09新規（ルール学習システム）：投資判断ログ系の他テーブルより後に作成する必要は
@@ -10865,3 +10912,152 @@ def set_initial_realized_pnl(database_url, user_id, value):
             [user_id, value],
         )
         conn.commit()
+
+
+# ============================================================
+# 買付余力・IPO・shadow_watch（2026-09-24新規）
+# ============================================================
+
+def get_cash_balance(database_url, user_id):
+    """現在の買付余力（1ユーザー1行）。未設定ならNone。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT cash_available, currency, source, auto_reference, updated_at "
+                        "FROM portfolio_cash_balance WHERE user_id = %s", [user_id])
+            row = cur.fetchone()
+    if not row:
+        return None
+    return _row_to_json(row)
+
+
+def set_cash_balance(database_url, user_id, cash_available, source="MANUAL", auto_reference=None,
+                     currency="JPY"):
+    """UPSERT（増殖させない）。MANUALが最優先：AUTO更新はMANUAL設定値を上書きしない
+    （auto_referenceだけ更新する）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            if source == "AUTO":
+                cur.execute(
+                    "INSERT INTO portfolio_cash_balance (user_id, cash_available, currency, source, auto_reference) "
+                    "VALUES (%s, %s, %s, 'AUTO', %s) "
+                    "ON CONFLICT (user_id) DO UPDATE SET auto_reference = EXCLUDED.auto_reference, "
+                    "cash_available = CASE WHEN portfolio_cash_balance.source = 'MANUAL' "
+                    "THEN portfolio_cash_balance.cash_available ELSE EXCLUDED.cash_available END, "
+                    "updated_at = CASE WHEN portfolio_cash_balance.source = 'MANUAL' "
+                    "THEN portfolio_cash_balance.updated_at ELSE now() END "
+                    "RETURNING cash_available, currency, source, auto_reference, updated_at",
+                    [user_id, cash_available, currency, cash_available if auto_reference is None else auto_reference])
+            else:
+                cur.execute(
+                    "INSERT INTO portfolio_cash_balance (user_id, cash_available, currency, source, auto_reference) "
+                    "VALUES (%s, %s, %s, 'MANUAL', %s) "
+                    "ON CONFLICT (user_id) DO UPDATE SET cash_available = EXCLUDED.cash_available, "
+                    "currency = EXCLUDED.currency, source = 'MANUAL', updated_at = now() "
+                    "RETURNING cash_available, currency, source, auto_reference, updated_at",
+                    [user_id, cash_available, currency, auto_reference])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def upsert_ipo_stock(database_url, user_id, code, name=None, listing_date=None, offer_price=None,
+                     first_price=None, fundamentals=None):
+    pool = _get_pool(database_url)
+    if pool is None or not code:
+        return None
+    fj = json.dumps(fundamentals, ensure_ascii=False) if fundamentals is not None else None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "INSERT INTO ipo_stocks (user_id, code, name, listing_date, offer_price, first_price, fundamentals_json) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb) "
+                "ON CONFLICT (user_id, code) DO UPDATE SET "
+                "name = COALESCE(EXCLUDED.name, ipo_stocks.name), "
+                "listing_date = COALESCE(EXCLUDED.listing_date, ipo_stocks.listing_date), "
+                "offer_price = COALESCE(EXCLUDED.offer_price, ipo_stocks.offer_price), "
+                "first_price = COALESCE(EXCLUDED.first_price, ipo_stocks.first_price), "
+                "fundamentals_json = COALESCE(EXCLUDED.fundamentals_json, ipo_stocks.fundamentals_json), "
+                "updated_at = now() RETURNING *",
+                [user_id, code, name, listing_date, offer_price, first_price, fj])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_ipo_stocks(database_url, user_id):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM ipo_stocks WHERE user_id = %s ORDER BY listing_date DESC NULLS LAST", [user_id])
+            return [_row_to_json(r) for r in cur.fetchall()]
+
+
+def set_ipo_watch_stage(database_url, user_id, code, stage, reason=None):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return False
+    with pool.connection() as conn:
+        conn.execute("UPDATE ipo_stocks SET watch_stage = %s, stage_reason = %s, stage_updated_at = now(), "
+                     "updated_at = now() WHERE user_id = %s AND code = %s", [stage, reason, user_id, code])
+        conn.commit()
+    return True
+
+
+def upsert_shadow_watch(database_url, user_id, code, kind, until_date, name=None, reason=None):
+    """既存行があればkind/期限を延長方向にだけ更新（再削除で期限が短くならない）、ACTIVEへ戻す。"""
+    pool = _get_pool(database_url)
+    if pool is None or not code:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "INSERT INTO shadow_watch (user_id, code, name, kind, reason, until_date) "
+                "VALUES (%s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (user_id, code) DO UPDATE SET status = 'ACTIVE', "
+                "until_date = GREATEST(shadow_watch.until_date, EXCLUDED.until_date), "
+                "kind = EXCLUDED.kind, reason = COALESCE(EXCLUDED.reason, shadow_watch.reason), "
+                "name = COALESCE(EXCLUDED.name, shadow_watch.name) RETURNING *",
+                [user_id, code, name, kind, reason, until_date])
+            row = cur.fetchone()
+        conn.commit()
+    return _row_to_json(row) if row else None
+
+
+def list_shadow_watch(database_url, user_id, status=None, active_on=None):
+    """active_on(date)を渡すとstatus='ACTIVE'かつuntil_date>=active_onのみ。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = ["user_id = %s"], [user_id]
+    if status:
+        where.append("status = %s")
+        params.append(status)
+    if active_on is not None:
+        where.append("status = 'ACTIVE' AND until_date >= %s")
+        params.append(active_on)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SELECT * FROM shadow_watch WHERE {' AND '.join(where)} ORDER BY started_at", params)
+            return [_row_to_json(r) for r in cur.fetchall()]
+
+
+def update_shadow_watch_check(database_url, user_id, code, trigger=None, status=None):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return False
+    tj = json.dumps(trigger, ensure_ascii=False) if trigger is not None else None
+    with pool.connection() as conn:
+        conn.execute("UPDATE shadow_watch SET last_checked_at = now(), "
+                     "last_trigger_json = COALESCE(%s::jsonb, last_trigger_json), "
+                     "status = COALESCE(%s, status) WHERE user_id = %s AND code = %s",
+                     [tj, status, user_id, code])
+        conn.commit()
+    return True
