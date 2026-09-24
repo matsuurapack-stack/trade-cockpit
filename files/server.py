@@ -13681,6 +13681,37 @@ def capture_entry_thesis_snapshot(code, market="JP"):
         return None
 
 
+# 振り返り：PTS売買対応（2026-09-23新規）。市場区分（通常/PTS）の許容値。既存market列
+# （JP/US、取引所の国）とは別軸——ここでは同じ取引所内での立会時間内/時間外の区別のみを扱う。
+TRADE_VENUES = ("REGULAR", "PTS")
+
+
+def normalize_trade_venue(value):
+    """市場区分の入力値を正規化する。未知の値・空文字はNone（不明。過去データ同様、推測で
+    REGULARに寄せない——UI側は新規登録時に明示選択させる設計のため、値が無ければ本当に
+    未入力・旧データのどちらか）。"""
+    v = str(value or "").strip().upper()
+    return v if v in TRADE_VENUES else None
+
+
+THESIS_CONDITION_KEYS = ("trend_up", "volume_expanding", "above_vwap", "market_supportive",
+                          "sector_supportive", "breakout_detected", "momentum_positive")
+
+
+def compute_thesis_weakened(entry_thesis, exit_thesis):
+    """保有中撤退判断支援アラート Phase A（capture_entry_thesis_snapshot）のENTRY時点
+    スナップショットと、決済時刻に同じ関数を再度呼んで得たEXIT時点スナップショットを比較し、
+    「エントリー根拠が崩れていたか」を判定する。フロント側deriveExitDecisionAlert()の
+    THESIS_BREAK判定（brokenConditions>=2件でTHESIS_BREAK）と同じ閾値を踏襲し、二重の判定
+    ロジックを作らない。どちらかのスナップショットが無ければ判定不能（推測しない）。
+    戻り値：{"thesis_weakened": bool|None, "broken_conditions": [...], "broken_count": int}。"""
+    if not entry_thesis or not exit_thesis:
+        return {"thesis_weakened": None, "broken_conditions": [], "broken_count": 0}
+    broken = [k for k in THESIS_CONDITION_KEYS
+              if entry_thesis.get(k) is True and exit_thesis.get(k) is False]
+    return {"thesis_weakened": len(broken) >= 2, "broken_conditions": broken, "broken_count": len(broken)}
+
+
 def compute_entry_risk_assessment(similar_result):
     """指示書3番：GOOD_ENTRY_SIMILARITY / LOSS_PATTERN_SIMILARITY / ENTRY_RISK_SCOREを算出する。
     既存find_similar_trade_experiences()が返すsimilar_result（symbol一致＋タグ/特徴量類似度）を
@@ -14274,6 +14305,49 @@ def evaluate_trade_quality_axes(ctx, stage_sequence, stop_quality_evidence, init
     }
 
 
+# 振り返り：PTS売買対応（2026-09-23新規）。既存4/5軸のquality_axes_json（ENTRY/STOP/EXIT/
+# REENTRY/EVENT、いずれも損益の符号を見ない判定）とは別枠の、EXIT実行の「判断の巧拙」を
+# 説明するタグ群。フロントのderiveExitDecisionAlert()由来のリアルタイムタグ
+# （build_position_alert_tags：PROFIT_GIVEBACK/HOPE_HOLDING/THESIS_BREAK/LATE_EXIT）が
+# 「保有中に検出した警戒サイン」であるのに対し、ここは決済が確定した後に、決済時点までの
+# 情報だけを使って「その警戒サインへどう対処したか」を評価する（例：HOPE_HOLDING_AVOIDED＝
+# 含み損を抱えた後、期待保有で粘らずに同値付近で撤退できたことを示す）。
+EXIT_JUDGMENT_TAG_MEANINGS = {
+    "PTS_EXIT": "通常市場の取引時間外（PTS）で決済した",
+    "BREAKEVEN_RECOVERY": "含み損（MAE）を抱えた後、ほぼ同値まで回復させて撤退した",
+    "HOPE_HOLDING_AVOIDED": "含み損からの回復局面で、期待保有（根拠なき保有継続）に陥らず撤退した",
+    "EVENT_RISK_EXIT": "決済時点で重要イベントリスクが高い状況下での決済だった",
+    "THESIS_WEAKENED": "エントリー根拠のうち2項目以上が決済時点までに崩れていた",
+}
+
+
+def classify_exit_judgment_tags(trade, ctx, gross_pnl_pct, active_macro_events_at_exit, thesis_comparison):
+    """振り返り：PTS売買対応。「損切りしたあと上がった／同値撤退の後さらに上がった」という
+    後知恵で評価しない——判定材料はすべて決済時点までに確定していた情報のみ：
+      - exit_venue：決済という事実そのもの（後知恵の余地なし）
+      - MAE（max_adverse_excursion_pct）：entry〜exit（reconstruct_trade_market_contextが
+        exit_idxまでのバーだけから計算、exit後の値動きは含まれない）
+      - active_macro_events_at_exit：build_active_macro_events(now_jst=決済時刻)で計算済み
+        （決済時点で既に判明していたイベントのみ、Phase4のcompute_market_event_status()と
+        同じnow_jstパラメータ化の仕組みをそのまま再利用）
+      - thesis_comparison：ENTRY時点とEXIT時点、両方とも決済までに確定済みのスナップショット比較
+    戻り値：タグのlist（0件以上、複数可）。"""
+    tags = []
+    if (trade or {}).get("exit_venue") == "PTS":
+        tags.append("PTS_EXIT")
+    mae = (ctx or {}).get("max_adverse_excursion_pct")
+    near_breakeven = gross_pnl_pct is not None and abs(gross_pnl_pct) < 1.0
+    had_meaningful_drawdown = mae is not None and mae <= -1.5
+    if had_meaningful_drawdown and near_breakeven:
+        tags.append("BREAKEVEN_RECOVERY")
+        tags.append("HOPE_HOLDING_AVOIDED")
+    if (active_macro_events_at_exit or {}).get("market_event_risk") in ("HIGH", "EXTREME"):
+        tags.append("EVENT_RISK_EXIT")
+    if (thesis_comparison or {}).get("thesis_weakened"):
+        tags.append("THESIS_WEAKENED")
+    return tags
+
+
 def sync_trade_experiences_for_date(database_url, user_id, review_date):
     """15:30自動評価（指示書12・13・21・26・29番）：当日の実トレード（勝ち/負け/同値/損切り/
     利確、全部——勝ちトレードだけの登録は禁止）をtrade_experiencesへ冪等にupsertし、WAITのみで
@@ -14426,6 +14500,19 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
             entry_price=entry_price, exit_price=exit_price, event_risk_at_entry=event_risk_today,
         )
 
+        # 振り返り：PTS売買対応（2026-09-23新規）。決済時点（exit_time_iso）のイベントリスクを
+        # 「その時点で既に判明していた情報」として再現する——now_jst=決済時刻で計算するため
+        # 未来情報は混ざらない（Phase4のcompute_market_event_status()と同じ設計）。
+        active_macro_events_at_exit = None
+        try:
+            exit_dt_jst = datetime.datetime.fromisoformat(str(exit_time_iso).replace("Z", "+00:00")).astimezone(_JST)
+            active_macro_events_at_exit = build_active_macro_events(database_url, user_id, now_jst=exit_dt_jst)
+        except Exception as e:
+            print("  daily-review: 決済時点のactive_macro_events取得で例外（無視して続行）", t.get("code"), e)
+        thesis_comparison = compute_thesis_weakened(t.get("entry_thesis_json"), t.get("exit_thesis_json"))
+        exit_judgment_tags = classify_exit_judgment_tags(
+            t, market_ctx, gross_pnl_pct, active_macro_events_at_exit, thesis_comparison)
+
         fields = {
             "trade_date": review_date, "symbol": t.get("code"), "stock_name": t.get("name"),
             "side": "BUY", "trade_style": t.get("trade_style"),
@@ -14452,7 +14539,7 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
             "max_adverse_excursion_pct": market_ctx.get("max_adverse_excursion_pct"),
             "post_exit_max_price": market_ctx.get("post_exit_max_price"),
             "post_exit_min_price": market_ctx.get("post_exit_min_price"),
-            "pattern_tags_json": pattern_tags or None, "exit_reason_json": loss_tags or None,
+            "pattern_tags_json": (pattern_tags + exit_judgment_tags) or None, "exit_reason_json": loss_tags or None,
             "decision_snapshot_json": {
                 "entry_snapshot": entry_snapshot,  # 指示書5番：ENTRY時点固定スキーマ
                 "day_open": market_ctx.get("day_open"), "vwap_at_entry": market_ctx.get("vwap_at_entry"),
@@ -14478,6 +14565,12 @@ def sync_trade_experiences_for_date(database_url, user_id, review_date):
                     "loss_reason_categories": categorize_loss_reason_tags(loss_tags),
                     "entry_unblock_conditions": entry_unblock_conditions,  # 指示書9番
                 } if result_class == "LOSS" else {}),
+                # 振り返り：PTS売買対応（2026-09-23新規）。exit_judgment_tagsが空でも常にキーを
+                # 出す（「該当タグなし」と「未評価」を区別するため、resultClassに関わらず出力）。
+                "exit_judgment_tags": exit_judgment_tags,
+                "entry_venue": t.get("entry_venue"), "exit_venue": t.get("exit_venue"),
+                "thesis_comparison": thesis_comparison,
+                "market_event_risk_at_exit": (active_macro_events_at_exit or {}).get("market_event_risk"),
             },
             # Trade Learning Phase C（2026-09-16新規）：ENTRY_QUALITY/STOP_QUALITY/EXIT_QUALITY/
             # REENTRY_QUALITYの4軸独立評価。既存execution_score/entry_avoidability/loss_reason_tags
@@ -26047,7 +26140,7 @@ class Handler(SimpleHTTPRequestHandler):
             updated = investment_db.add_position_entry(
                 DATABASE_URL, self.current_user, body.get("code"), body.get("name"),
                 body.get("market") or "JP", body.get("price"), body.get("shares"), body.get("trade_style"),
-                entry_thesis=entry_thesis)
+                entry_thesis=entry_thesis, entry_venue=normalize_trade_venue(body.get("entry_venue")))
             if updated is None:
                 self._send_json({"error": "買値・枚数は正の数で指定してください"})
                 return
@@ -26089,9 +26182,18 @@ class Handler(SimpleHTTPRequestHandler):
                 position_id = match.get("id") if match else None
             except Exception:
                 position_id = None
+            # 振り返り：PTS売買対応（2026-09-23新規）。EXIT時点のentry_thesis比較用スナップショット
+            # を、既存のENTRY時点キャプチャと同じ軽量関数で今この瞬間分を取得する（新しい取得経路は
+            # 増やさない）。取得失敗してもEXIT自体はブロックしない。
+            exit_thesis_snapshot = None
+            try:
+                exit_thesis_snapshot = capture_entry_thesis_snapshot(body.get("code"), body.get("market") or "JP")
+            except Exception as e:
+                print("  /api/portfolio/exit: exit_thesis取得で例外（無視して続行）", e)
             result = investment_db.add_position_exit(
                 DATABASE_URL, self.current_user, body.get("code"), body.get("market") or "JP",
-                body.get("exitPrice"), body.get("shares"))
+                body.get("exitPrice"), body.get("shares"),
+                exit_venue=normalize_trade_venue(body.get("exit_venue")), exit_thesis_snapshot=exit_thesis_snapshot)
             # 2026-09-09追加（判断エンジン全画面統合、指示書8番）：売却が成功した場合のみ、
             # ベストエフォートでplaybook実績を更新する（add_position_exit自体は無変更、
             # 失敗してもここで例外を握りつぶし売却結果のレスポンスには影響させない）。

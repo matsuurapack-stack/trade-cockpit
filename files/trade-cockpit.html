@@ -6568,6 +6568,7 @@ function PositionEntryModal({code,name,market,needsTradeStyle,onClose,onSaved}){
 function PositionExitModal({position,currentPrice,onClose,onSaved}){
   const [price,setPrice]=useState(currentPrice!=null?String(Math.round(currentPrice)):"");
   const [shares,setShares]=useState(position.quantity!=null?String(position.quantity):"");
+  const [venue,setVenue]=useState("REGULAR"); // 振り返り：PTS売買対応（2026-09-23新規）
   const [confirming,setConfirming]=useState(false);
   const [saving,setSaving]=useState(false);
   const [errMsg,setErrMsg]=useState("");
@@ -6597,7 +6598,7 @@ function PositionExitModal({position,currentPrice,onClose,onSaved}){
     setSaving(true);setErrMsg("");
     try{
       const r=await fetch("/api/portfolio/exit",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({code:position.code,market:position.market,exitPrice:p,shares:s})});
+        body:JSON.stringify({code:position.code,market:position.market,exitPrice:p,shares:s,exit_venue:venue})});
       const d=await r.json();
       if(d.error){setErrMsg(d.error);setConfirming(false);}
       else{onSaved&&onSaved(d);onClose();}
@@ -6626,6 +6627,12 @@ function PositionExitModal({position,currentPrice,onClose,onSaved}){
         <label style={{display:"block",fontSize:12,color:"var(--inkSoft)",marginTop:10}}>売却枚数
           <input type="number" value={shares} onChange={e=>setShares(e.target.value)} style={inputStyle}/>
         </label>
+        {/* 振り返り：PTS売買対応（2026-09-23新規）：市場区分（通常/PTS）。既定は通常。 */}
+        <label style={{display:"block",fontSize:12,color:"var(--inkSoft)",marginTop:10}}>市場区分
+          <select value={venue} onChange={e=>setVenue(e.target.value)} style={inputStyle}>
+            <option value="REGULAR">通常</option><option value="PTS">PTS</option>
+          </select>
+        </label>
         {/* item14/15：株数ショートカット。押しただけでは確定せず、あくまで入力欄に値をセットするのみ
             （従来通り「入力→確認画面→確定」の2段階は維持）。単元株数（JP=100株・US=1株）にfloor
             丸め。丸めた結果0株になる場合（例：保有100株＝1単元のみで25%を選ぶと0株になる）は、
@@ -6652,7 +6659,7 @@ function PositionExitModal({position,currentPrice,onClose,onSaved}){
         <div style={{fontSize:13,marginBottom:6}}>{position.name||position.code} <span className="mono" style={{color:"var(--inkSoft)"}}>{position.code}</span></div>
         <div style={{fontSize:12.5,color:"var(--inkSoft)",display:"flex",flexDirection:"column",gap:2,marginBottom:12}}>
           <div>取得単価　{avg.toLocaleString()}円</div>
-          <div>売却単価　{p.toLocaleString()}円</div>
+          <div>売却単価　{p.toLocaleString()}円［{venue==="PTS"?"PTS":"通常"}］</div>
           <div>売却枚数　{s.toLocaleString()}株</div>
         </div>
         {/* 2026-09-07追加（通算実現損益を税引後ベースへ変更）：税引前損益・概算税額・税引後損益を
@@ -7278,7 +7285,8 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
   // SWINGの-10% HARD STOP等、取引タイプに応じた判断ロジックの起点となるフィールドのため。
   const emptyDraft={code:"",name:"",market:"JP",quantity:"",average_price:"",acquired_at:"",memo:"",
     initial_stop:"",target_1:"",target_2:"",trade_style:"",
-    stop_reason_category:"",stop_reason_text:""}; // Trade Learning Phase B：STOP根拠（構造化カテゴリ＋自由文）
+    stop_reason_category:"",stop_reason_text:"",
+    entry_venue:"REGULAR"}; // 振り返り：PTS売買対応。市場区分（通常/PTS）、既定は通常
   const [draft,setDraft]=useState(emptyDraft);
   const [saving,setSaving]=useState(false);
   // 2026-09-08新規（ポジション登録機能の改善）：監視銘柄に未登録の銘柄でも、日本市場/米国株一覧が
@@ -7439,7 +7447,7 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
       setSaving(true);
       try{
         const r=await fetch("/api/portfolio/add-entry",{method:"POST",headers:{"Content-Type":"application/json"},
-          body:JSON.stringify({code,name:draft.name,market:draft.market,price:num(draft.average_price),shares:num(draft.quantity),trade_style:draft.trade_style})});
+          body:JSON.stringify({code,name:draft.name,market:draft.market,price:num(draft.average_price),shares:num(draft.quantity),trade_style:draft.trade_style,entry_venue:draft.entry_venue})});
         const d=await r.json();
         if(d.error){alert(d.error);}
         else{
@@ -7652,9 +7660,12 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
           {todaysTrades.map(t=>{
             const gross=num(t.gross_pnl)??num(t.pnl);
             const net=num(t.net_pnl);
+            // 振り返り：PTS売買対応（2026-09-23新規）：市場区分（通常/PTS）をENTRY/EXITそれぞれ
+            // 個別に表示する（通常市場で買いPTSで売る、のような市場を跨いだ取引が分かるように）。
+            const venueLabel=v=>v==="PTS"?"［PTS］":v==="REGULAR"?"［通常］":"";
             return <div key={t.id} style={{fontSize:12,display:"flex",flexWrap:"wrap",gap:8,alignItems:"center"}}>
               <span style={{fontWeight:700}}>{t.name||t.code}</span>
-              <span className="mono" style={{color:"var(--inkSoft)"}}>{num(t.entry_price)?.toLocaleString()} → {num(t.exit_price)?.toLocaleString()}</span>
+              <span className="mono" style={{color:"var(--inkSoft)"}}>買 {num(t.entry_price)?.toLocaleString()}円{venueLabel(t.entry_venue)} → 売 {num(t.exit_price)?.toLocaleString()}円{venueLabel(t.exit_venue)}</span>
               <span className="mono" style={{color:"var(--inkSoft)"}}>{num(t.shares)?.toLocaleString()}株</span>
               <span className="mono" style={{fontSize:11,color:"var(--inkFaint)"}}>
                 税引前 <span style={{fontWeight:700,color:gross>0?"var(--up)":gross<0?"var(--down)":"var(--inkSoft)"}}>{gross!=null?`${gross>0?"+":""}${Math.round(gross).toLocaleString()}円`:"—"}</span>
@@ -7677,7 +7688,7 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
         （candidatesJP/US）から即座に候補を表示する。285Aのような英字混じりコードもcode列は
         常に文字列のまま扱い、数値変換は一切行わない（指示書9番）。自由入力（候補に無い銘柄を
         手で打つ）も従来通り可能。 */}
-    <div className="position-add-grid-1" style={{display:"grid",gridTemplateColumns:"110px 1fr 55px 90px 70px 90px 110px",gap:6,marginBottom:6}}>
+    <div className="position-add-grid-1" style={{display:"grid",gridTemplateColumns:"110px 1fr 55px 90px 110px 70px 90px 110px",gap:6,marginBottom:6}}>
       <div style={{position:"relative"}}>
         <input placeholder="コード/銘柄名で検索" value={draft.code}
           onChange={e=>{setDraft({...draft,code:e.target.value});setCodeSearchOpen(true);setPreviewQuote(null);setSelectedSector("");}}
@@ -7700,6 +7711,10 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
       {/* v3-8 Step1：取引タイプは新規登録で必須（未選択のプレースホルダーを空値のoptionとして用意）。 */}
       <select value={draft.trade_style} onChange={e=>setDraft({...draft,trade_style:e.target.value})} style={{...fieldStyle,fontWeight:draft.trade_style?400:700,color:draft.trade_style?"var(--ink)":"var(--down)"}}>
         <option value="">取引タイプ*</option><option value="DAY">DAY（デイトレ）</option><option value="SWING">SWING（スイング）</option>
+      </select>
+      {/* 振り返り：PTS売買対応（2026-09-23新規）：市場区分（通常/PTS）。既定は通常。 */}
+      <select value={draft.entry_venue} onChange={e=>setDraft({...draft,entry_venue:e.target.value})} style={fieldStyle} title="購入した市場区分（通常市場／PTS）">
+        <option value="REGULAR">市場区分：通常</option><option value="PTS">市場区分：PTS</option>
       </select>
       <input placeholder="株数" value={draft.quantity} onChange={e=>setDraft({...draft,quantity:e.target.value})} style={fieldStyle}/>
       <input placeholder="平均取得単価（実際の約定単価）" value={draft.average_price} onChange={e=>setDraft({...draft,average_price:e.target.value})} style={fieldStyle}/>

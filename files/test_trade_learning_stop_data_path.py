@@ -72,7 +72,8 @@ class _FakeCursor:
             cols = ["user_id", "code", "name", "market", "entry_price", "exit_price", "shares",
                     "pnl", "gross_pnl", "tax", "net_pnl", "acquired_at", "trade_style",
                     "initial_stop_price", "final_stop_price", "stop_reason_category",
-                    "stop_reason_text", "stop_quality_evidence"]
+                    "stop_reason_text", "stop_quality_evidence", "entry_venue", "exit_venue",
+                    "entry_thesis_json", "exit_thesis_json"]
             record = dict(zip(cols, params))
             record["id"] = self.db._next_id
             self.db._next_id += 1

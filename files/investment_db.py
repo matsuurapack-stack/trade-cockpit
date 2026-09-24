@@ -632,6 +632,24 @@ ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS priority TEXT;
 -- scopeのDB列として永続化し、PC/iPhone/他端末で同一集合になるようにする。
 ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS is_watch_target BOOLEAN NOT NULL DEFAULT false;
 
+-- 2026-09-23新規（振り返り：PTS売買対応）：通常市場とPTS（私設取引システム、立会時間外）の
+-- 約定を区別して記録する。既存market列（JP/US、取引所の国）とは意味が別のため新規列とする。
+-- entry_venue：portfolio建玉登録時の市場区分（REGULAR|PTS）。trade_history.entry_venue/
+-- exit_venueは決済確定時に、その時点のportfolio.entry_venueと決済自体の市場区分を1行へ
+-- 一緒に記録する（既存のtrade_historyが「1行=1トレードのentry〜exitライフサイクル」という
+-- 設計のため、通常市場で買いPTSで売る、のような市場を跨いだ取引も自然に同一行として紐付く
+-- ——新しい「トレードリンク」テーブルは作らない）。
+-- entry_thesis_json/exit_thesis_jsonは、保有中撤退判断支援アラート Phase A
+-- （capture_entry_thesis_snapshot()）のENTRY時点スナップショットを決済時に複製して残す
+-- （portfolio行は全株決済で削除されるため、Phase Bのstop値と同じ理由でここで失われないように
+-- する）。EXIT時点は同じ関数を決済時刻に再度呼んで得たスナップショットをexit_thesis_jsonへ
+-- 保存し、両者を比較してTHESIS_WEAKENEDタグ（server.py compute_thesis_weakened）を判定する。
+ALTER TABLE portfolio ADD COLUMN IF NOT EXISTS entry_venue TEXT;
+ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS entry_venue TEXT;
+ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS exit_venue TEXT;
+ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS entry_thesis_json JSONB;
+ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS exit_thesis_json JSONB;
+
 -- 2026-09-24新規（Smart Import 入力原本の永続化）：Smart Importに貼り付けた元データ（自然文・JSON）
 -- を「解析結果（EVENT等の各行）」とは別に、Import単位で1行だけ保存する。従来は解析結果の1行
 -- （carrier行）が原文を抱えていたため、その行を消すと再解析できなくなっていた。source_hash
@@ -3413,7 +3431,14 @@ def _check_entry_quality(new_positions):
 def _check_exit_quality(exits_today, reflection_tags):
     """利確・損切り（20点満点）：当日の決済（trade_history）を評価する。損失決済＝悪い、では
     なく、損切り遅れ等の反省タグが無ければ「計画通りの損切り」として扱う（指示書15番の
-    「損失でも正しい損切りなら高評価可能」の実装）。"""
+    「損失でも正しい損切りなら高評価可能」の実装）。
+    2026-09-23追記（振り返り：PTS売買対応）：市場区分（exit_venue、trade_historyへ直接記録済み
+    のためここで追加の取得は不要）を表示ラベルへ添えるだけの軽量な変更——generate_daily_review
+    は高速なDB専用処理という既存の役割分担を維持するため、reconstruct_trade_market_context()等
+    重い市場データ再構築はここでは行わない（それはtrade_experiences側＝
+    sync_trade_experiences_for_dateの役割のまま）。またpnl===0（同値決済）を「利益確定」と
+    ひとまとめにせず「同値撤退」として明示する（結果評価「ほぼ±0」を正しく言語化するため、
+    点数自体は変更しない）。"""
     if not exits_today:
         return EXIT_QUALITY_MAX, ["本日の決済なし（判定対象外、満点扱い）"], []
     good, bad = [], []
@@ -3421,21 +3446,25 @@ def _check_exit_quality(exits_today, reflection_tags):
     per_item = EXIT_QUALITY_MAX / max(1, len(exits_today))
     late_exit_flagged = "損切り遅れ" in reflection_tags
     greedy_flagged = "利確遅れ" in reflection_tags
+    venue_labels = {"PTS": "［PTS］", "REGULAR": "［通常］"}
     for t in exits_today:
         label = t.get("name") or t["code"]
+        venue_label = venue_labels.get(t.get("exit_venue"), "")
         pnl = t.get("net_pnl") if t.get("net_pnl") is not None else t.get("pnl")
         if pnl is not None and pnl < 0:
             if late_exit_flagged:
                 score -= per_item
-                bad.append(f"{label}：損失決済かつ本人の振り返りで「損切り遅れ」を自己申告")
+                bad.append(f"{label}：損失決済{venue_label}かつ本人の振り返りで「損切り遅れ」を自己申告")
             else:
-                good.append(f"{label}：損失決済だが計画的な損切りとして処理（自己申告の遅れ報告なし）")
+                good.append(f"{label}：損失決済{venue_label}だが計画的な損切りとして処理（自己申告の遅れ報告なし）")
+        elif pnl is not None and abs(pnl) < 1e-9:
+            good.append(f"{label}：同値撤退{venue_label}")
         else:
             if greedy_flagged:
                 score -= per_item * 0.5
-                bad.append(f"{label}：利益確定だが本人の振り返りで「利確遅れ」を自己申告")
+                bad.append(f"{label}：利益確定{venue_label}だが本人の振り返りで「利確遅れ」を自己申告")
             else:
-                good.append(f"{label}：利益確定")
+                good.append(f"{label}：利益確定{venue_label}")
     return max(0, round(score)), good, bad
 
 
@@ -10446,7 +10475,7 @@ def list_portfolio(database_url, user_id):
 
 _PORTFOLIO_COLS = ["name", "quantity", "average_price", "acquired_at", "memo",
                    "initial_stop", "current_stop", "target_1", "target_2",
-                   "trade_style", "stop_reason_category", "stop_reason_text"]
+                   "trade_style", "stop_reason_category", "stop_reason_text", "entry_venue"]
                    # marketはINSERT文で別途固定列として扱うためここには含めない
 
 
@@ -10492,14 +10521,19 @@ def delete_portfolio_item(database_url, user_id, code, market=None):
 # 売却はtrade_history（新設）へ1行記録し、全株売却でportfolioの行自体を削除する
 # （trade_historyは削除しない＝取引履歴は消さない、というユーザー指示）。
 
-def add_position_entry(database_url, user_id, code, name, market, price, shares, trade_style=None, entry_thesis=None):
+def add_position_entry(database_url, user_id, code, name, market, price, shares, trade_style=None, entry_thesis=None,
+                        entry_venue=None):
     """買い/買い増し。既存ポジション（同一user_id・code・market）があれば加重平均で合算し、
     無ければ新規作成する。price/sharesは正の数であることをここでも確認する（不正な値は保存
     しない）。戻り値：更新後のportfolio 1行（dict）、または失敗時None。
     2026-09-18追記（保有中撤退判断支援アラート Phase A）：entry_thesis（dict、呼び出し側が
     capture_entry_thesis_snapshot()で作成済み）を渡すと、まだentry_thesis_jsonを持たない
     行（新規作成時、または既存行でNULLのまま＝この機能追加より前に建てたポジション）にだけ
-    書き込む。買い増し時に既存の根拠を上書きしない（最初になぜ入ったかを保持する）。"""
+    書き込む。買い増し時に既存の根拠を上書きしない（最初になぜ入ったかを保持する）。
+    2026-09-23追記（振り返り：PTS売買対応）：entry_venue（"REGULAR"|"PTS"）は新規建て時
+    （else分岐）にのみ書き込み、買い増し（if row分岐）では既存値を変更しない——trade_style
+    同様「最初にどう入ったか」を表す属性として扱う（平均取得単価は買い増しごとに再計算する
+    のに対し、建玉全体としての市場区分ラベルは複数建てをまたいで単一のまま維持する設計）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
@@ -10543,9 +10577,10 @@ def add_position_entry(database_url, user_id, code, name, market, price, shares,
         else:
             conn.execute(
                 "INSERT INTO portfolio (user_id, code, name, market, quantity, average_price, "
-                "trade_style, entries, active, acquired_at, entry_thesis_json) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, true, now(), %s::jsonb)",
-                [user_id, code, name, market, shares, price, trade_style, json.dumps([entry], ensure_ascii=False), thesis_json],
+                "trade_style, entries, active, acquired_at, entry_thesis_json, entry_venue) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, true, now(), %s::jsonb, %s)",
+                [user_id, code, name, market, shares, price, trade_style, json.dumps([entry], ensure_ascii=False),
+                 thesis_json, entry_venue],
             )
         conn.commit()
         with conn.cursor(row_factory=dict_row) as cur:
@@ -10606,12 +10641,20 @@ def _calc_trade_tax(gross_pnl):
     return tax, gross_pnl - tax
 
 
-def add_position_exit(database_url, user_id, code, market, exit_price, shares):
+def add_position_exit(database_url, user_id, code, market, exit_price, shares, exit_venue=None,
+                       exit_thesis_snapshot=None):
     """売却確定。(exit_price - average_price) * sharesを実現損益としてtrade_historyへ1行記録
     する。一部売却の場合、残った建玉のaverage_priceは変更しない（ユーザー指示）。残り枚数が
     0以下ならportfolioの行を削除する（trade_historyは削除しない）。保有枚数を超える売却・
     0以下の売値/枚数は拒否する。戻り値：{"trade":{...},"remainingShares":..,"closed":bool}
-    または{"error":...}。"""
+    または{"error":...}。
+    2026-09-23追記（振り返り：PTS売買対応）：exit_venue（"REGULAR"|"PTS"）と、決済直前の
+    portfolio.entry_venue/entry_thesis_jsonをtrade_historyへ引き継ぐ（Phase Bのstop値と
+    同じ理由——portfolio行は全株決済で削除されるため、決済時にコピーしておかないと失われる）。
+    exit_thesis_snapshot（呼び出し側がcapture_entry_thesis_snapshot()を決済時刻に呼んで
+    作成済みのdict）はexit_thesis_jsonへそのまま保存し、entry_thesis_jsonとの比較
+    （server.py compute_thesis_weakened）はここでは行わない（このモジュールは判断の
+    「品質」を評価しない、既存の役割分担を維持する）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return {"error": "DB未設定（DATABASE_URLが未設定、またはpsycopg未インストール）"}
@@ -10646,15 +10689,22 @@ def add_position_exit(database_url, user_id, code, market, exit_price, shares):
         stop_reason_category = row.get("stop_reason_category")
         stop_reason_text = row.get("stop_reason_text")
         stop_quality_evidence = "ACTUAL_STOP" if initial_stop_price is not None else "UNKNOWN"
+        entry_venue = row.get("entry_venue")
+        entry_thesis_json = row.get("entry_thesis_json")
+        exit_thesis_json = json.dumps(exit_thesis_snapshot, ensure_ascii=False) if exit_thesis_snapshot else None
+        entry_thesis_json_param = json.dumps(entry_thesis_json, ensure_ascii=False) if isinstance(entry_thesis_json, (dict, list)) else None
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "INSERT INTO trade_history (user_id, code, name, market, entry_price, exit_price, shares, "
                 "pnl, gross_pnl, tax, net_pnl, acquired_at, trade_style, initial_stop_price, final_stop_price, "
-                "stop_reason_category, stop_reason_text, stop_quality_evidence) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
+                "stop_reason_category, stop_reason_text, stop_quality_evidence, entry_venue, exit_venue, "
+                "entry_thesis_json, exit_thesis_json) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                "%s::jsonb, %s::jsonb) RETURNING *",
                 [user_id, code, row.get("name"), market, avg_price, exit_price, shares, pnl, pnl, tax, net_pnl,
                  row.get("acquired_at"), row.get("trade_style"), initial_stop_price, final_stop_price,
-                 stop_reason_category, stop_reason_text, stop_quality_evidence],
+                 stop_reason_category, stop_reason_text, stop_quality_evidence, entry_venue, exit_venue,
+                 entry_thesis_json_param, exit_thesis_json],
             )
             trade = cur.fetchone()
         new_remaining = remaining - shares
