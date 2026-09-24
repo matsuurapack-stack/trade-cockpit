@@ -725,6 +725,14 @@ CREATE TABLE IF NOT EXISTS ipo_stocks (
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (user_id, code)
 );
+-- 2026-09-24追加：自動結合した業績スナップショット（明示入力のfundamentals_jsonとは別に保持し、
+-- 優先順位＝既存の企業業績データ＞Smart Import＞明示入力 を崩さない）。新しい業績DBではなく
+-- 既存データ（TDnet/jQuants/Smart Import）の結合結果のキャッシュ。
+ALTER TABLE ipo_stocks ADD COLUMN IF NOT EXISTS current_price NUMERIC;
+ALTER TABLE ipo_stocks ADD COLUMN IF NOT EXISTS market_cap NUMERIC;
+ALTER TABLE ipo_stocks ADD COLUMN IF NOT EXISTS auto_fundamentals_json JSONB;
+ALTER TABLE ipo_stocks ADD COLUMN IF NOT EXISTS fundamental_sources_json JSONB;
+ALTER TABLE ipo_stocks ADD COLUMN IF NOT EXISTS auto_fundamentals_at TIMESTAMPTZ;
 
 -- 監視解除後も内部追跡する銘柄（UIには通常出さない）。kind別に期限（IPO20/MATERIAL3/SURGE2営業日）。
 CREATE TABLE IF NOT EXISTS shadow_watch (
@@ -11061,3 +11069,70 @@ def update_shadow_watch_check(database_url, user_id, code, trigger=None, status=
                      [tj, status, user_id, code])
         conn.commit()
     return True
+
+
+def save_ipo_auto_snapshot(database_url, user_id, code, auto_fundamentals, sources, market_cap=None,
+                           current_price=None, first_price=None, listing_date=None):
+    """自動結合した業績スナップショットを保存（更新日時つき）。first_price/listing_dateは
+    未設定の場合のみ補完する（既存の明示入力は上書きしない）。"""
+    pool = _get_pool(database_url)
+    if pool is None or not code:
+        return False
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE ipo_stocks SET auto_fundamentals_json = %s::jsonb, fundamental_sources_json = %s::jsonb, "
+            "auto_fundamentals_at = now(), market_cap = COALESCE(%s, market_cap), "
+            "current_price = COALESCE(%s, current_price), first_price = COALESCE(first_price, %s), "
+            "listing_date = COALESCE(listing_date, %s), updated_at = now() WHERE user_id = %s AND code = %s",
+            [json.dumps(auto_fundamentals, ensure_ascii=False), json.dumps(sources, ensure_ascii=False),
+             market_cap, current_price, first_price, listing_date, user_id, code])
+        conn.commit()
+    return True
+
+
+def extend_trade_rule(database_url, user_id, rule_id, new_rule_text, source_entry=None, reason=None):
+    """既存ルールを新規作成せず拡張する：rule_textとrule_key（重複判定キー）を更新し、変更履歴
+    (trade_rule_history TEXT_EDIT)とsource_json（拡張元の追記）を残す。冪等：同じ文面なら何もしない。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    key = _normalize_rule_key(new_rule_text)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM trade_rules WHERE id=%s AND user_id=%s", [rule_id, user_id])
+            row = cur.fetchone()
+            if not row:
+                return None
+            if row["rule_key"] == key:
+                return {"action": "unchanged", "id": rule_id}
+            sj = row.get("source_json") or []
+            if isinstance(sj, dict):
+                sj = [sj]
+            if source_entry:
+                sj = list(sj) + [source_entry]
+            cur.execute("UPDATE trade_rules SET rule_text=%s, rule_key=%s, source_json=%s::jsonb, "
+                        "updated_at=now() WHERE id=%s AND user_id=%s",
+                        [new_rule_text, key, json.dumps(sj, ensure_ascii=False), rule_id, user_id])
+            cur.execute("INSERT INTO trade_rule_history (user_id,rule_id,event_type,old_text,new_text,reason,source) "
+                        "VALUES (%s,%s,'TEXT_EDIT',%s,%s,%s,%s)",
+                        [user_id, rule_id, row["rule_text"], new_rule_text, reason, "extend_trade_rule"])
+        conn.commit()
+    return {"action": "extended", "id": rule_id}
+
+
+def find_trade_rule_by_source_type(database_url, user_id, source_type):
+    """source_json（配列/オブジェクト）にtype=source_typeを含むルールを返す（最初の1件）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM trade_rules WHERE user_id=%s AND status NOT IN ('RETIRED','EXPIRED') "
+                        "ORDER BY id", [user_id])
+            for r in cur.fetchall():
+                sj = r.get("source_json") or []
+                if isinstance(sj, dict):
+                    sj = [sj]
+                if any(isinstance(x, dict) and x.get("type") == source_type for x in sj):
+                    return _trade_rule_row_to_json(r)
+    return None

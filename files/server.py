@@ -3122,9 +3122,11 @@ def generate_morning_market_check(database_url, user_id, snapshot_time):
     saved = investment_db.save_morning_check(database_url, user_id, check_date, snapshot_time, payload) if investment_db else None
     # 朝TOP5をstock_thesesへ永続化（source='MORNING'固定、以後書き換えない成績評価用スナップ
     # ショット）。保存済みMorningCheckのidをmorning_check_idとして使う（指示書11・12番）。
-    if saved and entry_ready_top5:
+    # 永続化する朝TOP5は余力を見ないanalysis_top5（過去比較・精度検証の固定基準を壊さない）。
+    analysis_top5_for_theses = morning_entry_result.get("analysisTop5") if data_quality.get("entry_top5") == "ok" else []
+    if saved and analysis_top5_for_theses:
         try:
-            persist_morning_theses(database_url, user_id, check_date, saved.get("id"), entry_ready_top5)
+            persist_morning_theses(database_url, user_id, check_date, saved.get("id"), analysis_top5_for_theses)
         except Exception as e:
             print("  MorningCheck: 朝TOP5 thesis永続化で例外", e)
     return saved
@@ -4263,7 +4265,18 @@ def _select_entry_ready_top5(candidates):
     for c in tier3:
         c["candidateTier"] = 3
 
-    entry_ready_top5 = (tier1 + tier2 + tier3)[:5]
+    # 復活枠（2026-09-24、akippa事例）：IPO/shadow_watch/朝の弱さで除外しない対象が再評価で
+    # BUY_CANDIDATEまで復活した銘柄は、既存の3階層に入らなくてもTier1の直後に入れる
+    # （「再注目通知だけでTOP5に戻らない」状態の禁止）。高値追い危険等のRISK状態・データ不足は
+    # 入れない（理由はshadowRecheck/actionableReasonに明示）。
+    _placed = {c["code"] for c in tier1 + tier2 + tier3}
+    revived = [c for c in candidates
+               if c.get("revivalStage") == "BUY_CANDIDATE" and c["code"] not in _placed
+               and c["entryState"] not in ENTRY_TOP5_RISK_STATES and c["entryState"] != "PROVISIONAL"]
+    for c in revived:
+        c["candidateTier"] = 2
+        c["revivedBuyCandidate"] = True
+    entry_ready_top5 = (tier1 + revived + tier2 + tier3)[:5]
     top5_codes = {c["code"] for c in entry_ready_top5}
     watch_candidates = [c for c in candidates
                          if c["entryState"] in ("WAIT_PULLBACK", "WAIT_BREAKOUT", "WATCH")
@@ -4298,6 +4311,7 @@ def _select_entry_ready_top5(candidates):
         "final_candidates": len(entry_ready_top5),
         "rendered": len(entry_ready_top5),
         "reversal_confirmed": len(reversal_confirmed), "reversal_watch": len(reversal_watch),
+        "revived_buy_candidate": len(revived),
     }
     return entry_ready_top5, watch_candidates, reversal_confirmed, reversal_watch, debug
 
@@ -4476,7 +4490,7 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
     永続化（stock_thesesへの書き込み）はしない副作用フリーな関数にし、呼び出し側
     （generate_morning_market_check）だけが朝TOP5として結果を保存する設計にした（指示書
     22・23番「Current TOP5とMorning TOP5は別物、Morning TOP5は後から書き換えない」）。"""
-    empty = {"entryReadyTop5": [], "watchCandidates": [], "reversalCandidates": [], "reversalWatchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None,
+    empty = {"entryReadyTop5": [], "actionableTop5": [], "analysisTop5": [], "watchCandidates": [], "reversalCandidates": [], "reversalWatchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None,
              "debug": {"scanned": 0, "entry_ready": 0, "active_break": 0, "watch_near_ready": 0,
                        "risk_excluded": 0, "failed_break_excluded": 0, "weak_excluded": 0,
                        "provisional_excluded": 0, "final_candidates": 0, "rendered": 0}}
@@ -4496,7 +4510,52 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
     # 買付余力（2026-09-24新規）：手動設定値。未設定なら余力制約なし（従来通り）。朝TOP5
     # （成績評価用）はapply_capital=Falseで呼ばれ、余力に依存しない同一基準を保つ。
     cash_rec = get_capital_context(database_url, user_id) if apply_capital else None
-    ipo_signals_by_code = {}
+    position_summary = get_position_summary(database_url, user_id) if apply_capital else None
+    ipo_signals_by_code = {}  # IPO/shadow_watch/保護対象の再評価に使うシグナル（全候補分）
+    protective_by_code = {}
+    # shadow_watch（監視解除済みの直近IPO・材料株・急騰株）も同じscanの対象に加える：既存の
+    # 一括prefetch（market data・日足）に載るのでN+1にならず、通常候補と同じ判定基準で
+    # entry candidate化される（akippa型：監視解除→再上昇→actionable_top5復帰の一本のパイプライン）。
+    shadow_targets, _shadow_rows = _active_shadow_targets(database_url, user_id, {w.get("code") for w in watchlist})
+    scan_list = list(watchlist) + shadow_targets
+    shadow_codes = {w["code"] for w in shadow_targets}
+    try:
+        ipo_rows_by_code = {r["code"]: r for r in investment_db.list_ipo_stocks(database_url, user_id)}
+    except Exception as e:
+        print("  entry-candidates: ipo_stocks取得で例外（IPO再評価なしで続行）", e)
+        ipo_rows_by_code = {}
+    _today_jst = _jst_today()
+    ipo_in_window_codes = set()
+    for _c, _r in ipo_rows_by_code.items():
+        _ld = _r.get("listing_date")
+        if _ld is None or capital_ranking.is_within_ipo_watch_window(
+                datetime.date.fromisoformat(str(_ld)[:10]), _today_jst, is_jp_trading_day):
+            ipo_in_window_codes.add(_c)
+    # 自動業績スナップショットが未取得/古いIPO銘柄（監視期間内）だけ最大3件まで更新する。
+    for _c in [c for c in ipo_in_window_codes][:3]:
+        _r = ipo_rows_by_code[_c]
+        _at = _r.get("auto_fundamentals_at")
+        _stale = True
+        if _at:
+            try:
+                _stale = (datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(str(_at))
+                          ).total_seconds() > IPO_FUNDAMENTALS_REFRESH_HOURS * 3600
+            except Exception:
+                _stale = True
+        if _stale:
+            try:
+                refresh_ipo_fundamentals(database_url, user_id, _c)
+                ipo_rows_by_code[_c] = next((x for x in investment_db.list_ipo_stocks(database_url, user_id)
+                                              if x["code"] == _c), _r)
+            except Exception as e:
+                print("  entry-candidates: IPO業績の自動更新で例外（既存データで続行）", _c, e)
+    try:
+        _lu = investment_db.list_limit_up_events(database_url, user_id, limit=500)
+        _cut = (_today_jst - datetime.timedelta(days=10)).isoformat()
+        limit_up_codes = {str(e.get("symbol")) for e in _lu if str(e.get("event_date") or "") >= _cut}
+    except Exception as e:
+        print("  entry-candidates: ストップ高履歴取得で例外（無視して続行）", e)
+        limit_up_codes = set()
 
     _t = time.time()
     stage1 = run_momentum_stage1()
@@ -4545,7 +4604,7 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
     # 変更していない——prefetch失敗時も個別フォールバックでこれまで通り動作する。
     _t = time.time()
     try:
-        market_data_diagnostics = prefetch_market_data_for_watchlist(watchlist)
+        market_data_diagnostics = prefetch_market_data_for_watchlist(scan_list)
     except Exception as e:
         # prefetch自体は内部で各取得を個別にtry/exceptしているため通常ここには来ないが、
         # 万一の場合でも「データがないのに分析全体を止める」ことがないよう、既存の他の
@@ -4577,7 +4636,7 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
     # していない（ゴールデン比較テストで確認）。対象はこの後のループと同じ判定条件
     # （stage1_rowsに有効な現在値がある銘柄のみ）に絞る。
     support_targets = []
-    for w in watchlist:
+    for w in scan_list:
         code = w.get("code")
         row = stage1_rows.get(code)
         if row and row.get("current") is not None:
@@ -4606,7 +4665,7 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
     # _cached_daily_arrays()がキャッシュミス分だけ個別に取得を試みる（既存の安全側動作）。
     _t = time.time()
     try:
-        daily_arrays_diagnostics = prefetch_daily_arrays_for_watchlist(watchlist, stage1_rows)
+        daily_arrays_diagnostics = prefetch_daily_arrays_for_watchlist(scan_list, stage1_rows)
     except Exception as e:
         print("  entry-candidates: daily arrays prefetchで例外（無視して続行、既存の個別取得へ委ねる）", e)
         daily_arrays_diagnostics = {"error": str(e)}
@@ -4637,7 +4696,7 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
     candidates = []
     quality_counts = {"FULL": 0, "PARTIAL": 0, "DEGRADED": 0}
     snapshot_ready_count = 0  # 場中リアルタイム化指示書 STEP1・20：5分足スナップショットが取得できた銘柄数（"intraday_ready"の実体）
-    for w in watchlist:
+    for w in scan_list:
         code = w.get("code")
         row = stage1_rows.get(code)
         if not row or row.get("current") is None:
@@ -4741,6 +4800,12 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
         neg_cat_present = bool(comp["negativeCatalysts"])
         entry_score = comp["total"]
         ipo_signals_by_code[code] = capital_ranking.derive_signals(row, stage2, snapshot, comp)
+        # 朝9:00〜9:30の値動きだけで完全除外しない対象（IPO・決算直後・材料・前日出来高急増・
+        # ストップ高経験・前日大幅高・寄り前GU/GD大）。既に取得済みの日足/材料を使い新規取得なし。
+        protective_by_code[code] = capital_ranking.detect_protective_context(
+            row, daily_arrays_by_code.get(code), stage2, comp["positiveCatalysts"],
+            is_ipo=code in ipo_in_window_codes, recent_limit_up=code in limit_up_codes,
+            recent_earnings=any(("決算" in str(cc.get("title") or "")) for cc in (catalysts or [])))
         entry_state, exception_applied = _classify_entry_state(
             entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present, nikkei_chg,
             entry_risk=entry_risk, momentum_state=momentum_state, event_guard=event_guard)
@@ -4817,6 +4882,7 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
             "rangeMetrics": range_metrics, "reversalInfo": reversal_info,
             "eventRiskLevel": event_guard["level"], "eventRiskScore": event_guard["score"],
             "eventRiskReasons": event_guard["reasons"],
+            "volumeRatio": (stage2 or {}).get("timeAdjustedVolumeRatio"),  # IPOスコア（出来高）用
         })
         per_symbol_ms.append((code, (time.time() - _t_symbol) * 1000))
 
@@ -4829,9 +4895,23 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
     section_ms["sortRank"] = round((time.time() - _t) * 1000)
 
     _t = time.time()
-    apply_ipo_reevaluation(database_url, user_id, candidates, ipo_signals_by_code)
-    entry_ready_top5, watch_candidates, reversal_confirmed, reversal_watch, debug, capital_info = \
-        _build_capital_selection(candidates, cash_rec)
+    apply_ipo_reevaluation(database_url, user_id, candidates, ipo_signals_by_code, ipo_rows=ipo_rows_by_code)
+    for c in candidates:
+        c["protectedReasons"] = protective_by_code.get(c["code"], [])
+        c["shadow"] = c["code"] in shadow_codes
+        if c["shadow"]:
+            c["shadowKind"] = next((t.get("_shadowKind") for t in shadow_targets if t["code"] == c["code"]), None)
+            c["source"] = "SHADOW_WATCH"
+        info = c.get("ipoInfo")
+        if info and info.get("inWindow"):
+            c["revivalStage"] = info["stage"]
+        elif c["protectedReasons"] or c["shadow"]:
+            c["revivalStage"] = capital_ranking.evaluate_ipo_stage(
+                None, ipo_signals_by_code.get(c["code"]), c.get("entryScore"))[0]
+    dual = _build_capital_selection(candidates, cash_rec, position_summary)
+    entry_ready_top5, watch_candidates, reversal_confirmed, reversal_watch = (
+        dual["top5"], dual["watch"], dual["reversal"], dual["reversalWatch"])
+    debug, capital_info, analysis = dual["debug"], dual["capital"], dual["analysis"]
     section_ms["top5Selection"] = round((time.time() - _t) * 1000)
     overall_quality = "FULL" if quality_counts["DEGRADED"] == 0 and quality_counts["PARTIAL"] == 0 else (
         "DEGRADED" if quality_counts["FULL"] == 0 else "PARTIAL")
@@ -4843,13 +4923,15 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
     _t = time.time()
     snapshot_persistence_calls = 0
     try:
-        for i, c in enumerate(entry_ready_top5):
+        # 精度検証・成績比較用のsnapshotは、余力を考慮しないanalysis_top5を使う（余力で検証母集団が
+        # 変わらないようにする）。
+        for i, c in enumerate(analysis["top5"]):
             capture_entry_candidate_snapshot_safe(
                 database_url, user_id, c["code"], "ENTRY", price=c.get("current"), entry_score=c.get("entryScore"),
                 event_support=c.get("eventSupport"), candidate_state=c.get("eventSupport") or c.get("entryState"),
                 candidate_rank=i + 1)
             snapshot_persistence_calls += 1
-        for c in watch_candidates:
+        for c in analysis["watch"]:
             capture_entry_candidate_snapshot_safe(
                 database_url, user_id, c["code"], "WAIT", price=c.get("current"), entry_score=c.get("entryScore"),
                 event_support=c.get("eventSupport"), candidate_state=c.get("eventSupport") or c.get("entryState"),
@@ -4909,8 +4991,30 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
     # 金融政策イベント統合 Phase4新規（2026-09-16）：MARKET_EVENT_RISK（銘柄非依存）は
     # macro変数として関数冒頭で既に取得済み（Event Risk Guardの市場共通分と共用するため）。
 
+    actionable_codes = {c["code"] for c in entry_ready_top5}
+    # 余力情報（buyable/必要資金）を持つ注釈済み候補を渡す＝「BUY_CANDIDATEでも余力不足で入れない」等の
+    # 理由を正しく返すため。実戦順位はTOP5から引く。
+    shadow_recheck = finalize_shadow_scan(
+        database_url, user_id, dual["annotated"], ipo_signals_by_code, actionable_codes,
+        actionable_ranks={c["code"]: i + 1 for i, c in enumerate(entry_ready_top5)})
+    # 朝の弱さだけで除外しない：保護対象でWEAK/INVALID判定の銘柄は、TOP5には出さないが最低WATCH_LOWとして
+    # 別枠に維持する（完全除外しない）。
+    watch_low = [{"code": c["code"], "name": c.get("name"), "entryScore": c.get("entryScore"),
+                  "entryState": c.get("entryState"), "changePct": c.get("changePct"), "current": c.get("current"),
+                  "protectedReasons": c["protectedReasons"], "stage": c.get("revivalStage") or "WATCH_LOW"}
+                 for c in candidates
+                 if c["protectedReasons"] and c["code"] not in actionable_codes
+                 and c["code"] not in {x["code"] for x in analysis["top5"]}
+                 and c.get("entryState") in ("WEAK", "INVALID", "WATCH")]
     return {
         "entryReadyTop5": [{**c, "rank": i + 1} for i, c in enumerate(entry_ready_top5)],
+        "actionableTop5": [{**c, "rank": i + 1} for i, c in enumerate(entry_ready_top5)],
+        "analysisTop5": analysis["top5"],
+        "analysisWatchCandidates": analysis["watch"],
+        "shadowRecheck": shadow_recheck,
+        "shadowScannedCodes": sorted(shadow_codes),
+        "watchLowCandidates": watch_low,
+        "positionSummary": position_summary,
         "watchCandidates": watch_candidates,
         # 値幅余地・反転モメンタム選考（2026-09-16新規、指示書4・6番）：前日比マイナスだが
         # 当日安値から強く反転している銘柄の新規探索レーン。entry_score/entryReadyTop5の
@@ -4959,44 +5063,69 @@ def get_capital_context(database_url, user_id):
     return rec
 
 
-def _build_capital_selection(candidates, cash_rec):
-    """既存_select_entry_ready_top5を余力制約つきで実行する唯一の入口（_score_entry_candidatesと
-    余力変更時の即時再計算の両方から呼ぶ）。戻り値: (top5, watch, reversal, reversal_watch, debug, capital)。"""
+def get_position_summary(database_url, user_id):
+    """既存ポジション数・取得原価合計・新規ENTRY余地（NORMAL/CAUTION/ENTRY_LIMIT）。補助判断のみ
+    （候補の除外・既存ポジションの売却はしない）。取得失敗時はNORMAL扱い。"""
+    try:
+        rows = investment_db.list_portfolio(database_url, user_id) if (investment_db is not None and database_url) else []
+    except Exception as e:
+        print("  ポジション数取得で例外（NORMAL扱いで続行）", e)
+        rows = []
+    return capital_ranking.summarize_positions(rows)
+
+
+def _build_capital_selection(candidates, cash_rec, position_summary=None):
+    """既存_select_entry_ready_top5を使ってanalysis_top5（余力を見ない純粋な分析順位）と
+    actionable_top5（現在余力で実際に買える候補）を同時に作る唯一の入口（_score_entry_candidates_impl
+    と余力変更時の即時再計算の両方から呼ぶ）。"""
     cash = float(cash_rec["cash_available"]) if cash_rec else None
-    sel, annotated, notable, combos = capital_ranking.apply_capital_selection(
-        candidates, cash, _select_entry_ready_top5)
-    top5, watch, reversal, reversal_watch, debug = sel
+    dual = capital_ranking.build_dual_ranking(candidates, cash, _select_entry_ready_top5, position_summary)
+    a_top5, a_watch, a_rev, a_revw, a_debug = dual["analysis"]
+    top5, watch, reversal, reversal_watch, debug = dual["actionable"]
     top5 = capital_ranking.rerank_by_capital_efficiency(top5)
-    not_buyable = sum(1 for c in annotated if c.get("buyable") is False)
+    for i, c in enumerate(top5):
+        c["actionableRank"] = c["rank"] = i + 1
+    not_buyable = sum(1 for c in dual["annotated"] if c.get("buyable") is False)
     debug["capitalApplied"] = cash is not None
     debug["capitalNotBuyableCount"] = not_buyable
+    capacity = dual["capacity"] or {}
     capital = {"applied": cash is not None, "cashAvailable": cash,
                "source": (cash_rec or {}).get("source"), "updatedAt": (cash_rec or {}).get("updated_at"),
-               "notBuyableNotable": notable, "combinations": combos, "notBuyableCount": not_buyable}
-    return top5, watch, reversal, reversal_watch, debug, capital
+               "notBuyableNotable": dual["notable"], "combinations": dual["combos"], "notBuyableCount": not_buyable,
+               "openPositionCount": capacity.get("openPositionCount"),
+               "portfolioExposure": capacity.get("portfolioExposure"),
+               "newEntryCapacity": capacity.get("newEntryCapacity", "NORMAL"),
+               "entryCapacityWarning": capacity.get("entryCapacityWarning")}
+    return {"top5": top5, "watch": watch, "reversal": reversal, "reversalWatch": reversal_watch,
+            "debug": debug, "capital": capital, "annotated": dual["annotated"],
+            "analysis": {"top5": a_top5, "watch": a_watch, "reversal": a_rev, "reversalWatch": a_revw,
+                         "debug": a_debug}}
 
 
-def recompute_entry_top5_cache_for_cash(user_id, cash_rec):
+def recompute_entry_top5_cache_for_cash(user_id, cash_rec, position_summary=None):
     """余力を手動変更した直後、フルスキャン（数分）を待たずキャッシュ済み候補プールから
-    ランキングだけを即時再計算する。プールが無い（スキャン前）場合はFalse。"""
+    ランキングだけを即時再計算する（analysis_topは不変、actionable_top5だけが変わる）。
+    プールが無い（スキャン前）場合はFalse。"""
     with _ENTRY_TOP5_CACHE_LOCK:
         entry = _ENTRY_TOP5_CACHE.get(user_id)
         pool = entry.get("_candidatePool") if entry else None
+        stored_pos = (entry or {}).get("positionSummary")
     if not entry or pool is None:
         return False
-    top5, watch, reversal, reversal_watch, debug, capital = _build_capital_selection([dict(c) for c in pool], cash_rec)
-    new_debug = {**(entry.get("debug") or {}), **debug}
+    dual = _build_capital_selection([dict(c) for c in pool], cash_rec, position_summary or stored_pos)
+    new_debug = {**(entry.get("debug") or {}), **dual["debug"]}
     with _ENTRY_TOP5_CACHE_LOCK:
         cur = _ENTRY_TOP5_CACHE.get(user_id)
         if cur is None:
             return False
         cur.update({
-            "entryReadyTop5": [{**c, "rank": i + 1} for i, c in enumerate(top5)],
-            "watchCandidates": watch, "reversalCandidates": [{**c, "rank": i + 1} for i, c in enumerate(reversal)],
-            "reversalWatchCandidates": reversal_watch, "capital": capital, "debug": new_debug,
-            "entryReadyCount": debug.get("entry_ready", 0),
-            "waitCount": debug.get("active_break", 0) + debug.get("watch_near_ready", 0),
-            "riskCount": debug.get("risk_excluded", 0)})
+            "entryReadyTop5": dual["top5"], "actionableTop5": dual["top5"],
+            "analysisTop5": dual["analysis"]["top5"],
+            "watchCandidates": dual["watch"], "reversalCandidates": dual["reversal"],
+            "reversalWatchCandidates": dual["reversalWatch"], "capital": dual["capital"], "debug": new_debug,
+            "entryReadyCount": dual["debug"].get("entry_ready", 0),
+            "waitCount": dual["debug"].get("active_break", 0) + dual["debug"].get("watch_near_ready", 0),
+            "riskCount": dual["debug"].get("risk_excluded", 0)})
     return True
 
 
@@ -5004,16 +5133,161 @@ def _jst_today():
     return datetime.datetime.now(_JST).date()
 
 
-def apply_ipo_reevaluation(database_url, user_id, candidates, signals_by_code):
-    """監視銘柄内のIPO銘柄をスキャンの度に再評価する（朝に弱くても昇格可能、下限はWATCH_LOW）。
-    candidatesを直接更新（ipoInfoを付与）。段階が変わった場合だけipo_stocksへ保存。"""
-    if investment_db is None or not database_url:
-        return
+# ---- IPO 業績データの自動結合（新しい業績DBは作らず、既存データを再利用する） ----
+
+IPO_FUNDAMENTALS_REFRESH_HOURS = 24
+
+
+def _ipo_market_snapshot(code):
+    """既存のmarket data取得（yfinance）から、上場日・初値・現在値・時価総額・PER・大株主等保有比率を
+    取る。取れない項目はNone（推測しない）。初値=上場初日の始値、上場日=日足の最初の日付。"""
+    out = {}
+    if yf is None:
+        return out
     try:
-        ipo_rows = {r["code"]: r for r in investment_db.list_ipo_stocks(database_url, user_id)}
+        tk = yf.Ticker(f"{code}.T")
+        hist = tk.history(period="max")
+        if hist is not None and not hist.empty:
+            out["listing_date"] = hist.index[0].date().isoformat()
+            out["first_price"] = float(hist["Open"].iloc[0])
+            out["current_price"] = float(hist["Close"].iloc[-1])
+        info = tk.info or {}
+        out["market_cap"] = info.get("marketCap")
+        out["per"] = info.get("trailingPE")
+        out["shares_outstanding"] = info.get("sharesOutstanding")
+        held = info.get("heldPercentInsiders")
+        out["insider_holding_pct"] = round(held * 100, 1) if held is not None else None
     except Exception as e:
-        print("  IPO再評価: ipo_stocks取得で例外（無視して続行）", e)
-        return
+        print("  IPO market snapshot取得で例外（取得できた項目のみ使用）", code, e)
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def _smart_import_fundamentals(database_url, user_id, code):
+    """Smart Importで保存された決算・企業情報（market_events / news_catalysts の affected_stocks に
+    銘柄コードを含むもの）から、会社予想の修正方向（上方/下方修正）を取り出す。"""
+    if investment_db is None or not database_url:
+        return {}, []
+    titles, refs = [], []
+    try:
+        for e in investment_db.list_market_events(database_url, user_id, limit=500):
+            if code in (e.get("affected_stocks") or []) or code in str(e.get("title") or ""):
+                titles.append(str(e.get("title") or ""))
+                refs.append({"type": "market_event", "id": e.get("id")})
+        for c in investment_db.list_news_catalysts(database_url, user_id, limit=500):
+            if code in (c.get("affected_stocks") or []) or code in str(c.get("title") or ""):
+                titles.append(str(c.get("title") or ""))
+                refs.append({"type": "news_catalyst", "id": c.get("id")})
+    except Exception as e:
+        print("  IPO: Smart Import業績取得で例外（無視して続行）", e)
+        return {}, []
+    g = capital_ranking.derive_guidance_from_titles(titles)
+    return ({"guidance": g} if g else {}), refs
+
+
+def collect_ipo_fundamentals(database_url, user_id, code):
+    """IPO銘柄の業績を、既存データから自動収集する。優先順位：
+      ①既存の企業業績データ：TDnet決算短信（analyze_earnings_pdf）→ jQuants推移 → 上場時に開示された
+        「当社決算情報等のお知らせ」の業績予想表 ／ 会社予想の修正方向（TDnet見出し）／ market data
+      ②Smart Importで保存された決算・企業情報
+      （③ipo_stocksの明示入力は評価時にmerge_fundamentalsで最下位として結合）
+    戻り値: dict(existing, smart_import, market, disclosure, sources_refs)。"""
+    existing, disclosure = {}, {}
+    history = []
+    try:
+        history = _tdnet_company_history(code)
+    except Exception as e:
+        print("  IPO: TDnet履歴取得で例外", code, e)
+    # (a) 決算短信（あれば最優先）
+    latest = next((h for h in history if "決算短信" in h["title"] and h.get("url")), None)
+    if latest:
+        try:
+            d = analyze_earnings_pdf(latest["url"]) or {}
+            if d.get("revenueYoy") is not None:
+                existing["revenue_growth_pct"] = round(d["revenueYoy"], 1)
+            if d.get("opYoy") is not None:
+                existing["profit_growth_pct"] = round(d["opYoy"], 1)
+            disclosure["latest_earnings"] = {"title": latest["title"], "url": latest["url"], "detail": d}
+        except Exception as e:
+            print("  IPO: 決算短信解析で例外", code, e)
+    # (b) jQuants推移（決算短信が取れなかった場合の補助）
+    if "revenue_growth_pct" not in existing:
+        try:
+            trend = build_earnings_trend(code)
+            last = trend[-1] if trend else None
+            if last and last.get("salesYoy") is not None:
+                existing["revenue_growth_pct"] = round(last["salesYoy"], 1)
+            if last and last.get("opYoy") is not None:
+                existing.setdefault("profit_growth_pct", round(last["opYoy"], 1))
+        except Exception as e:
+            print("  IPO: jQuants推移取得で例外", code, e)
+    # (c) 上場時の業績予想（TDnet「決算情報等のお知らせ」）
+    ipo_doc = next((h for h in history if "決算情報等のお知らせ" in h["title"] and h.get("url")), None)
+    if ipo_doc:
+        try:
+            parsed = capital_ranking.parse_ipo_forecast_table(_fetch_pdf_text(ipo_doc["url"]))
+            if parsed:
+                disclosure["ipo_forecast"] = {**parsed, "title": ipo_doc["title"], "url": ipo_doc["url"],
+                                               "pubdate": ipo_doc.get("pubdate")}
+                for k in ("revenue_growth_pct", "profit_growth_pct", "margin_change_pt"):
+                    if parsed.get(k) is not None:
+                        existing.setdefault(k, parsed[k])
+                if parsed.get("op_margin_pct") is not None:
+                    existing["op_margin_pct"] = parsed["op_margin_pct"]
+        except Exception as e:
+            print("  IPO: 上場時業績予想の解析で例外", code, e)
+    g = capital_ranking.derive_guidance_from_titles([h["title"] for h in history])
+    if g:
+        existing["guidance"] = g
+    market = _ipo_market_snapshot(code)
+    if market.get("per") is not None:
+        existing["per"] = round(market["per"], 1)
+    derived = []
+    if market.get("insider_holding_pct") is not None:
+        # 流通比率は「100−大株主等(insider)保有比率」からの推定値（開示された流通株式数ではない）。
+        # derivedFieldsに明示し、スコアの根拠として表示側で区別できるようにする。
+        existing["float_ratio_pct"] = round(100.0 - market["insider_holding_pct"], 1)
+        derived.append("float_ratio_pct")
+    disclosure["derivedFields"] = derived
+    smart, refs = _smart_import_fundamentals(database_url, user_id, code)
+    return {"existing": existing, "smart_import": smart, "market": market, "disclosure": disclosure,
+            "smartImportRefs": refs, "disclosureTitles": [h["title"] for h in history[:10]]}
+
+
+def refresh_ipo_fundamentals(database_url, user_id, code):
+    """collect_ipo_fundamentalsの結果をipo_stocks.auto_fundamentals_jsonへキャッシュする。"""
+    auto = collect_ipo_fundamentals(database_url, user_id, code)
+    m = auto.get("market", {})
+    merged, sources = capital_ranking.merge_fundamentals(auto["existing"], auto["smart_import"], None)
+    investment_db.save_ipo_auto_snapshot(
+        database_url, user_id, code, {**auto, "fetchedAt": datetime.datetime.now(_JST).isoformat()}, sources,
+        market_cap=m.get("market_cap"), current_price=m.get("current_price"),
+        first_price=m.get("first_price"), listing_date=m.get("listing_date"))
+    return auto
+
+
+def _ipo_derived_fields(row):
+    return ((((row.get("auto_fundamentals_json") or {}).get("disclosure")) or {}).get("derivedFields")) or []
+
+
+def _ipo_fundamentals_for(row):
+    """行の自動スナップショット＋明示入力を、優先順位（既存の企業業績＞Smart Import＞明示入力）で結合。"""
+    auto = row.get("auto_fundamentals_json") or {}
+    return capital_ranking.merge_fundamentals(
+        auto.get("existing"), auto.get("smart_import"), row.get("fundamentals_json"))
+
+
+def apply_ipo_reevaluation(database_url, user_id, candidates, signals_by_code, ipo_rows=None):
+    """監視銘柄（＋shadow_watch）内のIPO銘柄をスキャンの度に再評価する（朝に弱くても昇格可能、
+    下限はWATCH_LOW）。candidatesを直接更新（ipoInfo付与）。段階が変わった場合だけ保存。
+    業績データは既存データ（自動スナップショット）＋明示入力の結合結果を使う。"""
+    if ipo_rows is None:
+        if investment_db is None or not database_url:
+            return
+        try:
+            ipo_rows = {r["code"]: r for r in investment_db.list_ipo_stocks(database_url, user_id)}
+        except Exception as e:
+            print("  IPO再評価: ipo_stocks取得で例外（無視して続行）", e)
+            return
     if not ipo_rows:
         return
     today = _jst_today()
@@ -5021,7 +5295,10 @@ def apply_ipo_reevaluation(database_url, user_id, candidates, signals_by_code):
         row = ipo_rows.get(c.get("code"))
         if not row:
             continue
-        info = capital_ranking.build_ipo_info(row, c, signals_by_code.get(c["code"]), today, is_jp_trading_day)
+        merged, sources = _ipo_fundamentals_for(row)
+        info = capital_ranking.build_ipo_info(row, c, signals_by_code.get(c["code"]), today, is_jp_trading_day,
+                                              fundamentals=merged, derived_fields=_ipo_derived_fields(row))
+        info["fundamentalSources"] = sources
         c["ipoInfo"] = info
         if info["inWindow"] and info["stage"] != row.get("watch_stage"):
             try:
@@ -5064,10 +5341,81 @@ def register_shadow_watch_before_delete(database_url, user_id, code, name=None, 
     return investment_db.upsert_shadow_watch(database_url, user_id, code, kind, until, name=name, reason=reason)
 
 
-def evaluate_shadow_watches(database_url, user_id):
-    """shadow_watch（監視解除済みだが内部追跡中）の銘柄を再評価し、出来高急増・高値更新・材料発生
-    があれば「再注目候補」として返す。期限切れはEXPIREDへ。1銘柄ずつの既存取得関数
-    （get_stock_quotes・_intraday_stock_snapshot・_volume_stage2_detail）を再利用する。"""
+def _active_shadow_targets(database_url, user_id, watchlist_codes):
+    """有効期限内のshadow_watchのうち、監視銘柄に無いものをscan対象（既存の一括prefetchに載せる）へ。"""
+    if investment_db is None or not database_url:
+        return [], []
+    try:
+        rows = investment_db.list_shadow_watch(database_url, user_id, status="ACTIVE")
+    except Exception as e:
+        print("  shadow_watch取得で例外（無視して続行）", e)
+        return [], []
+    today = _jst_today()
+    master = {}
+    try:
+        master = get_jp_issue_master() or {}
+    except Exception:
+        pass
+    targets = []
+    for r in rows:
+        try:
+            if datetime.date.fromisoformat(str(r["until_date"])[:10]) < today:
+                investment_db.update_shadow_watch_check(database_url, user_id, r["code"], status="EXPIRED")
+                continue
+        except Exception:
+            continue
+        if r["code"] in watchlist_codes:
+            continue
+        m = master.get(r["code"]) or {}
+        targets.append({"code": r["code"], "name": r.get("name") or m.get("name"), "market": "JP",
+                        "sector": m.get("sector"), "_shadow": True, "_shadowKind": r["kind"]})
+    return targets, rows
+
+
+def finalize_shadow_scan(database_url, user_id, candidates, signals_by_code, actionable_codes, actionable_ranks=None):
+    """scan済みのshadow_watch候補から「再注目候補」を作り、actionable_top5へ戻ったかまで明示する
+    （shadow_watch → 再評価 → BUY_CANDIDATE → entry candidate → actionable_top5 の一本のパイプライン）。
+    出来高急増・高値更新・材料発生のいずれかで再注目。pipelineStatus:
+      ACTIONABLE_TOP5 … 実戦TOP5へ復帰済み
+      BUY_CANDIDATE_BLOCKED … BUY_CANDIDATEだが余力不足/危険状態等で実戦TOP5に入れない（理由つき）
+      WATCHING … 再注目条件のみ（まだBUY_CANDIDATE未満）"""
+    out = []
+    for c in candidates:
+        if not c.get("shadow"):
+            continue
+        sig = signals_by_code.get(c["code"]) or {}
+        reasons = capital_ranking.detect_shadow_trigger(sig)
+        stage = c.get("revivalStage") or "WATCH_LOW"
+        if c["code"] in actionable_codes:
+            status, blocked = "ACTIONABLE_TOP5", None
+        elif stage == "BUY_CANDIDATE":
+            status = "BUY_CANDIDATE_BLOCKED"
+            if c.get("buyable") is False:
+                blocked = f"余力不足（必要資金{c.get('minimumPurchaseAmount'):,}円）"
+            elif c.get("entryState") in ENTRY_TOP5_RISK_STATES:
+                blocked = f"高値追い危険等（{c.get('entryState')}）"
+            else:
+                blocked = "実戦TOP5の枠外"
+        else:
+            status, blocked = "WATCHING", None
+        try:
+            trig = {"reasons": reasons, "price": c.get("current"), "changePct": c.get("changePct"), "stage": stage,
+                    "pipelineStatus": status, "at": datetime.datetime.now(_JST).isoformat()} if reasons else None
+            investment_db.update_shadow_watch_check(database_url, user_id, c["code"], trigger=trig)
+        except Exception as e:
+            print("  shadow_watch状態保存で例外（無視して続行）", c.get("code"), e)
+        if reasons:
+            out.append({"code": c["code"], "name": c.get("name"), "kind": c.get("shadowKind"),
+                        "price": c.get("current"), "changePct": c.get("changePct"), "reasons": reasons,
+                        "stage": stage, "pipelineStatus": status, "blockedReason": blocked,
+                        "actionableRank": (actionable_ranks or {}).get(c["code"], c.get("actionableRank")),
+                        "label": "再注目候補"})
+    return out
+
+
+def evaluate_shadow_watches(database_url, user_id, skip_codes=()):
+    """scanに載らなかったshadow_watch銘柄（Stage1に行が無い等）だけを1銘柄ずつ再評価するフォールバック。
+    通常はscan内のバッチ取得（finalize_shadow_scan）で処理されるためskip_codesで除外する。"""
     if investment_db is None or not database_url:
         return []
     today = _jst_today()
@@ -5079,6 +5427,8 @@ def evaluate_shadow_watches(database_url, user_id):
     out = []
     for sw in shadows:
         code = sw["code"]
+        if code in skip_codes:
+            continue
         try:
             if datetime.date.fromisoformat(str(sw["until_date"])[:10]) < today:
                 investment_db.update_shadow_watch_check(database_url, user_id, code, status="EXPIRED")
@@ -5104,7 +5454,8 @@ def evaluate_shadow_watches(database_url, user_id):
                         "at": datetime.datetime.now(_JST).isoformat()}
                 investment_db.update_shadow_watch_check(database_url, user_id, code, trigger=trig)
                 out.append({"code": code, "name": sw.get("name"), "kind": sw["kind"], "untilDate": str(sw["until_date"])[:10],
-                            "price": q["t"], "changePct": change, "reasons": reasons, "label": "再注目候補"})
+                            "price": q["t"], "changePct": change, "reasons": reasons, "label": "再注目候補",
+                            "pipelineStatus": "OUT_OF_SCAN"})
             else:
                 investment_db.update_shadow_watch_check(database_url, user_id, code)
         except Exception as e:
@@ -5113,18 +5464,44 @@ def evaluate_shadow_watches(database_url, user_id):
 
 
 def seed_ipo_early_unwatch_learning_rule(database_url, user_id, source_date="2026-09-24"):
-    """akippa事例のLearning Rule登録（冪等：rule_keyで重複判定、再実行はevidence_count加算のみ）。
+    """akippa事例のLearning Rule登録（冪等）。既に同種ルール（拡張済みを含む）があれば新規作成しない。
     category=ENTRY / priority=HIGH / status=TESTING。"""
     if investment_db is None or not database_url:
         return None
+    existing = investment_db.find_trade_rule_by_source_type(database_url, user_id, "akippa_ipo_early_unwatch")
+    if existing:
+        return {"action": "exists", "id": existing["id"]}
     spec = capital_ranking.IPO_LEARNING_RULE
     source_info = {"type": "akippa_ipo_early_unwatch", "date": source_date, "rule_name": spec["rule_name"],
                    "priority": spec["priority"],
-                   "case": "akippa：直近IPO(公開価格570円)、朝の下落だけで監視解除→資金再流入でストップ高、機会損失"}
+                   "case": "akippa(627A)：直近IPO(公開価格570円)、朝の下落だけで監視解除→ストップ高、機会損失"}
     return investment_db.upsert_trade_rule_from_text(
         database_url, user_id, spec["rule_text"], source_info=source_info, category=spec["category"],
         rule_type="TESTING", initial_status="TESTING", initial_confidence="MEDIUM",
         created_from="akippa_ipo_early_unwatch_seed", seen_date=source_date)
+
+
+def seed_morning_weakness_learning_rule(database_url, user_id, source_date="2026-09-24"):
+    """「朝の弱さだけで候補除外しない」（ENTRY/HIGH/TESTING）。既存のIPO早期監視解除禁止ルールと
+    重複するため新規作成せず、既存ルールを拡張する（本文の対象をIPO以外へ広げ、変更履歴を残す）。
+    既存ルールが無い場合のみ新規作成。冪等。"""
+    if investment_db is None or not database_url:
+        return None
+    spec = capital_ranking.MORNING_WEAKNESS_RULE
+    source_entry = {"type": "morning_weakness_generalization", "date": source_date,
+                    "rule_name": spec["rule_name"], "priority": spec["priority"],
+                    "targets": ["直近IPO", "決算直後", "材料発生", "前日出来高急増", "ストップ高経験",
+                                "前日大幅高", "寄り前GU/GD大"]}
+    base = investment_db.find_trade_rule_by_source_type(database_url, user_id, "akippa_ipo_early_unwatch")
+    if base:
+        res = investment_db.extend_trade_rule(
+            database_url, user_id, base["id"], spec["rule_text"], source_entry=source_entry,
+            reason="朝の弱さだけで候補除外しない：IPO以外（決算直後・材料・出来高急増等）へ対象を拡張")
+        return {**(res or {}), "id": base["id"]}
+    return investment_db.upsert_trade_rule_from_text(
+        database_url, user_id, spec["rule_text"], source_info=source_entry, category=spec["category"],
+        rule_type="TESTING", initial_status="TESTING", initial_confidence="MEDIUM",
+        created_from="morning_weakness_seed", seen_date=source_date)
 
 
 def compute_entry_ready_candidates(database_url, user_id):
@@ -5214,20 +5591,28 @@ def _apply_entry_top5_staleness(cache_entry):
     age_sec = max(0.0, now - cache_entry["generatedAtEpoch"])
     stale = age_sec > ENTRY_TOP5_STALE_DATA_SEC
     delayed = age_sec > ENTRY_TOP5_UPDATE_DELAY_WARNING_SEC
-    top5 = cache_entry["entryReadyTop5"]
-    downgraded = []
     any_symbol_stale = False
-    for c in top5:
-        symbol_stale = c.get("marketDataCacheStatus") not in ("ok", None)
-        if symbol_stale:
-            any_symbol_stale = True
-        if c.get("entryState") in ("NOW_BUYABLE", "ENTRY_READY") and (stale or symbol_stale):
-            reason = "ranking_age" if stale else "symbol_market_data"
-            c = {**c, "entryState": "WAIT_DATA_STALE", "staleDowngraded": True, "staleReason": reason}
-        downgraded.append(c)
-    top5 = downgraded
+
+    def _downgrade(lst):
+        nonlocal any_symbol_stale
+        res = []
+        for c in lst:
+            symbol_stale = c.get("marketDataCacheStatus") not in ("ok", None)
+            if symbol_stale:
+                any_symbol_stale = True
+            if c.get("entryState") in ("NOW_BUYABLE", "ENTRY_READY") and (stale or symbol_stale):
+                reason = "ranking_age" if stale else "symbol_market_data"
+                c = {**c, "entryState": "WAIT_DATA_STALE", "staleDowngraded": True, "staleReason": reason}
+            res.append(c)
+        return res
+
+    top5 = _downgrade(cache_entry["entryReadyTop5"])
+    analysis_top5 = _downgrade(cache_entry.get("analysisTop5", cache_entry["entryReadyTop5"]))
     return {
         "entryReadyTop5": top5,
+        "actionableTop5": top5,
+        "analysisTop5": analysis_top5,
+        "watchLowCandidates": cache_entry.get("watchLowCandidates", []),
         "watchCandidates": cache_entry["watchCandidates"],
         "reversalCandidates": cache_entry.get("reversalCandidates", []),
         "reversalWatchCandidates": cache_entry.get("reversalWatchCandidates", []),
@@ -5288,6 +5673,11 @@ def _run_entry_top5_scan(database_url, user_id, trigger="AUTO", wait_for_lock=Fa
             "riskCount": debug.get("risk_excluded", 0),
             "debug": debug,  # 既存の🔧デバッグ表示（scanned/entry_ready/…）を維持するため丸ごと保持
             "capital": result.get("capital"),
+            "actionableTop5": result.get("actionableTop5", result["entryReadyTop5"]),
+            "analysisTop5": result.get("analysisTop5", result["entryReadyTop5"]),
+            "analysisWatchCandidates": result.get("analysisWatchCandidates", []),
+            "watchLowCandidates": result.get("watchLowCandidates", []),
+            "positionSummary": result.get("positionSummary"),
             "_candidatePool": result.get("_candidatePool"),
             "durationMs": round((t1 - t0) * 1000),
             "trigger": trigger,
@@ -5296,7 +5686,9 @@ def _run_entry_top5_scan(database_url, user_id, trigger="AUTO", wait_for_lock=Fa
         }
         # shadow_watch（監視解除済みIPO/材料株/急騰株）の再評価：再注目候補を同じキャッシュへ載せる
         try:
-            cache_entry["shadowRecheck"] = evaluate_shadow_watches(database_url, user_id)
+            # scan内のバッチ取得で処理済みの銘柄はスキップ（N+1回避）。scanに載らなかった分だけ個別取得。
+            cache_entry["shadowRecheck"] = (result.get("shadowRecheck") or []) + evaluate_shadow_watches(
+                database_url, user_id, skip_codes=set(result.get("shadowScannedCodes") or []))
         except Exception as e:
             print("  shadow_watch再評価で例外（無視して続行）", e)
             cache_entry["shadowRecheck"] = []
@@ -5537,8 +5929,9 @@ def generate_morning_entry_top5(database_url, user_id):
     """朝TOP5（entry_ready_top5、08:50MorningMarketCheck生成時点のスナップショット）を算出
     する。Current TOP5と全く同じ_score_entry_candidates()を使う（指示書「同じ選考基準」）。
     永続化はしない（呼び出し側でsave_morning_check後にpersist_morning_thesesを呼ぶ）。
-    朝TOP5は成績評価用の固定基準のため、買付余力の制約は適用しない（apply_capital=False）。"""
-    return _score_entry_candidates_impl(database_url, user_id, apply_capital=False)
+    結果はanalysisTop5（余力を見ない固定基準＝stock_thesesへ永続化し成績評価に使う）と
+    entryReadyTop5/actionableTop5（現在余力で実際に買える候補＝朝一チェックの表示用）の両方を含む。"""
+    return _score_entry_candidates_impl(database_url, user_id, apply_capital=True)
 
 
 def persist_morning_theses(database_url, user_id, trade_date, morning_check_id, entry_ready_top5):
@@ -25221,6 +25614,11 @@ class Handler(SimpleHTTPRequestHandler):
                                  "auto_reference": rec.get("auto_reference")})
         elif self.path.startswith("/api/ipo-stocks"):
             items = investment_db.list_ipo_stocks(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
+            for it in items:
+                merged, sources = _ipo_fundamentals_for(it)
+                it["fundamentals_merged"] = merged
+                it["fundamental_sources"] = sources
+                it["fundamental"] = capital_ranking.compute_ipo_fundamental_score(merged, _ipo_derived_fields(it))
             self._send_json({"items": items})
         elif self.path.startswith("/api/shadow-watch"):
             items = investment_db.list_shadow_watch(DATABASE_URL, self.current_user, status="ACTIVE") if (investment_db is not None and DATABASE_URL) else []
@@ -26370,7 +26768,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             rerank = False
             try:
-                rerank = recompute_entry_top5_cache_for_cash(self.current_user, rec)
+                rerank = recompute_entry_top5_cache_for_cash(
+                    self.current_user, rec, get_position_summary(DATABASE_URL, self.current_user))
             except Exception as e:
                 print("  買付余力変更後の即時再ランキングで例外（保存は成功、次回スキャンで反映）", e)
             self._send_json({"cash_available": rec.get("cash_available"), "currency": rec.get("currency") or "JPY",
@@ -26393,6 +26792,23 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as e:
                 print("  IPO Learning Rule登録で例外（IPO保存は成功）", e)
             self._send_json({"ok": row is not None, "item": row})
+        elif self.path == "/api/ipo-stocks/refresh":
+            # 既存の業績データ（TDnet/jQuants/Smart Import/market data）からIPO業績を自動結合して
+            # ipo_stocksへキャッシュする（手入力不要）。
+            if not self._investment_db_ready():
+                return
+            body = self._read_json_body()
+            code = str(body.get("code") or "")
+            if not code:
+                self._send_json({"error": "codeは必須です"}, status=400)
+                return
+            auto = refresh_ipo_fundamentals(DATABASE_URL, self.current_user, code)
+            row = next((r for r in investment_db.list_ipo_stocks(DATABASE_URL, self.current_user)
+                        if r["code"] == code), None)
+            merged, sources = _ipo_fundamentals_for(row) if row else ({}, {})
+            self._send_json({"ok": True, "fundamentals": merged, "sources": sources,
+                             "fundamental": capital_ranking.compute_ipo_fundamental_score(merged, _ipo_derived_fields(row) if row else ()),
+                             "disclosureTitles": auto.get("disclosureTitles")})
         elif self.path == "/api/portfolio/save":
             if not self._investment_db_ready():
                 return

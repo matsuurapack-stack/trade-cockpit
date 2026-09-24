@@ -5562,6 +5562,17 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                       </div>
                       <span style={{fontSize:10,color:"var(--inkFaint)"}}>{expanded?"▲内訳を閉じる":"▼内訳"}</span>
                     </div>
+                    {/* 分析順位と実戦順位の区別（2026-09-24）：analysis_top5は余力を見ない分析順位、
+                        actionable_top5は現在の余力で実際に買える実戦順位。 */}
+                    {(c.actionableRank!=null||c.analysisRank!=null) && <div style={{marginTop:4,display:"flex",flexWrap:"wrap",gap:"2px 12px",fontSize:10.5}} className="mono">
+                      <span>分析評価 {c.entryScore}（分析{c.analysisRank!=null?c.analysisRank+"位":"TOP5圏外"}）</span>
+                      <span style={{fontWeight:800,color:"var(--accent)"}}>実戦順位 {c.actionableRank}位</span>
+                      {c.revivedBuyCandidate && <span style={{fontWeight:800,color:"var(--accent)"}}>🔄 復活（BUY_CANDIDATE）</span>}
+                      {c.shadow && <span style={{color:"var(--inkSoft)"}}>👁 shadow_watch由来</span>}
+                      {(c.protectedReasons||[]).length>0 && <span style={{color:"var(--inkSoft)"}}>朝の弱さで除外しない：{c.protectedReasons.join("・")}</span>}
+                      {c.entryCapacity && <span style={{fontWeight:800,color:c.entryCapacity==="ENTRY_LIMIT"?"var(--down)":"var(--warn)"}}>
+                        {c.entryCapacity==="ENTRY_LIMIT"?"🔴 ENTRY_LIMIT":"🟠 CAUTION"}：{c.entryCapacityWarning}</span>}
+                    </div>}
                     {/* 買付余力ベース評価（2026-09-24新規）：余力設定済みの時だけ表示 */}
                     {c.minimumPurchaseAmount!=null && c.buyable!==undefined && c.buyable!==null && <div style={{marginTop:4,display:"flex",flexWrap:"wrap",gap:"2px 12px",fontSize:10.5}} className="mono">
                       <span style={{fontWeight:800,color:"var(--accent)"}}>{c.capitalStatus||"BUY_NOW"}</span>
@@ -5576,9 +5587,15 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                     </div>}
                     {c.ipoInfo && <div style={{marginTop:4,display:"flex",flexWrap:"wrap",gap:"2px 12px",fontSize:10.5}} className="mono">
                       <span style={{fontWeight:800,color:"var(--accent)"}}>IPO {c.ipoInfo.stage}</span>
-                      {c.ipoInfo.fundamental&&c.ipoInfo.fundamental.ipo_fundamental_score!=null && <span>IPO FUNDAMENTAL {c.ipoInfo.fundamental.ipo_fundamental_score}</span>}
-                      {c.ipoInfo.fundamental&&c.ipoInfo.fundamental.supply_demand_score!=null && <span>IPO SUPPLY DEMAND {c.ipoInfo.fundamental.supply_demand_score}</span>}
-                      {c.ipoInfo.ipoTotalScore!=null && <span>IPO総合 {c.ipoInfo.ipoTotalScore}</span>}
+                      {c.ipoInfo.ipo_fundamental_score!=null && <span>IPO FUNDAMENTAL {c.ipoInfo.ipo_fundamental_score}</span>}
+                      {c.ipoInfo.ipo_supply_demand_score!=null && <span>IPO SUPPLY DEMAND {c.ipoInfo.ipo_supply_demand_score}</span>}
+                      {c.ipoInfo.ipo_momentum_score!=null && <span>IPO MOMENTUM {c.ipoInfo.ipo_momentum_score}</span>}
+                      {c.ipoInfo.ipo_total_score!=null && <span>IPO総合 {c.ipoInfo.ipo_total_score}</span>}
+                      {c.ipoInfo.fundamental_data_quality && <span style={{fontWeight:800,
+                          color:["HIGH","MEDIUM"].includes(c.ipoInfo.fundamental_data_quality)?"var(--inkSoft)":"var(--down)"}}
+                          title={"未取得の指標："+((c.ipoInfo.fundamental&&c.ipoInfo.fundamental.missing_components)||[]).join("・")}>
+                        業績データ品質 {c.ipoInfo.fundamental_data_quality}{["LOW","INSUFFICIENT"].includes(c.ipoInfo.fundamental_data_quality)?"（データ不足：スコアは参考値）":""}
+                      </span>}
                       {c.ipoInfo.priceVsOfferPct!=null && <span>公開価格比 {c.ipoInfo.priceVsOfferPct>0?"+":""}{c.ipoInfo.priceVsOfferPct}%</span>}
                     </div>}
                     {confirmationOverrideReasons&&confirmationOverrideReasons.length>0 && <div style={{marginTop:4,fontSize:10.5,color:stMeta.color}}>
@@ -5595,8 +5612,26 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                 })}
               </div>}
           {entryResult.capital&&entryResult.capital.applied && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:6}}>
-            現在の買付余力 <span className="mono" style={{fontWeight:800}}>{Math.round(entryResult.capital.cashAvailable).toLocaleString()}円</span>
-            ／ 余力不足で除外：{entryResult.capital.notBuyableCount}銘柄
+            上の一覧は<b>実戦TOP5</b>（現在の買付余力
+            <span className="mono" style={{fontWeight:800}}> {Math.round(entryResult.capital.cashAvailable).toLocaleString()}円 </span>
+            で実際に買える候補）。余力不足で除外：{entryResult.capital.notBuyableCount}銘柄
+            {entryResult.capital.openPositionCount!=null && <span>　／　保有 {entryResult.capital.openPositionCount}銘柄（新規ENTRY余地：{entryResult.capital.newEntryCapacity}）</span>}
+          </div>}
+          {entryResult.capital&&entryResult.capital.entryCapacityWarning && <div style={{fontSize:11,fontWeight:700,marginBottom:6,
+              color:entryResult.capital.newEntryCapacity==="ENTRY_LIMIT"?"var(--down)":"var(--warn)"}}>
+            ⚠ {entryResult.capital.entryCapacityWarning}（補助判断：既存ポジションの売却や候補の除外はしません）
+          </div>}
+          {entryResult.analysisTop5&&entryResult.analysisTop5.length>0 && entryResult.capital&&entryResult.capital.applied && <div style={{marginBottom:8}}>
+            <div style={{fontSize:11,fontWeight:700,color:"var(--inkSoft)",marginBottom:4}}>分析TOP5（余力を考慮しない純粋な分析評価・過去検証用）—「良い銘柄なのに実戦TOP5に出ない理由」</div>
+            <div style={{display:"flex",flexDirection:"column",gap:2}}>
+              {entryResult.analysisTop5.map(c=><div key={c.code} className="mono" style={{fontSize:10.5}}>
+                分析{c.analysisRank}位 {c.code} {c.name} 評価{c.entryScore}
+                {c.minimumPurchaseAmount!=null && <span>　必要資金 {c.minimumPurchaseAmount.toLocaleString()}円</span>}
+                {c.actionableRank!=null
+                  ? <span style={{color:"var(--accent)",fontWeight:800}}>　→ 実戦{c.actionableRank}位</span>
+                  : <span style={{color:"var(--down)"}}>　→ 実戦TOP5外：{c.actionableReason||"—"}</span>}
+              </div>)}
+            </div>
           </div>}
           {entryResult.capital&&entryResult.capital.combinations&&entryResult.capital.combinations.length>0 && <div style={{fontSize:11,marginBottom:8}}>
             <div style={{fontWeight:700,color:"var(--inkSoft)",marginBottom:2}}>同時に持てる組み合わせ（余力内・集中リスク考慮）</div>
@@ -5618,6 +5653,17 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
             <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
               {entryResult.shadowRecheck.map(c=><span key={c.code} style={{fontSize:11,padding:"2px 7px",borderRadius:3,border:"1px solid var(--accent)",whiteSpace:"nowrap"}}>
                 {c.code} {c.name||""} {c.kind} <span className="mono">{c.price!=null?c.price.toLocaleString():"—"}円{c.changePct!=null?`（${c.changePct>0?"+":""}${c.changePct}%）`:""}</span> {c.reasons.join("・")}
+                {c.pipelineStatus==="ACTIONABLE_TOP5" && <b style={{color:"var(--accent)"}}>　✅ 実戦TOP5{c.actionableRank!=null?c.actionableRank+"位":""}へ復帰</b>}
+                {c.pipelineStatus==="BUY_CANDIDATE_BLOCKED" && <b style={{color:"var(--down)"}}>　BUY_CANDIDATE到達も実戦TOP5に入れない：{c.blockedReason}</b>}
+                {c.pipelineStatus==="WATCHING" && <span style={{color:"var(--inkSoft)"}}>　監視継続（{c.stage}）</span>}
+              </span>)}
+            </div>
+          </div>}
+          {entryResult.watchLowCandidates&&entryResult.watchLowCandidates.length>0 && <div style={{marginBottom:8}}>
+            <div style={{fontSize:11,fontWeight:700,color:"var(--inkSoft)",marginBottom:4}}>WATCH_LOW維持（朝の弱さだけで完全除外しない対象）</div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+              {entryResult.watchLowCandidates.map(c=><span key={c.code} style={{fontSize:11,padding:"2px 7px",borderRadius:3,border:"1px dashed var(--rule)",whiteSpace:"nowrap"}}>
+                {c.code} {c.name} <span className="mono">{c.changePct!=null?(c.changePct>0?"+":"")+c.changePct+"%":""}</span> {c.stage}：{(c.protectedReasons||[]).join("・")}
               </span>)}
             </div>
           </div>}
@@ -7427,8 +7473,8 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
   const loadCash=async()=>{
     try{
       const r=await fetch("/api/portfolio/cash");
-      if(r.ok)setCashInfo(await r.json());
-    }catch(e){}
+      if(r.ok)setCashInfo(await r.json());else setCashInfo({cash_available:null});
+    }catch(e){setCashInfo({cash_available:null});}
   };
   useEffect(()=>{loadCash();},[]);
   const saveCash=async()=>{
@@ -7712,7 +7758,7 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
           </div>
         : <div style={{display:"flex",alignItems:"baseline",gap:10,marginTop:2,flexWrap:"wrap"}}>
             <span className="mono" style={{fontSize:22,fontWeight:800}}>
-              {cashInfo&&cashInfo.cash_available!=null?Math.round(cashInfo.cash_available).toLocaleString()+"円":"未設定"}
+              {cashInfo===null?"読込中…":cashInfo.cash_available!=null?Math.round(cashInfo.cash_available).toLocaleString()+"円":"未設定"}
             </span>
             <button className="iconbtn" style={{fontSize:11}}
               onClick={()=>{setCashDraft(cashInfo&&cashInfo.cash_available!=null?String(Math.round(cashInfo.cash_available)):"");setEditingCash(true);}}>編集</button>

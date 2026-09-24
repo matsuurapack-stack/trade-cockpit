@@ -54,8 +54,8 @@ class BuyabilityTests(unittest.TestCase):
 
 class CapitalRankingTests(unittest.TestCase):
     def _select(self, cands, cash):
-        cr_result = server._build_capital_selection(cands, {"cash_available": cash, "source": "MANUAL"} if cash is not None else None)
-        return cr_result
+        d = server._build_capital_selection(cands, {"cash_available": cash, "source": "MANUAL"} if cash is not None else None)
+        return d["top5"], d["watch"], d["reversal"], d["reversalWatch"], d["debug"], d["capital"]
 
     def test4_not_buyable_excluded_from_top5_and_listed_separately(self):
         cands = [cand("A", 3000, 90), cand("B", 5000, 88), cand("C", 9000, 95)]
@@ -95,13 +95,14 @@ class CapitalRankingTests(unittest.TestCase):
         self.assertEqual(ab[0]["cashRemaining"], 150000)
 
     def test3_cash_change_reranks_cached_top5_immediately(self):
-        pool = [cand("A", 3000, 90), cand("B", 5000, 88), cand("C", 9000, 95)]
+        pool = sorted([cand("A", 3000, 90), cand("B", 5000, 88), cand("C", 9000, 95)], key=lambda c: -c["entryScore"])
         server._ENTRY_TOP5_CACHE["u_cash_test"] = {
             "entryReadyTop5": [], "watchCandidates": [], "debug": {}, "_candidatePool": pool}
         try:
             self.assertTrue(server.recompute_entry_top5_cache_for_cash("u_cash_test", {"cash_available": 700000, "source": "MANUAL"}))
             e1 = server._ENTRY_TOP5_CACHE["u_cash_test"]
             self.assertEqual([c["code"] for c in e1["entryReadyTop5"]], ["A", "B"])
+            self.assertEqual([c["code"] for c in e1["analysisTop5"]][:3], ["C", "A", "B"])  # 分析順位は余力を見ない
             # 余力を1,000,000円へ引き上げると、9,000円(=900,000円)のCが買える＝1位に
             self.assertTrue(server.recompute_entry_top5_cache_for_cash("u_cash_test", {"cash_available": 1000000, "source": "MANUAL"}))
             e2 = server._ENTRY_TOP5_CACHE["u_cash_test"]
@@ -120,7 +121,8 @@ class CapitalRankingTests(unittest.TestCase):
         cands.sort(key=lambda c: -c["entryScore"])
         import copy
         expected = server._select_entry_ready_top5(copy.deepcopy(cands))
-        top5, watch, rc, rw, debug, capital = server._build_capital_selection(copy.deepcopy(cands), None)
+        d = server._build_capital_selection(copy.deepcopy(cands), None)
+        top5, capital = d["top5"], d["capital"]
         self.assertEqual([c["code"] for c in top5], [c["code"] for c in expected[0]])
         self.assertFalse(capital["applied"])
         self.assertNotIn("capitalStatus", top5[0])
@@ -243,15 +245,16 @@ class ShadowWatchTests(unittest.TestCase):
 
 
 class RegressionTests(unittest.TestCase):
-    def test12_morning_top5_ignores_capital_constraint(self):
+    def test12_morning_top5_returns_both_lists(self):
         with mock.patch.object(server, "_score_entry_candidates_impl", return_value={}) as m:
             server.generate_morning_entry_top5("url", "u")
-        m.assert_called_once_with("url", "u", apply_capital=False)
+        m.assert_called_once_with("url", "u", apply_capital=True)
 
     def test_learning_rule_spec(self):
         r = cr.IPO_LEARNING_RULE
         self.assertEqual((r["rule_name"], r["category"], r["priority"]), ("直近IPOの早期監視解除禁止", "ENTRY", "HIGH"))
         with mock.patch.object(server, "investment_db") as db:
+            db.find_trade_rule_by_source_type.return_value = None
             db.upsert_trade_rule_from_text.return_value = {"ok": True}
             server.seed_ipo_early_unwatch_learning_rule("url", "u")
             kw = db.upsert_trade_rule_from_text.call_args.kwargs
