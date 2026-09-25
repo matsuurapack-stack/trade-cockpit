@@ -68,9 +68,17 @@ def source_confidence(source):
     return SOURCE_CONFIDENCE.get(source, "LOW")
 
 
+_PREFIX_RE = re.compile(r"^\s*(<[^>]{1,20}>\s*)+(AI\s*[:：]\s*)?(?:[^\s()（）]{0,30}\(\w{4}\)\s*)?")     # 「<TDnet>AI: アキッパ(627A) 」等の配信元ラベル・銘柄表記
+
+
+def clean_title(title):
+    """立花の開示速報などの配信元ラベル（<TDnet>AI: 社名(コード) ）を除いた本文。ラベルの「AI」をテーマ語と誤認しないため。"""
+    return _PREFIX_RE.sub("", title or "", count=1).strip() or (title or "")
+
+
 def classify_text(title):
     """見出し/開示タイトル → (type, direction, weight)。方向がタイトルだけで決まらない場合はUNKNOWN（推測しない）。"""
-    t = title or ""
+    t = clean_title(title)
     typ, direction, weight = "OTHER", "NEUTRAL", 10
     for rtype, rdir, rw, pats in RULES:
         if any((p in t) if p != "AI" else bool(_AI_RE.search(t)) for p in pats):

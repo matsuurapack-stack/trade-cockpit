@@ -6602,12 +6602,13 @@ _CATALYST_PREV = {}          # user_id -> {"top5": set(codes)}
 _CATALYST_HOLDINGS = {}      # user_id -> (epoch, set(codes))
 _TDNET_DAY_CACHE = {}        # "YYYYMMDD" -> (epoch, by_code)
 _TDNET_TODAY_TTL_SEC = 300
-_TDNET_LOOKBACK_DAYS = 7
+_TDNET_LOOKBACK_DAYS = 14        # 最大遡り日数（連休対応）。実際は直近6営業日ぶんで打ち切る
 _TDNET_LOCK = threading.Lock()
 _EARNINGS_CACHE = {}         # code -> (date_str, next_date or None)
 _REGULATION = {"date": None, "flags": None, "prev_active": None, "prev_known": False, "fetched_at": None, "error": None,
                "duration_ms": None, "count": 0, "active": 0}
 _REGULATION_LOCK = threading.Lock()
+_REGULATION_RETRY_SEC = 30 * 60
 
 
 def _jst_dt(date_str, hhmm):
@@ -6640,14 +6641,20 @@ def _catalyst_tdnet_fetch(code):
     out = []
     now = datetime.datetime.now(_JST)
     failed_today = False
+    covered = 0
     for i in range(_TDNET_LOOKBACK_DAYS):
-        ds = (now - datetime.timedelta(days=i)).strftime("%Y%m%d")
+        day = now - datetime.timedelta(days=i)
+        ds = day.strftime("%Y%m%d")
         by_code = _tdnet_day(ds)
+        if _is_jp_market_business_day(day):
+            covered += 1
         if by_code is None:
             failed_today = failed_today or (i == 0)
-            continue
-        for r in by_code.get(code, []):
-            out.append({"title": r.get("title"), "published_at": _jst_dt(ds, r.get("time")), "url": r.get("url"), "source": "TDNET"})
+        else:
+            for r in by_code.get(code, []):
+                out.append({"title": r.get("title"), "published_at": _jst_dt(ds, r.get("time")), "url": r.get("url"), "source": "TDNET"})
+        if covered >= 6 and i >= 5:
+            break                                                        # 直近6営業日ぶん（連休を挟んでも遡る）
     if failed_today:
         raise RuntimeError("TDnet当日一覧を取得できない")
     return out
@@ -6658,7 +6665,9 @@ def _catalyst_news_fetch(code):
         raise RuntimeError("tachibana_api unavailable")
     now = datetime.datetime.now(_JST)
     heads = tachibana_api.get_stock_news(code, (now - datetime.timedelta(days=7)).strftime("%Y%m%d"), now.strftime("%Y%m%d"), limit=20)
-    return [{"title": h.get("headline"), "published_at": _jst_dt(h.get("date", ""), h.get("time", "")), "source": "NQN"} for h in heads]
+    # 立花のニュースには「<TDnet>AI: 社名(コード) …」の開示速報（TDnet由来）が含まれる：一次情報として扱う（HIGH）。それ以外は日経QUICK等（MEDIUM）
+    return [{"title": h.get("headline"), "published_at": _jst_dt(h.get("date", ""), h.get("time", "")),
+             "source": "TACHIBANA_DISCLOSURE" if str(h.get("headline") or "").startswith("<TDnet>") else "NQN"} for h in heads]
 
 
 def _catalyst_db_fetch_for(user_id):
@@ -6668,6 +6677,8 @@ def _catalyst_db_fetch_for(user_id):
         rows = investment_db.relevant_catalysts_for(DATABASE_URL, user_id, code=code, sector=None, limit=5)
         out = []
         for r in rows:
+            if code not in (r.get("affected_stocks") or []):
+                continue                                              # 市場全体・セクターの材料はこの銘柄の材料ではない
             try:
                 d = datetime.date.fromisoformat(str(r.get("catalyst_date"))[:10])
             except Exception:
@@ -6716,13 +6727,17 @@ def _regulation_load(force=False):
     with _REGULATION_LOCK:
         if not force and _REGULATION["date"] == today and _REGULATION["flags"] is not None:
             return
+        if (not force and _REGULATION.get("error") and _REGULATION.get("failed_at")
+                and time.time() - _REGULATION["failed_at"] < _REGULATION_RETRY_SEC):
+            raise RuntimeError("規制情報は直近で取得失敗（再試行待ち）: " + str(_REGULATION["error"])[:120])     # 毎回20秒待たない（fail-fast）
         if tachibana_api is None:
             raise RuntimeError("tachibana_api unavailable")
         t0 = time.time()
         try:
             flags = tachibana_api.get_issue_regulation_kabu()
         except Exception as e:
-            _REGULATION.update({"date": today, "flags": None, "error": str(e)[:200], "duration_ms": round((time.time() - t0) * 1000)})
+            _REGULATION.update({"date": today, "flags": None, "error": str(e)[:200], "failed_at": time.time(),
+                                "duration_ms": round((time.time() - t0) * 1000)})
             raise
         active = {c: catalyst_engine.margin_restriction_from_flags(f)["kinds"] for c, f in flags.items()
                   if catalyst_engine.margin_restriction_from_flags(f)["active"]}

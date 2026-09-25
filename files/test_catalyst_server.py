@@ -41,7 +41,7 @@ class TdnetTests(unittest.TestCase):
         with mock.patch.object(server, "_tdnet_disclosures_for_date", side_effect=fake), \
                 mock.patch.object(server, "_is_jp_market_business_day", return_value=True):
             rows = server._catalyst_tdnet_fetch("6270")
-            self.assertEqual(len(rows), server._TDNET_LOOKBACK_DAYS)
+            self.assertEqual(len(rows), 6)                                    # 直近6営業日ぶん
             self.assertEqual({r["source"] for r in rows}, {"TDNET"})
             self.assertEqual(rows[0]["published_at"].hour, 9)
             self.assertIsNotNone(rows[0]["published_at"].tzinfo)
@@ -69,12 +69,35 @@ class NewsAndDbTests(unittest.TestCase):
         self.assertEqual((rows[0]["title"], rows[0]["source"], rows[0]["published_at"].minute), ("6270、大型受注を発表", "NQN", 30))
         self.assertEqual(api.get_stock_news.call_args[0][0], "6270")
 
+    def test_tdnet_derived_headlines_from_tachibana_are_primary_sources(self):
+        d = datetime.datetime.now(JST).strftime("%Y%m%d")
+        heads = [{"id": "1", "date": d, "time": "0800", "codes": ["627A"], "headline": "<TDnet>AI: アキッパ(627A) 主要株主の異動に関するお知らせ"},
+                 {"id": "2", "date": d, "time": "0900", "codes": ["627A"], "headline": "アキッパ、9月の売上高が最高"}]
+        with mock.patch.object(server, "tachibana_api") as api:
+            api.get_stock_news.return_value = heads
+            rows = server._catalyst_news_fetch("627A")
+        self.assertEqual([r["source"] for r in rows], ["TACHIBANA_DISCLOSURE", "NQN"])
+        self.assertEqual(ce.source_confidence(rows[0]["source"]), "HIGH")
+        self.assertEqual(ce.source_confidence(rows[1]["source"]), "MEDIUM")
+
+    def test_lookback_reaches_back_over_a_holiday_streak(self):
+        def fake(ds):
+            return {"6270": [{"time": "09:00", "date": ds, "title": "資本業務提携に関するお知らせ", "url": "u"}]} if ds.endswith("18") else {"1": [{"time": "09:00", "date": ds, "title": "x", "url": "u"}]}
+        n = datetime.datetime.now(JST)
+        holiday = lambda d: d.strftime("%Y%m%d") not in {(n - datetime.timedelta(days=k)).strftime("%Y%m%d") for k in (1, 2, 3, 4)}
+        with mock.patch.object(server, "_tdnet_disclosures_for_date", side_effect=fake), mock.patch.object(server, "_is_jp_market_business_day", side_effect=holiday):
+            server._TDNET_DAY_CACHE.clear()
+            rows = server._catalyst_tdnet_fetch("6270")
+        self.assertIsInstance(rows, list)                                    # 連休（4日）を挟んでも例外なく遡れる
+
     def test_existing_news_catalysts_table_is_reused(self):
-        row = {"title": "AI関連の提携", "catalyst_date": "2026-09-26", "verification_status": "VERIFIED"}
+        row = {"title": "6270の提携", "catalyst_date": "2026-09-26", "verification_status": "VERIFIED", "affected_stocks": ["6270"]}
+        macro = {"title": "米国 AI半導体への資金流入", "catalyst_date": "2026-09-26", "verification_status": "UNVERIFIED", "affected_stocks": []}
+        other = {"title": "別銘柄の材料", "catalyst_date": "2026-09-26", "affected_stocks": ["1111"]}
         with mock.patch.object(server, "investment_db") as db, mock.patch.object(server, "DATABASE_URL", "url"):
-            db.relevant_catalysts_for.return_value = [row, {"title": "x", "catalyst_date": "bad"}]
+            db.relevant_catalysts_for.return_value = [row, macro, other, {"title": "x", "catalyst_date": "bad", "affected_stocks": ["6270"]}]
             rows = server._catalyst_db_fetch_for("u1")("6270")
-        self.assertEqual([(r["source"], r["verified"]) for r in rows], [("DB_VERIFIED", True)])
+        self.assertEqual([(r["title"], r["source"], r["verified"]) for r in rows], [("6270の提携", "DB_VERIFIED", True)])   # 市場全体・他銘柄の材料は除外
 
 
 class EarningsTests(unittest.TestCase):
@@ -123,6 +146,20 @@ class RegulationTests(unittest.TestCase):
             saved = db.save_margin_restriction_snapshot.call_args[0]
             self.assertEqual(set(saved[2]), {"7777"})                            # 有効な銘柄だけ保存
             self.assertEqual(server._REGULATION["active"], 1)
+
+    def test_failure_is_cached_so_lookups_fail_fast_instead_of_waiting_20s_each(self):
+        with mock.patch.object(server, "tachibana_api") as api:
+            api.get_issue_regulation_kabu.side_effect = RuntimeError("p_errno=-1 引数エラー")
+            with self.assertRaises(RuntimeError):
+                server._catalyst_regulation("7777")
+            with self.assertRaises(RuntimeError) as cm:
+                server._catalyst_regulation("8888")
+            self.assertIn("再試行待ち", str(cm.exception))
+            self.assertEqual(api.get_issue_regulation_kabu.call_count, 1)      # 30分は再試行しない（毎回長い待ちを発生させない）
+            server._REGULATION["failed_at"] = time.time() - 31 * 60
+            with self.assertRaises(RuntimeError):
+                server._catalyst_regulation("7777")
+            self.assertEqual(api.get_issue_regulation_kabu.call_count, 2)
 
     def test_previous_snapshot_unknown_gives_none_and_failure_is_recorded(self):
         with mock.patch.object(server, "tachibana_api") as api, mock.patch.object(server, "investment_db") as db, \

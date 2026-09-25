@@ -50,6 +50,14 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(ce.classify_text("〇〇、4-6月期決算 最終赤字に転落")[1], "NEGATIVE")
         self.assertEqual(ce.classify_text("〇〇、4-6月期決算 増益も通期は下振れ")[1], "MIXED")
 
+    def test_delivery_labels_are_not_classified_as_themes(self):
+        # 立花の開示速報「<TDnet>AI: 社名(コード) 本文」の「AI」は配信元ラベル。テーマ語と誤認しない
+        self.assertEqual(ce.classify_text("<TDnet>AI: アキッパ(627A) 会社説明及び今後の戦略概要")[0], "OTHER")
+        self.assertEqual(ce.clean_title("<TDnet>AI: アキッパ(627A) 主要株主の異動に関するお知らせ"), "主要株主の異動に関するお知らせ")
+        self.assertEqual(ce.classify_text("<TDnet>AI: アキッパ(627A) 通期業績予想の上方修正に関するお知らせ")[:2], ("UPWARD_REVISION", "POSITIVE"))
+        self.assertEqual(ce.classify_text("<TDnet>AI: アキッパ(627A) 東京証券取引所スタンダードへの上場に伴う当社決算情報等のお知らせ")[:2], ("EARNINGS", "UNKNOWN"))
+        self.assertEqual(ce.classify_text("生成AI関連の展示会に出展")[0], "THEME_AI_SEMI")
+
     def test_margin_notices_and_theme_only(self):
         self.assertEqual(ce.classify_text("増担保規制の実施について")[:2], ("MARGIN_REGULATION", "NEGATIVE"))
         self.assertEqual(ce.classify_text("日々公表銘柄に指定")[0], "MARGIN_REGULATION")
