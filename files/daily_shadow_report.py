@@ -1,0 +1,91 @@
+# Phase C shadow運用の日次レポート（読み取り専用。判定・サーバーには触れない）。
+#   python daily_shadow_report.py [YYYY-MM-DD] [サーバーのstderrログパス]
+# 事後価格(+5/+15/+30分)は集計専用で、判定ロジックへ戻さない。
+
+import datetime
+import re
+import sys
+
+import chart_signal_log as sl
+
+JST = datetime.timezone(datetime.timedelta(hours=9))
+ENTRY = sl.ENTRY_STATES
+
+
+def _r(x):
+    return "-" if x is None else f"{x:+.2f}%"
+
+
+def _line(r):
+    ft = r.get("features") or {}
+    reasons = "; ".join((r.get("reasons") or [])[:3])
+    pens = "; ".join((r.get("penalties") or [])[:2])
+    return (f"  {str(r['logged_at'])[11:16]}(UTC) {r['code']} ¥{r['current_price']:.0f} ENTRY点={r.get('entry_timing')} "
+            f"強さ={r.get('stock_strength')} {r['chart_pattern']} {r['legacy_entry_state']}→{r['chart_entry_state']} "
+            f"+5/+15/+30={_r(r.get('ret_5m'))}/{_r(r.get('ret_15m'))}/{_r(r.get('ret_30m'))} "
+            f"上ヒゲ={r.get('upper_wick_ratio')} VWAP乖離={r.get('vwap_distance')} | {reasons} | {pens}")
+
+
+def _avg(rs, h):
+    v = [r[f"ret_{h}m"] for r in rs if r.get(f"ret_{h}m") is not None]
+    return (round(sum(v) / len(v), 3), len(v)) if v else (None, 0)
+
+
+def main():
+    sys.stdout.reconfigure(encoding="utf-8")   # Windowsのcp932で¥等が出力できず落ちるのを防ぐ
+    day = sys.argv[1] if len(sys.argv) > 1 else datetime.datetime.now(JST).date().isoformat()
+    err_path = sys.argv[2] if len(sys.argv) > 2 else None
+    import server
+    import investment_db as db
+    rows = db.list_chart_signals(server.DATABASE_URL, "matsuura", day, None, 20000)
+    day_sum = sl.summarize_day(rows)
+    rr = sl._with_ret(rows)
+    print(f"=== Phase C shadow 日次レポート {day} ===")
+    print(f"shadowログ総行数: {len(rows)}（目標 1,000〜2,000）/ 銘柄数 {len({r['code'] for r in rows})}")
+
+    stop = [r for r in rr if r["legacy_entry_state"] in ENTRY and r["chart_entry_state"] not in ENTRY]
+    promo = [r for r in rr if r["legacy_entry_state"] not in ENTRY and r["chart_entry_state"] in ENTRY]
+    diff = [r for r in rr if r["legacy_entry_state"] != r["chart_entry_state"]]
+    print(f"legacy≠chart 差分: {len(diff)}行 / Phase CがENTRYを止めた: {len(stop)}行 / ENTRYへ昇格させた: {len(promo)}行")
+    for title, rs in (("legacy ENTRY_READY → chart WAIT/WATCH（止めた）", stop), ("legacy WAIT → chart ENTRY_READY（昇格）", promo)):
+        print(f"\n[{title}] {len(rs)}行  平均リターン " + " / ".join(f"+{h}m {_avg(rs, h)[0]}%(n={_avg(rs, h)[1]})" for h in (5, 15, 30)))
+        seen = set()
+        for r in rs:
+            k = (r["code"], r["chart_pattern"], r["chart_entry_state"])
+            if k in seen:
+                continue
+            seen.add(k)
+            print(_line(r))
+
+    print("\n--- 件数 ---")
+    for k in ("chase_stop_count", "failed_breakout_count", "pullback_ready_count", "entry_ready_count"):
+        print(f"{k}: {day_sum[k]}")
+    print("ENTRY_READY +15m/+30m プラス率:", day_sum["entry_ready_plus_rate_15m"], day_sum["entry_ready_plus_rate_30m"])
+    print("CHASE見送り成功率/見逃し率:", day_sum["chase_stop_success_rate"], day_sum["chase_miss_rate"],
+          "| PULLBACK成功率:", day_sum["pullback_success_rate"], "| FAILED_BREAKOUT誤判定率:", day_sum["failed_breakout_misjudge_rate"])
+
+    print("\n--- 厳密なtransition_type ---")
+    ts = day_sum["transition_types"]
+    for t in ("ENTRY_READY_TO_CHASE", "ENTRY_READY_TO_FAILED_BREAKOUT", "CHASE_TO_PULLBACK_READY",
+              "PULLBACK_READY_TO_ENTRY_READY", "FAILED_BREAKOUT_TO_RECOVERY"):
+        d = ts.get(t)
+        print(f"{t}: {d['count'] if d else 0}" + (f" origins={d['origins']} 平均+15m={d['avg_ret_15m']} +30m={d['avg_ret_30m']}" if d else ""))
+        for r in rr:
+            if t in (r.get("transition_type") or "").split(","):
+                print(_line(r))
+
+    print("\n--- outcome delay（実取得時刻 − 目標時刻, 秒）---")
+    for h, q in day_sum["outcome_quality"].items():
+        print(h, q)
+
+    if err_path:
+        try:
+            txt = open(err_path, encoding="utf-8", errors="replace").read()
+            print(f"\nサーバー例外(Traceback)件数: {txt.count('Traceback')} / 立花関連エラー行: "
+                  f"{len(re.findall(r'(?i)tachibana.*(error|失敗|例外)|立花.*(失敗|例外|エラー)', txt))}")
+        except OSError as e:
+            print("stderrログを読めません:", e)
+
+
+if __name__ == "__main__":
+    main()
