@@ -789,6 +789,9 @@ CREATE TABLE IF NOT EXISTS chart_signal_log (
     new_high_after_sec     INTEGER,
     outcome_done           BOOLEAN NOT NULL DEFAULT FALSE
 );
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS at_5m TIMESTAMPTZ;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS at_15m TIMESTAMPTZ;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS at_30m TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_chart_signal_log_user_date ON chart_signal_log (user_id, trade_date, code);
 CREATE INDEX IF NOT EXISTS idx_chart_signal_log_pending ON chart_signal_log (outcome_done, logged_at);
 """
@@ -11153,7 +11156,7 @@ def list_pending_chart_signals(database_url, since):
             return cur.fetchall()
 
 
-_CHART_SIGNAL_UPDATE_COLS = ("price_5m", "price_15m", "price_30m", "max_30m", "min_30m", "new_high_after_sec", "outcome_done")
+_CHART_SIGNAL_UPDATE_COLS = ("price_5m", "price_15m", "price_30m", "at_5m", "at_15m", "at_30m", "max_30m", "min_30m", "new_high_after_sec", "outcome_done")
 
 
 def update_chart_signal_outcomes(database_url, updates):

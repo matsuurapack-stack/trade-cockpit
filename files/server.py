@@ -6161,6 +6161,7 @@ def fill_chart_signal_outcomes(database_url):
             if t is not None:
                 for h in due:
                     u[f"price_{h}m"] = t
+                    u[f"at_{h}m"] = now   # 実際に価格を取れた時刻（目標時刻とのズレを後から検証できるように）
                 if age <= 30 * 60 + chart_signal_log.OUTCOME_TOLERANCE_SEC:
                     u["max_30m"] = max(x for x in (r.get("max_30m"), t) if x is not None)
                     u["min_30m"] = min(x for x in (r.get("min_30m"), t) if x is not None)
@@ -6170,10 +6171,30 @@ def fill_chart_signal_outcomes(database_url):
                 u["outcome_done"] = True
             if len(u) > 1:
                 updates.append(u)
-        return investment_db.update_chart_signal_outcomes(database_url, updates)
+        n = investment_db.update_chart_signal_outcomes(database_url, updates)
+        filled = sum(1 for u in updates if any(k.startswith("price_") for k in u))
+        if filled:
+            print(f"  [ChartSignalOutcome] pending={len(pending)} filled={filled} elapsed={round((datetime.datetime.now(_JST) - now).total_seconds(), 1)}s")
+        return n
     except Exception as e:
         print("  [ChartSignalOutcome] 追記で例外（無視して続行）", e)
         return 0
+
+
+CHART_OUTCOME_INTERVAL_SEC = 20
+
+
+def _chart_outcome_loop():
+    """事後価格(+5/15/30分)の追記専用スレッド。再スコアloop（スキャン中は詰まる）と分離し、
+    目標時刻の許容内（OUTCOME_TOLERANCE_SEC）に確実に価格を取る。"""
+    while True:
+        try:
+            now_jst = datetime.datetime.now(_JST)
+            if _in_jp_session(now_jst) and _is_jp_market_business_day(now_jst):
+                fill_chart_signal_outcomes(DATABASE_URL)
+        except Exception as e:
+            print("  [ChartSignalOutcome] loopで例外", e)
+        time.sleep(CHART_OUTCOME_INTERVAL_SEC)
 
 
 ENTRY_RESCORE_POOL_SIZE = 50
@@ -6349,7 +6370,6 @@ def _entry_rescore_loop():
             if in_session and _is_jp_market_business_day(now_jst):
                 for user_id in list(_ENTRY_TOP5_CACHE.keys()):
                     rescore_entry_top5_cache(DATABASE_URL, user_id)
-                fill_chart_signal_outcomes(DATABASE_URL)
         except Exception as e:
             print("  [EntryRescore] loopで例外", e)
         time.sleep(ENTRY_RESCORE_INTERVAL_SEC)
@@ -28033,6 +28053,7 @@ def main():
         # スケジューラと同じくサービス分離方針（指示書31番）で別スレッドにする。既存の
         # _restart_time_morning_warmup・281銘柄warmupガードには一切触れない（別経路）。
         threading.Thread(target=_entry_top5_scheduler_loop, daemon=True).start()
+        threading.Thread(target=_chart_outcome_loop, daemon=True).start()  # Phase C shadow：事後価格の追記（記録専用）
         threading.Thread(target=_entry_rescore_loop, daemon=True).start()  # 2026-09-25 Phase B-1：候補poolの軽量再スコア
         # 2026-09-10新規（にこそく@nicosokufx X投稿連携、指示書2番）：X_API_BEARER_TOKEN
         # 未設定なら_nicosoku_poll_scheduler_loop内で即returnする（アプリ本体には影響しない）。
