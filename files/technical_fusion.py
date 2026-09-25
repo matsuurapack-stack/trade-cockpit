@@ -12,6 +12,11 @@
 #   （GC/DC・LATE_GOLDEN_CROSS・ダマシ・グランビル）、一目均衡表、ダイバージェンス、価格×出来高マトリクス、
 #   グループ集約のconfluence。日足/5分足の生データは呼び出し側（server.py）から渡される。
 #
+# データ取得はしない純関数。データの出どころは呼び出し側が lineage（intraday_source等）で渡し、結果に
+# source メタ情報（intraday_source/daily_source/quote_at/bar_at/analyzed_at）として残す。
+# 現在のENTRY判定に関わる intraday は立花のリアルタイム（内部5分足・quote・pVWAP）が主。yfinanceの遅延
+# 5分足しか無い場合は STALE_INTRADAY を付けて信頼度を下げる（現在のENTRY根拠にしない）。
+#
 # 設計原則：同一グループの似た指標は「代表signal1つ」に集約し、根拠を重複加点しない。データが無い項目は
 # UNKNOWN/未算出のままにし推測しない。遅行signal（GC・MA整列・RSI・一目）は「今買う」根拠にしない
 # （すでにCHASE/EXTENDEDならTECHNICALLY_STRONG_BUT_LATE）。
@@ -528,8 +533,17 @@ def _setup_type(chart, movement, brk, candles, pv, sr_support_near, ma):
     return None
 
 
+def _source_block(lineage, daily_source, analyzed_at, quote_at=None):
+    lin = lineage or {}
+    return {"intraday_source": lin.get("intraday_source") or "UNKNOWN", "daily_source": daily_source,
+            "quote_at": quote_at or lin.get("quote_at"), "bar_at": lin.get("bar_at"), "analyzed_at": analyzed_at,
+            "gap_bars": lin.get("gap_bars"), "yf_bars_used": lin.get("yf_bars_used"),
+            "internal_bars": lin.get("internal_bars"), "stale_intraday": bool(lin.get("stale")),
+            "sourceReasons": list(lin.get("reasons") or [])}
+
+
 def evaluate_fusion(bars, chart=None, movement=None, quote=None, vwap=None, day_high=None, day_low=None, daily=None,
-                    market=None, entry_decision=None, in_profit=None):
+                    market=None, entry_decision=None, in_profit=None, lineage=None, daily_source=None, analyzed_at=None):
     """7グループ統合の評価。chart/movementは既存エンジンの出力（必須ではないが渡すと再利用する）。
     戻り値は常にdict（データ不足でも例外を出さない）。ENTRY/TOP5判定には使わない（shadow）。"""
     b = cc.normalize_bars(bars)
@@ -537,7 +551,12 @@ def evaluate_fusion(bars, chart=None, movement=None, quote=None, vwap=None, day_
     cur = (quote or {}).get("t") if (quote or {}).get("t") is not None else (b["closes"][-1] if b else None)
     ft = (chart or {}).get("features") or {}
     conf = cc.confidence_for(n) if n else "UNKNOWN"
-    res = {"version": VERSION, "barCount": n, "confidence": conf, "unsupported": UNSUPPORTED, "role": "shadow"}
+    stale = bool((lineage or {}).get("stale"))
+    if stale:
+        conf = "LOW"                         # 遅延/欠落したintradayを根拠にした評価は信頼度を下げる
+    res = {"version": VERSION, "barCount": n, "confidence": conf, "unsupported": UNSUPPORTED, "role": "shadow",
+           "source": _source_block(lineage, daily_source if daily else None, analyzed_at, (quote or {}).get("at")),
+           "flags": ["STALE_INTRADAY"] if stale else []}
     if not b or n < 3:
         res.update({"groups": {g: _group() for g in GROUPS}, "confluence": {"score": None, "level": "UNKNOWN", "knownGroups": 0},
                     "setupType": None, "warnings": ["5分足不足（推測しない）"], "technicalState": "UNKNOWN",
@@ -714,7 +733,7 @@ def evaluate_fusion(bars, chart=None, movement=None, quote=None, vwap=None, day_
         score = 100.0 * bull / wsum
         if bear > 0:                                           # 逆方向のグループがあれば割り引く（競合）
             score *= max(0.0, 1.0 - 1.5 * bear / wsum)
-        if len(known) < MIN_KNOWN_GROUPS:
+        if len(known) < MIN_KNOWN_GROUPS or stale:
             score = min(score, 50.0)
         score = round(score, 1)
     bull_groups = [k for k, g in known.items() if g["state"] == BULL]
@@ -738,7 +757,10 @@ def evaluate_fusion(bars, chart=None, movement=None, quote=None, vwap=None, day_
     setup = _setup_type(chart, movement, brk, candles, pv, bool(near_sup), ma)
     timing = (chart or {}).get("entry_timing_score")
     # ENTRYタイミングが悪ければ買わない（テクニカルが強くてもWAIT）
-    if late or (timing is not None and timing < 40):
+    if stale:
+        rec = "STALE_INTRADAY"               # 遅延足では現在のENTRYを支持しない
+        warnings.append("intraday足が古い/立花足が不足（STALE_INTRADAY）：現在のENTRY根拠にしない")
+    elif late or (timing is not None and timing < 40):
         rec = "WAIT"
     elif level == "HIGH" and setup and (timing is None or timing >= 60):
         rec = "ENTRY_SUPPORTED"
@@ -830,6 +852,7 @@ def compact(fusion):
             "bullGroups": (fusion.get("confluence") or {}).get("bullGroups"),
             "bearGroups": (fusion.get("confluence") or {}).get("bearGroups"),
             "warnings": fusion.get("warnings"), "breakout": fusion.get("breakout"),
+            "source": fusion.get("source"), "flags": fusion.get("flags"), "confidence": fusion.get("confidence"),
             "patterns": [p["name"] for p in (fusion.get("patterns") or [])], "candles": fusion.get("candles"),
             "ma": (fusion.get("maContext") or {}).get("signals"), "exitPressure": fusion.get("exitPressure"),
             "entryDecisionExisting": fusion.get("entryDecisionExisting")}

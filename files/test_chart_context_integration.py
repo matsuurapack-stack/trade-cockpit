@@ -95,9 +95,12 @@ class RescoreParityTests(unittest.TestCase):
         ctx_bars = {"closes": [1, 2, 3], "highs": [1, 2, 3], "lows": [1, 2, 3], "volumes": [1, 1, 1]}
         internal = [{"open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}] * 12
         with mock.patch.object(server, "get_internal_intraday_bars", return_value={"bars": internal}):
-            self.assertIs(server._chart_bars_for_rescore("5301", ctx_bars), internal)
+            bars, lin = server.build_chart_bars("5301", ctx_bars)
+        self.assertEqual(len(bars["closes"]), 12)
+        self.assertEqual(lin["intraday_source"], "TACHIBANA_INTERNAL_5M")
         with mock.patch.object(server, "get_internal_intraday_bars", return_value={"bars": internal[:2]}):
-            self.assertIs(server._chart_bars_for_rescore("5301", ctx_bars), ctx_bars)
+            bars, lin = server.build_chart_bars("5301", ctx_bars)
+        self.assertIs(bars, ctx_bars)   # 内部足が少なく時刻も無い場合は従来の足のまま
 
     def test_rescore_uses_only_latest_quote_and_bars_no_heavy_fetch(self):
         ctx = strong_ctx(2300.0)

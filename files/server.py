@@ -676,6 +676,114 @@ def get_internal_intraday_bars(code):
 
 
 
+# ============================================================
+# 場中5分足のデータ系統（lineage）：立花リアルタイム（内部5分足）を主、yfinance（15〜20分遅延）は
+# 「過去足のbootstrap」にだけ使い、その後ろへ必ず立花の足を接続する（2026-09-26、Phase G追補）。
+# 立花の足が無い（起動直後・場外等）場合、yfinanceの遅延足は現在のENTRY判定の根拠として「新鮮」
+# とは扱わず、lineage.stale=True（STALE_INTRADAY）を付ける。
+# ============================================================
+STALE_INTRADAY_MIN = 10   # 場中に最新bar開始がこれより古ければ古いとみなす（分）
+
+
+def _slots_between(a, b):
+    """aとbの間（両端を含まない）にある前場・後場の5分足スロット数（昼休みは数えない）。"""
+    n, t = 0, a + datetime.timedelta(minutes=5)
+    while t < b:
+        if _in_jp_session_minutes(t.hour * 60 + t.minute):
+            n += 1
+        t += datetime.timedelta(minutes=5)
+    return n
+
+
+def build_chart_bars(code, yf_bars, now=None):
+    """Chart Context/Movement/Radar/Technical Fusionへ渡す5分足を組み立てる。戻り値：(bars, lineage)。
+    立花の内部5分足があれば、yfinance履歴のうち内部足より前のものだけを残してその後ろに接続する。
+    lineage={intraday_source, internal_bars, yf_bars_used, gap_bars, bar_at, yf_last_bar_at, stale, reasons}"""
+    now = now or datetime.datetime.now(_JST)
+    try:
+        internal = (get_internal_intraday_bars(code) or {}).get("bars") or []
+    except Exception:
+        internal = []
+    lin = {"intraday_source": "NONE", "internal_bars": len(internal), "yf_bars_used": 0, "gap_bars": None,
+           "bar_at": None, "yf_last_bar_at": None, "stale": False, "reasons": []}
+    starts = (yf_bars or {}).get("starts")
+    n_yf = len((yf_bars or {}).get("closes") or [])
+    if starts:
+        lin["yf_last_bar_at"] = starts[-1]
+    if not internal:
+        if not yf_bars:
+            lin["stale"] = True
+            lin["reasons"].append("5分足なし")
+            return yf_bars, lin
+        if starts:
+            lin["intraday_source"] = "YFINANCE_DELAYED"
+            lin["bar_at"] = starts[-1]
+            lin["stale"] = True
+            lin["reasons"].append("立花の内部5分足が未蓄積：yfinance遅延足のみ（現在のENTRY根拠にしない）")
+        else:
+            lin["intraday_source"] = "UNTIMED_BARS"      # 時刻不明の足（呼び出し元が既に用意したもの。鮮度は判定しない）
+        return yf_bars, lin
+    first = internal[0].get("start")
+    last = internal[-1].get("start")
+    lin["bar_at"] = last
+    try:
+        first_dt = datetime.datetime.fromisoformat(first)
+        last_dt = datetime.datetime.fromisoformat(last)
+    except Exception:
+        first_dt = last_dt = None
+    keep = []
+    if starts and first_dt is not None and len(starts) == n_yf:
+        for i, s in enumerate(starts):
+            try:
+                if datetime.datetime.fromisoformat(s) < first_dt:
+                    keep.append(i)
+            except Exception:
+                break
+    if keep and n_yf:
+        try:
+            lin["gap_bars"] = _slots_between(datetime.datetime.fromisoformat(starts[keep[-1]]), first_dt)
+        except Exception:
+            lin["gap_bars"] = None
+    elif not keep and n_yf and not starts:
+        # yfinance側に時刻が無く接続できない：内部足のほうが多ければ内部足だけ、そうでなければ従来の足
+        if len(internal) >= max(6, n_yf):
+            lin["intraday_source"] = "TACHIBANA_INTERNAL_5M"
+            return _internal_to_arrays(internal), lin
+        lin["intraday_source"] = "UNTIMED_BARS"
+        return yf_bars, lin
+    merged = _internal_to_arrays(internal)
+    if keep:
+        have_o = bool(yf_bars.get("opens")) and len(yf_bars["opens"]) == n_yf
+        for key in ("highs", "lows", "closes", "volumes"):
+            merged[key] = [yf_bars[key][i] for i in keep] + merged[key]
+        if have_o:
+            merged["opens"] = [yf_bars["opens"][i] for i in keep] + merged["opens"]
+        else:
+            merged.pop("opens", None)
+        merged["starts"] = [starts[i] for i in keep] + [b.get("start") for b in internal]
+        lin["yf_bars_used"] = len(keep)
+        lin["intraday_source"] = "YF_HISTORY+TACHIBANA_INTERNAL_5M"
+        if lin["gap_bars"]:
+            lin["reasons"].append(f"yfinance履歴と立花足の間に{lin['gap_bars']}本の欠落")
+    else:
+        merged["starts"] = [b.get("start") for b in internal]
+        lin["intraday_source"] = "TACHIBANA_INTERNAL_5M"
+    if last_dt is not None and _in_jp_session_minutes(now.hour * 60 + now.minute) \
+            and (now - last_dt).total_seconds() > STALE_INTRADAY_MIN * 60:
+        lin["stale"] = True
+        lin["reasons"].append(f"最新の立花5分足が{STALE_INTRADAY_MIN}分以上前")
+    if lin["gap_bars"] and lin["gap_bars"] > 2:
+        lin["stale"] = True
+    return merged, lin
+
+
+def _internal_to_arrays(internal):
+    return {"opens": [b["open"] for b in internal], "highs": [b["high"] for b in internal],
+            "lows": [b["low"] for b in internal], "closes": [b["close"] for b in internal],
+            "volumes": [b.get("volume") or 0.0 for b in internal]}
+
+
+
 def _fetch_fast_quote_chunk_with_retry(chunk):
     """立花証券APIから1チャンク（最大FAST_QUOTE_CHUNK件）分の時価を取得する。
     tachibana_api.get_market_price()内部では「セッション切れ等は1回だけ再ログイン再試行」
@@ -3668,6 +3776,10 @@ def _parse_intraday_bars_frame(h):
     out = {"closes": closes, "highs": highs, "lows": lows, "volumes": volumes}
     if len(opens) == len(closes):
         out["opens"] = opens  # Chart Context Engine（足の形）用
+    try:
+        out["starts"] = [ts.isoformat() for ts in h["Close"].dropna().index]   # 立花の内部足との接続用（各足の開始時刻）
+    except Exception:
+        pass
     return out
 
 
@@ -4655,18 +4767,6 @@ def _minutes_since_open(now_jst=None):
     return (m - 540) if 540 <= m <= 690 else None
 
 
-def _chart_bars_for_rescore(code, ctx_bars):
-    """軽量再スコア用の5分足。内部生成5分足（立花quoteのtickから作成）が、スキャン時のバー数以上
-    あればそれを、無ければスキャン時のバーを使う（最終足は最新quoteで更新される）。"""
-    try:
-        ib = (get_internal_intraday_bars(code) or {}).get("bars") or []
-    except Exception:
-        ib = []
-    if len(ib) >= max(6, len((ctx_bars or {}).get("closes") or [])):
-        return ib
-    return ctx_bars
-
-
 def load_chart_rule_penalties(database_url, user_id):
     """既存のLearning Rule（trade_rules）から、エントリー失敗パターン（高値追い・上昇後横ばい・
     微下落撤退・breakout失敗・エントリー遅れ）のentry_penaltyを読み込む（固定値をコードへ直書き
@@ -4712,13 +4812,30 @@ def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, 
     両方が同じこの関数を呼ぶ——スコアロジックの二重実装を避け、同じ入力なら必ず同じ結果になる
     （テストで固定）。shared＝{auto_rs_current, auto_sector_current, nikkei_chg, event_guard_market}。
     副作用（event_risk_by_code等の集計dictへの書き込み）は持たない、呼び出し側が行う。"""
+    # 場中5分足の系統（2026-09-26、Phase G追補）：現在のENTRY判定に使う5分足は立花の内部5分足（リアルタイム）
+    # を主にし、yfinance（15〜20分遅延）は過去足のbootstrapだけに使ってその後ろへ立花足を接続する。
+    # 値幅余地・反転・5分足構造・Chart Context・Movement・Radar・Technical Fusionが全て同じ足を見る。
+    lineage = None
+    if chart_bars is None:
+        chart_bars, lineage = build_chart_bars(code, bars)
+    else:
+        lineage = {"intraday_source": "CALLER_SUPPLIED", "stale": False, "reasons": []}
+    lineage["quote_at"] = row.get("_quoteAt")
+    intraday = chart_bars if chart_bars is not None else bars
+    if snapshot is not None and lineage.get("intraday_source") in ("TACHIBANA_INTERNAL_5M", "YF_HISTORY+TACHIBANA_INTERNAL_5M") \
+            and not lineage.get("stale"):
+        _rg = _regime_from_bars(intraday)
+        if _rg:
+            # 5分足構造（higher_highs/mixed/lower_lows）を遅延足ではなく立花足を接続した足から再判定する。
+            # VWAP・VWAP上下は既に立花のpVWAPで上書き済み（Phase B）のため触らない。
+            snapshot = {**snapshot, "fiveMinStructure": _rg["pattern"], "structureSource": lineage["intraday_source"]}
     day_change = row.get("changePct")
-    range_metrics = compute_tradeable_range_metrics(bars, current=row.get("current"), day_high=row.get("high"))
+    range_metrics = compute_tradeable_range_metrics(intraday, current=row.get("current"), day_high=row.get("high"))
     tradeable_range_score, room_to_move = compute_tradeable_range_score(range_metrics)
     momentum_state = classify_momentum_state(range_metrics, day_change)
     reversal_info = None
     if day_change is not None and day_change <= 0:
-        reversal_info = detect_intraday_reversal(bars, row.get("current"), row.get("low"))
+        reversal_info = detect_intraday_reversal(intraday, row.get("current"), row.get("low"))
     setup_type = None
     if day_change is not None and day_change > 0:
         setup_type = "PULLBACK_REENTRY" if momentum_state in ("RANGE_COMPRESSION", "MOMENTUM_DECAY") \
@@ -4748,7 +4865,7 @@ def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, 
     # 既存のentry_score・状態判定は削除せず、その上にチャート判定を重ねる（二重実装しない）。
     strength = chart_context.stock_strength_score(comp)
     chart = chart_context.evaluate_chart_context(
-        chart_bars if chart_bars is not None else bars, quote={"t": row.get("current")},
+        chart_bars, quote={"t": row.get("current")},
         vwap=(snapshot or {}).get("vwap"), day_high=row.get("high"), day_low=row.get("low"),
         existing_signals={"structure": (snapshot or {}).get("fiveMinStructure"), "overheat": comp["overheat"] < 0,
                           "momentumState": momentum_state,
@@ -4760,7 +4877,7 @@ def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, 
     decision = chart_context.entry_decision(strength, chart)
     # Phase D（shadow）：値幅を見た評価。既存のentry_state（Phase C適用後）は変えず、並行して保存する。
     movement = movement_potential.evaluate_movement(
-        chart_bars if chart_bars is not None else bars, quote={"t": row.get("current")}, vwap=(snapshot or {}).get("vwap"),
+        chart_bars, quote={"t": row.get("current")}, vwap=(snapshot or {}).get("vwap"),
         day_high=row.get("high"), day_low=row.get("low"), rel_volume=(stage2 or {}).get("timeAdjustedVolumeRatio"),
         market_rs=row.get("marketRS"), sector_lead=comp["autoSector"] > 0, chart=chart,
         minutes_since_open=shared.get("minutes_since_open", _minutes_since_open()))
@@ -4769,7 +4886,7 @@ def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, 
     ask, bid = row.get("ask"), row.get("bid")
     spread_pct = round((ask - bid) / ((ask + bid) / 2) * 100, 3) if (ask and bid and ask >= bid and (ask + bid) > 0) else None
     radar = early_radar.evaluate_radar(
-        chart_bars if chart_bars is not None else bars, quote={"t": row.get("current")}, vwap=(snapshot or {}).get("vwap"),
+        chart_bars, quote={"t": row.get("current")}, vwap=(snapshot or {}).get("vwap"),
         day_high=row.get("high"), market_rs=row.get("marketRS"), sector_lead=comp["autoSector"] > 0, spread_pct=spread_pct)
 
     reasons = []
@@ -4815,7 +4932,7 @@ def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, 
         risks.append(f"チャート {chart['pattern']}（ENTRYタイミングスコア{chart['entry_timing_score']}）")
     # Phase D.2（shadow）：場中を通した直近5本窓の警戒レーダー。ENTRY判定・movement_recommendationには一切使わない。
     rolling = rolling_radar.evaluate_rolling(
-        chart_bars if chart_bars is not None else bars, quote={"t": row.get("current")}, vwap=(snapshot or {}).get("vwap"),
+        chart_bars, quote={"t": row.get("current")}, vwap=(snapshot or {}).get("vwap"),
         day_high=row.get("high"), market_rs=row.get("marketRS"), sector_lead=comp["autoSector"] > 0, sector_weak=None,
         spread_pct=spread_pct)
     # Phase G（shadow）：Technical Fusion。既存のchart/movementの出力を入力にし、7グループ統合のconfluenceを
@@ -4828,13 +4945,14 @@ def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, 
             daily_d = {"closes": list(d_closes), "opens": list(d_opens), "highs": list(d_highs), "lows": list(d_lows),
                        "volumes": list(d_vols)}
         fusion = technical_fusion.evaluate_fusion(
-            chart_bars if chart_bars is not None else bars, chart=chart, movement=movement, quote={"t": row.get("current")},
+            chart_bars, chart=chart, movement=movement, quote={"t": row.get("current")},
             vwap=(snapshot or {}).get("vwap"), day_high=row.get("high"), day_low=row.get("low"), daily=daily_d,
             market={"marketRS": row.get("marketRS"), "nikkeiChg": shared.get("nikkei_chg"), "sectorLead": comp["autoSector"] > 0},
-            entry_decision=decision)
+            entry_decision=decision, lineage=lineage, daily_source="TACHIBANA_DAILY" if daily_d else None,
+            analyzed_at=datetime.datetime.now(_JST).isoformat())
     except Exception as e:
         print("  technical_fusion評価で例外（shadowのため無視して続行）", code, e)
-    return {"fusion": fusion, "rolling": rolling, "radar": radar, "spread_pct": spread_pct, "movement": movement, "movement_recommendation": movement_recommendation,
+    return {"fusion": fusion, "chart_lineage": lineage, "rolling": rolling, "radar": radar, "spread_pct": spread_pct, "movement": movement, "movement_recommendation": movement_recommendation,
             "chart_context": chart, "stock_strength_score": strength, "entry_timing_score": chart["entry_timing_score"],
             "entry_decision": decision, "entry_state_pre_chart": entry_state_pre_chart, "range_metrics": range_metrics, "tradeable_range_score": tradeable_range_score,
             "room_to_move": room_to_move, "momentum_state": momentum_state, "reversal_info": reversal_info,
@@ -5219,6 +5337,7 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
             "entryDecision": pd_fields["entry_decision"], "chartPattern": pd_fields["chart_context"]["pattern"],
             "chartConfidence": pd_fields["chart_context"]["confidence"], "chartContext": pd_fields["chart_context"],
             "technicalFusion": technical_fusion.compact(pd_fields["fusion"]),
+            "chartLineage": pd_fields["chart_lineage"],
             "entryStatePreChart": pd_fields["entry_state_pre_chart"],
             "legacyEntryState": pd_fields["entry_state_pre_chart"], "chartEntryState": pd_fields["entry_state"],
             **_movement_candidate_fields(pd_fields), "isManual": w.get("manual_registered") is not False,
@@ -7024,12 +7143,13 @@ def rescore_entry_candidate_with_quote(ctx, shared, q):
     f = _compute_price_dependent_entry_fields(
         ctx["w"].get("code"), ctx["w"], row, stage2, snapshot, ctx.get("bars"), ctx["catalysts"], ctx["event_signals"],
         ctx["entry_risk"], ctx["data_quality"], shared, ctx["related_events"],
-        chart_bars=_chart_bars_for_rescore(ctx["w"].get("code"), ctx.get("bars")), daily=ctx.get("daily"))
+        daily=ctx.get("daily"))
     return {
         "stockStrengthScore": f["stock_strength_score"], "entryTimingScore": f["entry_timing_score"],
         "entryDecision": f["entry_decision"], "chartPattern": f["chart_context"]["pattern"],
         "chartConfidence": f["chart_context"]["confidence"], "chartContext": f["chart_context"],
         "technicalFusion": technical_fusion.compact(f["fusion"]),
+        "chartLineage": f["chart_lineage"],
         "entryStatePreChart": f["entry_state_pre_chart"],
         "legacyEntryState": f["entry_state_pre_chart"], "chartEntryState": f["entry_state"],
         **_movement_candidate_fields(f), "momentumState": f["momentum_state"],
