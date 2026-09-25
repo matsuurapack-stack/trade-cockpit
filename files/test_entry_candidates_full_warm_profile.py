@@ -91,6 +91,7 @@ class FullyWarmFixtureProfileTests(unittest.TestCase):
         with mock.patch.object(server.investment_db, "list_watchlist", return_value=self.watchlist), \
              mock.patch.object(server.investment_db, "get_codes_with_auto_tag", return_value=set()), \
              mock.patch.object(server, "run_momentum_stage1", return_value=stage1_payload), \
+             mock.patch.object(server, "get_fast_quotes", return_value=({}, {})), \
              mock.patch.object(server.investment_db, "list_news_catalysts", return_value=[]), \
              mock.patch.object(server.investment_db, "list_market_events", return_value=[]), \
              mock.patch.object(server.investment_db, "list_trade_experiences", return_value=[]), \

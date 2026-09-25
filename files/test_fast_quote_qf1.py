@@ -142,7 +142,10 @@ class FastQuoteFallbackTests(unittest.TestCase):
             "value": {"t": 688.0, "p": 677.0, "change": 11.0, "changePct": 1.62, "volume": 1500000,
                         "open": 680.0, "high": 690.0, "low": 675.0, "ask": 688.1, "bid": 687.9,
                         "source": "tachibana", "quote_timestamp": "x", "fetched_at": "x", "is_stale": False},
-            "at": time.time(),
+            # 2026-09-25：LATEST_QUOTE_REUSE_SEC以内の成功値は「新鮮な共有latest quote」として
+            # 再利用される（別テストで検証）。ここでは再利用窓を過ぎた（＝再取得対象だが
+            # FAST_QUOTE_CACHE_TTL_SEC以内の）値がtachibana失敗時のfallback①になることを確認する。
+            "at": time.time() - (server.LATEST_QUOTE_REUSE_SEC + 1),
         }
         mock_tachibana.get_market_price.return_value = {}
         with mock.patch("server.time.sleep"), mock.patch("server.get_stock_quotes") as mock_yf:

@@ -586,6 +586,10 @@ FAST_QUOTE_CHUNK = 40  # tachibana_api.PRICE_CHUNKと同じ単位を維持（QF-
 FAST_QUOTE_MAX_ATTEMPTS = 3  # 失敗したチャンクだけこの回数まで再試行（無限リトライ禁止）
 FAST_QUOTE_CACHE_TTL_SEC = 15  # tachibana取得失敗時のfallback①（直近キャッシュ）のTTL
 _fast_quote_cache = {}  # code -> {"value": {...FAST QUOTE dict...}, "at": epoch_sec}
+# リアルタイム価格・分析同期（2026-09-25）：最新quoteのSource of Truth。立花から取得に成功した
+# 直近の値をこの秒数だけ全consumer（監視銘柄・ポジション・分析・TOP5）で共有する。同一取得時刻
+# なら全画面・全APIが同じ現在値・同じquote_timestampを見る（銘柄ごとにバラバラに取得しない）。
+LATEST_QUOTE_REUSE_SEC = 5
 
 
 def _fetch_fast_quote_chunk_with_retry(chunk):
@@ -636,12 +640,25 @@ def get_fast_quotes(watchlist):
     now_iso = datetime.datetime.now(_JST).isoformat()
 
     fetched_all = {}
+    reused = {}
+    now_epoch = time.time()
+    for code in codes:
+        c = _fast_quote_cache.get(code)
+        if c is not None and (now_epoch - c["at"]) <= LATEST_QUOTE_REUSE_SEC                 and c["value"].get("source") in ("tachibana", "yfinance_fallback"):
+            reused[code] = c["value"]  # source/is_staleはそのまま（フォールバック値を新鮮と偽らない）
     if tachibana_api is not None:
-        for i in range(0, len(codes), FAST_QUOTE_CHUNK):
-            fetched_all.update(_fetch_fast_quote_chunk_with_retry(codes[i:i + FAST_QUOTE_CHUNK]))
+        to_fetch = [c for c in codes if c not in reused]
+        for i in range(0, len(to_fetch), FAST_QUOTE_CHUNK):
+            fetched_all.update(_fetch_fast_quote_chunk_with_retry(to_fetch[i:i + FAST_QUOTE_CHUNK]))
+    for code, v in reused.items():
+        out[code] = dict(v)
+        stats["tachibana" if v.get("source") == "tachibana" else "fallback_yf"] += 1
+        stats["reused"] = stats.get("reused", 0) + 1
 
     still_missing = []
     for code in codes:
+        if code in reused:
+            continue
         v = fetched_all.get(code)
         if v is not None and v.get("t") is not None:
             out[code] = {
@@ -693,6 +710,51 @@ def get_fast_quotes(watchlist):
           f"fallback_cache={stats['fallback_cache']} fallback_yf={stats['fallback_yf']} "
           f"failed={stats['failed']} duration={stats['duration_ms']}ms")
     return out, stats
+
+
+def overlay_latest_quotes_on_stage1_rows(stage1_rows, codes, nikkei_chg=None):
+    """Stage1行（TTL約10分のキャッシュ、共有・破壊禁止）のcurrent/changePct/high/low/volume系を、
+    全画面共通のlatest quote（get_fast_quotes）で上書きした「新しいdict」を返す（リアルタイム価格・
+    分析同期、2026-09-25）。Stage1キャッシュ本体は書き換えない。latest quoteを取得できない銘柄は
+    Stage1行をそのまま返し、_priceSource="STAGE1_CACHE"で区別できるようにする（古い値を新しい値と
+    偽らない）。sectorRSはセクター平均が必要で再計算できないためStage1の値を残す。
+    戻り値: (rows_dict, quotes_dict)"""
+    rows = dict(stage1_rows)
+    codes = [c for c in dict.fromkeys(codes) if c in rows]
+    if not codes:
+        return rows, {}
+    try:
+        quotes, _stats = get_fast_quotes([{"code": c, "market": "JP"} for c in codes])
+    except Exception as e:
+        print("  latest quote取得失敗（Stage1価格で続行）", e)
+        return rows, {}
+    for code in codes:
+        q = quotes.get(code)
+        base = rows[code]
+        if not q or q.get("t") is None:
+            rows[code] = {**base, "_priceSource": "STAGE1_CACHE"}
+            continue
+        t, p, high, volume = q.get("t"), q.get("p"), q.get("high"), q.get("volume")
+        chg = q.get("changePct")
+        if chg is None and t is not None and p:
+            chg = (t - p) / p * 100
+        new = dict(base)
+        new.update({
+            "current": t, "changePct": chg if chg is not None else base.get("changePct"),
+            "high": high if high is not None else base.get("high"),
+            "low": q.get("low") if q.get("low") is not None else base.get("low"),
+            "volume": volume if volume is not None else base.get("volume"),
+            "ask": q.get("ask"), "bid": q.get("bid"),
+            "_priceSource": "LATEST_QUOTE", "_quoteAt": q.get("quote_timestamp"),
+            "_quoteIsStale": bool(q.get("is_stale")),
+        })
+        vol = new.get("volume")
+        new["turnover"] = (t * vol) if (t is not None and vol is not None) else base.get("turnover")
+        new["highRetention"] = (t / new["high"]) if (t is not None and new.get("high")) else base.get("highRetention")
+        if new.get("changePct") is not None and nikkei_chg is not None:
+            new["marketRS"] = new["changePct"] - nikkei_chg
+        rows[code] = new
+    return rows, quotes
 
 
 def _fmt_published(entry):
@@ -3379,7 +3441,11 @@ def _fetch_intraday(tk, interval):
         volumes = h["Volume"].dropna().tolist()
         if len(closes) < 2:
             return None
-        return {"closes": closes, "highs": highs, "lows": lows, "volumes": volumes}
+        try:
+            last_bar_at = h["Close"].dropna().index[-1].isoformat()
+        except Exception:
+            last_bar_at = None
+        return {"closes": closes, "highs": highs, "lows": lows, "volumes": volumes, "lastBarAt": last_bar_at}
     except Exception:
         return None
 
@@ -4562,6 +4628,12 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
     section_ms["stage1"] = round((time.time() - _t) * 1000)
     stage1_rows = stage1.get("rows", {})
     nikkei_chg = stage1.get("nikkeiChangePct")
+    # リアルタイム価格・分析同期（2026-09-25）：Stage1はTTL約10分のキャッシュのため、スキャンの
+    # 入力価格を全画面共通のlatest quoteで上書きする（Stage1キャッシュ本体は不変）。
+    _t = time.time()
+    stage1_rows, _latest_quotes_for_scan = overlay_latest_quotes_on_stage1_rows(
+        stage1_rows, [w.get("code") for w in scan_list], nikkei_chg)
+    section_ms["stage1"] = section_ms.get("stage1", 0) + round((time.time() - _t) * 1000)  # 所要時間の内訳に含める
 
     # Event Risk Guard（2026-09-17新規、PHASE 8）：market_event_risk（銘柄非依存、
     # build_active_macro_eventsを既存どおり再利用）＋「連続重要イベント」加点を1回だけ計算し、
@@ -4866,6 +4938,12 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
         candidates.append({
             "code": code, "name": w.get("name"), "sector": w.get("sector"),
             "current": row.get("current"),
+            "quoteAt": row.get("_quoteAt"), "priceSource": row.get("_priceSource"),
+            # 3値デバッグ（candidate price / latest quote / score calculation price）。スコア計算は
+            # overlay後のrowだけを見るため、正常なら3値は必ず一致する。
+            "priceTrace": {"candidatePrice": row.get("current"),
+                            "latestQuotePrice": ((_latest_quotes_for_scan.get(code) or {}).get("t")),
+                            "scoreCalcPrice": row.get("current")},
             "changePct": round(row.get("changePct"), 2) if row.get("changePct") is not None else None,
             "marketRS": round(row.get("marketRS"), 2) if row.get("marketRS") is not None else None,
             "entryScore": round(entry_score), "entryState": entry_state, "resilience": resilience,
@@ -4895,6 +4973,10 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
     section_ms["sortRank"] = round((time.time() - _t) * 1000)
 
     _t = time.time()
+    _pt = [c["priceTrace"] for c in candidates if c.get("priceTrace")]
+    _mismatch = [t for t in _pt if t["latestQuotePrice"] is not None and t["latestQuotePrice"] != t["scoreCalcPrice"]]
+    print(f"  [EntryPriceTrace] candidates={len(_pt)} latestQuoteOverlaid={sum(1 for t in _pt if t['latestQuotePrice'] is not None)} "
+          f"candidate/latest/score価格の不一致={len(_mismatch)}")
     apply_ipo_reevaluation(database_url, user_id, candidates, ipo_signals_by_code, ipo_rows=ipo_rows_by_code)
     for c in candidates:
         c["protectedReasons"] = protective_by_code.get(c["code"], [])
@@ -5572,6 +5654,59 @@ def get_entry_top5_cached(user_id):
     return dict(entry) if entry is not None else None
 
 
+_ENTRY_RESULT_CANDIDATE_LISTS = ("entryReadyTop5", "actionableTop5", "analysisTop5", "watchCandidates",
+                                  "reversalCandidates", "reversalWatchCandidates")
+
+
+def overlay_latest_quotes_on_entry_result(result):
+    """/api/entry-candidates/live専用（リアルタイム価格・分析同期、2026-09-25）：キャッシュ済み
+    スキャン結果の各候補のcurrent/changePctを、全画面共通のlatest quoteで上書きして返す（読み取り時
+    だけの変換、キャッシュ本体は不変）。スコア・順位・ENTRY判定そのものは再計算しない（重い
+    全スキャンをGETで走らせない設計）ため、scoredAt（=スキャン時刻）とscoredPrice（=スコア算出時の
+    価格）を添え、「表示価格は最新／スコアはscoredAt時点」であることをUIが区別できるようにする。
+    quoteを取れない候補はcurrentを変えずpriceOverlaid=Falseにする。"""
+    codes = []
+    for key in _ENTRY_RESULT_CANDIDATE_LISTS:
+        for c in result.get(key) or []:
+            if isinstance(c, dict) and c.get("code"):
+                codes.append(c["code"])
+    codes = list(dict.fromkeys(codes))
+    if not codes:
+        return result
+    try:
+        quotes, _stats = get_fast_quotes([{"code": c, "market": "JP"} for c in codes])
+    except Exception as e:
+        print("  ENTRY TOP5 live：latest quote取得失敗（スキャン時点の価格のまま返す）", e)
+        quotes = {}
+    scored_at = result.get("generatedAt")
+    out = dict(result)
+    for key in _ENTRY_RESULT_CANDIDATE_LISTS:
+        lst = result.get(key)
+        if not lst:
+            continue
+        new_list = []
+        for c in lst:
+            q = quotes.get(c.get("code")) if isinstance(c, dict) else None
+            if q and q.get("t") is not None:
+                chg = q.get("changePct")
+                if chg is None and q.get("p"):
+                    chg = (q["t"] - q["p"]) / q["p"] * 100
+                c = {**c, "scoredPrice": c.get("current"), "scoredAt": scored_at, "current": q["t"],
+                     "changePct": round(chg, 2) if chg is not None else c.get("changePct"),
+                     "quoteAt": q.get("quote_timestamp"), "quoteIsStale": bool(q.get("is_stale")),
+                     "priceOverlaid": True,
+                     # スコア算出時の価格からの乖離（スキャンは数分かかるため、表示価格は最新でもスコアは
+                     # 算出時点の価格に基づく——その乖離をUIが警告できるようにする）
+                     "priceDriftPct": (round((q["t"] - c["current"]) / c["current"] * 100, 2)
+                                        if c.get("current") else None)}
+            elif isinstance(c, dict):
+                c = {**c, "priceOverlaid": False, "scoredAt": scored_at}
+            new_list.append(c)
+        out[key] = new_list
+    out["quotesOverlaidAt"] = datetime.datetime.now(_JST).isoformat()
+    return out
+
+
 def _apply_entry_top5_staleness(cache_entry):
     """指示書「stale data対策」（2026-09-15追記：レビュー指摘反映）：ranking_generated_at
     （=market_data_at、_score_entry_candidatesは毎回フレッシュにmarket dataを取り直すため
@@ -5786,6 +5921,8 @@ def compute_light_trade_analysis_snapshot(database_url, user_id, code, market="J
     stage1 = run_momentum_stage1()
     stage1_rows = stage1.get("rows", {})
     nikkei_chg = stage1.get("nikkeiChangePct")
+    if market != "US":
+        stage1_rows, _lq = overlay_latest_quotes_on_stage1_rows(stage1_rows, [code], nikkei_chg)
     row = stage1_rows.get(code)
     if not row or row.get("current") is None:
         return None
@@ -5922,6 +6059,8 @@ def compute_light_trade_analysis_snapshot(database_url, user_id, code, market="J
         fields["choruco_fit"] = None
 
     fields["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    fields["quote_at"] = row.get("_quoteAt")
+    fields["price_source"] = row.get("_priceSource")
     return fields
 
 
@@ -20988,6 +21127,15 @@ def run_volume_scan(database_url, user_id, force=False):
 # 再利用する。ポジション本体（entries/trade_history/実現損益）には一切書き込まない、
 # 読み取り専用の参考情報API。失敗しても売買機能自体には影響しない設計にする。
 def get_position_live_detail(code, market="JP"):
+    # latest quoteを先に取得する（yfinance履歴取得の待ち時間の後だと共有窓を過ぎ、他画面と別時刻の
+    # 価格になってしまうため）。
+    _fqv = None
+    if market == "JP":
+        try:
+            _fq, _st = get_fast_quotes([{"code": code, "market": market}])
+            _fqv = _fq.get(code)
+        except Exception as e:
+            print("  ポジション・リアルタイム：latest quote取得失敗（従来値で継続）", code, e)
     quotes = get_stock_quotes([{"code": code, "market": market}])
     quote = quotes.get(code)
     if not quote:
@@ -20995,6 +21143,17 @@ def get_position_live_detail(code, market="JP"):
     result = dict(quote)
     result["code"] = code
     result["market"] = market
+    # リアルタイム価格・分析同期（2026-09-25）：現在値は全画面共通のlatest quote（get_fast_quotes）
+    # を正とする。get_stock_quotesの値（yfinance＋立花上書き、別タイミング取得）と食い違う場合も
+    # ポジション画面・分析・TOP5が同じ数値を見るよう、t/high/low/volumeをlatest quoteで上書きする。
+    if _fqv and _fqv.get("t") is not None:
+        for k in ("t", "high", "low", "volume"):
+            if _fqv.get(k) is not None:
+                result[k] = _fqv[k]
+        result["quoteAt"] = _fqv.get("quote_timestamp")
+        result["quoteSource"] = _fqv.get("source")
+        result["quoteIsStale"] = bool(_fqv.get("is_stale"))
+        quote = result
     jst = datetime.timezone(datetime.timedelta(hours=9))
     result["fetchedAtJst"] = datetime.datetime.now(jst).strftime("%H:%M:%S")
     if market == "JP":
@@ -22023,6 +22182,7 @@ def analyze_stock(w, market_env=None, external_intelligence=None):
     }
 
     return {
+        "barAt": (m5 or {}).get("lastBarAt"),  # 分析に使った最新5分足の時刻（デバッグ用、quoteAtとは別）
         "current": round(current, 2),
         "entry": round(entry, 2), "entryReason": "・".join(entry_reasons),
         "pullbackEntry": pullback_entry,  # v3-7：表示用の押し目価格帯（ゾーン・根拠・分類）。entryとは独立
@@ -22107,23 +22267,108 @@ def analyze_stock(w, market_env=None, external_intelligence=None):
     }
 
 
-def build_analysis(watchlist):
+# リアルタイム価格・分析同期（2026-09-25）：分析の入力価格はクライアントが送った値ではなく
+# サーバーのlatest quote（get_fast_quotes＝立花、全画面共通のSource of Truth）を正とする。
+# 価格が変わっていない銘柄の再計算は省略する（DYNAMIC分析の不要な全再計算を避ける）。
+ANALYSIS_DYNAMIC_REUSE_SEC = 45
+_ANALYSIS_DYNAMIC_CACHE = {}  # code -> {"price": float, "result": dict, "at": epoch_sec}
+
+
+def _attach_latest_quotes_to_watchlist(watchlist):
+    """watchlistの各要素のcurrentをlatest quoteで上書きしたコピーと、quote情報のdictを返す。
+    JP銘柄のみ（USはlatest quote経路が無いためクライアント送信値のまま）。取得できなかった
+    銘柄はクライアント送信値をそのまま使い、currentSource=CLIENT_SENTで区別できるようにする。"""
+    jp_items = [w for w in watchlist if w.get("code") and w.get("market", "JP") != "US"]
+    quotes = {}
+    if jp_items:
+        try:
+            quotes, _stats = get_fast_quotes(jp_items)
+        except Exception as e:
+            print("  分析用latest quote取得失敗（クライアント送信値で続行）", e)
+            quotes = {}
+    items = []
+    for w in watchlist:
+        w2 = dict(w)
+        q = quotes.get(w.get("code"))
+        if q and q.get("t") is not None:
+            w2["client_current"] = w.get("current")
+            w2["current"] = q["t"]
+            w2["_quote"] = q
+        items.append(w2)
+    return items, quotes
+
+
+def _stamp_analysis_with_quote(r, w, now_iso):
+    q = w.get("_quote")
+    r["analyzedAt"] = now_iso
+    if q:
+        r["currentSource"] = "SERVER_LATEST_QUOTE"
+        r["quoteAt"] = q.get("quote_timestamp")
+        r["quoteSource"] = q.get("source")
+        r["quoteIsStale"] = bool(q.get("is_stale"))
+        r["clientCurrent"] = w.get("client_current")
+    else:
+        r["currentSource"] = "CLIENT_SENT"
+        r["quoteAt"] = None
+        r["quoteSource"] = None
+        r["quoteIsStale"] = None
+    return r
+
+
+def build_analysis(watchlist, dynamic_only=False):
     """12章：分析タブ対象銘柄それぞれの購入/損切り/利確の目安を返す。
-    相場環境（日経平均のトレンド）は全銘柄共通のため1回だけ計算する。"""
+    相場環境（日経平均のトレンド）は全銘柄共通のため1回だけ計算する。
+    dynamic_only=True（リアルタイム価格・分析同期、2026-09-25）：STATIC情報（銘柄詳細・信用残・
+    証金残・逆日歩・ニュース本文）の取得を省き、latest quoteに依存するDYNAMIC分析だけを返す。"""
     out = {}
     if yf is None:
         return out
+    _t_dyn = time.time()
     market_env = _market_environment()
-    for w in watchlist:
+    watchlist, _latest = _attach_latest_quotes_to_watchlist(watchlist)
+    now_iso = datetime.datetime.now(_JST).isoformat()
+
+    def _analyze_one(w):
         code = w.get("code", "")
-        if not code:
-            continue
         try:
-            r = analyze_stock(w, market_env)
+            price = num_or_none(w.get("current"))
+            cached = _ANALYSIS_DYNAMIC_CACHE.get(code)
+            if (dynamic_only and cached is not None and price is not None and cached["price"] == price
+                    and (time.time() - cached["at"]) <= ANALYSIS_DYNAMIC_REUSE_SEC):
+                r = dict(cached["result"])
+                r["analysisReused"] = True  # analyzedAtは元の計算時刻のまま（再計算していない事実を隠さない）
+                q = w.get("_quote")
+                if q:
+                    r["quoteAt"] = q.get("quote_timestamp")
+                    r["quoteIsStale"] = bool(q.get("is_stale"))
+                return code, r
+            r = analyze_stock({k: v for k, v in w.items() if k != "_quote"}, market_env)
             if r:
-                out[code] = r
+                _stamp_analysis_with_quote(r, w, now_iso)
+                r["analysisReused"] = False
+                if price is not None:
+                    _ANALYSIS_DYNAMIC_CACHE[code] = {"price": price, "result": dict(r), "at": time.time()}
+                return code, r
         except Exception as e:
             print("  分析失敗", code, e)
+        return code, None
+
+    targets = [w for w in watchlist if w.get("code")]
+    if dynamic_only and len(targets) > 1:
+        # DYNAMIC更新は数銘柄を毎回まとめて回すため、yfinance分足取得の待ち時間を並列化する
+        # （直列だと3銘柄で約20秒、更新間隔を超えてしまう）。
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            results = list(ex.map(_analyze_one, targets))
+    else:
+        results = [_analyze_one(w) for w in targets]
+    for code, r in results:
+        if r:
+            out[code] = r
+    if dynamic_only:
+        recomputed = sum(1 for r in out.values() if not r.get("analysisReused"))
+        print(f"  [DynamicAnalysis] requested={len(targets)} produced={len(out)} recomputed={recomputed} "
+              f"reused={len(out) - recomputed} elapsed={round((time.time() - _t_dyn) * 1000)}ms")
+        return out
 
     # 2026-08-21 ユーザー要望：銘柄分析カードに銘柄詳細情報・信用残情報・証金残情報・逆日歩情報・
     # ニュース（見出し＋本文）を追加。立花証券APIの仕様書（e_api_web_access添付のCLMMfdsGetIssueDetail
@@ -25171,7 +25416,7 @@ class Handler(SimpleHTTPRequestHandler):
                                   "durationMs": None, "trigger": None, "rankingAgeSec": None,
                                   "dataStale": False, "updateDelayWarning": False, "notReadyYet": True})
             else:
-                self._send_json(_apply_entry_top5_staleness(cache_entry))
+                self._send_json(overlay_latest_quotes_on_entry_result(_apply_entry_top5_staleness(cache_entry)))
         elif self.path.startswith("/api/entry-candidates"):
             # 2026-09-10新規（Market Intelligence Timeline Phase2-C「今買い時TOP5＋Thesis永続化」）：
             # entry_ready_top5（ENTRY_SCOREで選ばれた「今エントリー条件が整っている」候補）と
@@ -27087,8 +27332,9 @@ class Handler(SimpleHTTPRequestHandler):
                 targets = json.loads(raw.decode("utf-8") or "[]")
             except Exception:
                 targets = []
-            print(f"[取得] 分析（対象 {len(targets)} 銘柄）…")
-            analysis = build_analysis(targets)
+            dynamic_only = "dynamic=1" in self.path
+            print(f"[取得] 分析（対象 {len(targets)} 銘柄{'・DYNAMICのみ' if dynamic_only else ''}）…")
+            analysis = build_analysis(targets, dynamic_only=dynamic_only)
             self._send_json({"analysis": analysis})
         elif self.path.startswith("/api/earnings-detail"):
             length = int(self.headers.get("Content-Length", 0))

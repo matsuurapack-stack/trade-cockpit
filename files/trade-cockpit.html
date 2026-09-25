@@ -532,6 +532,13 @@ const freshnessInfo = (iso, staleMinutes) => {
   if (ageMin <= staleMinutes) return { text: `${Math.round(ageMin)}分遅延（${hhmm}取得）`, level: "delayed" };
   return { text: `STALE（${hhmm}取得）`, level: "stale" };
 };
+const ANALYSIS_QUOTE_STALE_MINUTES = 3; // 株価(quote)時刻基準のSTALE閾値（市場時間中、分析に使った株価が2分超古ければSTALE）
+const fmtHms = (iso) => {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}:${String(d.getSeconds()).padStart(2,"0")}`;
+};
 const FRESHNESS_COLOR = { live: "var(--up)", delayed: "var(--inkSoft)", stale: "var(--down)" };
 function FreshnessBadge({ iso, staleMinutes, title }) {
   const info = freshnessInfo(iso, staleMinutes);
@@ -5522,7 +5529,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                       <div style={{fontSize:13,fontWeight:800,color:"var(--inkFaint)",width:16,textAlign:"center"}}>{c.rank}</div>
                       <div style={{width:56,fontSize:11.5,color:"var(--inkSoft)"}} className="mono">{c.code}</div>
                       <div style={{flex:"0 0 auto",minWidth:90,fontSize:12.5,fontWeight:700}}>{c.name}</div>
-                      <div className="mono" style={{width:70,fontSize:12.5,textAlign:"right"}}>{c.current!=null?c.current.toLocaleString():"—"}</div>
+                      <div className="mono" style={{width:70,fontSize:12.5,textAlign:"right"}} title={`株価 ${fmtHms(c.quoteAt)||"--"}${c.priceOverlaid?"（最新quoteで更新済み）":""} ／ スコア算出 ${fmtHms(c.scoredAt||entryResult?.generatedAt)||"--"}${c.scoredPrice!=null?`（算出時の価格 ${c.scoredPrice.toLocaleString()}）`:""}`}>{c.current!=null?c.current.toLocaleString():"—"}{c.priceDriftPct!=null&&Math.abs(c.priceDriftPct)>=0.5&&<span style={{display:"block",fontSize:9.5,color:"var(--down)"}}>算出時比{c.priceDriftPct>0?"+":""}{c.priceDriftPct}%</span>}</div>
                       <span className="mono" style={{width:56,fontSize:12,textAlign:"right",color:c.changePct==null?"var(--inkFaint)":c.changePct>0?"var(--up)":c.changePct<0?"var(--down)":"var(--inkFaint)"}}>
                         {c.changePct!=null?(c.changePct>0?"+":"")+c.changePct.toFixed(2)+"%":"—"}
                       </span>
@@ -7181,7 +7188,7 @@ function PositionLiveDetail({item,onOpenExit,posFlags,posIndicators,enrStatus,on
         // 上部カードの現在値・評価損益等が「初回ロード時だけ」ではなくポーリングの度に追従する
         // ようにする（single source of truth、指示書6番）。
         const freshCur=num(d.t);
-        if(freshCur!=null&&!cancelled)onQuote?.(freshCur);
+        if(freshCur!=null&&!cancelled)onQuote?.(freshCur,d.quoteAt||null);
       }
       if(!cancelled)setLoading(false);
     };
@@ -7530,9 +7537,9 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
   // だけがこのmapに値を持ち、優先順位は「liveQuotes（実測） > stockQuotes（30秒バッチ） >
   // なし」とする（指示書の優先順位：live > market quote > DB/cache）。
   const [liveQuotes,setLiveQuotes]=useState({}); // key: code+market -> {price, fetchedAt}
-  const reportLiveQuote=useCallback((key,price)=>{
+  const reportLiveQuote=useCallback((key,price,quoteAt)=>{
     if(price==null)return;
-    setLiveQuotes(p=>(p[key]?.price===price?p:{...p,[key]:{price,fetchedAt:new Date().toISOString()}}));
+    setLiveQuotes(p=>((p[key]?.price===price&&p[key]?.quoteAt===(quoteAt||null))?p:{...p,[key]:{price,quoteAt:quoteAt||null,fetchedAt:new Date().toISOString()}}));
   },[]);
 
   // v3-4：入力中のコードがトレード分析タブで既に「分析」済みなら、その時点のstop/target/
@@ -7899,7 +7906,11 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
               // RR・EXIT/CAUTION等）は全てこのcurrent 1つから導出されるため、ここを直すだけで
               // カード全体が同じ現在値に揃う。
               const liveKey=it.code+it.market;
-              const current=liveQuotes[liveKey]?.price??num(stockQuotes?.[it.code]?.t);
+              // 2026-09-25：liveQuotes（12秒poll）とstockQuotes（30秒poll）のうち、quote時刻が新しい方を
+              // 採用する（liveが古いのに優先されて他画面とズレるのを防ぐ）。時刻が無ければ従来のlive優先。
+              const _lq=liveQuotes[liveKey], _sq=stockQuotes?.[it.code];
+              const _lqAt=Date.parse(_lq?.quoteAt||_lq?.fetchedAt||"")||0, _sqAt=Date.parse(_sq?.quote_timestamp||_sq?.quoteFetchedAt||"")||0;
+              const current=(_lq?.price!=null&&!(num(_sq?.t)!=null&&_sqAt>_lqAt))?_lq.price:(num(_sq?.t)??_lq?.price??null);
               const {amount:pnlAmount,pct:pnlPct}=calcUnrealizedPnl(it.average_price,it.quantity,current);
               const basisPrice=it.average_price??current;
               const rr=calcPositionRR(it.target_1,basisPrice,it.current_stop);
@@ -8081,7 +8092,7 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
                   </button>
                   {expandedLiveCode===(it.code+it.market) && <PositionLiveDetail item={it} onOpenExit={openExit}
                     posFlags={posFlags} posIndicators={posIndicators} enrStatus={enr?.status}
-                    onQuote={price=>reportLiveQuote(liveKey,price)}/>}
+                    onQuote={(price,quoteAt)=>reportLiveQuote(liveKey,price,quoteAt)}/>}
                 </div>
 
                 {/* ⑧ 操作・参考情報・メモ */}
@@ -11224,7 +11235,13 @@ function App(){
       // （/api/stock-quotes/fast、立花証券API主ソース・yfinance履歴を経由しない）を使う。
       // レスポンスにはspark（ミニチャート用7点履歴）が含まれないため、既存のspark等は
       // 前回値からそのまま引き継ぐ（コード単位でオブジェクト全体を置き換えず、マージする）。
-      const priorityTargets=sRef.current.watchlist.filter(w=>sRef.current.watchTargets.includes(w.code));
+      // 2026-09-25：登録銘柄（分析対象）・保有銘柄も監視銘柄と同じ30秒FAST経路で更新する
+      // （従来は監視銘柄だけで、それ以外は90秒の遅い経路＝別ソース・別タイミングの現在値になり、
+      // 画面ごとに現在値がズレる原因だった）。
+      const posCodes=(positionCodesRef.current||[]);
+      const prioSet=new Set([...sRef.current.watchTargets,...sRef.current.analysisTargets,...posCodes]);
+      const priorityTargets=sRef.current.watchlist.filter(w=>prioSet.has(w.code));
+      posCodes.forEach(c=>{if(!priorityTargets.some(w=>w.code===c))priorityTargets.push({code:c,market:"JP"});});
       const srJP=await fetch("/api/stock-quotes/fast",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(priorityTargets)});
       if(srJP.ok){
         const sdJP=await srJP.json();
@@ -11251,7 +11268,10 @@ function App(){
     if(restFetchingRef.current||monitorFetchingRef.current)return;
     restFetchingRef.current=true;
     try{
-      const rest=sRef.current.watchlist.filter(w=>!sRef.current.watchTargets.includes(w.code));
+      // 2026-09-25：FAST 30秒経路の対象（監視銘柄＋登録銘柄＋保有銘柄）は除外する
+      // （両ループが同じ銘柄の現在値を別ソースで上書きし合ってズレを生むのを防ぐ）。
+      const restPrio=new Set([...sRef.current.watchTargets,...sRef.current.analysisTargets,...(positionCodesRef.current||[])]);
+      const rest=sRef.current.watchlist.filter(w=>!restPrio.has(w.code));
       if(rest.length){
         const r=await fetch("/api/stock-quotes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(rest)});
         if(r.ok){
@@ -12541,6 +12561,101 @@ function App(){
     return()=>{clearInterval(id);window.removeEventListener("cash-updated",onCash);};
   },[]);
 
+  // ===== リアルタイム価格・分析同期（2026-09-25新規）：DYNAMIC分析のタブ非依存・優先度付き自動更新 =====
+  // 従来、詳細分析（analysisData）は「分析タブを開いている間」しか更新されず、localStorageへ
+  // 丸ごと永続化された登録時/前回取得時の値（current・VWAP・RSI・ENTRY条件等）が表示され続けた。
+  // ここでは最新quote→DYNAMIC分析再計算（/api/analysis?dynamic=1、サーバーがlatest quoteを正として
+  // 現在値を決める）→analysisData反映の流れを、表示タブに関係なく自動で回す。STATIC情報（信用残・
+  // ニュース等）は取り直さず、既存のanalysisDataの値を保持したままDYNAMIC項目だけを上書きする
+  // （{...prev,...r}）。優先度：保有銘柄・今買い時TOP5・（分析タブ表示中の）表示銘柄は毎tick、
+  // それ以外の登録銘柄は3tickに1回。既にanalysisDataがある／分析対象に登録済みの銘柄だけが対象
+  // （新規にanalysisDataを増やして他画面の判定を変えない）。価格が変わっていない銘柄はサーバー側が
+  // 再計算を省略する。
+  const entryResultRef=useRef(null);
+  useEffect(()=>{entryResultRef.current=entryResult;},[entryResult]);
+  const tabRef=useRef(tab);
+  useEffect(()=>{tabRef.current=tab;},[tab]);
+  const positionCodesRef=useRef([]); // 保有中銘柄コード（FAST quote 30秒経路とDYNAMIC分析の優先対象）
+  const dynamicSyncBusyRef=useRef(false);
+  const dynamicTickRef=useRef(null);
+  const [dynamicSyncInfo,setDynamicSyncInfo]=useState(null); // デバッグ表示用：{at,requested,reused,tier1}
+  useEffect(()=>{
+    let cancelled=false, timeoutId=null, tickNo=0;
+    const DYN_MARKET_MS=30*1000, DYN_OFFHOURS_MS=5*60*1000, DYN_MAX_CODES=15;
+    const tick=async()=>{
+      if(cancelled)return;
+      if(!dynamicSyncBusyRef.current){
+        dynamicSyncBusyRef.current=true;
+        try{
+          const st=sRef.current;
+          const ad=st.analysisData||{};
+          const allW=[...st.watchlist,...st.watchlistUS];
+          // 優先順位：POSITION > ENTRY_READY > TOP5 > visible > HOT(watch候補) > その他登録銘柄。
+          // 先頭ほど先にDYNAMIC再分析され、上限(DYN_MAX_CODES)で切られるのは常に末尾側。
+          const ordered=new Map(), tierOf={};
+          const add=(code,market,tier)=>{if(code&&!ordered.has(code)){ordered.set(code,market||"JP");tierOf[code]=tier;}};
+          let posMarkets={};
+          try{
+            const pd=await fetchJsonSafe("/api/portfolio");
+            const activePos=(pd?.items||[]).filter(it=>it.active!==false);
+            positionCodesRef.current=activePos.filter(it=>(it.market||"JP")==="JP").map(it=>it.code);
+            activePos.forEach(it=>{add(it.code,it.market,"POSITION");posMarkets[it.code]=true;});
+          }catch(e){}
+          const er=entryResultRef.current;
+          const top5=er?.entryReadyTop5||[];
+          top5.filter(c=>c.entryState==="ENTRY_READY"||c.entryState==="NOW_BUYABLE").forEach(c=>add(c.code,"JP","ENTRY_READY"));
+          top5.forEach(c=>add(c.code,"JP","TOP5"));
+          if(tabRef.current==="analysis")st.analysisTargets.forEach(c=>add(c,st.analysisTargetMarkets?.[c],"VISIBLE"));
+          (er?.watchCandidates||[]).slice(0,10).forEach(c=>add(c.code,"JP","HOT"));
+          const tier1Count=ordered.size;
+          if(tickNo%2===0)st.analysisTargets.forEach(c=>add(c,st.analysisTargetMarkets?.[c],"REGISTERED")); // 保有・TOP5・表示中は毎tick(30秒)、その他の登録銘柄は2tickに1回(60秒)
+          const eligible=(code)=>!!ad[code]||st.analysisTargets.includes(code)||tierOf[code]==="POSITION"; // 保有銘柄は最優先で常に対象（売却判断を最新価格で再計算するため）
+          const chosen=[...ordered.entries()].filter(([c])=>eligible(c));
+          const items=chosen.filter(([c])=>!(ad[c]&&ad[c]._refreshing)).slice(0,DYN_MAX_CODES).map(([code,market])=>{
+            const w=allW.find(x=>x.code===code)||{code,market:market||"JP",name:ad[code]?.name||code};
+            return {...w,current:st.stockQuotes[code]?.t};
+          });
+          const cycleStart=Date.now();
+          if(items.length&&!cancelled){
+            const r=await fetch("/api/analysis?dynamic=1",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(items)});
+            if(r.ok){
+              const d=await r.json();
+              const res=d.analysis||{};
+              const stampedAt=new Date().toISOString();
+              setS(p=>{
+                const nad={...p.analysisData};
+                Object.entries(res).forEach(([code,x])=>{
+                  const prev=nad[code]||{};
+                  nad[code]={...prev,...x,_fetchedAtIso:x.analyzedAt||stampedAt,_currentSent:x.current,
+                    _quoteFetchedAtIso:x.quoteAt||null,_refreshing:false,_refreshFailed:false};
+                });
+                return {...p,analysisData:nad};
+              });
+              const posLat=Object.entries(res).filter(([c])=>tierOf[c]==="POSITION"&&res[c].quoteAt).map(([c])=>Date.now()-new Date(res[c].quoteAt).getTime());
+              const info={at:stampedAt,requested:items.length,produced:Object.keys(res).length,
+                reused:Object.values(res).filter(x=>x.analysisReused).length,tier1:tier1Count,
+                cycleMs:Date.now()-cycleStart,tiers:items.map(w=>tierOf[w.code]),
+                positionQuoteToUiMs:posLat.length?Math.max(...posLat):null};
+              console.log("[DynamicSync]",JSON.stringify(info));
+              setDynamicSyncInfo(info);
+            }
+          }
+        }catch(e){}
+        dynamicSyncBusyRef.current=false;
+      }
+      tickNo++;
+      if(cancelled)return;
+      const hidden=typeof document!=="undefined"&&document.visibilityState==="hidden";
+      timeoutId=setTimeout(tick,isJstMarketHours()?(hidden?DYN_MARKET_MS*2:DYN_MARKET_MS):DYN_OFFHOURS_MS);
+    };
+    dynamicTickRef.current=()=>{if(dynamicSyncBusyRef.current||cancelled)return;if(timeoutId)clearTimeout(timeoutId);tick();}; // 既存の待機タイマーを止めてから実行（tickが次を再設定するので二重ループにならない）
+    timeoutId=setTimeout(tick,3000); // 起動直後（localStorage復元直後の古いanalysisDataを早く入れ替える）
+    return()=>{cancelled=true;if(timeoutId)clearTimeout(timeoutId);};
+  },[]);
+  // タブ切替（特に分析タブを開いた瞬間）は次の30秒tickを待たず即座にDYNAMIC同期する。
+  // ただし「開いた時だけ更新」ではなく、上のポーラーが常時回っている前提の追加トリガー。
+  useEffect(()=>{const id=setTimeout(()=>dynamicTickRef.current&&dynamicTickRef.current(),400);return()=>clearTimeout(id);},[tab]);
+
   // 売買記録（トレードジャーナル）：銘柄分析カードの「記録に追加」ボタンから、そのカードの
   // entry/stop/target/marketEnv/entryReasonを初期値にしたドラフトを開き、「記録」タブへ遷移する。
   // 保存するまでs.journalには追加しない（下書き段階ではjournalDraft stateのみで保持）。
@@ -13401,9 +13516,14 @@ function App(){
                             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:6}}>
                               <div className="mono" style={{fontSize:14,color:"var(--inkSoft)"}}>現在値 <span style={{fontWeight:800,fontSize:20,color:"var(--ink)"}}>{a.current.toLocaleString()}</span>
                                 {a._refreshing
-                                  ? <span style={{marginLeft:8,fontSize:10.5,color:"var(--inkSoft)"}}>更新中…（参考：<FreshnessBadge iso={a._fetchedAtIso} staleMinutes={ANALYSIS_STALE_MINUTES}/>時点）</span>
-                                  : a._fetchedAtIso && <FreshnessBadge iso={a._fetchedAtIso} staleMinutes={ANALYSIS_STALE_MINUTES}
-                                      title={`この分析結果の取得時刻。サーバーへ送った現在値：${a._currentSent!=null?a._currentSent:"（未送信＝日足終値で算出）"}`}/>}
+                                  ? <span style={{marginLeft:8,fontSize:10.5,color:"var(--inkSoft)"}}>更新中…（参考：<FreshnessBadge iso={a.quoteAt||a._fetchedAtIso} staleMinutes={ANALYSIS_STALE_MINUTES}/>時点）</span>
+                                  : (a.quoteAt||a._fetchedAtIso) && (()=>{
+                                      const tip=`LIVE/STALEは分析に実際に使った株価(quote)の時刻基準。quote_timestamp ${fmtHms(a.quoteAt)} ／ bar_timestamp ${fmtHms(a.barAt)||"--"} ／ analysis_timestamp ${fmtHms(a.analyzedAt||a._fetchedAtIso)} ／ rendered_at ${fmtHms(new Date().toISOString())} ／ 価格ソース：${a.currentSource||"CLIENT_SENT"}${a.quoteIsStale?"（quoteがSTALE）":""}${a.analysisReused?"（価格不変のため再計算省略）":""}。サーバーへ送った現在値：${a._currentSent!=null?a._currentSent:"（未送信＝日足終値で算出）"}`;
+                                      return a.quoteIsStale
+                                        ? <span className="mono" style={{fontSize:10.5,color:"var(--down)",marginLeft:8}} title={tip}>STALE（{fmtHms(a.quoteAt)}時点のquote）</span>
+                                        : <FreshnessBadge iso={a.quoteAt||a._fetchedAtIso} staleMinutes={ANALYSIS_QUOTE_STALE_MINUTES} title={tip}/>;
+                                    })()}
+                                {!a._refreshing&&<span className="mono" style={{marginLeft:6,fontSize:10,color:"var(--inkSoft)"}}>株価 {fmtHms(a.quoteAt)||"--"} ／ 分析 {fmtHms(a.analyzedAt||a._fetchedAtIso)||"--"}</span>}
                               </div>
                               {/* 2026-09-16新規（指示書6番「A/B/C表示も意味を明示」）：単独の
                                   文字だけでは何の評価か分からないため、常時見える短いラベルを
