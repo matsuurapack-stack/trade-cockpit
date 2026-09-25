@@ -806,6 +806,11 @@ ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS stop_distance_pct DOUBLE P
 ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS risk_reward DOUBLE PRECISION;
 ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS movement_recommendation TEXT;
 ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS movement_json JSONB;
+-- Phase D.1（Early Momentum Radar・shadow）
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS radar_state TEXT;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS early_momentum_score DOUBLE PRECISION;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS spread_pct DOUBLE PRECISION;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS atr5_pct DOUBLE PRECISION;
 
 -- 動いている銘柄だけのオーバーレイ（手動のwatchlistとは別。watchlistテーブルには触れない）
 CREATE TABLE IF NOT EXISTS dynamic_watchlist (
@@ -11154,7 +11159,8 @@ _CHART_SIGNAL_INSERT_COLS = (
     "entry_timing", "chart_pattern", "chart_confidence", "legacy_entry_state", "chart_entry_state", "entry_decision",
     "vwap", "vwap_distance", "change_15m", "consecutive_green", "upper_wick_ratio", "breakout_volume_ratio",
     "transition_type", "transition_origin", "movement_score", "recent_activity", "activity_state", "pre_breakout",
-    "too_late", "momentum_mode", "recommended_stop", "stop_distance_pct", "risk_reward", "movement_recommendation")
+    "too_late", "momentum_mode", "recommended_stop", "stop_distance_pct", "risk_reward", "movement_recommendation",
+    "radar_state", "early_momentum_score", "spread_pct", "atr5_pct")
 
 
 def insert_chart_signals(database_url, records):

@@ -90,6 +90,16 @@ def main():
         print("  " + t["code"] + " " + " ".join(f"{k.replace('first_', '').replace('_at', '')}={str(t[k])[11:16]}"
                                                 for k, _ in sl.MILESTONES if t.get(k)))
 
+    rd = mv["radar"]
+    print("\n--- Phase D.1 Early Momentum Radar（shadow・買い判定ではない）---")
+    for name, g in rd["states"].items():
+        print(f"{name}: n={g['n']} +5m={g['avg_ret_5m']} +15m={g['avg_ret_15m']}(n={g['n_15m']}) +30m={g['avg_ret_30m']} MFE={g['avg_mfe_30m']} MAE={g['avg_mae_30m']}")
+    print("Radar先行時間（分。Radar初検出→各イベント）:")
+    for t in rd["lead_times"]:
+        print("  ", t)
+    sq = mv["stop_quality"]
+    print("推奨逆指値の品質（movement ENTRY_READY全イベント）:", sq)
+
     print("\n--- outcome delay（実取得時刻 − 目標時刻, 秒）---")
     for h, q in day_sum["outcome_quality"].items():
         print(h, q)

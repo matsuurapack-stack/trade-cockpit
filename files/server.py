@@ -192,6 +192,7 @@ import chart_context  # Chart Context Engine（Phase C：5分足の時系列形�
 import chart_signal_log  # Phase C shadow運用：判定ログ・事後リターン・日次集計（記録専用、判定へは戻さない）
 import movement_potential  # Phase D：Movement Potential（今日これから値幅が出る可能性。shadow運用）
 import dynamic_watch  # Phase D：dynamic_watchlist（動いている銘柄のオーバーレイ。手動watchlistとは別）
+import early_radar  # Phase D.1：Early Momentum Radar（寄り直後2〜5本の初動監視。shadow、ENTRYには使わない）
 
 INDEX = {
     "usdjpy": "JPY=X", "nikkei": "^N225", "dow": "^DJI",
@@ -4684,7 +4685,15 @@ def _movement_candidate_fields(f):
             "tooLateReasons": mv["too_late_reasons"], "momentumMode": mv["momentum_mode"], "momentumFlags": mv["momentum_flags"],
             "recommendedStop": mv["recommended_stop"], "riskReward": mv["risk_reward"],
             "movementRecommendation": f["movement_recommendation"], "movementReasons": mv["reasons"][:5],
-            "movementBreakdown": mv["breakdown"], "movementFeatures": mv["features"], "movementConfidence": mv["confidence"]}
+            "movementBreakdown": mv["breakdown"], "movementFeatures": mv["features"], "movementConfidence": mv["confidence"],
+            # Phase D.1：初動監視Radar（shadow。買い判定ではない）と、逆指値評価用のspread・5分ATR%
+            "radarState": f["radar"]["state"], "earlyMomentumScore": f["radar"]["early_momentum_score"],
+            "radarRankScore": f["radar"]["rank_score"], "radarConfidence": f["radar"]["confidence"],
+            "radarHandoff": f["radar"]["handoff"], "radarReasons": f["radar"]["reasons"], "radarFeatures": f["radar"]["features"],
+            "radarText": early_radar.radar_reason_text(f["radar"]), "radarHot": early_radar.radar_hot(f["radar"]),
+            "spreadPct": f["spread_pct"],
+            "atr5Pct": (round(mv["features"]["atr5"] / mv["features"]["price"] * 100, 3)
+                        if (mv.get("features") and mv["features"].get("atr5") and mv["features"].get("price")) else None)}
 
 
 def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, catalysts, event_signals,
@@ -4747,6 +4756,12 @@ def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, 
         market_rs=row.get("marketRS"), sector_lead=comp["autoSector"] > 0, chart=chart,
         minutes_since_open=shared.get("minutes_since_open", _minutes_since_open()))
     movement_recommendation = movement_potential.movement_recommendation(entry_state_pre_chart, entry_state, movement, chart)
+    # Phase D.1（shadow）：寄り直後（5分足2〜5本）だけの初動監視。ENTRY判定・movement_recommendationには一切使わない。
+    ask, bid = row.get("ask"), row.get("bid")
+    spread_pct = round((ask - bid) / ((ask + bid) / 2) * 100, 3) if (ask and bid and ask >= bid and (ask + bid) > 0) else None
+    radar = early_radar.evaluate_radar(
+        chart_bars if chart_bars is not None else bars, quote={"t": row.get("current")}, vwap=(snapshot or {}).get("vwap"),
+        day_high=row.get("high"), market_rs=row.get("marketRS"), sector_lead=comp["autoSector"] > 0, spread_pct=spread_pct)
 
     reasons = []
     if comp["momentum"] > 0:
@@ -4789,7 +4804,7 @@ def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, 
         (reasons if entry_state in ("NOW_BUYABLE", "ENTRY_READY") else risks).append(gr)
     if chart["pattern"] in chart_context.BAD_PATTERNS:
         risks.append(f"チャート {chart['pattern']}（ENTRYタイミングスコア{chart['entry_timing_score']}）")
-    return {"movement": movement, "movement_recommendation": movement_recommendation,
+    return {"radar": radar, "spread_pct": spread_pct, "movement": movement, "movement_recommendation": movement_recommendation,
             "chart_context": chart, "stock_strength_score": strength, "entry_timing_score": chart["entry_timing_score"],
             "entry_decision": decision, "entry_state_pre_chart": entry_state_pre_chart, "range_metrics": range_metrics, "tradeable_range_score": tradeable_range_score,
             "room_to_move": room_to_move, "momentum_state": momentum_state, "reversal_info": reversal_info,
@@ -6148,16 +6163,18 @@ def refresh_shadow_movement(database_url, user_id):
         now = datetime.datetime.now(_JST)
         cands = []
         for c in pool:
-            if c.get("movementScore") is None:
-                continue
+            if c.get("movementScore") is None and not c.get("radarHot"):
+                continue                     # 6本未満はMovement未算出。Radarがhotなら初動として候補に含める
             c["movementEntryReason"] = movement_potential.entry_reason_line(c) if c.get("movementRecommendation") == "ENTRY_READY" else None
-            mv_like = {"movement_potential_score": c["movementScore"], "recent_activity_score": c.get("recentActivityScore"),
+            mv_like = {"movement_potential_score": c.get("movementScore"), "recent_activity_score": c.get("recentActivityScore"),
                        "activity_state": c.get("activityState"), "pre_breakout": c.get("preBreakout")}
-            cands.append({"code": c["code"], "name": c.get("name"), "movement": c["movementScore"],
+            cands.append({"radar_hot": bool(c.get("radarHot")), "radar_state": c.get("radarState"), "early_score": c.get("earlyMomentumScore"),
+                          "code": c["code"], "name": c.get("name"), "movement": c.get("movementScore") or 0,
                           "recent_activity": c.get("recentActivityScore"), "activity_state": c.get("activityState"),
                           "pre_breakout": c.get("preBreakout"), "above_vwap": (c.get("movementFeatures") or {}).get("aboveVwap"),
                           "momentum_state": c.get("momentumState"), "is_manual": c.get("isManual", True),
-                          "rank": movement_potential.attention_rank_score(mv_like)})
+                          "rank": (movement_potential.attention_rank_score(mv_like)
+                                   if c.get("movementScore") is not None else (c.get("radarRankScore") or 0))})
         can_write = bool(investment_db is not None and database_url and WRITE_E2E_ALLOWED)
         state = _DYNAMIC_WATCH.get(user_id)
         if state is None:
@@ -6172,7 +6189,8 @@ def refresh_shadow_movement(database_url, user_id):
             except Exception as e:
                 print("  [DynamicWatch] DB保存で例外（メモリ上は更新済み）", e)
         _DYNAMIC_WATCH[user_id] = res["state"]
-        shadow = movement_potential.build_shadow_lists(pool, analysis, res["hot"])
+        shadow = movement_potential.build_shadow_lists([c for c in pool if c.get("movementScore") is not None], analysis, res["hot"])
+        shadow["earlyRadar"] = early_radar.build_early_radar_list(pool)      # 初動監視（🚨）最大5銘柄。買い判定ではない
         shadow["dynamicWatch"] = {"active": len(res["state"]), "hot": res["hot"], "added": [a["code"] for a in res["adds"]],
                                   "removed": res["removes"], "updatedAt": now.isoformat(),
                                   "note": "shadow：既存のTOP5・監視対象には反映していない"}

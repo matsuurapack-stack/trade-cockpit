@@ -22,11 +22,13 @@ HOT_RECENT_ACTIVITY = 60
 
 
 def is_hot(c):
-    return bool(c.get("pre_breakout") or c.get("activity_state") == "EXPANDING"
+    return bool(c.get("radar_hot") or c.get("pre_breakout") or c.get("activity_state") == "EXPANDING"
                 or ((c.get("movement") or 0) >= HOT_SCORE and (c.get("recent_activity") or 0) >= HOT_RECENT_ACTIVITY))
 
 
 def add_reason(c):
+    if c.get("radar_hot"):
+        return f"RADAR:{c.get('radar_state') or 'SCORE'}"      # 通常のMovement Scoreがまだ低くても初動として即追加
     if c.get("pre_breakout"):
         return "PRE_BREAKOUT"
     if c.get("activity_state") == "EXPANDING":
@@ -40,7 +42,7 @@ def add_reason(c):
 
 def weak_reason(c):
     """外す候補にする弱い状態。回復（movementが再び高い・EXPANDING・PRE_BREAKOUT）していれば弱くない。"""
-    if c.get("pre_breakout") or c.get("activity_state") == "EXPANDING" or (c.get("movement") or 0) >= ADD_SCORE:
+    if c.get("radar_hot") or c.get("pre_breakout") or c.get("activity_state") == "EXPANDING" or (c.get("movement") or 0) >= ADD_SCORE:
         return None
     if c.get("activity_state") == "LOW_ACTIVITY":
         return "LOW_ACTIVITY"

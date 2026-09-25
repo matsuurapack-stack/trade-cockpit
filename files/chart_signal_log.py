@@ -36,7 +36,9 @@ MOVEMENT_NOTABLE_RECS = ("ENTRY_READY", "TOO_LATE", "PRE_BREAKOUT", "WATCH_EXPAN
 MILESTONES = (("first_movement_at", "値幅拡大の始まり（movement>=65またはEXPANDING）"),
               ("first_expanding_at", "EXPANDING"), ("first_pre_breakout_at", "PRE_BREAKOUT"),
               ("first_early_breakout_at", "EARLY_BREAKOUT"), ("first_chase_at", "CHASE/EXTENDED/EXHAUSTION"),
-              ("first_movement_entry_at", "movement-aware ENTRY_READY"))
+              ("first_movement_entry_at", "movement-aware ENTRY_READY"),
+              ("first_radar_at", "RADAR_SURGE/EXPANDING/PRE_BREAKOUT（初動監視）"), ("first_radar_surge_at", "RADAR_SURGE"))
+RADAR_NOTABLE = ("RADAR_SURGE", "RADAR_EXPANDING", "RADAR_PRE_BREAKOUT")
 
 ENTRY_STATES = ("NOW_BUYABLE", "ENTRY_READY")
 CHASE_PATTERNS = ("CHASE", "EXTENDED", "EXHAUSTION")
@@ -67,6 +69,8 @@ def build_signal_record(user_id, cand, now, source, top5_codes=None):
     top5 = top5_codes or {}
     return {
         "transition_type": None, "transition_origin": None,
+        "radar_state": cand.get("radarState"), "early_momentum_score": cand.get("earlyMomentumScore"),
+        "spread_pct": cand.get("spreadPct"), "atr5_pct": cand.get("atr5Pct"),
         "movement_score": cand.get("movementScore"), "recent_activity": cand.get("recentActivityScore"),
         "activity_state": cand.get("activityState"), "pre_breakout": cand.get("preBreakout"),
         "too_late": cand.get("tooLate"), "momentum_mode": cand.get("momentumMode"),
@@ -76,7 +80,10 @@ def build_signal_record(user_id, cand, now, source, top5_codes=None):
         "movement": {"breakdown": cand.get("movementBreakdown"), "reasons": cand.get("movementReasons"),
                      "tooLateReasons": cand.get("tooLateReasons"), "momentumFlags": cand.get("momentumFlags"),
                      "stop": cand.get("recommendedStop"), "riskReward": cand.get("riskReward"),
-                     "features": cand.get("movementFeatures"), "entryReason": cand.get("movementEntryReason")},
+                     "features": cand.get("movementFeatures"), "entryReason": cand.get("movementEntryReason"),
+                     "radar": {"state": cand.get("radarState"), "score": cand.get("earlyMomentumScore"),
+                               "confidence": cand.get("radarConfidence"), "reasons": cand.get("radarReasons"),
+                               "features": cand.get("radarFeatures")}},
         "user_id": user_id, "logged_at": now, "code": str(cand["code"]), "name": cand.get("name"), "source": source,
         "current_price": price, "day_high": day_high,
         "stock_strength": cand.get("stockStrengthScore"), "entry_timing": cc.get("entry_timing_score"),
@@ -98,7 +105,7 @@ def build_signal_record(user_id, cand, now, source, top5_codes=None):
 
 def movement_notable(rec):
     return bool(rec.get("movement_recommendation") in MOVEMENT_NOTABLE_RECS or rec.get("activity_state") == "EXPANDING"
-                or rec.get("pre_breakout") or rec.get("momentum_mode"))
+                or rec.get("pre_breakout") or rec.get("momentum_mode") or rec.get("radar_state") in RADAR_NOTABLE)
 
 
 def update_milestones(mem, key, rec, now):
@@ -121,6 +128,8 @@ def update_milestones(mem, key, rec, now):
     mark("first_early_breakout_at", rec.get("chart_pattern") == "EARLY_BREAKOUT")
     mark("first_chase_at", rec.get("chart_pattern") in CHASE_PATTERNS)
     mark("first_movement_entry_at", rec.get("movement_recommendation") == "ENTRY_READY")
+    mark("first_radar_at", rec.get("radar_state") in RADAR_NOTABLE)
+    mark("first_radar_surge_at", rec.get("radar_state") == "RADAR_SURGE")
     rec.setdefault("context", {})["milestones"] = {k: v for k, v in ms.items() if not k.startswith("_")}
     rec["context"]["newMilestones"] = new
     return new
@@ -146,7 +155,8 @@ def last_state(rec, now):
     return {"pattern": rec["chart_pattern"], "chart": rec["chart_entry_state"], "legacy": rec["legacy_entry_state"],
             "at": now, "timing": rec.get("entry_timing"), "vdist": rec.get("vwap_distance"), "chg15": rec.get("change_15m"),
             "prio": is_priority(rec), "top5": tuple((rec.get("context") or {}).get("top5") or ()),
-            "mrec": rec.get("movement_recommendation"), "act": rec.get("activity_state"), "pre": bool(rec.get("pre_breakout"))}
+            "mrec": rec.get("movement_recommendation"), "act": rec.get("activity_state"), "pre": bool(rec.get("pre_breakout")),
+            "radar": rec.get("radar_state")}
 
 
 def _moved(a, b, th):
@@ -166,8 +176,9 @@ def should_log(last, rec, now):
         return True
     if (rec.get("context") or {}).get("newMilestones"):
         return True       # 最初にEXPANDING/PRE_BREAKOUT/EARLY_BREAKOUT/CHASEになった瞬間は必ず残す
-    if (last.get("mrec"), last.get("act"), last.get("pre")) != (rec.get("movement_recommendation"), rec.get("activity_state"),
-                                                              bool(rec.get("pre_breakout"))) and (prio or last.get("prio")):
+    if (last.get("mrec"), last.get("act"), last.get("pre"), last.get("radar")) != (
+            rec.get("movement_recommendation"), rec.get("activity_state"), bool(rec.get("pre_breakout")), rec.get("radar_state")) \
+            and (prio or last.get("prio")):
         return True       # 値幅を見た推奨・活動状態・PRE_BREAKOUTの変化
     if last["pattern"] != rec["chart_pattern"] and (prio or last.get("prio"))             and (now - last["at"]).total_seconds() >= PATTERN_FLAP_MIN_SEC:
         return True       # 優先パターンへ/から変わった瞬間（BASE_BUILDING↔NEUTRAL等の非優先間の揺れは継続扱い）
@@ -528,6 +539,8 @@ def summarize_movement(rows):
                          "rr": r.get("risk_reward"), "ret_5m": r.get("ret_5m"), "ret_15m": r.get("ret_15m"),
                          "ret_30m": r.get("ret_30m"), "mfe_30m": mfe, "mae_30m": mae, "stop_evaluation": stop_evaluation(r),
                          "entry_reason": (r.get("movement") or {}).get("entryReason")})
+    for m, r in zip(momentum, mom):
+        m["spread_pct"], m["atr5_pct"] = r.get("spread_pct"), r.get("atr5_pct")
     ev = [m["stop_evaluation"] for m in momentum if m["stop_evaluation"]]
     stop_eval = {k: ev.count(k) for k in ("TOO_SHALLOW", "APPROPRIATE", "TOO_DEEP")}
     last_ms = {}
@@ -537,7 +550,39 @@ def summarize_movement(rows):
             last_ms[r["code"]] = ms
     timeline = [dict(code=c, **ms) for c, ms in last_ms.items()]
     timeline.sort(key=lambda d: d.get("first_movement_at") or "9999")
-    return {"comparison": {k: _group_stats(v) for k, v in groups.items()},
+    # 推奨逆指値の品質（momentum以外も含む、movement-aware ENTRY_READYの全イベント）：ノイズで刈られていないかを見る材料
+    sq = [r for r in events if r.get("movement_recommendation") == "ENTRY_READY" and r.get("recommended_stop")]
+    hit = [r for r in sq if _num(r.get("min_30m")) is not None and _num(r["min_30m"]) <= _num(r["recommended_stop"])]
+    known = [r for r in sq if _num(r.get("min_30m")) is not None]
+    rec_after = [r for r in hit if _num(r.get("price_30m")) is not None and _num(r["price_30m"]) >= _num(r["current_price"])]
+    stop_quality = {"n": len(sq), "n_with_outcome": len(known), "stop_hit": len(hit),
+                    "stop_hit_rate": _rate(len(hit), len(known)),
+                    "recovered_to_entry_after_stop": len(rec_after), "recovered_rate": _rate(len(rec_after), len(hit)),
+                    "avg_mae_30m": _group_stats(sq)["avg_mae_30m"],
+                    "avg_stop_distance_pct": (round(sum(_num(r["stop_distance_pct"]) for r in sq if r.get("stop_distance_pct") is not None)
+                                                    / max(1, sum(1 for r in sq if r.get("stop_distance_pct") is not None)), 3) if sq else None),
+                    "avg_atr5_pct": (round(sum(_num(r["atr5_pct"]) for r in sq if r.get("atr5_pct") is not None)
+                                           / max(1, sum(1 for r in sq if r.get("atr5_pct") is not None)), 3) if sq else None),
+                    "avg_spread_pct": (round(sum(_num(r["spread_pct"]) for r in sq if r.get("spread_pct") is not None)
+                                             / max(1, sum(1 for r in sq if r.get("spread_pct") is not None)), 3) if sq else None)}
+    # Radar（初動監視）：状態別の件数・その後の値動き、Radarが通常判定より何分早かったか
+    radar_groups = {s: [r for r in events if r.get("radar_state") == s] for s in
+                    ("RADAR_SURGE", "RADAR_EXPANDING", "RADAR_PRE_BREAKOUT", "RADAR_ACTIVE")}
+    lead = []
+    for c, ms in last_ms.items():
+        t0 = ms.get("first_radar_at")
+        if not t0:
+            continue
+        def mins(k, t0=t0, ms=ms):
+            return round((_parse_dt(ms[k]) - _parse_dt(t0)).total_seconds() / 60, 1) if ms.get(k) and _parse_dt(t0) and _parse_dt(ms[k]) else None
+        lead.append({"code": c, "first_radar_at": t0, "minutes_before_expanding": mins("first_expanding_at"),
+                     "minutes_before_pre_breakout": mins("first_pre_breakout_at"),
+                     "minutes_before_early_breakout": mins("first_early_breakout_at"),
+                     "minutes_before_movement_entry": mins("first_movement_entry_at"),
+                     "minutes_before_chase": mins("first_chase_at")})
+    return {"radar": {"states": {s: _group_stats(v) for s, v in radar_groups.items()}, "lead_times": lead},
+            "stop_quality": stop_quality,
+            "comparison": {k: _group_stats(v) for k, v in groups.items()},
             "activity_states": {s: sum(1 for r in events if r.get("activity_state") == s)
                                 for s in ("EXPANDING", "ACTIVE", "COILING", "LOW_ACTIVITY", "FADING", "UNKNOWN")},
             "pre_breakout_count": sum(1 for r in events if r.get("pre_breakout")),
