@@ -332,5 +332,52 @@ class MorningWeaknessTests(unittest.TestCase):
         db.upsert_trade_rule_from_text.assert_not_called()
 
 
+class RevivalQualityGateTests(unittest.TestCase):
+    """実市場（2026-09-25 09:28）で、entry score 10〜15のWEAK/AVOID銘柄が復活枠経由で
+    実戦TOP5に入った不具合の最低品質ゲート。"""
+
+    def test_gate_1_weak_avoid_low_score_revival_stays_out(self):
+        weak = cand("5301", 3000, 15, state="WEAK", revivalStage="BUY_CANDIDATE", protectedReasons=["前日出来高急増"])
+        d = dual([weak, cand("A", 3000, 80)], 700000)
+        self.assertEqual(d["annotated"][[c["code"] for c in d["annotated"]].index("5301")]["capitalStatus"], "AVOID")
+        self.assertNotIn("5301", [c["code"] for c in d["top5"]])
+        self.assertNotIn("5301", [c["code"] for c in d["analysis"]["top5"]])
+        self.assertEqual(server._select_entry_ready_top5([weak])[4]["revived_buy_candidate"], 0)
+
+    def test_gate_1b_weak_state_blocked_even_with_high_score_or_no_annotation(self):
+        w = cand("W", 3000, 60, state="WEAK", revivalStage="BUY_CANDIDATE")
+        self.assertEqual(server._select_entry_ready_top5([w])[4]["revived_buy_candidate"], 0)
+        avoid = cand("V", 3000, 60, state="WATCH", revivalStage="BUY_CANDIDATE", capitalStatus="AVOID")
+        self.assertEqual(server._select_entry_ready_top5([avoid])[4]["revived_buy_candidate"], 0)
+
+    def test_gate_1c_score_floor(self):
+        low = cand("L", 3000, server.REVIVAL_MIN_ENTRY_SCORE - 1, state="WATCH", revivalStage="BUY_CANDIDATE")
+        self.assertEqual(server._select_entry_ready_top5([low])[4]["revived_buy_candidate"], 0)
+
+    def test_gate_2_qualified_revival_enters(self):
+        ok = cand("627A", 1300, server.REVIVAL_MIN_ENTRY_SCORE, state="WATCH", revivalStage="BUY_CANDIDATE", shadow=True)
+        d = dual([ok, cand("A", 3000, 80)], 700000)
+        r = next(c for c in d["top5"] if c["code"] == "627A")
+        self.assertTrue(r["revivedBuyCandidate"])
+        self.assertNotEqual(r["capitalStatus"], "AVOID")
+
+    def test_gate_3_regular_entry_ready_unaffected(self):
+        d = dual([cand("A", 3000, 80), cand("B", 2000, 70, state="NOW_BUYABLE")], 700000)
+        self.assertEqual([c["code"] for c in d["top5"]], ["A", "B"])
+
+    def test_gate_4_chase_risk_still_excluded(self):
+        risky = cand("Z", 1000, 90, state="CHASE_RISK", revivalStage="BUY_CANDIDATE")
+        d = dual([risky, cand("A", 3000, 80)], 700000)
+        self.assertNotIn("Z", [c["code"] for c in d["top5"]])
+
+    def test_gate_5_e2e3_style_revival_lane_still_works(self):
+        # E2E3と同条件：entry score 44・状態WATCH（Tier1〜3の外）・BUY_CANDIDATE → 復活枠でのみ入る
+        rev = cand("627A", 1337, 44, state="WATCH", revivalStage="BUY_CANDIDATE")
+        others = [cand("A", 3000, 80), cand("B", 5000, 70, state="WAIT_PULLBACK")]
+        self.assertIn("627A", [c["code"] for c in dual(others + [rev], 850000)["top5"]])
+        plain = cand("627A", 1337, 44, state="WATCH", revivalStage="WATCH")
+        self.assertNotIn("627A", [c["code"] for c in dual(others + [plain], 850000)["top5"]])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4292,6 +4292,7 @@ ENTRY_TOP5_TIER3_MIN_SCORE = 45
 ENTRY_TOP5_TIER1_STATES = ("NOW_BUYABLE", "ENTRY_READY")
 ENTRY_TOP5_TIER2_STATES = ("WAIT_BREAKOUT", "WAIT_PULLBACK")
 ENTRY_TOP5_RISK_STATES = ("CHASE_RISK", "INVALID")
+REVIVAL_MIN_ENTRY_SCORE = 40  # 復活枠の最低entry score（akippa型のIPO/shadow復活=40〜44を通し、実測10〜15のWEAKは通さない）
 
 
 def _select_entry_ready_top5(candidates):
@@ -4336,9 +4337,14 @@ def _select_entry_ready_top5(candidates):
     # （「再注目通知だけでTOP5に戻らない」状態の禁止）。高値追い危険等のRISK状態・データ不足は
     # 入れない（理由はshadowRecheck/actionableReasonに明示）。
     _placed = {c["code"] for c in tier1 + tier2 + tier3}
+    # 最低品質ゲート（2026-09-25、実市場で発見）：寄り直後は「当日高値更新」「時間補正出来高倍率」が
+    # 自明に成立しBUY_CANDIDATE判定が過剰になるため、WEAK/AVOID・entry score下限未満は復活枠に
+    # 入れない（通常ルートで入れない品質の銘柄が復活枠経由で実戦TOP5に入るのを防ぐ）。
     revived = [c for c in candidates
                if c.get("revivalStage") == "BUY_CANDIDATE" and c["code"] not in _placed
-               and c["entryState"] not in ENTRY_TOP5_RISK_STATES and c["entryState"] != "PROVISIONAL"]
+               and c["entryState"] not in ENTRY_TOP5_RISK_STATES and c["entryState"] != "PROVISIONAL"
+               and c["entryState"] != "WEAK" and c.get("capitalStatus") != "AVOID"
+               and (c.get("entryScore") or 0) >= REVIVAL_MIN_ENTRY_SCORE]
     for c in revived:
         c["candidateTier"] = 2
         c["revivedBuyCandidate"] = True
