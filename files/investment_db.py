@@ -815,6 +815,34 @@ ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS atr5_pct DOUBLE PRECISION;
 ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS rolling_state TEXT;
 ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS rolling_score DOUBLE PRECISION;
 
+-- Phase E（Market-Wide Discovery・shadow）：登録外から発見した銘柄のpool（手動watchlist・dynamic_watchlistとは別）
+CREATE TABLE IF NOT EXISTS market_discovery_pool (
+    id                 SERIAL PRIMARY KEY,
+    user_id            TEXT NOT NULL,
+    code               TEXT NOT NULL,
+    trade_date         DATE NOT NULL,
+    name               TEXT,
+    source             TEXT,
+    status             TEXT NOT NULL DEFAULT 'BROAD',
+    discovered_at      TIMESTAMPTZ NOT NULL,
+    discovery_reason   JSONB,
+    broad_score        DOUBLE PRECISION,
+    price_at_discovery DOUBLE PRECISION,
+    last_seen_at       TIMESTAMPTZ,
+    latest_quote_at    TIMESTAMPTZ,
+    rt_first_at        TIMESTAMPTZ,
+    promoted_at        TIMESTAMPTZ,
+    promote_reasons    JSONB,
+    hot_at             TIMESTAMPTZ,
+    radar_at           TIMESTAMPTZ,
+    expanding_at       TIMESTAMPTZ,
+    entry_at           TIMESTAMPTZ,
+    chase_at           TIMESTAMPTZ,
+    expired_at         TIMESTAMPTZ,
+    expire_reason      TEXT,
+    UNIQUE (user_id, code, trade_date)
+);
+
 -- 動いている銘柄だけのオーバーレイ（手動のwatchlistとは別。watchlistテーブルには触れない）
 CREATE TABLE IF NOT EXISTS dynamic_watchlist (
     id                SERIAL PRIMARY KEY,
@@ -11225,6 +11253,47 @@ def update_chart_signal_outcomes(database_url, updates):
                            col("at_30m"), col("max_30m"), col("min_30m"), col("new_high_after_sec"), col("outcome_done")])
         conn.commit()
     return len(updates)
+
+
+_MDP_TS = ("discovered_at", "last_seen_at", "latest_quote_at", "rt_first_at", "promoted_at", "hot_at", "radar_at", "expanding_at",
+           "entry_at", "chase_at", "expired_at")
+
+
+def upsert_market_discovery(database_url, user_id, entries):
+    """market_discovery_pool（登録外から発見した銘柄。手動watchlist・dynamic_watchlistとは別テーブル）へ差分を保存する。"""
+    pool = _get_pool(database_url)
+    if pool is None or not entries:
+        return 0
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    cols = ("user_id", "code", "trade_date", "name", "source", "status", "discovery_reason", "broad_score", "price_at_discovery",
+            "promote_reasons", "expire_reason") + _MDP_TS
+    upd = [c for c in cols if c not in ("user_id", "code", "trade_date", "discovered_at")]
+    sql = (f"INSERT INTO market_discovery_pool ({', '.join(cols)}) VALUES ("
+           + ", ".join("%s::jsonb" if c in ("discovery_reason", "promote_reasons") else "%s" for c in cols) + ") "
+           "ON CONFLICT (user_id, code, trade_date) DO UPDATE SET " + ", ".join(f"{c} = EXCLUDED.{c}" for c in upd))
+    params = []
+    for e in entries:
+        d = e["discovered_at"]
+        row = [user_id, e["code"], d.astimezone(jst).date(), e.get("name"), ",".join(e.get("sources") or []), e.get("status"),
+               json.dumps(e.get("discovery_reason") or [], ensure_ascii=False), e.get("broad_score"), e.get("price_at_discovery"),
+               json.dumps(e.get("promote_reasons") or [], ensure_ascii=False), e.get("expire_reason")]
+        row += [e.get(k) if k != "rt_first_at" else e.get("rt_first_at") for k in _MDP_TS]
+        params.append(row)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(sql, params)
+        conn.commit()
+    return len(params)
+
+
+def list_market_discovery(database_url, user_id, trade_date):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM market_discovery_pool WHERE user_id = %s AND trade_date = %s ORDER BY discovered_at", [user_id, trade_date])
+            return [_row_to_json(r) for r in cur.fetchall()]
 
 
 def load_dynamic_watch(database_url, user_id):

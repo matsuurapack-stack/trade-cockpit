@@ -132,6 +132,30 @@ def main():
         print("dynamic watch 追加件数（理由別）:", by_src, "/ 合計", len(hist))
     except Exception as e:
         print("dynamic watch履歴を取得できません:", e)
+    try:
+        import datetime as _dt2
+        md_rows = db.list_market_discovery(server.DATABASE_URL, "matsuura", day)
+        print("\n--- Market Discovery（登録外から発見。shadow）---")
+        by_status, by_src = {}, {}
+        for r in md_rows:
+            by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+            by_src[r["source"]] = by_src.get(r["source"], 0) + 1
+        print(f"発見件数 {len(md_rows)} / 状態別 {by_status} / source別 {by_src}")
+        def _m(a, b):
+            ta, tb = sl._parse_dt(a), sl._parse_dt(b)
+            return None if not (ta and tb) else round((tb - ta).total_seconds() / 60.0, 1)
+        for label, key in (("発見→realtime初回", "rt_first_at"), ("発見→昇格", "promoted_at"), ("発見→hot", "hot_at"), ("発見→Radar", "radar_at"),
+                           ("発見→EXPANDING", "expanding_at"), ("発見→ENTRY相当(上限)", "entry_at"), ("発見→CHASE", "chase_at")):
+            v = [_m(r["discovered_at"], r.get(key)) for r in md_rows if r.get(key)]
+            v = [x for x in v if x is not None]
+            print(f"  {label}: n={len(v)} 平均 {round(sum(v) / len(v), 1) if v else None}分")
+        for r in md_rows:
+            if r.get("promoted_at"):
+                print("   ", r["code"], r["status"], "発見", str(r["discovered_at"])[11:16], "昇格", str(r["promoted_at"])[11:16],
+                      "Radar", str(r.get("radar_at") or "-")[11:16], "EXPANDING", str(r.get("expanding_at") or "-")[11:16],
+                      "ENTRY", str(r.get("entry_at") or "-")[11:16], "CHASE", str(r.get("chase_at") or "-")[11:16], r.get("discovery_reason"))
+    except Exception as e:
+        print("Market Discovery集計を取得できません:", e)
     sq = mv["stop_quality"]
     print("推奨逆指値の品質（movement ENTRY_READY全イベント）:", sq)
 

@@ -192,6 +192,7 @@ import chart_context  # Chart Context Engine（Phase C：5分足の時系列形�
 import chart_signal_log  # Phase C shadow運用：判定ログ・事後リターン・日次集計（記録専用、判定へは戻さない）
 import movement_potential  # Phase D：Movement Potential（今日これから値幅が出る可能性。shadow運用）
 import dynamic_watch  # Phase D：dynamic_watchlist（動いている銘柄のオーバーレイ。手動watchlistとは別）
+import market_discovery  # Phase E：Market-Wide Discovery（登録外から動き始めた銘柄を発見。shadow、ENTRYには使わない）
 import rolling_radar  # Phase D.2：Rolling Momentum Radar（場中の直近5本窓での警戒レーダー。shadow、ENTRYには使わない）
 import early_radar  # Phase D.1：Early Momentum Radar（寄り直後2〜5本の初動監視。shadow、ENTRYには使わない）
 
@@ -6187,6 +6188,23 @@ def refresh_shadow_movement(database_url, user_id):
                           "momentum_state": c.get("momentumState"), "is_manual": c.get("isManual", True),
                           "rank": (movement_potential.attention_rank_score(mv_like)
                                    if c.get("movementScore") is not None else (c.get("radarRankScore") or c.get("rollingScore") or 0))})
+        with _DISCOVERY_LOCK:
+            dpool = dict(_DISCOVERY_POOL.get(user_id) or {})
+        have = {c["code"] for c in cands}
+        for code, e in dpool.items():                     # Phase E：登録外から発見した銘柄（既存の登録銘柄とは重複しない）
+            if code in have:
+                continue
+            ev = e.get("eval") or {}
+            base = {"code": code, "name": e.get("name"), "movement": ev.get("movement") or 0, "recent_activity": 0,
+                    "activity_state": ev.get("activity") or "UNKNOWN", "pre_breakout": False, "above_vwap": None, "momentum_state": None,
+                    "is_manual": False, "rank": e["broad_score"] + (30 if e["status"] == "HOT" else 0), "radar_hot": False,
+                    "rolling_hot": False, "rolling_watch": False, "rolling_state": ev.get("rolling")}
+            if e["status"] in ("PROMOTED", "HOT"):
+                cands.append(dict(base, discovery_promoted=True, discovery_hot=(e["status"] == "HOT"),
+                                  rolling_hot=ev.get("rolling") in chart_signal_log.ROLLING_HOT,
+                                  rolling_watch=ev.get("rolling") in ("ROLLING_EXPANDING", "RADAR_WEAK")))
+            elif e["status"] == "EXPIRED":
+                cands.append(dict(base, discovery_expired=True))
         can_write = bool(investment_db is not None and database_url and WRITE_E2E_ALLOWED)
         state = _DYNAMIC_WATCH.get(user_id)
         if state is None:
@@ -6204,6 +6222,8 @@ def refresh_shadow_movement(database_url, user_id):
         shadow = movement_potential.build_shadow_lists([c for c in pool if c.get("movementScore") is not None], analysis, res["hot"])
         shadow["earlyRadar"] = early_radar.build_early_radar_list(pool)      # 初動監視（🚨）最大5銘柄。買い判定ではない
         shadow["rollingRadar"] = rolling_radar.build_rolling_radar_list(pool)   # 警戒レーダー（📡）最大5銘柄。買い判定ではない
+        shadow["marketDiscovery"] = market_discovery.build_shadow_list(dpool, now)      # 🌐 市場発見（shadow。買い判定ではない）
+        shadow["discoveryPool"] = market_discovery.summarize_pool(dpool)
         for d in shadow["rollingRadar"]:      # radar_age_minutes（観測のみ。並び順・hot pool優先度にはまだ使わない）
             ep = _RADAR_EPISODES.get((user_id, d["code"]))
             d["radarAgeMinutes"] = round((now - ep["start"]).total_seconds() / 60.0, 1) if (ep and not ep["ended"]) else None
@@ -6320,6 +6340,248 @@ def _chart_outcome_loop():
         except Exception as e:
             print("  [ChartSignalOutcome] loopで例外", e)
         time.sleep(CHART_OUTCOME_INTERVAL_SEC)
+
+
+# ============================================================
+# Phase E：Market-Wide Discovery（shadow）。二段階：
+#   Tier 1 Broad（10分ごと・yfinance JP screener、20分遅延）→ 最大300銘柄のpool（登録済み銘柄は対象外）
+#   Tier 2 Real-time（30秒ごと・最大120銘柄を立花quoteで確認）→ dynamic watch / hot poolへ昇格
+# 昇格には必ず立花quote（source=tachibana・非stale）が必要。yfinance値・フォールバック値では昇格しない。
+# 昇格した銘柄は既存の Rolling Radar / Chart Context / Movement をそのまま通す（新しいRadarロジックは無い）。
+# ENTRY・既存TOP5には一切接続しない。立花は既存のget_fast_quotes（5秒共有キャッシュ・40銘柄チャンク・再試行つき）だけを使う。
+# ============================================================
+_DISCOVERY_POOL = {}     # user_id -> {code: entry}
+_DISCOVERY_HIST = {}     # code -> [(epoch, price, volume)]（立花quote履歴）
+_DISCOVERY_STATS = {"broad": [], "rt": [], "errors": {"tachibana": 0, "yfinance": 0}}
+_DISCOVERY_LOCK = threading.RLock()
+DISCOVERY_RT_INTERVAL_SEC = 30
+DISCOVERY_BROAD_MINUTES = 10
+
+
+def _trading_minutes_elapsed(now):
+    """寄り付きからの取引時間（分）。前場9:00〜11:30＋後場12:30〜15:30。寄り前はNone。"""
+    m = now.hour * 60 + now.minute
+    if m < 540:
+        return None
+    if m <= 690:
+        return m - 540
+    if m < 750:
+        return 150
+    return min(300, 150 + (m - 750))
+
+
+def _fetch_yf_broad(size=250):
+    """yfinance JP screener（20分遅延）。2本のクエリ（前日比上位・出来高上位）。戻り値: ([(source, quote)], stats)。"""
+    t0 = time.time()
+    stats = {"calls": 0, "rows": 0, "duration_ms": 0, "error": None}
+    out = []
+    if yf is None:
+        stats["error"] = "yfinance unavailable"
+        return out, stats
+    try:
+        from yfinance import EquityQuery as Q
+        specs = (("YF_GAINERS", Q("and", [Q("eq", ["region", "jp"]), Q("gt", ["percentchange", 2]), Q("gt", ["dayvolume", 100000])]), "percentchange"),
+                 ("YF_VOLUME", Q("and", [Q("eq", ["region", "jp"]), Q("gt", ["dayvolume", 300000])]), "dayvolume"))
+        for src, q, sf in specs:
+            stats["calls"] += 1
+            r = yf.screen(q, sortField=sf, sortAsc=False, size=size)
+            for x in (r or {}).get("quotes", []):
+                out.append((src, x))
+    except Exception as e:
+        stats["error"] = str(e)[:200]
+    stats["rows"], stats["duration_ms"] = len(out), round((time.time() - t0) * 1000)
+    return out, stats
+
+
+def _mark_dirty(entries):
+    for e in entries:
+        e["_dirty"] = True
+
+
+def _persist_discovery(database_url, user_id, now=None):
+    """変更のあったDiscovery pool行だけをmarket_discovery_poolへ保存（DB書き込み許可環境・寄り前〜場中のみ）。"""
+    if investment_db is None or not database_url or not WRITE_E2E_ALLOWED:
+        return 0
+    now = now or datetime.datetime.now(_JST)
+    if not (_in_jp_session(now) or (8 * 60 + 30 <= now.hour * 60 + now.minute < 9 * 60)):
+        return 0
+    with _DISCOVERY_LOCK:
+        dirty = [e for e in (_DISCOVERY_POOL.get(user_id) or {}).values() if e.get("_dirty")]
+        snap = [dict(e) for e in dirty]
+        for e in dirty:
+            e["_dirty"] = False
+    try:
+        return investment_db.upsert_market_discovery(database_url, user_id, snap)
+    except Exception as e:
+        print("  [Discovery] DB保存で例外（メモリ上は継続）", e)
+        _mark_dirty(dirty)
+        return 0
+
+
+def discovery_broad_refresh(database_url, user_id, fetcher=None, now=None):
+    """Tier 1 Broad Discovery：screener → 複数要素を満たす登録外銘柄 → Discovery Pool（最大300）。"""
+    fetcher = fetcher or _fetch_yf_broad
+    now = now or datetime.datetime.now(_JST)
+    raw, st = fetcher()
+    registered, ipo_codes = set(), set()
+    try:
+        if investment_db is not None and database_url:
+            registered = {w.get("code") for w in investment_db.list_watchlist(database_url, user_id, market="JP")}
+            ipo_codes = {r.get("code") for r in investment_db.list_ipo_stocks(database_url, user_id)}
+    except Exception as e:
+        print("  [Discovery] 登録銘柄/IPO取得で例外（続行）", e)
+    minutes = _trading_minutes_elapsed(now)
+    pre_open = now.hour * 60 + now.minute < 540
+    cands = []
+    for src, q in raw:
+        r = market_discovery.normalize_screener_row(q)
+        code = r["code"]
+        if not code or code in registered:
+            continue                                                 # 登録済み（手動watchlist）は既存スキャンが見ている
+        tags = set()
+        if code in ipo_codes:
+            tags.add("ipo")
+        if pre_open:
+            tags.add("prev_day_mover")                               # 寄り前のscreenerは前営業日のデータ＝前日の急騰銘柄
+        res = market_discovery.broad_score(r, minutes_since_open=minutes, tags=tags)
+        if res is None:
+            continue
+        cands.append({"code": code, "name": r.get("name"), "source": src, "score": res[0], "factors": res[1], "reasons": res[2],
+                      "price": r.get("price")})
+    with _DISCOVERY_LOCK:
+        pool = _DISCOVERY_POOL.setdefault(user_id, {})
+        added = market_discovery.merge_broad(pool, cands, now)
+        expired = market_discovery.expire_pool(pool, now)
+        _mark_dirty(pool[c["code"]] for c in cands if c["code"] in pool)
+        _mark_dirty(pool[c] for c in expired if c in pool)
+        summ = market_discovery.summarize_pool(pool)
+        rec = {"at": now.isoformat(), "duration_ms": st.get("duration_ms"), "calls": st.get("calls"), "rows": st.get("rows"),
+               "candidates": len(cands), "added": len(added), "expired": len(expired), "live": summ["live"], "error": st.get("error")}
+        _DISCOVERY_STATS["broad"].append(rec)
+        del _DISCOVERY_STATS["broad"][:-50]
+        if st.get("error"):
+            _DISCOVERY_STATS["errors"]["yfinance"] += 1
+    _persist_discovery(database_url, user_id, now)
+    print(f"  [Discovery/Broad] rows={rec['rows']} candidates={rec['candidates']} added={rec['added']} live={rec['live']} "
+          f"duration={rec['duration_ms']}ms error={rec['error']}")
+    return rec
+
+
+def discovery_realtime_cycle(database_url, user_id, quote_fn=None, now=None):
+    """Tier 2 Real-time Discovery：pool（最大120）を立花quoteで確認し、加速・高値接近・spread・movementが揃えば昇格する。
+    昇格した銘柄は内部5分足（立花quote由来）で既存のRolling Radar / Chart Context / Movementに通し、マイルストーン時刻を保存する。"""
+    quote_fn = quote_fn or get_fast_quotes
+    now = now or datetime.datetime.now(_JST)
+    with _DISCOVERY_LOCK:
+        codes = market_discovery.select_realtime(_DISCOVERY_POOL.get(user_id) or {})
+    if not codes:
+        return None
+    t0 = time.time()
+    err = None
+    try:
+        quotes, st = quote_fn([{"code": c, "market": "JP"} for c in codes])
+    except Exception as e:
+        quotes, st, err = {}, {}, str(e)[:200]
+    rec = {"at": now.isoformat(), "codes": len(codes), "calls_est": -(-len(codes) // FAST_QUOTE_CHUNK), "tachibana": st.get("tachibana"),
+           "reused": st.get("reused", 0), "fallback_yf": st.get("fallback_yf"), "fallback_cache": st.get("fallback_cache"),
+           "failed": st.get("failed"), "duration_ms": round((time.time() - t0) * 1000), "error": err}
+    minutes = _trading_minutes_elapsed(now)
+    events, expired = [], []
+    with _DISCOVERY_LOCK:
+        pool = _DISCOVERY_POOL.get(user_id) or {}
+        for code in codes:
+            e, q = pool.get(code), quotes.get(code)
+            if e is None or not q or q.get("source") != "tachibana" or q.get("is_stale"):
+                continue                                            # yfinance/キャッシュ値では昇格判定しない（必ず立花quoteで再確認）
+            market_discovery.update_history(_DISCOVERY_HIST, code, q, now)
+            sig = market_discovery.realtime_signals(_DISCOVERY_HIST.get(code, []), q, now)
+            bars = (get_internal_intraday_bars(code) or {}).get("bars") or []
+            ev = market_discovery.evaluate_entry_state(bars, q, minutes_since_open=minutes)
+            prev, cur = (e.get("eval") or {}).get("movement"), ev.get("movement")
+            level, reasons = market_discovery.evaluate_promotion(sig, movement_up=(None if (prev is None or cur is None) else bool(cur - prev >= 5)))
+            new = market_discovery.apply_realtime(e, sig, level, reasons, ev, now)
+            if new:
+                events.append((code, new))
+                e["_dirty"] = True
+        expired = market_discovery.expire_pool(pool, now)
+        _mark_dirty(pool[c] for c in expired if c in pool)
+        rec.update({"events": len(events), "expired": len(expired), "live": market_discovery.summarize_pool(pool)["live"]})
+        _DISCOVERY_STATS["rt"].append(rec)
+        del _DISCOVERY_STATS["rt"][:-200]
+        if err or (st.get("failed") or 0) > 0:
+            _DISCOVERY_STATS["errors"]["tachibana"] += 1
+    if events or expired:
+        refresh_shadow_movement(database_url, user_id)              # 昇格・失効をdynamic watch（shadow）へ反映
+        _persist_discovery(database_url, user_id, now)
+    return rec
+
+
+def _discovery_users():
+    return list(_DISCOVERY_POOL.keys()) or list(_ENTRY_TOP5_CACHE.keys())
+
+
+def _discovery_broad_loop():
+    """10分ごと（毎時0,10,20…分）と寄り前（8:45〜8:59に1回）にBroad Discoveryを更新する。"""
+    fired = set()
+    while True:
+        try:
+            now = datetime.datetime.now(_JST)
+            hm = now.hour * 60 + now.minute
+            if _is_jp_market_business_day(now):
+                slot = None
+                if 8 * 60 + 45 <= hm < 9 * 60:
+                    slot = (now.date(), "PRE")
+                elif _in_jp_session(now) and hm % DISCOVERY_BROAD_MINUTES == 0:
+                    slot = (now.date(), hm)
+                if slot and slot not in fired:
+                    fired.add(slot)
+                    for user_id in (list(_ENTRY_TOP5_CACHE.keys()) or list(_morning_check_scheduler_users())):
+                        discovery_broad_refresh(DATABASE_URL, user_id)
+        except Exception as e:
+            print("  [Discovery/Broad] loopで例外", e)
+        time.sleep(30)
+
+
+def _discovery_realtime_loop():
+    while True:
+        try:
+            now = datetime.datetime.now(_JST)
+            if _in_jp_session(now) and _is_jp_market_business_day(now):
+                for user_id in _discovery_users():
+                    discovery_realtime_cycle(DATABASE_URL, user_id)
+        except Exception as e:
+            print("  [Discovery/Realtime] loopで例外", e)
+        time.sleep(DISCOVERY_RT_INTERVAL_SEC)
+
+
+DISCOVERY_MANUAL_MIN_INTERVAL_SEC = 60
+
+
+def discovery_manual_run(database_url, user_id, broad_fetcher=None, quote_fn=None):
+    """API負荷の実測用：Broad 1回＋Real-time 1サイクルを手動で実行し、所要時間・呼び出し数を返す（shadow・読み取り専用の探索）。
+    立花への負荷を避けるため60秒スロットル。場外はDBへ書き込まない（_persist_discoveryが場中のみ）。"""
+    now = time.time()
+    with _DISCOVERY_LOCK:
+        last = _DISCOVERY_STATS.get("last_manual") or 0
+        if now - last < DISCOVERY_MANUAL_MIN_INTERVAL_SEC:
+            return {"error": "throttled", "retryAfterSec": round(DISCOVERY_MANUAL_MIN_INTERVAL_SEC - (now - last))}
+        _DISCOVERY_STATS["last_manual"] = now
+    t0 = time.time()
+    broad = discovery_broad_refresh(database_url, user_id, fetcher=broad_fetcher)
+    rt = discovery_realtime_cycle(database_url, user_id, quote_fn=quote_fn)
+    return {"broad": broad, "realtime": rt, "totalMs": round((time.time() - t0) * 1000), "payload": discovery_api_payload(user_id)}
+
+
+def discovery_api_payload(user_id):
+    with _DISCOVERY_LOCK:
+        pool = _DISCOVERY_POOL.get(user_id) or {}
+        now = datetime.datetime.now(_JST)
+        return {"pool": market_discovery.summarize_pool(pool), "list": market_discovery.build_shadow_list(pool, now, top_n=50),
+                "limits": {"broadMax": market_discovery.BROAD_MAX, "realtimeMax": market_discovery.RT_MAX, "dynamicMax": dynamic_watch.MAX_ACTIVE,
+                           "hotMax": dynamic_watch.MAX_HOT, "ttlBroadMin": market_discovery.TTL_BROAD_MIN, "ttlRealtimeMin": market_discovery.TTL_RT_MIN},
+                "load": {"broad": list(_DISCOVERY_STATS["broad"][-10:]), "realtime": list(_DISCOVERY_STATS["rt"][-10:]),
+                         "errors": dict(_DISCOVERY_STATS["errors"])},
+                "note": "shadow：yfinanceは20分遅延。昇格は立花quoteで再確認。ENTRY・既存TOP5には接続していない"}
 
 
 ENTRY_RESCORE_POOL_SIZE = 50
@@ -26595,6 +26857,10 @@ class Handler(SimpleHTTPRequestHandler):
             market = urllib.parse.parse_qs(qs).get("market", [None])[0]
             items = investment_db.list_watchlist(DATABASE_URL, self.current_user, market=market) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"items": items})
+        elif self.path.startswith("/api/market-discovery/run"):
+            self._send_json(discovery_manual_run(DATABASE_URL, self.current_user))
+        elif self.path.startswith("/api/market-discovery"):
+            self._send_json(discovery_api_payload(self.current_user))
         elif self.path.startswith("/api/chart-signals"):
             # Phase C shadow運用の記録参照（読み取り専用）。/daily は日次集計、無印は生ログ。
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -28181,6 +28447,8 @@ def main():
         # _restart_time_morning_warmup・281銘柄warmupガードには一切触れない（別経路）。
         threading.Thread(target=_entry_top5_scheduler_loop, daemon=True).start()
         threading.Thread(target=_chart_outcome_loop, daemon=True).start()  # Phase C shadow：事後価格の追記（記録専用）
+        threading.Thread(target=_discovery_broad_loop, daemon=True).start()     # Phase E shadow：Broad Discovery（10分ごと）
+        threading.Thread(target=_discovery_realtime_loop, daemon=True).start()  # Phase E shadow：Real-time Discovery（30秒ごと）
         threading.Thread(target=_entry_rescore_loop, daemon=True).start()  # 2026-09-25 Phase B-1：候補poolの軽量再スコア
         # 2026-09-10新規（にこそく@nicosokufx X投稿連携、指示書2番）：X_API_BEARER_TOKEN
         # 未設定なら_nicosoku_poll_scheduler_loop内で即returnする（アプリ本体には影響しない）。

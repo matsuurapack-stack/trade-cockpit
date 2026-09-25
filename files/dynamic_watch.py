@@ -22,11 +22,13 @@ HOT_RECENT_ACTIVITY = 60
 
 
 def is_hot(c):
-    return bool(c.get("radar_hot") or c.get("rolling_hot") or c.get("pre_breakout") or c.get("activity_state") == "EXPANDING"
+    return bool(c.get("discovery_hot") or c.get("radar_hot") or c.get("rolling_hot") or c.get("pre_breakout") or c.get("activity_state") == "EXPANDING"
                 or ((c.get("movement") or 0) >= HOT_SCORE and (c.get("recent_activity") or 0) >= HOT_RECENT_ACTIVITY))
 
 
 def add_reason(c):
+    if c.get("discovery_hot"):
+        return "DISCOVERY:HOT"                                # Market Discovery（登録外から発見）：立花quoteで明確な急変を確認
     if c.get("rolling_hot"):
         return f"ROLLING:{c.get('rolling_state')}"           # Rolling Radar（場中の警戒レーダー）：hot poolへ即追加
     if c.get("radar_hot"):
@@ -41,12 +43,15 @@ def add_reason(c):
         return f"MOVEMENT>={ADD_SCORE}"
     if c.get("rolling_watch"):
         return f"ROLLING:{c.get('rolling_state')}"           # RADAR_WEAK / ROLLING_EXPANDING：通常のdynamic watchまで（hotにはしない）
+    if c.get("discovery_promoted"):
+        return "DISCOVERY:PROMOTED"                           # Market Discovery：立花quoteで確認できた昇格（hotではない）
     return None
 
 
 def weak_reason(c):
     """外す候補にする弱い状態。回復（movementが再び高い・EXPANDING・PRE_BREAKOUT）していれば弱くない。"""
-    if (c.get("radar_hot") or c.get("rolling_hot") or c.get("rolling_watch") or c.get("pre_breakout")
+    if (c.get("discovery_hot") or c.get("discovery_promoted") or c.get("radar_hot") or c.get("rolling_hot")
+            or c.get("rolling_watch") or c.get("pre_breakout")
             or c.get("activity_state") == "EXPANDING" or (c.get("movement") or 0) >= ADD_SCORE):
         return None
     if c.get("activity_state") == "LOW_ACTIVITY":
@@ -74,6 +79,10 @@ def update_dynamic_watch(existing, cands, now, max_active=MAX_ACTIVE, max_hot=MA
             continue                       # 今回評価されなかった銘柄は状態を変えない
         st["last_seen_at"] = now
         st["is_manual"] = bool(c.get("is_manual", st.get("is_manual")))
+        if c.get("discovery_expired") and str(st.get("source") or "").startswith("DISCOVERY"):
+            removes.append({"code": code, "reason": "DISCOVERY_EXPIRED"})      # 鮮度：古い発見候補はdynamic watchからも外す
+            del state[code]
+            continue
         w = weak_reason(c)
         if w is None:
             st["weak_since"], st["weak_reason"] = None, None
