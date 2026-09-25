@@ -6123,7 +6123,7 @@ def log_chart_signals(database_url, user_id, source):
         recs = []
         for c in pool:
             rec = chart_signal_log.build_signal_record(user_id, c, now, source, top5)
-            if rec is None:
+            if rec is None or not chart_signal_log.is_loggable(rec):
                 continue
             key = (user_id, rec["code"])
             if not chart_signal_log.should_log(_CHART_SIGNAL_LAST.get(key), rec, now):

@@ -48,6 +48,17 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(rec["context"]["top5"], ["actionableTop5"])
         self.assertAlmostEqual(rec["vwap"], 1000 / 1.015, places=1)
 
+    def test_loggable_scope_and_idle_heartbeat(self):
+        weak = sl.build_signal_record("u", cand(legacy="WEAK", chart="WEAK", pattern="BASE_BUILDING"), T0, "SCAN")
+        self.assertFalse(sl.is_loggable(weak))
+        weak_top5 = sl.build_signal_record("u", cand(legacy="WEAK", chart="WEAK"), T0, "SCAN", {"analysisTop5": {"5301"}})
+        self.assertTrue(sl.is_loggable(weak_top5))
+        watch = sl.build_signal_record("u", cand(legacy="WATCH", chart="WATCH", pattern="BASE_BUILDING"), T0, "SCAN")
+        self.assertTrue(sl.is_loggable(watch))
+        last = {"pattern": "BASE_BUILDING", "chart": "WATCH", "legacy": "WATCH", "at": T0}
+        self.assertFalse(sl.should_log(last, watch, T0 + datetime.timedelta(seconds=400)))   # WATCHは15分ごと
+        self.assertTrue(sl.should_log(last, watch, T0 + datetime.timedelta(seconds=901)))
+
     def test_no_chart_or_price_gives_none(self):
         self.assertIsNone(sl.build_signal_record("u", {"code": "1", "current": 1.0}, T0, "SCAN"))
         c = cand()

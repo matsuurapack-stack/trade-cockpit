@@ -11,7 +11,10 @@ import datetime
 
 HORIZONS_MIN = (5, 15, 30)
 OUTCOME_TOLERANCE_SEC = 240        # 目標時刻からこの秒数以内に取れた価格だけを事後価格として採用
-HEARTBEAT_SEC = 300                # 状態が変わらなくても5分ごとに1行残す（追跡用）
+HEARTBEAT_SEC = 300                # TOP5・ENTRY状態の銘柄は、状態が変わらなくても5分ごとに1行残す（追跡用）
+HEARTBEAT_IDLE_SEC = 900           # それ以外のWATCH/WAIT系は15分ごと（Neon容量対策。状態変化は常に即記録）
+# 記録対象：TOP5系リスト、または旧/新どちらかが「注目状態」。WEAK/INVALID等の圏外は記録しない。
+LOGGED_STATES = ("NOW_BUYABLE", "ENTRY_READY", "WATCH", "WAIT_PULLBACK", "WAIT_BREAKOUT", "CHASE_RISK")
 
 # 結果分類（集計専用）：15分後リターンで 下落 / 横横 / 上昇 に分ける
 DECLINE_PCT = -0.3
@@ -65,10 +68,19 @@ def build_signal_record(user_id, cand, now, source, top5_codes=None):
     }
 
 
-def should_log(last, rec, now, heartbeat_sec=HEARTBEAT_SEC):
+def is_loggable(rec):
+    if (rec.get("context") or {}).get("top5"):
+        return True
+    return rec.get("legacy_entry_state") in LOGGED_STATES or rec.get("chart_entry_state") in LOGGED_STATES
+
+
+def should_log(last, rec, now, heartbeat_sec=None):
     """last: 直前に記録した {"pattern","chart","legacy","at"}。状態が変わった／ハートビート時のみTrue。"""
     if not last:
         return True
+    if heartbeat_sec is None:
+        hot = (rec.get("context") or {}).get("top5") or rec.get("chart_entry_state") in ENTRY_STATES             or rec.get("legacy_entry_state") in ENTRY_STATES
+        heartbeat_sec = HEARTBEAT_SEC if hot else HEARTBEAT_IDLE_SEC
     if (last.get("pattern"), last.get("chart"), last.get("legacy")) != \
             (rec["chart_pattern"], rec["chart_entry_state"], rec["legacy_entry_state"]):
         return True
