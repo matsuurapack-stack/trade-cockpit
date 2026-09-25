@@ -158,8 +158,8 @@ class MarginTests(unittest.TestCase):
         self.assertEqual((m["state"], m["kinds"]), ("ACTIVE", ["MARGIN_DEPOSIT_SAME_DAY"]))
         self.assertEqual(ce.margin_restriction_from_flags(active, prev_active=False)["state"], "NEW_RESTRICTION")
         self.assertEqual(ce.margin_restriction_from_flags({"sSokuzituNyukinC": "0"}, prev_active=True)["state"], "RELEASED")
-        self.assertEqual(ce.margin_restriction_from_flags({"sSokuzituNyukinC": "0"}, prev_active=False)["state"], "NONE")
-        self.assertEqual(ce.margin_restriction_from_flags({"sSokuzituNyukinC": "0"}, prev_active=None)["state"], "NONE")
+        self.assertEqual(ce.margin_restriction_from_flags({"sSokuzituNyukinC": "0"}, prev_active=False)["tachibana_restriction_state"], "NONE")
+        self.assertEqual(ce.margin_restriction_from_flags({"sSokuzituNyukinC": "0"}, prev_active=None)["tachibana_restriction_state"], "NONE")
         self.assertEqual(ce.margin_restriction_from_flags(None)["state"], "UNKNOWN")
         daily = ce.margin_restriction_from_flags({"sSinyouSyutyuKubun": "2"})
         self.assertIn("DAILY_PUBLICATION", daily["kinds"])
@@ -323,7 +323,8 @@ class LookupTests(unittest.TestCase):
         self.assertEqual(snap["source"], "TDNET")                            # 同じ見出しはTDnet(HIGH)を採用
         self.assertEqual(len([i for i in snap["items"] if i["type"] == "UPWARD_REVISION"]), 1)
         self.assertEqual(snap["earnings_state"], "NO_NEAR_EARNINGS")
-        self.assertEqual(snap["margin_restriction"], "NONE")
+        self.assertEqual(snap["margin_restriction"], "UNKNOWN")                       # 立花NONE・JPX未確認＝総合はNONEに確定しない
+        self.assertEqual((snap["tachibana_restriction_state"], snap["jpx_margin_restriction_state"]), ("NONE", "UNKNOWN"))
         self.assertEqual(snap["trigger"], "RADAR")
         self.assertTrue(all(snap["lookup"][k] for k in ("tdnet", "news", "db", "calendar", "regulation")))
 

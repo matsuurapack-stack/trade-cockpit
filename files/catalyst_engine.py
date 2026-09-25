@@ -204,9 +204,16 @@ def margin_restriction_from_flags(flags, prev_active=None):
       増し担保：即日入金規制(sSokuzituNyukinC=1) ／ 日々公表：信用一極集中区分=2 ／ 事前調整：sZizenCyouseiC=1 ／
       信用新規停止：制度/一般の新規買建・売建の停止区分が0以外 ／ 取引停止：sTeisiKubun!=0
     貸株注意喚起・空売り規制（値幅制限型の空売り規制）はこのAPIには無いため判定しない（unavailable_kinds）。
-    prev_active: 前営業日に規制があったか（True/False/None）。戻り値のstateは NONE / NEW_RESTRICTION / ACTIVE / RELEASED / UNKNOWN。"""
+    prev_active: 前営業日に規制があったか（True/False/None）。
+    戻り値：
+      tachibana_restriction_state … 立花APIで確認できる範囲の状態 NONE / NEW_RESTRICTION / ACTIVE / RELEASED / UNKNOWN
+      jpx_margin_restriction_state … JPXの増担保・日々公表（信用取引規制）。現在は自動取得していないため常にUNKNOWN
+      state（=margin_restriction_state、総合）… 立花で規制が確認できた場合だけ ACTIVE/NEW_RESTRICTION/RELEASED。それ以外は UNKNOWN。
+        立花APIはJPX増担保を網羅しない（2026-09-26実測：336A・278A・593A・3907は応答に無い）ため、「規制なし（NONE）」とは断定しない。
+      restriction_details … 立花で確認した6項目（True/False、取得不能時はUNKNOWN）＋増担保・貸株注意喚起・空売り規制（UNKNOWN）"""
     if flags is None:
-        return {"state": "UNKNOWN", "kinds": [], "active": None, "unavailable_kinds": ["貸株注意喚起", "空売り規制"]}
+        return {"state": "UNKNOWN", "tachibana_restriction_state": "UNKNOWN", "jpx_margin_restriction_state": "UNKNOWN", "kinds": [], "active": None,
+                "restriction_details": restriction_details(None, []), "unavailable_kinds": ["貸株注意喚起", "空売り規制"]}
     kinds = []
     # 立花APIの応答は「停止区分が0以外の項目がある銘柄」を全て含む（2026-09-26実測：611銘柄）。うち信用区分(sSinyouC)=3（一般信用のみ。TPM・プロ向け等）は
     # 制度信用・現物の停止が構造的な非対応であって規制ではないため、停止系の判定から除く。信用区分が取れない（"?"）場合も停止系は判定しない。
@@ -234,14 +241,27 @@ def margin_restriction_from_flags(flags, prev_active=None):
     # 実測(2026-09-26)：貸借銘柄でも約350銘柄が売建停止のため、これを規制扱いにするとACTIVEが大量に出て意味を失う。
     active = any(k != "MARGIN_NEW_SELL_HALT" for k in kinds)
     if active and prev_active is False:
-        state = "NEW_RESTRICTION"
+        t_state = "NEW_RESTRICTION"
     elif active:
-        state = "ACTIVE"
+        t_state = "ACTIVE"
     elif prev_active:
-        state = "RELEASED"
+        t_state = "RELEASED"
     else:
-        state = "NONE"
-    return {"state": state, "kinds": kinds, "active": active, "unavailable_kinds": ["貸株注意喚起", "空売り規制"]}
+        t_state = "NONE"
+    overall = t_state if t_state in ("NEW_RESTRICTION", "ACTIVE", "RELEASED") else "UNKNOWN"     # JPX側が未確認のため NONE に確定しない
+    return {"state": overall, "tachibana_restriction_state": t_state, "jpx_margin_restriction_state": "UNKNOWN", "kinds": kinds, "active": active,
+            "restriction_details": restriction_details(flags, kinds), "unavailable_kinds": ["貸株注意喚起", "空売り規制"]}
+
+
+def restriction_details(flags, kinds):
+    """立花APIで確認できる規制項目（True/False。取得不能はUNKNOWN）と、確認できない項目（UNKNOWN）。"""
+    def v(kind):
+        return "UNKNOWN" if flags is None else (kind in kinds)
+    return {
+        "tachibana": {"same_day_deposit": v("MARGIN_DEPOSIT_SAME_DAY"), "daily_publication": v("DAILY_PUBLICATION"), "pre_adjustment": v("PRE_ADJUSTMENT"),
+                      "new_buy_halt": v("MARGIN_NEW_BUY_HALT"), "trading_halt": v("TRADING_HALT"), "new_sell_halt": v("MARGIN_NEW_SELL_HALT")},
+        "not_confirmable": {"margin_deposit_increase(増担保)": "UNKNOWN", "lending_caution(貸株注意喚起)": "UNKNOWN", "short_sale_regulation(空売り規制)": "UNKNOWN"},
+    }
 
 
 # ---------------------------------------------------------------- 総合スナップショット
@@ -272,6 +292,8 @@ def build_snapshot(code, items, now, earnings_next=None, calendar_known=True, ma
             "age_business_days": (top["age_business_days"] if top else None), "freshness": (top["freshness"] if top else None),
             "source": (top["source"] if top else None), "catalyst_score": score, "earnings_state": earn, "days_to_earnings": days_to,
             "margin_restriction": m["state"], "margin_kinds": m.get("kinds", []), "strong_confirmed": bool(strong),
+            "tachibana_restriction_state": m.get("tachibana_restriction_state", "UNKNOWN"), "jpx_margin_restriction_state": m.get("jpx_margin_restriction_state", "UNKNOWN"),
+            "restriction_details": m.get("restriction_details") or restriction_details(None, []),
             "buyback": cap_pos and any(i["type"] == "BUYBACK" for i in real), "dilution": cap_neg,
             "unexplained_move": unexplained, "items": items[:8], "lookup": lookup or {}}
 

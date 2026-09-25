@@ -2112,6 +2112,8 @@ const CHART_PATTERN_META = {
 const CATALYST_VERDICT_LABEL = {
   HIGH_CONFIDENCE:"🎯 材料×値動き×タイミングが揃う", CATALYST_STRONG_BUT_NOT_NOW:"材料は強いが今は買わない（押し目待ち）",
   NEGATIVE_CATALYST_AVOID:"悪材料あり（見送り）", UNEXPLAINED_CAUTION:"材料不明の急変（要注意）", CATALYST_PENDING:"材料を確認中…", NORMAL:"—"};
+const MARGIN_KIND_LABEL = {MARGIN_DEPOSIT_SAME_DAY:"即日入金", DAILY_PUBLICATION:"日々公表", MARGIN_CONCENTRATION:"信用一極集中", PRE_ADJUSTMENT:"事前調整",
+  MARGIN_NEW_BUY_HALT:"新規買建停止", MARGIN_NEW_SELL_HALT:"新規売建停止", TRADING_HALT:"取引停止"};
 const CATALYST_FLAG_LABEL = {
   GOOD_NEWS_BAD_REACTION:"好材料なのに株価が弱い", BAD_NEWS_STRONG_PRICE:"悪材料なのに株価が強い", UNEXPLAINED_MOVE:"材料不明の急変",
   PRE_EARNINGS_RUNUP:"決算前の急騰", MOMENTUM_RISK_HIGH:"規制ありのモメンタム", CATALYST_FAILURE:"材料が株価に効いていない（保有中）",
@@ -5588,7 +5590,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                       {c.catalyst && ["PRE_EARNINGS","EARNINGS_TODAY"].includes(c.catalyst.earningsState) && <span style={{fontSize:10.5,fontWeight:700,color:"var(--warn)",whiteSpace:"nowrap"}}>
                           決算：{c.catalyst.earningsState==="EARNINGS_TODAY"?"本日":`${c.catalyst.daysToEarnings??"?"}営業日後`} ⚠️</span>}
                       {c.catalyst && ["ACTIVE","NEW_RESTRICTION"].includes(c.catalyst.marginState) && <span style={{fontSize:10.5,fontWeight:700,color:"var(--down)",whiteSpace:"nowrap"}}>
-                          増し担保：{c.catalyst.marginState} ⚠️</span>}
+                          信用規制（立花）：{(c.catalyst.marginKinds||[]).map(k=>MARGIN_KIND_LABEL[k]||k).join("・")||c.catalyst.marginState} ⚠️</span>}
                       {c.catalyst && c.catalyst.verdict==="CATALYST_STRONG_BUT_NOT_NOW" && <span style={{fontSize:10.5,fontWeight:700,color:"var(--warn)",whiteSpace:"nowrap"}}>強いが遅い／押し目待ち</span>}
                       {c.tooLate && <span style={{fontSize:10.5,fontWeight:800,whiteSpace:"nowrap",color:"var(--down)"}}
                           title={(c.tooLateReasons||[]).join(" / ")}>⚠️ TOO LATE{(c.tooLateReasons||[]).length>0?`（${c.tooLateReasons.slice(0,2).join(" / ")}）`:""}</span>}
@@ -5701,8 +5703,8 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                       {c.catalyst && c.catalyst.state!=="PENDING" && <div style={{flexBasis:"100%",borderTop:"1px dotted var(--rule)",paddingTop:4,marginTop:2}} className="mono">
                         <div>Catalyst {c.catalyst.score??"—"}／100 ・{c.catalyst.state} ・方向 {c.catalyst.direction} ・種別 {c.catalyst.label||c.catalyst.type||"—"} ・信頼度 {c.catalyst.confidence||"—"}
                           ・{c.catalyst.ageHours!=null?`${c.catalyst.ageHours}時間前`:"—"}（{c.catalyst.freshness||"—"}）・出所 {c.catalyst.source||"—"}</div>
-                        <div>決算 {c.catalyst.earningsState}{c.catalyst.daysToEarnings!=null?`（${c.catalyst.daysToEarnings}営業日）`:""} ／ 信用・取引規制 {c.catalyst.marginState}{(c.catalyst.marginKinds||[]).length>0?`（${c.catalyst.marginKinds.join("・")}）`:""}
-                          <span style={{color:"var(--inkFaint)"}}>　（貸株注意喚起・空売り規制はこのAPIでは判定不可）</span></div>
+                        <div>決算 {c.catalyst.earningsState}{c.catalyst.daysToEarnings!=null?`（${c.catalyst.daysToEarnings}営業日）`:""} ／ 信用規制（立花で確認できる範囲）{c.catalyst.tachibanaRestrictionState||c.catalyst.marginState}{(c.catalyst.marginKinds||[]).length>0?`（${c.catalyst.marginKinds.map(k=>MARGIN_KIND_LABEL[k]||k).join("・")}）`:""}
+                          <span style={{color:"var(--inkFaint)"}}>　／ JPX増担保・日々公表 {c.catalyst.jpxMarginRestrictionState||"UNKNOWN"}（未確認：「増担保なし」とは言えません）・貸株注意喚起／空売り規制 UNKNOWN</span></div>
                         <div>判定 {CATALYST_VERDICT_LABEL[c.catalyst.verdict]||c.catalyst.verdict} ・ENTRY confidence {c.catalyst.entryConfidence??"—"}（shadow）・サイズ {c.catalyst.sizeHint||"—"} ・stop {c.catalyst.stopHint||"—"} ・高値追い {c.catalyst.chaseStrictness||"—"}</div>
                         {(c.catalyst.flags||[]).length>0 && <div style={{color:"var(--warn)"}}>注意：{c.catalyst.flags.map(f=>CATALYST_FLAG_LABEL[f]||f).join("・")}</div>}
                         {(c.catalyst.exitHints||[]).length>0 && <div>EXITヒント：{c.catalyst.exitHints.join("・")}</div>}

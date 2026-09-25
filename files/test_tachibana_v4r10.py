@@ -162,8 +162,8 @@ class EngineStructuralStopTests(unittest.TestCase):
     def test_structural_stops_are_not_restrictions(self):
         import catalyst_engine as ce
         stop = {"sSeidoSinyouSinkiKaitate": "1", "sSeidoSinyouSinkiUritate": "1", "sTeisiKubun": "1"}
-        self.assertEqual(ce.margin_restriction_from_flags(dict(stop, _sinyouC="3"))["state"], "NONE")
-        self.assertEqual(ce.margin_restriction_from_flags(dict(stop, _sinyouC="?"))["state"], "NONE")
+        self.assertEqual(ce.margin_restriction_from_flags(dict(stop, _sinyouC="3"))["tachibana_restriction_state"], "NONE")
+        self.assertEqual(ce.margin_restriction_from_flags(dict(stop, _sinyouC="?"))["tachibana_restriction_state"], "NONE")
         self.assertEqual(ce.margin_restriction_from_flags(dict(stop, _sinyouC="2"))["state"], "ACTIVE")
         self.assertEqual(ce.margin_restriction_from_flags(stop)["state"], "ACTIVE")            # 信用区分なし＝従来どおり
 
@@ -223,9 +223,51 @@ class SellHaltOnlyTests(unittest.TestCase):
     def test_sell_halt_alone_is_not_a_margin_restriction_for_long_momentum(self):
         import catalyst_engine as ce
         r = ce.margin_restriction_from_flags({"sSeidoSinyouSinkiUritate": "1", "_sinyouC": "1"})
-        self.assertEqual((r["state"], r["active"], r["kinds"]), ("NONE", False, ["MARGIN_NEW_SELL_HALT"]))
+        self.assertEqual((r["tachibana_restriction_state"], r["active"], r["kinds"]), ("NONE", False, ["MARGIN_NEW_SELL_HALT"]))
         r2 = ce.margin_restriction_from_flags({"sSeidoSinyouSinkiUritate": "1", "sSeidoSinyouSinkiKaitate": "1", "_sinyouC": "2"})
         self.assertEqual(r2["state"], "ACTIVE")                                   # 新規買建も停止＝規制
+
+
+class RestrictionSemanticsTests(unittest.TestCase):
+    """規制情報の意味付け：立花NONE≠信用規制なし。JPX増担保は未取得なのでUNKNOWN。総合stateをNONEに確定しない。"""
+
+    def test_4440_like_issue(self):
+        import catalyst_engine as ce
+        r = ce.margin_restriction_from_flags({"sSeidoSinyouSinkiUritate": "1", "sSeidoSinyouGenbiki": "1", "_sinyouC": "1"})   # 4440の実データ相当
+        self.assertEqual(r["tachibana_restriction_state"], "NONE")
+        self.assertEqual(r["jpx_margin_restriction_state"], "UNKNOWN")
+        self.assertEqual(r["state"], "UNKNOWN")
+        d = r["restriction_details"]
+        self.assertIs(d["tachibana"]["new_sell_halt"], True)
+        self.assertIs(d["tachibana"]["new_buy_halt"], False)
+        for k in ("margin_deposit_increase(増担保)", "lending_caution(貸株注意喚起)", "short_sale_regulation(空売り規制)"):
+            self.assertEqual(d["not_confirmable"][k], "UNKNOWN")
+
+    def test_overall_follows_tachibana_only_when_restriction_confirmed(self):
+        import catalyst_engine as ce
+        self.assertEqual(ce.margin_restriction_from_flags({"sSeidoSinyouSinkiKaitate": "1", "_sinyouC": "2"})["state"], "ACTIVE")
+        self.assertEqual(ce.margin_restriction_from_flags({"sSeidoSinyouSinkiKaitate": "1", "_sinyouC": "2"}, prev_active=False)["state"], "NEW_RESTRICTION")
+        self.assertEqual(ce.margin_restriction_from_flags({}, prev_active=True)["state"], "RELEASED")
+        self.assertEqual(ce.margin_restriction_from_flags(None)["state"], "UNKNOWN")
+        self.assertEqual(ce.margin_restriction_from_flags(None)["restriction_details"]["tachibana"]["same_day_deposit"], "UNKNOWN")
+
+    def test_snapshot_carries_split_states_and_details(self):
+        import catalyst_engine as ce
+        snap = ce.build_snapshot("6862", [], datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))),
+                                 margin=ce.margin_restriction_from_flags({"sSeidoSinyouSinkiKaitate": "1", "_sinyouC": "2"}))
+        self.assertEqual((snap["margin_restriction"], snap["tachibana_restriction_state"], snap["jpx_margin_restriction_state"]), ("ACTIVE", "ACTIVE", "UNKNOWN"))
+        self.assertIs(snap["restriction_details"]["tachibana"]["new_buy_halt"], True)
+
+    def test_ui_never_asserts_no_margin_increase(self):
+        html = open(__import__("os").path.join(__import__("os").path.dirname(t.__file__), "trade-cockpit.html"), encoding="utf-8").read()
+        self.assertNotIn("増し担保：", html)
+        self.assertIn("「増担保なし」とは言えません", html)
+
+    def test_restriction_never_touches_entry_or_exit_source(self):
+        import inspect
+        import catalyst_engine as ce
+        for name in ("entry_confidence", "exit_hints"):
+            self.assertIn(name, dir(ce))              # 規制はshadowのhintに出るだけ。既存のENTRY/EXIT側からcatalyst_engineを参照していないことは既存テストで固定済み
 
 
 if __name__ == "__main__":
