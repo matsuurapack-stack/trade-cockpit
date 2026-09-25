@@ -6037,6 +6037,7 @@ def _apply_entry_top5_staleness(cache_entry):
         "trigger": cache_entry["trigger"],
         "rankingAgeSec": round(age_sec),
         "lastRescoreAt": cache_entry.get("lastRescoreAt"),  # 軽量再スコアの最終実行時刻（Phase B-1）
+        "shadowMovement": cache_entry.get("shadowMovement"),  # Phase D（shadow）：値幅を見た並び。既存のTOP5とは別枠
         "dataStale": stale,
         "anySymbolMarketDataStale": any_symbol_stale,  # 指示書STEP9：ranking全体は新しくても個別銘柄のmarket dataがstale fallbackだった場合にTrue
         "updateDelayWarning": delayed,

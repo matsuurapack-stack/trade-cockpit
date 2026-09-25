@@ -259,3 +259,26 @@ class NoHindsightTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExposureAndStopFloorTests(unittest.TestCase):
+    def test_shadow_movement_is_exposed_by_live_response_and_existing_lists_untouched(self):
+        from test_entry_top5_realtime import _make_cache_entry
+        entry = _make_cache_entry(age_sec=5, entry_states=["ENTRY_READY", "WATCH"])
+        entry["shadowMovement"] = {"attentionTop5": [{"code": "X"}], "entryBoard": [], "hotPool": []}
+        res = server._apply_entry_top5_staleness(entry)
+        self.assertEqual(res["shadowMovement"]["attentionTop5"][0]["code"], "X")
+        self.assertEqual(res["entryReadyTop5"][0]["entryState"], "ENTRY_READY")
+        entry.pop("shadowMovement")
+        self.assertIsNone(server._apply_entry_top5_staleness(entry)["shadowMovement"])
+
+    def test_stop_distance_is_at_least_one_5m_atr(self):
+        from test_movement_potential import pre_breakout_bars
+        f = mp.compute_movement_features(pre_breakout_bars())
+        atr_pct = f["atr5"] / f["price"] * 100.0
+        f["lows"] = f["lows"][:-2] + [f["price"] * 0.9999] * 2          # 直近安値が現在値の直下（ノイズ幅の逆指値になる）
+        st = mp.recommended_stop(f, {"pattern": "PRE_BREAKOUT", "features": {}})
+        self.assertGreaterEqual(st["distancePct"], round(atr_pct, 2) - 0.011)
+        self.assertGreater(st["distancePct"], mp.STOP_MIN_PCT)
+        rr = mp.risk_reward(f, st)
+        self.assertLess(rr["rr"], 6)                                     # 極小リスクでRRが水増しされない

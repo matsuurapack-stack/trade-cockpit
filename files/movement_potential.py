@@ -312,9 +312,11 @@ def recommended_stop(f, chart, pattern_hint=None):
         return None
     stop = cands[chosen]
     dist = (price - stop) / price * 100.0
-    if dist < STOP_MIN_PCT:                 # 浅すぎ→ノイズ幅を確保
-        stop, chosen = price * (1 - STOP_MIN_PCT / 100.0), chosen + "+MIN"
-        dist = STOP_MIN_PCT
+    # 浅すぎる逆指値は5分足1本分のノイズで刈られる。下限＝固定の最小幅と「5分足ATR×1（既存の損切り目安と同じ倍率）」の大きい方。
+    min_pct = max(STOP_MIN_PCT, (atr / price * 100.0 * STOP_ATR_MULT) if (atr and price) else 0.0)
+    if dist < min_pct:
+        stop, chosen = price * (1 - min_pct / 100.0), chosen + "+MIN"
+        dist = min_pct
     if atr and (price - stop) > atr * 4:    # 深すぎ→ATRベースへ
         stop, chosen = price - atr * 1.5, "ATR"
         dist = (price - stop) / price * 100.0
