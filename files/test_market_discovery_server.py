@@ -193,7 +193,7 @@ class DynamicWatchIntegrationTests(_Base):
         self.assertEqual({d["code"] for d in shadow["marketDiscovery"]}, {"P1", "H1", "B1"})
         self.assertTrue(all(d["entryAllowed"] is False for d in shadow["marketDiscovery"]))
         called = {name for name, *_ in db.method_calls}
-        self.assertTrue(called <= {"load_dynamic_watch", "sync_dynamic_watch"})   # 手動watchlistは触らない
+        self.assertTrue(called <= {"load_dynamic_watch", "sync_dynamic_watch", "list_portfolio"})   # 手動watchlistは触らない
         json.dumps(shadow, default=str)
 
     def test_expired_discovery_names_are_removed_from_dynamic_watch(self):

@@ -814,6 +814,47 @@ ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS atr5_pct DOUBLE PRECISION;
 -- Phase D.2（Rolling Momentum Radar・shadow）
 ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS rolling_state TEXT;
 ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS rolling_score DOUBLE PRECISION;
+-- Phase F（Catalyst Confirmation・shadow）
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS catalyst_state TEXT;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS catalyst_score DOUBLE PRECISION;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS catalyst_direction TEXT;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS catalyst_type TEXT;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS catalyst_confidence TEXT;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS catalyst_age_hours DOUBLE PRECISION;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS earnings_state TEXT;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS margin_restriction_state TEXT;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS entry_confidence DOUBLE PRECISION;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS entry_verdict TEXT;
+
+-- 急変検出時のCatalyst Snapshot（1回の調査ごと）
+CREATE TABLE IF NOT EXISTS catalyst_snapshot_log (
+    id                  SERIAL PRIMARY KEY,
+    user_id             TEXT NOT NULL,
+    code                TEXT NOT NULL,
+    detected_at         TIMESTAMPTZ NOT NULL,
+    trigger             TEXT,
+    state               TEXT,
+    catalyst_type       TEXT,
+    direction           TEXT,
+    confidence          TEXT,
+    age_hours           DOUBLE PRECISION,
+    source              TEXT,
+    earnings_state      TEXT,
+    margin_restriction  TEXT,
+    catalyst_score      DOUBLE PRECISION,
+    unexplained_move    BOOLEAN,
+    duration_ms         INTEGER,
+    snapshot_json       JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_catalyst_snapshot_user_time ON catalyst_snapshot_log (user_id, detected_at);
+
+-- 信用・取引規制の日次スナップショット（有効な銘柄のみ保存。前営業日との比較でNEW_RESTRICTION/RELEASEDを判定する）
+CREATE TABLE IF NOT EXISTS margin_restriction_snapshot (
+    trade_date   DATE NOT NULL,
+    code         TEXT NOT NULL,
+    kinds        JSONB,
+    PRIMARY KEY (trade_date, code)
+);
 
 -- Phase E（Market-Wide Discovery・shadow）：登録外から発見した銘柄のpool（手動watchlist・dynamic_watchlistとは別）
 CREATE TABLE IF NOT EXISTS market_discovery_pool (
@@ -11191,7 +11232,9 @@ _CHART_SIGNAL_INSERT_COLS = (
     "vwap", "vwap_distance", "change_15m", "consecutive_green", "upper_wick_ratio", "breakout_volume_ratio",
     "transition_type", "transition_origin", "movement_score", "recent_activity", "activity_state", "pre_breakout",
     "too_late", "momentum_mode", "recommended_stop", "stop_distance_pct", "risk_reward", "movement_recommendation",
-    "radar_state", "early_momentum_score", "spread_pct", "atr5_pct", "rolling_state", "rolling_score")
+    "radar_state", "early_momentum_score", "spread_pct", "atr5_pct", "rolling_state", "rolling_score",
+    "catalyst_state", "catalyst_score", "catalyst_direction", "catalyst_type", "catalyst_confidence", "catalyst_age_hours",
+    "earnings_state", "margin_restriction_state", "entry_confidence", "entry_verdict")
 
 
 def insert_chart_signals(database_url, records):
@@ -11332,6 +11375,68 @@ def sync_dynamic_watch(database_url, user_id, adds, removes, pool_updates):
                                 [[u["pool"], u["last_seen_at"], u.get("weak_since"), user_id, u["code"]] for u in pool_updates])
         conn.commit()
     return len(adds) + len(removes) + len(pool_updates)
+
+
+def insert_catalyst_snapshot(database_url, user_id, snap):
+    """Catalyst Snapshot（1回の調査結果）を保存する。"""
+    pool = _get_pool(database_url)
+    if pool is None or not snap:
+        return 0
+    try:
+        detected = datetime.datetime.fromisoformat(snap["detected_at"])
+    except Exception:
+        return 0
+    with pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO catalyst_snapshot_log (user_id, code, detected_at, trigger, state, catalyst_type, direction, confidence, age_hours, "
+            "source, earnings_state, margin_restriction, catalyst_score, unexplained_move, duration_ms, snapshot_json) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",
+            [user_id, snap.get("code"), detected, snap.get("trigger"), snap.get("state"), snap.get("catalyst_type"), snap.get("direction"),
+             snap.get("confidence"), snap.get("age_hours"), snap.get("source"), snap.get("earnings_state"), snap.get("margin_restriction"),
+             snap.get("catalyst_score"), bool(snap.get("unexplained_move")), snap.get("duration_ms"),
+             json.dumps({k: v for k, v in snap.items() if k != "errors"}, ensure_ascii=False, default=str)])
+        conn.commit()
+    return 1
+
+
+def list_catalyst_snapshots(database_url, user_id, trade_date):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM catalyst_snapshot_log WHERE user_id = %s AND (detected_at AT TIME ZONE 'Asia/Tokyo')::date = %s "
+                        "ORDER BY detected_at", [user_id, trade_date])
+            return [_row_to_json(r) for r in cur.fetchall()]
+
+
+def save_margin_restriction_snapshot(database_url, trade_date, active_by_code):
+    """その日の規制有効銘柄だけを保存（＋その日のスナップショットが存在した印として '__SNAPSHOT__' 行）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    rows = [[trade_date, "__SNAPSHOT__", json.dumps([])]] + [[trade_date, c, json.dumps(k)] for c, k in active_by_code.items()]
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany("INSERT INTO margin_restriction_snapshot (trade_date, code, kinds) VALUES (%s,%s,%s::jsonb) "
+                            "ON CONFLICT (trade_date, code) DO UPDATE SET kinds = EXCLUDED.kinds", rows)
+        conn.commit()
+    return len(rows)
+
+
+def load_margin_restriction_active(database_url, before_date):
+    """before_date より前で最新のスナップショット → (存在するか, {code: kinds})。前営業日比較（NEW/RELEASED）用。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return False, {}
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT MAX(trade_date) AS d FROM margin_restriction_snapshot WHERE trade_date < %s AND code = '__SNAPSHOT__'", [before_date])
+            r = cur.fetchone()
+            if not r or not r["d"]:
+                return False, {}
+            cur.execute("SELECT code, kinds FROM margin_restriction_snapshot WHERE trade_date = %s AND code <> '__SNAPSHOT__'", [r["d"]])
+            return True, {x["code"]: x["kinds"] for x in cur.fetchall()}
 
 
 def list_dynamic_watch_history(database_url, user_id, since):

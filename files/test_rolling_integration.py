@@ -93,7 +93,7 @@ class RefreshTests(_Base):
         self.assertNotIn("W1", hot)                                             # RADAR_WEAKはhot poolに入れない
         self.assertNotIn("E1", hot)
         called = {name for name, *_ in db.method_calls}
-        self.assertTrue(called <= {"load_dynamic_watch", "sync_dynamic_watch"})   # 手動watchlistは触らない
+        self.assertTrue(called <= {"load_dynamic_watch", "sync_dynamic_watch", "list_portfolio"})   # 手動watchlistは触らない
         json.dumps(shadow, default=str)
 
 

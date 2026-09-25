@@ -121,7 +121,7 @@ class RefreshTests(_Base):
         self.assertNotIn("S3", adds)
         self.assertIn("S1", shadow["dynamicWatch"]["hot"])
         called = {name for name, *_ in db.method_calls}
-        self.assertTrue(called <= {"load_dynamic_watch", "sync_dynamic_watch"})   # 手動watchlistは触らない
+        self.assertTrue(called <= {"load_dynamic_watch", "sync_dynamic_watch", "list_portfolio"})   # 手動watchlistは触らない
         json.dumps(shadow, default=str)
 
     def test_top_list_limited_to_five(self):

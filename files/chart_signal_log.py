@@ -39,10 +39,12 @@ MILESTONES = (("first_movement_at", "値幅拡大の始まり（movement>=65ま�
               ("first_movement_entry_at", "movement-aware ENTRY_READY"),
               ("first_radar_at", "RADAR_SURGE/EXPANDING/PRE_BREAKOUT（初動監視）"), ("first_radar_surge_at", "RADAR_SURGE"),
               ("first_rolling_at", "Rolling Radar hot（SURGE/SINGLE_BAR_SURGE/PRE_BREAKOUT）"),
-              ("first_single_bar_surge_at", "SINGLE_BAR_SURGE"), ("first_rolling_weak_at", "RADAR_WEAK"))
+              ("first_single_bar_surge_at", "SINGLE_BAR_SURGE"), ("first_rolling_weak_at", "RADAR_WEAK"),
+              ("first_catalyst_at", "Catalyst確認（CONFIRMED/NONE_FOUND）"))
 RADAR_NOTABLE = ("RADAR_SURGE", "RADAR_EXPANDING", "RADAR_PRE_BREAKOUT")
 ROLLING_HOT = ("ROLLING_SURGE", "SINGLE_BAR_SURGE", "ROLLING_PRE_BREAKOUT")
 ROLLING_NOTABLE = ROLLING_HOT + ("ROLLING_EXPANDING", "RADAR_WEAK")
+CATALYST_STRONG = 70            # 「強い材料」の目安（POSITIVE かつ catalyst_score がこれ以上。集計上の定義）
 EPISODE_TRACK_SEC = 90 * 60     # Radar発生から、その後の遷移（待ち→押し目→ENTRY／CHASE）を追跡する最大時間（観測用の定義）
 # Rolling Radar検出の後始末（false positiveの定義。集計専用で判定には使わない）：30分後が+0.5%以下、かつ30分内の最大上昇(MFE)が+1.0%以下
 FP_RET_30M = 0.5
@@ -77,6 +79,14 @@ def build_signal_record(user_id, cand, now, source, top5_codes=None):
     top5 = top5_codes or {}
     return {
         "transition_type": None, "transition_origin": None,
+        "catalyst_state": (cand.get("catalyst") or {}).get("state"), "catalyst_score": (cand.get("catalyst") or {}).get("score"),
+        "catalyst_direction": (cand.get("catalyst") or {}).get("direction"), "catalyst_type": (cand.get("catalyst") or {}).get("type"),
+        "catalyst_confidence": (cand.get("catalyst") or {}).get("confidence"),
+        "catalyst_age_hours": (cand.get("catalyst") or {}).get("ageHours"),
+        "earnings_state": (cand.get("catalyst") or {}).get("earningsState"),
+        "margin_restriction_state": (cand.get("catalyst") or {}).get("marginState"),
+        "entry_confidence": (cand.get("catalyst") or {}).get("entryConfidence"),
+        "entry_verdict": (cand.get("catalyst") or {}).get("verdict"),
         "rolling_state": cand.get("rollingState"), "rolling_score": cand.get("rollingScore"),
         "radar_state": cand.get("radarState"), "early_momentum_score": cand.get("earlyMomentumScore"),
         "spread_pct": cand.get("spreadPct"), "atr5_pct": cand.get("atr5Pct"),
@@ -93,6 +103,7 @@ def build_signal_record(user_id, cand, now, source, top5_codes=None):
                      "radar": {"state": cand.get("radarState"), "score": cand.get("earlyMomentumScore"),
                                "confidence": cand.get("radarConfidence"), "reasons": cand.get("radarReasons"),
                                "features": cand.get("radarFeatures")},
+                     "catalyst": cand.get("catalyst"),
                      "rolling": {"state": cand.get("rollingState"), "baseState": cand.get("rollingBaseState"),
                                  "score": cand.get("rollingScore"), "reasons": cand.get("rollingReasons"),
                                  "confirmations": cand.get("rollingConfirm"), "features": cand.get("rollingFeatures")}},
@@ -118,7 +129,15 @@ def build_signal_record(user_id, cand, now, source, top5_codes=None):
 def movement_notable(rec):
     return bool(rec.get("movement_recommendation") in MOVEMENT_NOTABLE_RECS or rec.get("activity_state") == "EXPANDING"
                 or rec.get("pre_breakout") or rec.get("momentum_mode") or rec.get("radar_state") in RADAR_NOTABLE
-                or rec.get("rolling_state") in ROLLING_NOTABLE)
+                or rec.get("rolling_state") in ROLLING_NOTABLE or catalyst_notable(rec))
+
+
+def catalyst_notable(rec):
+    """Catalyst確認で注目すべき状態（強い材料・材料不明の急変・規制・材料と値動きの不整合）。"""
+    c = (rec.get("movement") or {}).get("catalyst") or {}
+    return bool((c.get("flags") or []) or ((rec.get("catalyst_score") or 0) >= CATALYST_STRONG and rec.get("catalyst_direction") == "POSITIVE")
+                or rec.get("margin_restriction_state") in ("NEW_RESTRICTION", "ACTIVE")
+                or rec.get("earnings_state") in ("PRE_EARNINGS", "EARNINGS_TODAY", "POST_EARNINGS"))
 
 
 def update_milestones(mem, key, rec, now):
@@ -141,6 +160,7 @@ def update_milestones(mem, key, rec, now):
     mark("first_early_breakout_at", rec.get("chart_pattern") == "EARLY_BREAKOUT")
     mark("first_chase_at", rec.get("chart_pattern") in CHASE_PATTERNS)
     mark("first_movement_entry_at", rec.get("movement_recommendation") == "ENTRY_READY")
+    mark("first_catalyst_at", rec.get("catalyst_state") in ("CONFIRMED", "NONE_FOUND"))
     mark("first_radar_at", rec.get("radar_state") in RADAR_NOTABLE)
     mark("first_radar_surge_at", rec.get("radar_state") == "RADAR_SURGE")
     mark("first_rolling_at", rec.get("rolling_state") in ROLLING_HOT)
@@ -226,7 +246,8 @@ def last_state(rec, now):
             "at": now, "timing": rec.get("entry_timing"), "vdist": rec.get("vwap_distance"), "chg15": rec.get("change_15m"),
             "prio": is_priority(rec), "top5": tuple((rec.get("context") or {}).get("top5") or ()),
             "mrec": rec.get("movement_recommendation"), "act": rec.get("activity_state"), "pre": bool(rec.get("pre_breakout")),
-            "radar": rec.get("radar_state"), "rolling": rec.get("rolling_state")}
+            "radar": rec.get("radar_state"), "rolling": rec.get("rolling_state"),
+            "cat": (rec.get("catalyst_state"), rec.get("entry_verdict"), rec.get("margin_restriction_state"))}
 
 
 def _moved(a, b, th):
@@ -244,6 +265,8 @@ def should_log(last, rec, now):
     top5 = tuple((rec.get("context") or {}).get("top5") or ())
     if top5 != last.get("top5"):
         return True
+    if last.get("cat") != (rec.get("catalyst_state"), rec.get("entry_verdict"), rec.get("margin_restriction_state")) and (prio or last.get("prio")):
+        return True       # 材料の確認結果・verdict・規制状態の変化
     if (rec.get("context") or {}).get("newEpisodeSteps"):
         return True       # Radarの発生・終了・その後の遷移（待ち→押し目→ENTRY／CHASE）は必ず残す
     if (rec.get("context") or {}).get("newMilestones"):
@@ -535,6 +558,7 @@ def summarize_day(rows):
         "transitions_loose": transition_chains(rows),          # 参考：履歴列からの緩い推測（厳密な集計には使わない）
         "outcome_quality": outcome_quality(rows),
         "movement": summarize_movement(rows),                  # Phase D（shadow）：existing vs movement-aware
+        "catalyst": summarize_catalyst(rows),                  # Phase F（shadow）：材料×チャートの組み合わせ別
     }
 
 
@@ -663,6 +687,51 @@ def summarize_radar_episodes(rows):
                                                   "max": ages[-1] if ages else None},
             "snapshot_compare": {"false_positive": snap_means(fp_eps), "good": snap_means(good_eps)},
             "episodes": sorted(episodes, key=lambda e: e["startedAt"])[:60]}
+
+
+def summarize_catalyst(rows):
+    """Catalyst × チャートの組み合わせ別集計（shadow）。「材料が強い」と「今買える」を混同しないため別々に見る。
+    strong＝POSITIVEかつcatalyst_score>=70 / no_catalyst＝調査完了で材料なし(NONE_FOUND) / ENTRY_READY＝chart_entry_state系またはmovement ENTRY_READY"""
+    rr_ = _with_ret(rows)
+    seen, ev = set(), []
+    for r in sorted(rr_, key=lambda x: str(x["logged_at"])):
+        k = (r["code"], r.get("chart_pattern"), r.get("chart_entry_state"), r.get("catalyst_state"), r.get("entry_verdict"),
+             r.get("margin_restriction_state"), r.get("earnings_state"))
+        if k in seen:
+            continue
+        seen.add(k)
+        ev.append(r)
+
+    def flags(r):
+        return (((r.get("movement") or {}).get("catalyst") or {}).get("flags")) or []
+    strong = lambda r: r.get("catalyst_direction") == "POSITIVE" and (r.get("catalyst_score") or 0) >= CATALYST_STRONG
+    entry = lambda r: _is_entry(r.get("chart_entry_state")) or r.get("movement_recommendation") == "ENTRY_READY"
+    chase = lambda r: r.get("chart_pattern") in CHASE_PATTERNS or r.get("entry_decision") == "NO_ENTRY_CHASE"
+    groups = {
+        "strong_catalyst_and_ENTRY_READY": [r for r in ev if strong(r) and entry(r)],
+        "strong_catalyst_and_CHASE": [r for r in ev if strong(r) and chase(r)],
+        "no_catalyst_and_ENTRY_READY": [r for r in ev if r.get("catalyst_state") == "NONE_FOUND" and entry(r)],
+        "pre_earnings_and_ENTRY_READY": [r for r in ev if r.get("earnings_state") in ("PRE_EARNINGS", "EARNINGS_TODAY") and entry(r)],
+        "margin_restriction_and_momentum": [r for r in ev if r.get("margin_restriction_state") in ("NEW_RESTRICTION", "ACTIVE") and r.get("momentum_mode")],
+        "positive_catalyst_and_FAILED_BREAKOUT": [r for r in ev if r.get("catalyst_direction") == "POSITIVE" and r.get("chart_pattern") == "FAILED_BREAKOUT"],
+        "negative_catalyst_and_price_strength": [r for r in ev if r.get("catalyst_direction") == "NEGATIVE" and "BAD_NEWS_STRONG_PRICE" in flags(r)],
+    }
+    flag_counts = {}
+    for r in ev:
+        for f in flags(r):
+            flag_counts.setdefault(f, []).append(r)
+    verdicts = {}
+    for r in ev:
+        if r.get("entry_verdict"):
+            verdicts.setdefault(r["entry_verdict"], []).append(r)
+    return {"definitions": {"strong_catalyst": f"POSITIVE かつ catalyst_score >= {CATALYST_STRONG}", "no_catalyst": "調査完了（TDnet・ニュースとも取得成功）で材料なし",
+                            "ENTRY_READY": "chart_entry_state がENTRY系 または movement-aware ENTRY_READY"},
+            "states": {s: sum(1 for r in ev if r.get("catalyst_state") == s) for s in ("CONFIRMED", "NONE_FOUND", "INCOMPLETE", "PENDING")},
+            "combinations": {k: _group_stats(v) for k, v in groups.items()},
+            "flags": {k: _group_stats(v) for k, v in flag_counts.items()},
+            "verdicts": {k: _group_stats(v) for k, v in verdicts.items()},
+            "earnings_states": {s: sum(1 for r in ev if r.get("earnings_state") == s) for s in ("EARNINGS_TODAY", "POST_EARNINGS", "PRE_EARNINGS", "NO_NEAR_EARNINGS", "UNKNOWN")},
+            "margin_states": {s: sum(1 for r in ev if r.get("margin_restriction_state") == s) for s in ("NEW_RESTRICTION", "ACTIVE", "RELEASED", "NONE", "UNKNOWN")}}
 
 
 def summarize_movement(rows):

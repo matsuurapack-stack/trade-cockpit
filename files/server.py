@@ -192,6 +192,8 @@ import chart_context  # Chart Context Engine（Phase C：5分足の時系列形�
 import chart_signal_log  # Phase C shadow運用：判定ログ・事後リターン・日次集計（記録専用、判定へは戻さない）
 import movement_potential  # Phase D：Movement Potential（今日これから値幅が出る可能性。shadow運用）
 import dynamic_watch  # Phase D：dynamic_watchlist（動いている銘柄のオーバーレイ。手動watchlistとは別）
+import catalyst_engine  # Phase F：Catalyst Confirmation（材料の種類・方向・信頼度・新しさ・決算/規制。shadow）
+import catalyst_lookup  # Phase F：価格の異変があった銘柄だけを非同期で調査（チャート判定をブロックしない）
 import market_discovery  # Phase E：Market-Wide Discovery（登録外から動き始めた銘柄を発見。shadow、ENTRYには使わない）
 import rolling_radar  # Phase D.2：Rolling Momentum Radar（場中の直近5本窓での警戒レーダー。shadow、ENTRYには使わない）
 import early_radar  # Phase D.1：Early Momentum Radar（寄り直後2〜5本の初動監視。shadow、ENTRYには使わない）
@@ -6219,6 +6221,7 @@ def refresh_shadow_movement(database_url, user_id):
             except Exception as e:
                 print("  [DynamicWatch] DB保存で例外（メモリ上は更新済み）", e)
         _DYNAMIC_WATCH[user_id] = res["state"]
+        catalyst_request_triggers(user_id, pool, [a["code"] for a in res["adds"]])      # 異変のあった銘柄だけ非同期でCatalyst確認
         shadow = movement_potential.build_shadow_lists([c for c in pool if c.get("movementScore") is not None], analysis, res["hot"])
         shadow["earlyRadar"] = early_radar.build_early_radar_list(pool)      # 初動監視（🚨）最大5銘柄。買い判定ではない
         shadow["rollingRadar"] = rolling_radar.build_rolling_radar_list(pool)   # 警戒レーダー（📡）最大5銘柄。買い判定ではない
@@ -6261,7 +6264,8 @@ def log_chart_signals(database_url, user_id, source):
             top5["hotPool"] = set(sm.get("hotPool") or [])
         recs = []
         for c in pool:
-            rec = chart_signal_log.build_signal_record(user_id, c, now, source, top5)
+            v = _catalyst_view(user_id, c)
+            rec = chart_signal_log.build_signal_record(user_id, dict(c, catalyst=v) if v is not None else c, now, source, top5)
             if rec is None:
                 continue
             key = (user_id, rec["code"])
@@ -6582,6 +6586,316 @@ def discovery_api_payload(user_id):
                 "load": {"broad": list(_DISCOVERY_STATS["broad"][-10:]), "realtime": list(_DISCOVERY_STATS["rt"][-10:]),
                          "errors": dict(_DISCOVERY_STATS["errors"])},
                 "note": "shadow：yfinanceは20分遅延。昇格は立花quoteで再確認。ENTRY・既存TOP5には接続していない"}
+
+
+# ============================================================
+# Phase F：Catalyst Confirmation（shadow）。price anomaly → 非同期でcatalyst lookup。
+#   チャート判定（Phase C/D）は待たない：調査中は CATALYST_PENDING、材料が確認できたらconfidence（entry_confidence）だけ再評価。
+#   既存資産を再利用（重複取得しない）：TDnetの日別一覧（_tdnet_disclosures_for_date）・立花の銘柄別ニュース（tachibana_api.get_stock_news）・
+#   news_catalysts/market_events（investment_db）・決算日（_days_to_earnings）。新規取得は信用・取引規制のみ（立花マニュアル記載の機能）。
+#   本番のENTRY判定・既存TOP5は変更しない（材料はshadow記録とUI表示のみ）。
+# ============================================================
+_CATALYST_AUTOSTART = False  # True（サーバー起動時のみ）でないと、トリガーからlookupサービスを自動生成しない（テストで外部アクセスしない）
+_CATALYST_SVC = {}           # user_id -> CatalystLookup
+_CATALYST_LOCK = threading.RLock()
+_CATALYST_PREV = {}          # user_id -> {"top5": set(codes)}
+_CATALYST_HOLDINGS = {}      # user_id -> (epoch, set(codes))
+_TDNET_DAY_CACHE = {}        # "YYYYMMDD" -> (epoch, by_code)
+_TDNET_TODAY_TTL_SEC = 300
+_TDNET_LOOKBACK_DAYS = 7
+_TDNET_LOCK = threading.Lock()
+_EARNINGS_CACHE = {}         # code -> (date_str, next_date or None)
+_REGULATION = {"date": None, "flags": None, "prev_active": None, "prev_known": False, "fetched_at": None, "error": None,
+               "duration_ms": None, "count": 0, "active": 0}
+_REGULATION_LOCK = threading.Lock()
+
+
+def _jst_dt(date_str, hhmm):
+    """'YYYYMMDD'＋'HH:MM' or 'HHMM' → aware datetime(JST)。"""
+    try:
+        d = datetime.datetime.strptime(date_str, "%Y%m%d")
+        hhmm = (hhmm or "0000").replace(":", "")
+        return d.replace(hour=int(hhmm[:2]), minute=int(hhmm[2:4]), tzinfo=_JST)
+    except Exception:
+        return None
+
+
+def _tdnet_day(date_str):
+    """TDnetの1日分一覧（全上場企業）。過去日は永続キャッシュ、当日は5分TTL。取得失敗（営業日なのに空）はNone。"""
+    today_str = datetime.datetime.now(_JST).strftime("%Y%m%d")
+    with _TDNET_LOCK:
+        c = _TDNET_DAY_CACHE.get(date_str)
+        if c is not None and (date_str != today_str or time.time() - c[0] <= _TDNET_TODAY_TTL_SEC):
+            return c[1]
+        by_code = _tdnet_disclosures_for_date(date_str)
+        d = datetime.datetime.strptime(date_str, "%Y%m%d").replace(tzinfo=_JST)
+        if not by_code and _is_jp_market_business_day(d):
+            _TDNET_DAY_CACHE[date_str] = (time.time() - _TDNET_TODAY_TTL_SEC + 60, {})     # 失敗は1分後に再取得
+            return None
+        _TDNET_DAY_CACHE[date_str] = (time.time(), by_code)
+        return by_code
+
+
+def _catalyst_tdnet_fetch(code):
+    out = []
+    now = datetime.datetime.now(_JST)
+    failed_today = False
+    for i in range(_TDNET_LOOKBACK_DAYS):
+        ds = (now - datetime.timedelta(days=i)).strftime("%Y%m%d")
+        by_code = _tdnet_day(ds)
+        if by_code is None:
+            failed_today = failed_today or (i == 0)
+            continue
+        for r in by_code.get(code, []):
+            out.append({"title": r.get("title"), "published_at": _jst_dt(ds, r.get("time")), "url": r.get("url"), "source": "TDNET"})
+    if failed_today:
+        raise RuntimeError("TDnet当日一覧を取得できない")
+    return out
+
+
+def _catalyst_news_fetch(code):
+    if tachibana_api is None:
+        raise RuntimeError("tachibana_api unavailable")
+    now = datetime.datetime.now(_JST)
+    heads = tachibana_api.get_stock_news(code, (now - datetime.timedelta(days=7)).strftime("%Y%m%d"), now.strftime("%Y%m%d"), limit=20)
+    return [{"title": h.get("headline"), "published_at": _jst_dt(h.get("date", ""), h.get("time", "")), "source": "NQN"} for h in heads]
+
+
+def _catalyst_db_fetch_for(user_id):
+    def fetch(code):
+        if investment_db is None or not DATABASE_URL:
+            return []
+        rows = investment_db.relevant_catalysts_for(DATABASE_URL, user_id, code=code, sector=None, limit=5)
+        out = []
+        for r in rows:
+            try:
+                d = datetime.date.fromisoformat(str(r.get("catalyst_date"))[:10])
+            except Exception:
+                continue
+            verified = str(r.get("verification_status") or "").upper() == "VERIFIED"
+            out.append({"title": r.get("title"), "published_at": datetime.datetime(d.year, d.month, d.day, 9, 0, tzinfo=_JST),
+                        "source": "DB_VERIFIED" if verified else "DB_UNVERIFIED", "verified": verified})
+        return out
+    return fetch
+
+
+def _catalyst_earnings_for(user_id):
+    def fetch(code):
+        today = datetime.datetime.now(_JST).date()
+        c = _EARNINGS_CACHE.get(code)
+        if c is not None and c[0] == today.isoformat():
+            if c[1] == "UNKNOWN":
+                raise RuntimeError("決算日データなし")
+            return c[1]
+        nxt = None
+        if investment_db is not None and DATABASE_URL:                    # ①登録済みの決算イベント（market_events）
+            try:
+                evs = investment_db.upcoming_event_signals(DATABASE_URL, user_id, code=code, today=today, days_ahead=14)["events"]
+                dates = [datetime.date.fromisoformat(str(e["event_date"])[:10]) for e in evs if str(e.get("event_type")).upper() == "EARNINGS"]
+                nxt = min(dates) if dates else None
+            except Exception:
+                nxt = None
+        if nxt is None and yf is not None:                                # ②既存の決算日取得（決算またぎルールと同じ_days_to_earnings）
+            try:
+                dte = _days_to_earnings(yf.Ticker(code + ".T"))
+                if dte is not None:
+                    nxt = today + datetime.timedelta(days=dte)
+            except Exception:
+                nxt = None
+        _EARNINGS_CACHE[code] = (today.isoformat(), nxt if nxt is not None else "UNKNOWN")
+        if nxt is None:
+            raise RuntimeError("決算日データなし")                       # 推測しない：earnings_state=UNKNOWN
+        return nxt
+    return fetch
+
+
+def _regulation_load(force=False):
+    """信用・取引規制（全銘柄1回）を営業日の朝に1回取得して使い回す（マニュアルの指示）。前営業日のスナップショットと比較して
+    NEW_RESTRICTION / RELEASED を判定できるようにする。失敗時は例外（規制情報=UNKNOWN。断定しない）。"""
+    today = datetime.datetime.now(_JST).date().isoformat()
+    with _REGULATION_LOCK:
+        if not force and _REGULATION["date"] == today and _REGULATION["flags"] is not None:
+            return
+        if tachibana_api is None:
+            raise RuntimeError("tachibana_api unavailable")
+        t0 = time.time()
+        try:
+            flags = tachibana_api.get_issue_regulation_kabu()
+        except Exception as e:
+            _REGULATION.update({"date": today, "flags": None, "error": str(e)[:200], "duration_ms": round((time.time() - t0) * 1000)})
+            raise
+        active = {c: catalyst_engine.margin_restriction_from_flags(f)["kinds"] for c, f in flags.items()
+                  if catalyst_engine.margin_restriction_from_flags(f)["active"]}
+        prev_known, prev_active = False, {}
+        if investment_db is not None and DATABASE_URL:
+            try:
+                prev_known, prev_active = investment_db.load_margin_restriction_active(DATABASE_URL, datetime.date.fromisoformat(today))
+                if WRITE_E2E_ALLOWED:
+                    investment_db.save_margin_restriction_snapshot(DATABASE_URL, datetime.date.fromisoformat(today), active)
+            except Exception as e:
+                print("  [Catalyst] 規制スナップショットの保存/比較で例外（続行）", e)
+        _REGULATION.update({"date": today, "flags": flags, "prev_active": set(prev_active), "prev_known": prev_known,
+                            "fetched_at": datetime.datetime.now(_JST).isoformat(), "error": None,
+                            "duration_ms": round((time.time() - t0) * 1000), "count": len(flags), "active": len(active)})
+
+
+def _catalyst_regulation(code):
+    _regulation_load()
+    flags = _REGULATION["flags"].get(code)
+    if flags is None:
+        return None, None                                                  # 応答に無い銘柄は判定しない（UNKNOWN）
+    return flags, ((code in _REGULATION["prev_active"]) if _REGULATION["prev_known"] else None)
+
+
+def _catalyst_on_snapshot_for(user_id):
+    def cb(code, snap, reason):
+        if investment_db is not None and DATABASE_URL and WRITE_E2E_ALLOWED:
+            try:
+                investment_db.insert_catalyst_snapshot(DATABASE_URL, user_id, snap)
+            except Exception as e:
+                print("  [Catalyst] snapshot保存で例外（続行）", e)
+    return cb
+
+
+def _enable_catalyst_autostart():
+    """起動時に呼ぶ：Catalyst確認を有効化し、スケジューラ対象ユーザーのlookupサービス（非同期ワーカー）を起動する。"""
+    global _CATALYST_AUTOSTART
+    _CATALYST_AUTOSTART = True
+    for u in list(_morning_check_scheduler_users()):
+        catalyst_service(u)
+
+
+def catalyst_service(user_id):
+    with _CATALYST_LOCK:
+        svc = _CATALYST_SVC.get(user_id)
+        if svc is None:
+            svc = catalyst_lookup.CatalystLookup(
+                {"tdnet": _catalyst_tdnet_fetch, "news": _catalyst_news_fetch, "db": _catalyst_db_fetch_for(user_id),
+                 "earnings_next": _catalyst_earnings_for(user_id), "regulation": _catalyst_regulation},
+                now_fn=lambda: datetime.datetime.now(_JST), ttl_sec=600, cooldown_sec=120, max_queue=100,
+                on_snapshot=_catalyst_on_snapshot_for(user_id),
+                bdays_fn=lambda a, b: sum(1 for i in range((b - a).days) if _is_jp_market_business_day(
+                    datetime.datetime.combine(a + datetime.timedelta(days=i + 1), datetime.time(12), tzinfo=_JST))))
+            svc.start()
+            _CATALYST_SVC[user_id] = svc
+        return svc
+
+
+def _catalyst_holdings(user_id):
+    c = _CATALYST_HOLDINGS.get(user_id)
+    if c is not None and time.time() - c[0] < 60:
+        return c[1]
+    codes = set()
+    try:
+        if investment_db is not None and DATABASE_URL:
+            codes = {r.get("code") for r in investment_db.list_portfolio(DATABASE_URL, user_id) if r.get("code")}
+    except Exception:
+        pass
+    _CATALYST_HOLDINGS[user_id] = (time.time(), codes)
+    return codes
+
+
+def catalyst_request_triggers(user_id, pool, new_dynamic_codes=()):
+    """価格の異変（Radar・EXPANDING・PRE_BREAKOUT・EARLY_BREAKOUT・ENTRY_READY・急な出来高/価格・dynamic新規昇格・TOP5新規採用・
+    保有銘柄の急変）があった銘柄だけ、非同期のCatalyst確認を依頼する。すべての銘柄を常時調べない。依頼は即座に返る。"""
+    try:
+        svc = _CATALYST_SVC.get(user_id) or (catalyst_service(user_id) if _CATALYST_AUTOSTART else None)
+        if svc is None:
+            return 0
+        holdings = _catalyst_holdings(user_id)
+        with _ENTRY_TOP5_CACHE_LOCK:
+            entry = _ENTRY_TOP5_CACHE.get(user_id) or {}
+            top5 = {c.get("code") for k in ("entryReadyTop5", "actionableTop5", "analysisTop5") for c in (entry.get(k) or [])}
+        prev = _CATALYST_PREV.get(user_id, {}).get("top5")
+        state = {"new_top5": (top5 - prev) if prev is not None else set(), "new_dynamic": set(new_dynamic_codes)}
+        _CATALYST_PREV[user_id] = {"top5": top5}
+        n = 0
+        for c in pool:
+            cc_ = dict(c, holding=c.get("code") in holdings)
+            reasons = catalyst_engine.trigger_reasons(cc_, state)
+            if reasons:
+                vs = (c.get("movementFeatures") or {}).get("volRatioRecent")
+                if svc.request(c["code"], reasons[0], anomaly={"chgPct": c.get("changePct"), "volSurge": vs}) == "QUEUED":
+                    n += 1
+        for code in state["new_dynamic"]:
+            if code not in {c.get("code") for c in pool}:
+                if svc.request(code, "DYNAMIC_PROMOTED", anomaly=None) == "QUEUED":
+                    n += 1
+        return n
+    except Exception as e:
+        print("  [Catalyst] 発火判定で例外（無視して続行）", e)
+        return 0
+
+
+def _catalyst_view(user_id, c):
+    """候補dictに対する材料の要約（非ブロッキング：キャッシュだけを読む）。調査中はCATALYST_PENDING、未調査はNone。
+    材料が強くてもチャートが悪ければ買わない（verdict）。既存のscore・ENTRY判定は置き換えない。"""
+    svc = _CATALYST_SVC.get(user_id)
+    code = c.get("code")
+    if svc is None or not code:
+        return None
+    snap = svc.get(code)
+    if snap is None:
+        return None
+    if snap.get("state") == "PENDING":
+        return {"state": "PENDING", "verdict": "CATALYST_PENDING", "reason": snap.get("reason")}
+    mf = c.get("movementFeatures") or {}
+    cf = (c.get("chartContext") or {}).get("features") or {}
+    holding = code in _catalyst_holdings(user_id)
+    ctx = {"chgPct": c.get("changePct"), "aboveVwap": mf.get("aboveVwap"), "lowerHighs": mf.get("lowerHighs"), "volPeakout": cf.get("volPeakout"),
+           "pattern": c.get("chartPattern"), "momentum_mode": bool(c.get("momentumMode")), "holding": holding}
+    flags = catalyst_engine.reaction_flags(snap, ctx)
+    ec = catalyst_engine.entry_confidence(snap, {"entry_timing": c.get("entryTimingScore"), "movement": c.get("movementScore"),
+                                                 "pattern": c.get("chartPattern"), "liquidity": None})
+    hints = catalyst_engine.exit_hints(snap, {"flags": flags, "surge": (c.get("changePct") or 0) >= 5, "upperWick": (cf.get("upperWick") or 0) >= 0.35,
+                                              "healthyPullback": c.get("chartPattern") == "PULLBACK_READY"})
+    return {"state": snap["state"], "direction": snap["direction"], "score": snap["catalyst_score"], "type": snap["catalyst_type"],
+            "label": snap["catalyst_label"], "confidence": snap["confidence"], "ageHours": snap["age_hours"], "freshness": snap["freshness"],
+            "source": snap["source"], "earningsState": snap["earnings_state"], "daysToEarnings": snap["days_to_earnings"],
+            "marginState": snap["margin_restriction"], "marginKinds": snap["margin_kinds"], "flags": flags, "verdict": ec["verdict"],
+            "entryConfidence": ec["score"], "sizeHint": ec["size_hint"], "stopHint": ec["stop_hint"], "chaseStrictness": ec["chase_strictness"],
+            "exitHints": hints, "combinedLabel": catalyst_engine.combined_label(snap), "unexplained": snap["unexplained_move"],
+            "stale": snap.get("stale", False), "trigger": snap.get("trigger"), "detectedAt": snap["detected_at"],
+            "lookup": snap.get("lookup"), "items": [{"title": i["title"], "label": i["label"], "direction": i["direction"],
+                                                     "confidence": i["confidence"], "freshness": i["freshness"], "score": i["score"]}
+                                                    for i in snap["items"][:3]]}
+
+
+def attach_catalyst_to_result(user_id, result):
+    """/api/entry-candidates/live 用：各候補に材料の要約を付ける（読み取り時だけ・キャッシュ本体は不変）。"""
+    if user_id not in _CATALYST_SVC:
+        return result
+    out = dict(result)
+    for key in _ENTRY_RESULT_CANDIDATE_LISTS:
+        lst = result.get(key)
+        if isinstance(lst, list):
+            out[key] = [({**c, "catalyst": v} if (isinstance(c, dict) and (v := _catalyst_view(user_id, c)) is not None) else c) for c in lst]
+    return out
+
+
+def catalyst_api_payload(user_id, code=None):
+    svc = _CATALYST_SVC.get(user_id)
+    return {"snapshot": (svc.get(code) if (svc and code) else None), "service": (svc.summary() if svc else None),
+            "regulation": {k: (v if k not in ("flags", "prev_active") else None) for k, v in _REGULATION.items()},
+            "note": "shadow：既存のENTRY判定・TOP5には接続していない"}
+
+
+_CATALYST_PROBE = {"last": 0}
+
+
+def catalyst_probe(user_id, code):
+    """1銘柄を同期で調査して所要時間・各情報源の成否を返す（実測用。30秒スロットル）。"""
+    now = time.time()
+    if now - _CATALYST_PROBE["last"] < 30:
+        return {"error": "throttled", "retryAfterSec": round(30 - (now - _CATALYST_PROBE["last"]))}
+    _CATALYST_PROBE["last"] = now
+    svc = catalyst_service(user_id)
+    with svc.lock:
+        svc.pending[code] = {"reason": "PROBE", "queued_at": datetime.datetime.now(_JST).isoformat(), "anomaly": None}
+    t0 = time.time()
+    snap = svc.run_one(code)
+    return {"elapsedMs": round((time.time() - t0) * 1000), "snapshot": snap, "service": svc.summary(),
+            "regulation": {k: (v if k not in ("flags", "prev_active") else None) for k, v in _REGULATION.items()}}
 
 
 ENTRY_RESCORE_POOL_SIZE = 50
@@ -26425,7 +26739,7 @@ class Handler(SimpleHTTPRequestHandler):
                                   "durationMs": None, "trigger": None, "rankingAgeSec": None,
                                   "dataStale": False, "updateDelayWarning": False, "notReadyYet": True})
             else:
-                self._send_json(overlay_latest_quotes_on_entry_result(_apply_entry_top5_staleness(cache_entry)))
+                self._send_json(attach_catalyst_to_result(self.current_user, overlay_latest_quotes_on_entry_result(_apply_entry_top5_staleness(cache_entry))))
         elif self.path.startswith("/api/entry-candidates"):
             # 2026-09-10新規（Market Intelligence Timeline Phase2-C「今買い時TOP5＋Thesis永続化」）：
             # entry_ready_top5（ENTRY_SCOREで選ばれた「今エントリー条件が整っている」候補）と
@@ -26445,7 +26759,7 @@ class Handler(SimpleHTTPRequestHandler):
                 result = {"entryReadyTop5": [], "watchCandidates": [], "reversalCandidates": [], "reversalWatchCandidates": [], "dataQuality": "DEGRADED", "generatedAt": None}
             print(f"  ENTRY TOP5：{len(result['entryReadyTop5'])}件、Watch候補：{len(result.get('watchCandidates', []))}件"
                   f"（dataQuality={result['dataQuality']}）")
-            self._send_json(result)
+            self._send_json(attach_catalyst_to_result(self.current_user, result))
         elif self.path.startswith("/api/stock-theses"):
             # 2026-09-10新規（Phase2-C）：成績評価画面向け。?days=（既定30）で集計期間指定、
             # 一覧は?from=&to=で絞り込み可能。
@@ -26857,6 +27171,13 @@ class Handler(SimpleHTTPRequestHandler):
             market = urllib.parse.parse_qs(qs).get("market", [None])[0]
             items = investment_db.list_watchlist(DATABASE_URL, self.current_user, market=market) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"items": items})
+        elif self.path.startswith("/api/catalyst/probe"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            code = (qs.get("code") or [""])[0]
+            self._send_json(catalyst_probe(self.current_user, code) if code else {"error": "code is required"})
+        elif self.path.startswith("/api/catalyst"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            self._send_json(catalyst_api_payload(self.current_user, (qs.get("code") or [None])[0]))
         elif self.path.startswith("/api/market-discovery/run"):
             self._send_json(discovery_manual_run(DATABASE_URL, self.current_user))
         elif self.path.startswith("/api/market-discovery"):
@@ -28447,6 +28768,7 @@ def main():
         # _restart_time_morning_warmup・281銘柄warmupガードには一切触れない（別経路）。
         threading.Thread(target=_entry_top5_scheduler_loop, daemon=True).start()
         threading.Thread(target=_chart_outcome_loop, daemon=True).start()  # Phase C shadow：事後価格の追記（記録専用）
+        _enable_catalyst_autostart()                                            # Phase F shadow：Catalyst確認を有効化（非同期・shadow）
         threading.Thread(target=_discovery_broad_loop, daemon=True).start()     # Phase E shadow：Broad Discovery（10分ごと）
         threading.Thread(target=_discovery_realtime_loop, daemon=True).start()  # Phase E shadow：Real-time Discovery（30秒ごと）
         threading.Thread(target=_entry_rescore_loop, daemon=True).start()  # 2026-09-25 Phase B-1：候補poolの軽量再スコア

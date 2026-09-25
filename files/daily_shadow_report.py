@@ -156,6 +156,35 @@ def main():
                       "ENTRY", str(r.get("entry_at") or "-")[11:16], "CHASE", str(r.get("chase_at") or "-")[11:16], r.get("discovery_reason"))
     except Exception as e:
         print("Market Discovery集計を取得できません:", e)
+    ct = day_sum["catalyst"]
+    print("\n--- Phase F Catalyst Confirmation（shadow。材料×チャート）---")
+    print("定義:", ct["definitions"])
+    print("状態別:", ct["states"], "/ 決算:", ct["earnings_states"], "/ 規制:", ct["margin_states"])
+    def _g(name, g):
+        print(f"  {name}: n={g['n']} +5m={g['avg_ret_5m']} +15m={g['avg_ret_15m']}(n={g['n_15m']}) +30m={g['avg_ret_30m']} "
+              f"+15mプラス率={g['plus_rate_15m']} MFE={g['avg_mfe_30m']} MAE={g['avg_mae_30m']}")
+    print("組み合わせ別:")
+    for name, g in ct["combinations"].items():
+        _g(name, g)
+    print("フラグ別:")
+    for name, g in ct["flags"].items():
+        _g(name, g)
+    print("verdict別:")
+    for name, g in ct["verdicts"].items():
+        _g(name, g)
+    try:
+        snaps = db.list_catalyst_snapshots(server.DATABASE_URL, "matsuura", day)
+        by_trig, by_type = {}, {}
+        for r in snaps:
+            by_trig[r["trigger"]] = by_trig.get(r["trigger"], 0) + 1
+            by_type[r["catalyst_type"]] = by_type.get(r["catalyst_type"], 0) + 1
+        dur = sorted(r["duration_ms"] for r in snaps if r.get("duration_ms") is not None)
+        print(f"Catalyst Snapshot {len(snaps)}件 / 発火理由別 {by_trig} / 種別 {by_type} / 調査時間 中央値 {dur[len(dur) // 2] if dur else None}ms 最大 {dur[-1] if dur else None}ms")
+        for r in snaps[:30]:
+            print("   ", str(r["detected_at"])[11:16], r["code"], r["trigger"], r["state"], r["catalyst_type"], r["direction"], r["confidence"],
+                  "score", r["catalyst_score"], "決算", r["earnings_state"], "規制", r["margin_restriction"], "材料不明" if r["unexplained_move"] else "")
+    except Exception as e:
+        print("Catalyst Snapshotを取得できません:", e)
     sq = mv["stop_quality"]
     print("推奨逆指値の品質（movement ENTRY_READY全イベント）:", sq)
 

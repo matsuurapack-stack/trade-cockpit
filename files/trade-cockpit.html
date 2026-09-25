@@ -2108,6 +2108,15 @@ const CHART_PATTERN_META = {
 };
 // Phase D（Movement Potential・shadow）：値幅を見た活動状態と推奨の表示ラベル。既存のentryStateは変えず、
 // 並行して表示するだけ（30〜50件のshadow検証が済むまで本番の順位・判定には反映しない）。
+// Phase F（Catalyst Confirmation・shadow）：材料の確認結果の表示ラベル。既存のENTRY判定は変えない（材料はshadow表示のみ）。
+const CATALYST_VERDICT_LABEL = {
+  HIGH_CONFIDENCE:"🎯 材料×値動き×タイミングが揃う", CATALYST_STRONG_BUT_NOT_NOW:"材料は強いが今は買わない（押し目待ち）",
+  NEGATIVE_CATALYST_AVOID:"悪材料あり（見送り）", UNEXPLAINED_CAUTION:"材料不明の急変（要注意）", CATALYST_PENDING:"材料を確認中…", NORMAL:"—"};
+const CATALYST_FLAG_LABEL = {
+  GOOD_NEWS_BAD_REACTION:"好材料なのに株価が弱い", BAD_NEWS_STRONG_PRICE:"悪材料なのに株価が強い", UNEXPLAINED_MOVE:"材料不明の急変",
+  PRE_EARNINGS_RUNUP:"決算前の急騰", MOMENTUM_RISK_HIGH:"規制ありのモメンタム", CATALYST_FAILURE:"材料が株価に効いていない（保有中）",
+  CATALYST_CONFIRMED:"決算と値動きが一致", SELL_THE_NEWS_EXPECTATION_MISS:"好決算でも下落（期待外れ）",
+  NEGATIVE_NEWS_BUT_PRICE_STRONG:"悪決算でも強い", NEGATIVE_CONFIRMED:"悪決算どおりの下落", NEGATIVE_CATALYST_ACTIVE:"悪材料あり"};
 const ACTIVITY_STATE_META = {
   EXPANDING:{label:"📈 値幅拡大中",color:"var(--up)"}, ACTIVE:{label:"動いている",color:"var(--inkSoft)"},
   COILING:{label:"収束中",color:"var(--inkSoft)"}, LOW_ACTIVITY:{label:"😴 動かない",color:"var(--inkFaint)"},
@@ -5570,6 +5579,17 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                           title={(c.radarReasons||[]).join(" / ")+"（初動監視のみ。買い判定ではありません）"}>🚨 初動監視{c.radarText?`（${c.radarText}）`:""}</span>}
                       {["ROLLING_SURGE","SINGLE_BAR_SURGE","ROLLING_PRE_BREAKOUT"].includes(c.rollingState) && <span style={{fontSize:10.5,fontWeight:800,whiteSpace:"nowrap",color:"var(--warn)"}}
                           title={(c.rollingReasons||[]).join(" / ")+"（警戒レーダーのみ。買い判定ではありません）"}>📡 {c.rollingState==="SINGLE_BAR_SURGE"?"単発急伸":c.rollingState==="ROLLING_SURGE"?"急な活性化":"ブレイク接近"}（警戒）</span>}
+                      {/* Phase F（shadow）：材料・決算・増し担保。通常カードは1行程度に抑え、詳細は▼内訳へ。 */}
+                      {c.catalyst && c.catalyst.state==="CONFIRMED" && c.catalyst.combinedLabel && <span style={{fontSize:10.5,fontWeight:700,whiteSpace:"nowrap",
+                          color:c.catalyst.direction==="NEGATIVE"?"var(--down)":c.catalyst.direction==="POSITIVE"?"var(--up)":"var(--inkSoft)"}}
+                          title={(c.catalyst.items||[]).map(i=>`${i.label}（${i.confidence}・${i.freshness}）`).join(" / ")}>材料：{c.catalyst.combinedLabel}{c.catalyst.score>=70&&c.catalyst.direction==="POSITIVE"?" 🔥":""}</span>}
+                      {c.catalyst && c.catalyst.state==="PENDING" && <span style={{fontSize:10,color:"var(--inkFaint)",whiteSpace:"nowrap"}}>材料確認中…</span>}
+                      {c.catalyst && c.catalyst.unexplained && <span style={{fontSize:10.5,fontWeight:700,color:"var(--warn)",whiteSpace:"nowrap"}}>材料不明 ⚠️</span>}
+                      {c.catalyst && ["PRE_EARNINGS","EARNINGS_TODAY"].includes(c.catalyst.earningsState) && <span style={{fontSize:10.5,fontWeight:700,color:"var(--warn)",whiteSpace:"nowrap"}}>
+                          決算：{c.catalyst.earningsState==="EARNINGS_TODAY"?"本日":`${c.catalyst.daysToEarnings??"?"}営業日後`} ⚠️</span>}
+                      {c.catalyst && ["ACTIVE","NEW_RESTRICTION"].includes(c.catalyst.marginState) && <span style={{fontSize:10.5,fontWeight:700,color:"var(--down)",whiteSpace:"nowrap"}}>
+                          増し担保：{c.catalyst.marginState} ⚠️</span>}
+                      {c.catalyst && c.catalyst.verdict==="CATALYST_STRONG_BUT_NOT_NOW" && <span style={{fontSize:10.5,fontWeight:700,color:"var(--warn)",whiteSpace:"nowrap"}}>強いが遅い／押し目待ち</span>}
                       {c.tooLate && <span style={{fontSize:10.5,fontWeight:800,whiteSpace:"nowrap",color:"var(--down)"}}
                           title={(c.tooLateReasons||[]).join(" / ")}>⚠️ TOO LATE{(c.tooLateReasons||[]).length>0?`（${c.tooLateReasons.slice(0,2).join(" / ")}）`:""}</span>}
                       {c.activityState && ACTIVITY_STATE_META[c.activityState] && ["EXPANDING","LOW_ACTIVITY","FADING"].includes(c.activityState) &&
@@ -5669,6 +5689,17 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                           ／ ブレイク出来高 {c.chartContext.features.breakoutVolRatio??"—"}</div>}
                         {(c.chartContext.reasons||[]).length>0 && <div>理由：{c.chartContext.reasons.join("・")}</div>}
                         {(c.chartContext.penalties||[]).length>0 && <div style={{color:"var(--down)"}}>減点：{c.chartContext.penalties.join("・")}</div>}
+                      </div>}
+                      {c.catalyst && c.catalyst.state!=="PENDING" && <div style={{flexBasis:"100%",borderTop:"1px dotted var(--rule)",paddingTop:4,marginTop:2}} className="mono">
+                        <div>Catalyst {c.catalyst.score??"—"}／100 ・{c.catalyst.state} ・方向 {c.catalyst.direction} ・種別 {c.catalyst.label||c.catalyst.type||"—"} ・信頼度 {c.catalyst.confidence||"—"}
+                          ・{c.catalyst.ageHours!=null?`${c.catalyst.ageHours}時間前`:"—"}（{c.catalyst.freshness||"—"}）・出所 {c.catalyst.source||"—"}</div>
+                        <div>決算 {c.catalyst.earningsState}{c.catalyst.daysToEarnings!=null?`（${c.catalyst.daysToEarnings}営業日）`:""} ／ 信用・取引規制 {c.catalyst.marginState}{(c.catalyst.marginKinds||[]).length>0?`（${c.catalyst.marginKinds.join("・")}）`:""}
+                          <span style={{color:"var(--inkFaint)"}}>　（貸株注意喚起・空売り規制はこのAPIでは判定不可）</span></div>
+                        <div>判定 {CATALYST_VERDICT_LABEL[c.catalyst.verdict]||c.catalyst.verdict} ・ENTRY confidence {c.catalyst.entryConfidence??"—"}（shadow）・サイズ {c.catalyst.sizeHint||"—"} ・stop {c.catalyst.stopHint||"—"} ・高値追い {c.catalyst.chaseStrictness||"—"}</div>
+                        {(c.catalyst.flags||[]).length>0 && <div style={{color:"var(--warn)"}}>注意：{c.catalyst.flags.map(f=>CATALYST_FLAG_LABEL[f]||f).join("・")}</div>}
+                        {(c.catalyst.exitHints||[]).length>0 && <div>EXITヒント：{c.catalyst.exitHints.join("・")}</div>}
+                        {(c.catalyst.items||[]).map((i,ix)=><div key={ix} style={{color:"var(--inkSoft)"}}>・{i.title}（{i.label}／{i.direction}／{i.confidence}／{i.freshness}）</div>)}
+                        {c.catalyst.lookup && <div style={{color:"var(--inkFaint)"}}>取得：{Object.entries(c.catalyst.lookup).map(([k,v])=>`${k}${v?"○":"×"}`).join(" ")}{c.catalyst.stale?"（キャッシュ・古い）":""}</div>}
                       </div>}
                       {c.movementScore!=null && <div style={{flexBasis:"100%",borderTop:"1px dotted var(--rule)",paddingTop:4,marginTop:2}} className="mono">
                         <div>Movement Potential {c.movementScore}／100 ・直近の活動 {c.recentActivityScore??"—"}／100 ・状態 {(ACTIVITY_STATE_META[c.activityState]||{}).label||c.activityState}

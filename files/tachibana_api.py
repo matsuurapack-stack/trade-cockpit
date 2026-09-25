@@ -466,6 +466,41 @@ def get_shinyou_zan(codes, use_prod=True):
     return _mfds_issue_query_chunked("CLMMfdsGetShinyouZan", codes, "aCLMMfdsShinyouZan", use_prod=use_prod)
 
 
+def get_issue_regulation_kabu(use_prod=True):
+    """株式銘柄別・市場別規制情報問合取得（CLMStkGetIssueSizyouKiseiKabu）。公式マニュアル
+    「マスタ機能（REQUEST I/F）」に記載の機能で、引数なし・全銘柄分を1回のリクエストで返す（sUrlMaster宛）。
+    使う項目：sSokuzituNyukinC（即日入金規制＝増し担保）・sSinyouSyutyuKubun（0なし/1あり/2日々公表）・sZizenCyouseiC（事前調整）・
+    制度/一般信用の新規買建・売建の停止区分・sTeisiKubun（取引停止）と、それぞれの翌営業日分（〜Yoku）。
+    システム稼働中は更新されないため、営業日の朝に1回だけ取得して使い回す（マニュアルの指示）。
+    貸株注意喚起・空売り規制（値幅制限型）はこのAPIには含まれない。
+    戻り値: {code: {項目名: 値}}（東証 sZyouzyouSizyou=="00" のみ）。失敗時は例外（呼び出し側で握りつぶさず「規制情報UNKNOWN」にする）。"""
+    sess = _ensure_session(use_prod=use_prod)
+    payload = {
+        "sCLMID": "CLMStkGetIssueSizyouKiseiKabu",
+        "p_no": str(_next_p_no()),
+        "p_sd_date": _now_p_sd_date(),
+        "sJsonOfmt": "5",
+    }
+    resp = _http.request(
+        "POST", sess["sUrlMaster"],
+        body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        retries=urllib3.Retry(total=2, backoff_factor=1.0),
+        timeout=urllib3.Timeout(connect=10, read=60),
+    )
+    result = json.loads(resp.data.decode("shift_jis", errors="replace"))
+    if result.get("p_errno") not in (None, "0"):
+        raise RuntimeError(f"規制情報取得失敗: p_errno={result.get('p_errno')} {result.get('p_err')}")
+    if result.get("sResultCode") not in (None, "", "0"):
+        raise RuntimeError(f"規制情報取得失敗: sResultCode={result.get('sResultCode')} {result.get('sResultText')}")
+    out = {}
+    for row in result.get("aCLMStkIssueSizyouKiseiKabu", []):
+        code = row.get("sIssueCode")
+        if code and (row.get("sZyouzyouSizyou") in (None, "", "00")):
+            out[code] = {k: v for k, v in row.items() if k not in ("sIssueCode", "sZyouzyouSizyou")}
+    return out
+
+
 def get_hibu_info(codes, use_prod=True):
     """逆日歩情報（CLMMfdsGetHibuInfo）。戻り値: {code: {sIssueCode, pBWRQ}}（pBWRQ=逆日歩）。"""
     return _mfds_issue_query_chunked("CLMMfdsGetHibuInfo", codes, "aCLMMfdsHibuInfo", use_prod=use_prod)

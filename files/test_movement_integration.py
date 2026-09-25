@@ -136,7 +136,7 @@ class ShadowRefreshTests(unittest.TestCase):
         (_, user, adds, removes, pool_updates), _kw = db.sync_dynamic_watch.call_args
         self.assertEqual([a["code"] for a in adds], ["X"])
         called = {name for name, *_ in db.method_calls}
-        self.assertTrue(called <= {"load_dynamic_watch", "sync_dynamic_watch"})   # watchlistを触る関数は呼ばない
+        self.assertTrue(called <= {"load_dynamic_watch", "sync_dynamic_watch", "list_portfolio"})   # watchlistを触る関数は呼ばない
 
     def test_manual_code_may_leave_overlay_but_manual_watchlist_is_never_touched(self):
         real_now = datetime.datetime.now(JST)   # refresh_shadow_movementは実時刻で経過を測る
