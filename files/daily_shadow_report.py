@@ -57,6 +57,16 @@ def main():
             seen.add(k)
             print(_line(r))
 
+    # Phase G Technical Fusion（shadow）：confluence別・既存判定との組み合わせ別の成績
+    fu = sl.summarize_fusion(rows)
+    print(f"\n=== Phase G Technical Fusion（shadow） イベント数 {fu['n_events']}（判断材料は最低30〜50シグナル） ===")
+    for k, g in fu["groups"].items():
+        if g["n"]:
+            print(f"  {k}: n={g['n']} +5m {g['avg_ret_5m']} +15m {g['avg_ret_15m']} +30m {g['avg_ret_30m']} "
+                  f"+15m勝率 {g['plus_rate_15m']} MFE {g['avg_mfe_30m']} MAE {g['avg_mae_30m']}")
+    for k, g in fu["by_setup_type"].items():
+        print(f"  setup {k}: n={g['n']} +15m {g['avg_ret_15m']} +30m {g['avg_ret_30m']} MFE {g['avg_mfe_30m']} MAE {g['avg_mae_30m']}")
+
     print("\n--- 件数 ---")
     for k in ("chase_stop_count", "failed_breakout_count", "pullback_ready_count", "entry_ready_count"):
         print(f"{k}: {day_sum[k]}")

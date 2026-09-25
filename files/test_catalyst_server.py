@@ -142,7 +142,8 @@ class RegulationTests(unittest.TestCase):
             self.assertEqual(ce.margin_restriction_from_flags(f7, p7)["state"], "NEW_RESTRICTION")
             self.assertEqual(ce.margin_restriction_from_flags(f8, p8)["state"], "RELEASED")
             self.assertEqual(api.get_issue_regulation_kabu.call_count, 1)      # 全銘柄1回・営業日の朝に1回だけ
-            self.assertEqual(server._catalyst_regulation("0000"), (None, None))   # 応答に無い銘柄は判定しない
+            f0, p0 = server._catalyst_regulation("0000")                          # v4r10の応答は規制のある銘柄のみ：含まれない銘柄は規制なし
+            self.assertEqual((f0, ce.margin_restriction_from_flags(f0, p0)["state"]), ({}, "NONE"))
             saved = db.save_margin_restriction_snapshot.call_args[0]
             self.assertEqual(set(saved[2]), {"7777"})                            # 有効な銘柄だけ保存
             self.assertEqual(server._REGULATION["active"], 1)

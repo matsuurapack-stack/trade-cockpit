@@ -120,7 +120,8 @@ def build_signal_record(user_id, cand, now, source, top5_codes=None):
         "breakout_volume_ratio": _num(ft.get("breakoutVolRatio")),
         "reasons": list(cc.get("reasons") or []), "penalties": list(cc.get("penalties") or []),
         "features": ft,
-        "context": {"marketRS": cand.get("marketRS"), "changePct": cand.get("changePct"), "barCount": cc.get("barCount"),
+        "context": {"technicalFusion": cand.get("technicalFusion"),   # Phase G（shadow）：7グループconfluence（DB追加なし、context_jsonへ）
+                    "marketRS": cand.get("marketRS"), "changePct": cand.get("changePct"), "barCount": cc.get("barCount"),
                     "scoreBreakdown": cand.get("scoreBreakdown"), "entryScore": cand.get("entryScore"),
                     "top5": sorted(k for k, codes in top5.items() if cand["code"] in codes)},
     }
@@ -851,3 +852,44 @@ def summarize_movement(rows):
             "pre_breakout_count": sum(1 for r in events if r.get("pre_breakout")),
             "too_late_count": sum(1 for r in events if r.get("too_late")),
             "momentum_entries": momentum, "stop_evaluation": stop_eval, "milestone_timeline": timeline}
+
+
+def summarize_fusion(rows):
+    """Phase G Technical Fusion（shadow）の成績比較。context.technicalFusion付きの行だけを対象に、
+    既存判定（chart_entry_state/chart_pattern）との組み合わせ別に +5/+15/+30・MFE/MAE を集計する。
+    同一(code, level, setup, 既存状態, pattern)の連続行は初出のみ数える（重複でサンプルを水増ししない）。"""
+    rr = _with_ret(rows)
+    seen, ev = set(), []
+    for r in sorted(rr, key=lambda x: str(x["logged_at"])):
+        tf = (r.get("context") or {}).get("technicalFusion")
+        if not tf:
+            continue
+        key = (r["code"], tf.get("level"), tf.get("setupType"), r.get("chart_entry_state"), r.get("chart_pattern"))
+        if key in seen:
+            continue
+        seen.add(key)
+        r = dict(r)
+        r["_tf"] = tf
+        ev.append(r)
+
+    def lvl(r):
+        return r["_tf"].get("level")
+    groups = {
+        "HIGH_CONFLUENCE_and_ENTRY_READY": [r for r in ev if lvl(r) == "HIGH" and _is_entry(r.get("chart_entry_state"))],
+        "HIGH_CONFLUENCE_and_CHASE": [r for r in ev if lvl(r) == "HIGH" and r.get("chart_pattern") in CHASE_PATTERNS],
+        "LOW_CONFLUENCE_and_ENTRY_READY": [r for r in ev if lvl(r) == "LOW" and _is_entry(r.get("chart_entry_state"))],
+        "BREAKOUT_strong_volume": [r for r in ev if r["_tf"].get("breakout") in ("STRONG_VOLUME_BREAKOUT", "BREAKOUT_RETEST")],
+        "BREAKOUT_weak_volume": [r for r in ev if r["_tf"].get("breakout") == "WEAK_BREAKOUT"],
+        "PULLBACK_setup": [r for r in ev if r["_tf"].get("setupType") == "PULLBACK"],
+        "GOLDEN_CROSS_and_CHASE": [r for r in ev if "GOLDEN_CROSS_RECENT" in (r["_tf"].get("ma") or []) and r.get("chart_pattern") in CHASE_PATTERNS],
+        "GOOD_NEWS_and_BAD_TECHNICAL": [r for r in ev if r.get("catalyst_direction") == "POSITIVE" and lvl(r) == "LOW"],
+        "BAD_NEWS_and_STRONG_TECHNICAL": [r for r in ev if r.get("catalyst_direction") == "NEGATIVE" and lvl(r) == "HIGH"],
+        "TECHNICALLY_STRONG_BUT_LATE": [r for r in ev if r["_tf"].get("technicalState") == "TECHNICALLY_STRONG_BUT_LATE"],
+        "FUSION_ENTRY_SUPPORTED": [r for r in ev if r["_tf"].get("recommendation") == "ENTRY_SUPPORTED"],
+        "FUSION_WAIT_but_existing_ENTRY": [r for r in ev if r["_tf"].get("recommendation") == "WAIT" and _is_entry(r.get("chart_entry_state"))],
+    }
+    by_setup = {}
+    for r in ev:
+        by_setup.setdefault(r["_tf"].get("setupType") or "NONE", []).append(r)
+    return {"n_events": len(ev), "groups": {k: _group_stats(v) for k, v in groups.items()},
+            "by_setup_type": {k: _group_stats(v) for k, v in by_setup.items()}}

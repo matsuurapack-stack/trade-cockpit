@@ -5678,6 +5678,14 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                         {m.label} {bd[m.key]!=null?bd[m.key]:0}{m.max!=null?`/${m.max}`:""}
                       </span>)}
                       <span className="mono" style={{fontWeight:800}}>合計 {c.entryScore}</span>
+                      {/* Phase G Technical Fusion（shadow）：本番のENTRY判定には使わない参考表示。通常は1行、詳細は展開時のみ */}
+                      {c.technicalFusion && c.technicalFusion.score!=null && <div style={{flexBasis:"100%",fontSize:10.5,color:"var(--inkSoft)"}} className="mono"
+                        title={(c.technicalFusion.warnings||[]).join(" / ")}>
+                        テクニカル(shadow) {c.technicalFusion.score} / {({HIGH:"強気",MEDIUM:"中",LOW:"弱い"})[c.technicalFusion.level]||c.technicalFusion.level}
+                        {c.technicalFusion.setupType?` ／ Setup ${c.technicalFusion.setupType}`:""}
+                        {c.technicalFusion.technicalState==="TECHNICALLY_STRONG_BUT_LATE"?" ／ ⚠強いが遅い":""}
+                        <span style={{color:"var(--inkFaint)"}}>{" ／ "}{Object.entries(c.technicalFusion.groups||{}).map(([k,g])=>`${k.replace("support_resistance","S/R").replace("price_action","PA").replace("market_context","MKT")}:${g.state==="BULLISH"?"↑":g.state==="BEARISH"?"↓":g.state==="UNKNOWN"?"?":"→"}`).join(" ")}</span>
+                      </div>}
                       {c.chartContext && <div style={{flexBasis:"100%",borderTop:"1px dotted var(--rule)",paddingTop:4,marginTop:2}} className="mono">
                         <div>銘柄の強さ {c.stockStrengthScore??"—"} ／ ENTRYタイミング {c.entryTimingScore??"—"} ／ 判定 {ENTRY_DECISION_LABEL[c.entryDecision]||c.entryDecision}
                           ／ パターン {c.chartPattern} ／ 信頼度 {c.chartConfidence}（{c.chartContext.barCount}本）

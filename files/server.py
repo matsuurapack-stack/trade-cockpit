@@ -195,6 +195,7 @@ import dynamic_watch  # Phase D：dynamic_watchlist（動いている銘柄の�
 import catalyst_engine  # Phase F：Catalyst Confirmation（材料の種類・方向・信頼度・新しさ・決算/規制。shadow）
 import catalyst_lookup  # Phase F：価格の異変があった銘柄だけを非同期で調査（チャート判定をブロックしない）
 import market_discovery  # Phase E：Market-Wide Discovery（登録外から動き始めた銘柄を発見。shadow、ENTRYには使わない）
+import technical_fusion  # Phase G：Technical Fusion Engine（7グループ統合・shadow専用、ENTRY判定には使わない）
 import rolling_radar  # Phase D.2：Rolling Momentum Radar（場中の直近5本窓での警戒レーダー。shadow、ENTRYには使わない）
 import early_radar  # Phase D.1：Early Momentum Radar（寄り直後2〜5本の初動監視。shadow、ENTRYには使わない）
 
@@ -4705,7 +4706,7 @@ def _movement_candidate_fields(f):
 
 
 def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, catalysts, event_signals,
-                                          entry_risk, data_quality, shared, related_events, chart_bars=None):
+                                          entry_risk, data_quality, shared, related_events, chart_bars=None, daily=None):
     """今買い時TOP5：現在値に依存するスコア・状態・理由リスクの算出（2026-09-25、Phase B-1）。
     フルスキャン（_score_entry_candidates_impl）と軽量再スコア（rescore_entry_candidate_with_quote）の
     両方が同じこの関数を呼ぶ——スコアロジックの二重実装を避け、同じ入力なら必ず同じ結果になる
@@ -4817,7 +4818,23 @@ def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, 
         chart_bars if chart_bars is not None else bars, quote={"t": row.get("current")}, vwap=(snapshot or {}).get("vwap"),
         day_high=row.get("high"), market_rs=row.get("marketRS"), sector_lead=comp["autoSector"] > 0, sector_weak=None,
         spread_pct=spread_pct)
-    return {"rolling": rolling, "radar": radar, "spread_pct": spread_pct, "movement": movement, "movement_recommendation": movement_recommendation,
+    # Phase G（shadow）：Technical Fusion。既存のchart/movementの出力を入力にし、7グループ統合のconfluenceを
+    # 並行保存するだけ（entry_state・順位・ENTRY判定には一切使わない）。失敗しても本番判定に影響させない。
+    fusion = None
+    try:
+        daily_d = None
+        if daily and len(daily) >= 5:
+            d_closes, d_opens, d_highs, d_lows, d_vols = daily[:5]
+            daily_d = {"closes": list(d_closes), "opens": list(d_opens), "highs": list(d_highs), "lows": list(d_lows),
+                       "volumes": list(d_vols)}
+        fusion = technical_fusion.evaluate_fusion(
+            chart_bars if chart_bars is not None else bars, chart=chart, movement=movement, quote={"t": row.get("current")},
+            vwap=(snapshot or {}).get("vwap"), day_high=row.get("high"), day_low=row.get("low"), daily=daily_d,
+            market={"marketRS": row.get("marketRS"), "nikkeiChg": shared.get("nikkei_chg"), "sectorLead": comp["autoSector"] > 0},
+            entry_decision=decision)
+    except Exception as e:
+        print("  technical_fusion評価で例外（shadowのため無視して続行）", code, e)
+    return {"fusion": fusion, "rolling": rolling, "radar": radar, "spread_pct": spread_pct, "movement": movement, "movement_recommendation": movement_recommendation,
             "chart_context": chart, "stock_strength_score": strength, "entry_timing_score": chart["entry_timing_score"],
             "entry_decision": decision, "entry_state_pre_chart": entry_state_pre_chart, "range_metrics": range_metrics, "tradeable_range_score": tradeable_range_score,
             "room_to_move": room_to_move, "momentum_state": momentum_state, "reversal_info": reversal_info,
@@ -5138,7 +5155,7 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
         related_events = compute_related_events_for_stock(w, macro.get("events", []))
         pd_fields = _compute_price_dependent_entry_fields(
             code, w, row, stage2, snapshot, bars, catalysts, event_signals, entry_risk, data_quality,
-            shared_scoring, related_events)
+            shared_scoring, related_events, daily=daily_arrays_by_code.get(code))
         range_metrics, tradeable_range_score = pd_fields["range_metrics"], pd_fields["tradeable_range_score"]
         room_to_move, momentum_state = pd_fields["room_to_move"], pd_fields["momentum_state"]
         reversal_info, setup_type = pd_fields["reversal_info"], pd_fields["setup_type"]
@@ -5201,6 +5218,7 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
             "stockStrengthScore": pd_fields["stock_strength_score"], "entryTimingScore": pd_fields["entry_timing_score"],
             "entryDecision": pd_fields["entry_decision"], "chartPattern": pd_fields["chart_context"]["pattern"],
             "chartConfidence": pd_fields["chart_context"]["confidence"], "chartContext": pd_fields["chart_context"],
+            "technicalFusion": technical_fusion.compact(pd_fields["fusion"]),
             "entryStatePreChart": pd_fields["entry_state_pre_chart"],
             "legacyEntryState": pd_fields["entry_state_pre_chart"], "chartEntryState": pd_fields["entry_state"],
             **_movement_candidate_fields(pd_fields), "isManual": w.get("manual_registered") is not False,
@@ -5212,6 +5230,7 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
             "event_signals": event_signals, "entry_risk": entry_risk, "data_quality": data_quality,
             "related_events": related_events, "scoredPrice": row.get("current"), "baseHigh": row.get("high"),
             "recentHigh": (row["current"] / (1 + _d / 100.0)) if (_d is not None and row.get("current")) else None,
+            "daily": daily_arrays_by_code.get(code),
             "rescoreCount": 0}
         per_symbol_ms.append((code, (time.time() - _t_symbol) * 1000))
 
@@ -6763,7 +6782,11 @@ def _catalyst_regulation(code):
     _regulation_load()
     flags = _REGULATION["flags"].get(code)
     if flags is None:
-        return None, None                                                  # 応答に無い銘柄は判定しない（UNKNOWN）
+        # v4r10の応答は「規制情報のある銘柄のみ」（2026-09-26実測：611銘柄、7203/6501は含まれず、4440/6203は含まれる）。
+        # 応答が空でない成功時に限り、含まれない銘柄は規制なし（NONE）として扱う。応答が空・取得失敗はUNKNOWNのまま。
+        if not _REGULATION["flags"]:
+            return None, None
+        flags = {}
     return flags, ((code in _REGULATION["prev_active"]) if _REGULATION["prev_known"] else None)
 
 
@@ -6802,6 +6825,19 @@ def catalyst_service(user_id):
 
 
 def _catalyst_holdings(user_id):
+    threading.Thread(target=_catalyst_news_warmup, daemon=True).start()
+
+
+def _catalyst_news_warmup():
+    """v4r10のニュースは1日分ずつ取得する（銘柄別の問合せは廃止）ため、直近7日分を起動直後にキャッシュしておく
+    （初回のCatalyst調査が数秒余計にかからないように）。失敗しても無視（通常の調査時に再取得される）。"""
+    try:
+        if tachibana_api is None:
+            return
+        now = datetime.datetime.now(_JST)
+        tachibana_api._news_range((now - datetime.timedelta(days=7)).strftime("%Y%m%d"), now.strftime("%Y%m%d"))
+    except Exception as e:
+        print("  [Catalyst] ニュースの事前取得に失敗（無視して続行）", e)
     c = _CATALYST_HOLDINGS.get(user_id)
     if c is not None and time.time() - c[0] < 60:
         return c[1]
@@ -6988,11 +7024,12 @@ def rescore_entry_candidate_with_quote(ctx, shared, q):
     f = _compute_price_dependent_entry_fields(
         ctx["w"].get("code"), ctx["w"], row, stage2, snapshot, ctx.get("bars"), ctx["catalysts"], ctx["event_signals"],
         ctx["entry_risk"], ctx["data_quality"], shared, ctx["related_events"],
-        chart_bars=_chart_bars_for_rescore(ctx["w"].get("code"), ctx.get("bars")))
+        chart_bars=_chart_bars_for_rescore(ctx["w"].get("code"), ctx.get("bars")), daily=ctx.get("daily"))
     return {
         "stockStrengthScore": f["stock_strength_score"], "entryTimingScore": f["entry_timing_score"],
         "entryDecision": f["entry_decision"], "chartPattern": f["chart_context"]["pattern"],
         "chartConfidence": f["chart_context"]["confidence"], "chartContext": f["chart_context"],
+        "technicalFusion": technical_fusion.compact(f["fusion"]),
         "entryStatePreChart": f["entry_state_pre_chart"],
         "legacyEntryState": f["entry_state_pre_chart"], "chartEntryState": f["entry_state"],
         **_movement_candidate_fields(f), "momentumState": f["momentum_state"],
