@@ -359,7 +359,7 @@ def evaluate_movement(bars, quote=None, vwap=None, day_high=None, day_low=None, 
     rr = risk_reward(f, stop)
     rr_ok = True if (rr is None or not mode) else rr["rr"] >= RR_MIN     # RR基準はモメンタム銘柄に必須（他は表示のみ）
     late, late_why = detect_too_late(chart, rr_ok, rr["rr"] if rr else None)
-    if late and pre:
+    if (late or activity in ("LOW_ACTIVITY", "FADING")) and pre:      # 動いていない銘柄はブレイク接近にしない
         pre, pre_why = False, []
     conf = cc.confidence_for(f["n"], minutes_since_open)
     return {"movement_potential_score": score, "recent_activity_score": recent_activity_score(f, rel_volume),

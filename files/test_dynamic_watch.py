@@ -66,18 +66,18 @@ class RemoveTests(unittest.TestCase):
             r2 = dw.update_dynamic_watch(r1["state"], [cand], at(25))
             self.assertEqual(r2["removes"][0]["reason"], reason)
 
-    def test_manual_codes_are_never_removed(self):
+    def test_manual_codes_can_leave_the_overlay_but_the_overlay_is_capped_including_manual(self):
+        # 手動銘柄もオーバーレイ（dynamic_watchlist）上では上限・削除の対象。手動のwatchlistテーブルは別管理で無変更。
         st = self.setup_active(manual=True)
         r1 = dw.update_dynamic_watch(st, [c("A", 20, "LOW_ACTIVITY", manual=True)], at(1))
         r2 = dw.update_dynamic_watch(r1["state"], [c("A", 20, "LOW_ACTIVITY", manual=True)], at(60))
-        self.assertEqual(r2["removes"], [])
-        self.assertIn("A", r2["state"])
-
-    def test_cap_never_drops_manual(self):
-        cands = [c(f"M{i}", 90, "EXPANDING", manual=True, rank=1) for i in range(5)] + [c("X", 90, "EXPANDING", rank=99)]
-        r = dw.update_dynamic_watch({}, cands, T0, max_active=5, max_hot=5)
-        self.assertTrue(all(f"M{i}" in r["state"] for i in range(5)))
-        self.assertNotIn("X", r["state"])
+        self.assertEqual(r2["removes"], [{"code": "A", "reason": "LOW_ACTIVITY"}])
+        cands = [c(f"M{i}", 90, "EXPANDING", manual=True, rank=i) for i in range(120)]
+        r = dw.update_dynamic_watch({}, cands, T0)
+        self.assertLessEqual(len(r["state"]), dw.MAX_ACTIVE)
+        self.assertLessEqual(len(r["hot"]), dw.MAX_HOT)
+        self.assertIn("M119", r["state"])            # rankの高い順に残る
+        self.assertNotIn("M0", r["state"])
 
     def test_unseen_codes_keep_state(self):
         st = self.setup_active()

@@ -5,7 +5,8 @@
 #   ・自動削除：LOW_ACTIVITY / FADING / VWAP下で回復なし / モメンタム減衰 が REMOVE_GRACE_SEC 継続
 #   ・上限：active MAX_ACTIVE（30〜50）、hot pool MAX_HOT（10〜20）。超えたら弱い順（非手動から）に外す
 #   ・手動登録銘柄（is_manual）は、dynamic側から外れても manual watchlist からは一切削除されない。
-#     ここは watchlist テーブルには触れず、dynamic_watchlist だけを更新する。
+#     ここは watchlist テーブルには触れず、dynamic_watchlist（オーバーレイ）だけを更新する。
+#     手動銘柄もオーバーレイ上では上限・自動削除の対象（上限が効かず全銘柄がhot扱いになるのを防ぐ）。
 #
 # 現状の候補源は「全登録銘柄のうちスキャンでスコアリングされた銘柄」。全市場の値上がり率上位などの
 # 外部ランキングは取得経路が無いため未対応（データ源を追加していない）。
@@ -73,7 +74,7 @@ def update_dynamic_watch(existing, cands, now, max_active=MAX_ACTIVE, max_hot=MA
         st["weak_reason"] = w
         if st.get("weak_since") is None:
             st["weak_since"] = now
-        if (now - st["weak_since"]).total_seconds() >= grace_sec and not st["is_manual"]:
+        if (now - st["weak_since"]).total_seconds() >= grace_sec:
             removes.append({"code": code, "reason": w})
             del state[code]
     for c in cands:
@@ -87,14 +88,12 @@ def update_dynamic_watch(existing, cands, now, max_active=MAX_ACTIVE, max_hot=MA
                    "movement_at_add": c.get("movement")}
             state[code] = row
             adds.append(row)
-    # 上限：activeが多すぎる場合は、非手動・rankの低い順に外す
+    # 上限：activeが多すぎる場合は、rankの低い順に外す（オーバーレイからのみ。手動のwatchlistは無変更）
     if len(state) > max_active:
-        order = sorted(state, key=lambda k: (state[k].get("is_manual", False), (by_code.get(k) or {}).get("rank") or -1e9))
+        order = sorted(state, key=lambda k: (by_code.get(k) or {}).get("rank") or -1e9)
         for code in order:
             if len(state) <= max_active:
                 break
-            if state[code].get("is_manual"):
-                continue
             removes.append({"code": code, "reason": "CAP"})
             del state[code]
         adds = [a for a in adds if a["code"] in state]

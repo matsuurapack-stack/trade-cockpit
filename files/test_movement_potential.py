@@ -120,6 +120,18 @@ class PreBreakoutTests(unittest.TestCase):
         self.assertFalse(mv["pre_breakout"])
 
 
+class PreBreakoutNeedsActivityTests(unittest.TestCase):
+    def test_low_activity_stock_is_never_pre_breakout(self):
+        # 高値0.5%下・VWAP上・higher low・BASE形成でも、値幅が通常の半分以下なら「動かない銘柄」としてPRE_BREAKOUTにしない
+        spec = [(0.10, 0.6, 1000)] * 10 + [(0.02, 0.10, 400)] * 4 + [(0.05, 0.10, 400, 0.1), (0.03, 0.10, 380, 0.1)]
+        bars = build(spec)
+        b = cc.normalize_bars(bars)
+        mv, _ = evaluate(bars, day_high=max(b["highs"]) * 1.005, vwap=b["closes"][-1] * 0.99)
+        self.assertIn(mv["activity_state"], ("LOW_ACTIVITY", "COILING", "ACTIVE"))
+        if mv["activity_state"] == "LOW_ACTIVITY":
+            self.assertFalse(mv["pre_breakout"])
+
+
 class TooLateTests(unittest.TestCase):
     def chart(self, pattern="BASE_BUILDING", **ft):
         return {"pattern": pattern, "features": ft, "entry_timing_score": 60, "confidence": "HIGH"}

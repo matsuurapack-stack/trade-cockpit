@@ -138,14 +138,19 @@ class ShadowRefreshTests(unittest.TestCase):
         called = {name for name, *_ in db.method_calls}
         self.assertTrue(called <= {"load_dynamic_watch", "sync_dynamic_watch"})   # watchlistを触る関数は呼ばない
 
-    def test_manual_codes_are_not_removed_from_dynamic_or_watchlist(self):
+    def test_manual_code_may_leave_overlay_but_manual_watchlist_is_never_touched(self):
+        real_now = datetime.datetime.now(JST)   # refresh_shadow_movementは実時刻で経過を測る
         server._DYNAMIC_WATCH["u9"] = {"M": {"code": "M", "name": "M", "is_manual": True, "pool": "ACTIVE", "source": "HOT",
-                                             "added_at": at(-120), "last_seen_at": at(-1), "weak_since": at(-60)}}
+                                             "added_at": real_now - datetime.timedelta(hours=2), "last_seen_at": real_now,
+                                             "weak_since": real_now - datetime.timedelta(hours=1)}}
         self.put_cache([pool_cand("M", movementScore=10, activityState="LOW_ACTIVITY", isManual=True)])
-        with mock.patch.object(server, "investment_db", None):
+        with mock.patch.object(server, "investment_db") as db, mock.patch.object(server, "WRITE_E2E_ALLOWED", True), \
+                mock.patch.object(server, "_in_jp_session", return_value=True):
             shadow = server.refresh_shadow_movement("url", "u9")
-        self.assertIn("M", server._DYNAMIC_WATCH["u9"])
-        self.assertEqual(shadow["dynamicWatch"]["removed"], [])
+        self.assertNotIn("M", server._DYNAMIC_WATCH["u9"])
+        self.assertEqual(shadow["dynamicWatch"]["removed"], [{"code": "M", "reason": "LOW_ACTIVITY"}])
+        called = {name for name, *_ in db.method_calls}
+        self.assertTrue(called <= {"sync_dynamic_watch"})            # watchlist（手動）を更新・削除する関数は呼ばない
 
 
 class LogTests(unittest.TestCase):
