@@ -189,6 +189,7 @@ except ImportError:
     investment_db = None
 import capital_ranking  # 買付余力・IPO・shadow_watchの純粋ロジック（2026-09-24新規）
 import chart_context  # Chart Context Engine（Phase C：5分足の時系列形状・entry_timing_score）
+import chart_signal_log  # Phase C shadow運用：判定ログ・事後リターン・日次集計（記録専用、判定へは戻さない）
 
 INDEX = {
     "usdjpy": "JPY=X", "nikkei": "^N225", "dow": "^DJI",
@@ -5151,6 +5152,7 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
             "entryDecision": pd_fields["entry_decision"], "chartPattern": pd_fields["chart_context"]["pattern"],
             "chartConfidence": pd_fields["chart_context"]["confidence"], "chartContext": pd_fields["chart_context"],
             "entryStatePreChart": pd_fields["entry_state_pre_chart"],
+            "legacyEntryState": pd_fields["entry_state_pre_chart"], "chartEntryState": pd_fields["entry_state"],
         })
         _d = (stage2 or {}).get("distanceFromHighPct")
         rescore_ctx_by_code[code] = {
@@ -5173,6 +5175,9 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
     _pool_codes = [c["code"] for c in candidates[:ENTRY_RESCORE_POOL_SIZE]]
     _pool_codes += [c["code"] for c in candidates
                     if (c.get("reversalInfo") or {}).get("reversalState") and c["code"] not in _pool_codes][:10]
+    for _c in _pool_codes:
+        if _c in rescore_ctx_by_code:
+            rescore_ctx_by_code[_c]["lastBarSlot"] = int(time.time() // 300)   # NEW_BARトリガー用（スキャン時点の足）
     with _ENTRY_TOP5_CACHE_LOCK:
         _ENTRY_RESCORE_CTX[user_id] = {
             "byCode": {c: rescore_ctx_by_code[c] for c in _pool_codes if c in rescore_ctx_by_code},
@@ -6071,6 +6076,7 @@ def _run_entry_top5_scan(database_url, user_id, trigger="AUTO", wait_for_lock=Fa
             cache_entry["shadowRecheck"] = []
         with _ENTRY_TOP5_CACHE_LOCK:
             _ENTRY_TOP5_CACHE[user_id] = cache_entry
+        log_chart_signals(database_url, user_id, "SCAN")
         print(f"  [EntryTop5Scan] trigger={trigger} user={user_id} duration={cache_entry['durationMs']}ms "
               f"watchlist={cache_entry['watchlistCount']} ready={cache_entry['readyCount']} "
               f"scored={cache_entry['scoredCount']} entryReady={cache_entry['entryReadyCount']} "
@@ -6091,6 +6097,85 @@ def _run_entry_top5_scan(database_url, user_id, trigger="AUTO", wait_for_lock=Fa
 # 価格依存項目（現在値・前日比・対市場RS・高値乖離・VWAP位置・値幅余地・モメンタム・イベントガード
 # ・entry_score・ENTRY状態）だけを再計算する。
 # ============================================================
+_CHART_SIGNAL_LAST = {}   # (user_id, code) -> {"pattern","chart","legacy","at"}（重複ログ抑止）
+
+
+def _in_jp_session(now_jst):
+    hm = now_jst.hour * 60 + now_jst.minute
+    return (9 * 60 <= hm < 11 * 60 + 30) or (12 * 60 + 30 <= hm < 15 * 60 + 30)
+
+
+def log_chart_signals(database_url, user_id, source):
+    """Phase C shadow運用：キャッシュ済み候補poolのチャート判定（legacy/chart両方）をDBへ記録する。
+    記録専用——判定・TOP5選定はこのログを読まない。DB書き込みが許可された環境（WRITE_E2E_ALLOWED）
+    かつ場中のみ。失敗しても本処理へは影響させない。"""
+    if investment_db is None or not database_url or not WRITE_E2E_ALLOWED:
+        return 0
+    try:
+        now = datetime.datetime.now(_JST)
+        if not (_in_jp_session(now) and _is_jp_market_business_day(now)):
+            return 0
+        with _ENTRY_TOP5_CACHE_LOCK:
+            entry = _ENTRY_TOP5_CACHE.get(user_id) or {}
+            pool = list(entry.get("_candidatePool") or [])
+            top5 = {k: {c.get("code") for c in (entry.get(k) or [])}
+                    for k in ("entryReadyTop5", "actionableTop5", "analysisTop5", "watchCandidates")}
+        recs = []
+        for c in pool:
+            rec = chart_signal_log.build_signal_record(user_id, c, now, source, top5)
+            if rec is None:
+                continue
+            key = (user_id, rec["code"])
+            if not chart_signal_log.should_log(_CHART_SIGNAL_LAST.get(key), rec, now):
+                continue
+            _CHART_SIGNAL_LAST[key] = {"pattern": rec["chart_pattern"], "chart": rec["chart_entry_state"],
+                                       "legacy": rec["legacy_entry_state"], "at": now}
+            recs.append(rec)
+        return investment_db.insert_chart_signals(database_url, recs)
+    except Exception as e:
+        print("  [ChartSignalLog] 記録で例外（無視して続行）", e)
+        return 0
+
+
+def fill_chart_signal_outcomes(database_url):
+    """記録済みシグナルの +5/+15/+30分 価格（と30分内の最高/最安・再高値更新までの秒数）を追記する。
+    価格は最新quoteのみ。これは集計専用で、判定ロジックへは一切戻さない。"""
+    if investment_db is None or not database_url or not WRITE_E2E_ALLOWED:
+        return 0
+    try:
+        now = datetime.datetime.now(_JST)
+        pending = investment_db.list_pending_chart_signals(database_url, now - datetime.timedelta(hours=2))
+        if not pending:
+            return 0
+        codes = list(dict.fromkeys(r["code"] for r in pending))
+        quotes, _st = get_fast_quotes([{"code": c, "market": "JP"} for c in codes])
+        updates = []
+        for r in pending:
+            logged = r["logged_at"]
+            age = (now - logged).total_seconds()
+            have = {h for h in chart_signal_log.HORIZONS_MIN if r.get(f"price_{h}m") is not None}
+            due, _missed = chart_signal_log.due_horizons(logged, now, have)
+            q = quotes.get(r["code"]) or {}
+            t = q.get("t")
+            u = {"id": r["id"]}
+            if t is not None:
+                for h in due:
+                    u[f"price_{h}m"] = t
+                if age <= 30 * 60 + chart_signal_log.OUTCOME_TOLERANCE_SEC:
+                    u["max_30m"] = max(x for x in (r.get("max_30m"), t) if x is not None)
+                    u["min_30m"] = min(x for x in (r.get("min_30m"), t) if x is not None)
+                    if r.get("new_high_after_sec") is None and r.get("day_high") and t > r["day_high"]:
+                        u["new_high_after_sec"] = int(age)
+            if chart_signal_log.outcome_finished(logged, now):
+                u["outcome_done"] = True
+            if len(u) > 1:
+                updates.append(u)
+        return investment_db.update_chart_signal_outcomes(database_url, updates)
+    except Exception as e:
+        print("  [ChartSignalOutcome] 追記で例外（無視して続行）", e)
+        return 0
+
+
 ENTRY_RESCORE_POOL_SIZE = 50
 ENTRY_RESCORE_DRIFT_PCT = 0.3      # scoredPriceからこの%以上動いたら再スコア
 ENTRY_RESCORE_INTERVAL_SEC = 15    # 再スコアloopの周期（フロントの30秒pollと合わせ順位遅延<=60秒）
@@ -6116,6 +6201,10 @@ def entry_rescore_trigger(ctx, q):
         return "VWAP_CROSS"
     if ctx.get("baseHigh") and t > ctx["baseHigh"]:
         return "NEW_DAY_HIGH"
+    slot = int(time.time() // 300)   # 5分足の切り替わり（チャート形状は新しい足で変わる。しきい値ではなく時間トリガー）
+    if "lastBarSlot" in ctx and ctx["lastBarSlot"] != slot:
+        ctx["lastBarSlot"] = slot
+        return "NEW_BAR"
     return None
 
 
@@ -6163,6 +6252,7 @@ def rescore_entry_candidate_with_quote(ctx, shared, q):
         "entryDecision": f["entry_decision"], "chartPattern": f["chart_context"]["pattern"],
         "chartConfidence": f["chart_context"]["confidence"], "chartContext": f["chart_context"],
         "entryStatePreChart": f["entry_state_pre_chart"],
+        "legacyEntryState": f["entry_state_pre_chart"], "chartEntryState": f["entry_state"],
         "current": t, "quoteAt": q.get("quote_timestamp"), "priceSource": "LATEST_QUOTE",
         "changePct": round(row["changePct"], 2) if row.get("changePct") is not None else None,
         "marketRS": round(row["marketRS"], 2) if row.get("marketRS") is not None else None,
@@ -6240,6 +6330,8 @@ def rescore_entry_top5_cache(database_url, user_id):
         after = [c["code"] for c in ((_ENTRY_TOP5_CACHE.get(user_id) or {}).get("entryReadyTop5") or [])]
     diag["rankChanged"] = before != after
     diag["before"], diag["after"] = before, after
+    if diag["rescored"]:
+        log_chart_signals(database_url, user_id, "RESCORE")
     diag["elapsedMs"] = round((time.time() - t0) * 1000)
     if diag["rescored"]:
         print(f"  [EntryRescore] pool={diag['pool']} quotes={diag['quotes']} rescored={diag['rescored']} "
@@ -6257,6 +6349,7 @@ def _entry_rescore_loop():
             if in_session and _is_jp_market_business_day(now_jst):
                 for user_id in list(_ENTRY_TOP5_CACHE.keys()):
                     rescore_entry_top5_cache(DATABASE_URL, user_id)
+                fill_chart_signal_outcomes(DATABASE_URL)
         except Exception as e:
             print("  [EntryRescore] loopで例外", e)
         time.sleep(ENTRY_RESCORE_INTERVAL_SEC)
@@ -26355,6 +26448,17 @@ class Handler(SimpleHTTPRequestHandler):
             market = urllib.parse.parse_qs(qs).get("market", [None])[0]
             items = investment_db.list_watchlist(DATABASE_URL, self.current_user, market=market) if (investment_db is not None and DATABASE_URL) else []
             self._send_json({"items": items})
+        elif self.path.startswith("/api/chart-signals"):
+            # Phase C shadow運用の記録参照（読み取り専用）。/daily は日次集計、無印は生ログ。
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            day = (qs.get("date") or [datetime.datetime.now(_JST).date().isoformat()])[0]
+            code = (qs.get("code") or [None])[0]
+            rows = investment_db.list_chart_signals(DATABASE_URL, self.current_user, day, code) \
+                if (investment_db is not None and DATABASE_URL) else []
+            if urllib.parse.urlparse(self.path).path.endswith("/daily"):
+                self._send_json({"date": day, **chart_signal_log.summarize_day(rows)})
+            else:
+                self._send_json({"date": day, "count": len(rows), "rows": rows})
         elif self.path.startswith("/api/portfolio/cash"):
             # 買付余力（2026-09-24新規）：ユーザーが手動設定した現在値（MANUAL最優先）。
             rec = get_capital_context(DATABASE_URL, self.current_user)

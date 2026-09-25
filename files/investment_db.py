@@ -752,6 +752,45 @@ CREATE TABLE IF NOT EXISTS shadow_watch (
     last_trigger_json  JSONB,
     UNIQUE (user_id, code)
 );
+
+-- Phase C shadow運用：判定ごとのチャート判定ログ＋事後(+5/+15/+30分)価格。判定ロジックは読まない（記録・集計専用）。
+CREATE TABLE IF NOT EXISTS chart_signal_log (
+    id                     SERIAL PRIMARY KEY,
+    user_id                TEXT NOT NULL,
+    logged_at              TIMESTAMPTZ NOT NULL,
+    trade_date             DATE NOT NULL,
+    code                   TEXT NOT NULL,
+    name                   TEXT,
+    source                 TEXT,
+    current_price          DOUBLE PRECISION,
+    day_high               DOUBLE PRECISION,
+    stock_strength         DOUBLE PRECISION,
+    entry_timing           DOUBLE PRECISION,
+    chart_pattern          TEXT,
+    chart_confidence       TEXT,
+    legacy_entry_state     TEXT,
+    chart_entry_state      TEXT,
+    entry_decision         TEXT,
+    vwap                   DOUBLE PRECISION,
+    vwap_distance          DOUBLE PRECISION,
+    change_15m             DOUBLE PRECISION,
+    consecutive_green      INTEGER,
+    upper_wick_ratio       DOUBLE PRECISION,
+    breakout_volume_ratio  DOUBLE PRECISION,
+    reasons_json           JSONB,
+    penalties_json         JSONB,
+    features_json          JSONB,
+    context_json           JSONB,
+    price_5m               DOUBLE PRECISION,
+    price_15m              DOUBLE PRECISION,
+    price_30m              DOUBLE PRECISION,
+    max_30m                DOUBLE PRECISION,
+    min_30m                DOUBLE PRECISION,
+    new_high_after_sec     INTEGER,
+    outcome_done           BOOLEAN NOT NULL DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS idx_chart_signal_log_user_date ON chart_signal_log (user_id, trade_date, code);
+CREATE INDEX IF NOT EXISTS idx_chart_signal_log_pending ON chart_signal_log (outcome_done, logged_at);
 """
 
 # 2026-09-09新規（ルール学習システム）：投資判断ログ系の他テーブルより後に作成する必要は
@@ -11071,6 +11110,89 @@ def list_shadow_watch(database_url, user_id, status=None, active_on=None):
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(f"SELECT * FROM shadow_watch WHERE {' AND '.join(where)} ORDER BY started_at", params)
             return [_row_to_json(r) for r in cur.fetchall()]
+
+
+_CHART_SIGNAL_INSERT_COLS = (
+    "user_id", "logged_at", "trade_date", "code", "name", "source", "current_price", "day_high", "stock_strength",
+    "entry_timing", "chart_pattern", "chart_confidence", "legacy_entry_state", "chart_entry_state", "entry_decision",
+    "vwap", "vwap_distance", "change_15m", "consecutive_green", "upper_wick_ratio", "breakout_volume_ratio")
+
+
+def insert_chart_signals(database_url, records):
+    """chart_signal_logへ一括INSERT（Phase C shadow運用）。recordsはchart_signal_log.build_signal_recordの戻り値。"""
+    pool = _get_pool(database_url)
+    if pool is None or not records:
+        return 0
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    cols = _CHART_SIGNAL_INSERT_COLS + ("reasons_json", "penalties_json", "features_json", "context_json")
+    sql = (f"INSERT INTO chart_signal_log ({', '.join(cols)}) VALUES ("
+           + ", ".join(["%s"] * len(_CHART_SIGNAL_INSERT_COLS) + ["%s::jsonb"] * 4) + ")")
+    n = 0
+    with pool.connection() as conn:
+        for r in records:
+            vals = [r.get(c) if c != "trade_date" else r["logged_at"].astimezone(jst).date() for c in _CHART_SIGNAL_INSERT_COLS]
+            vals += [json.dumps(r.get("reasons"), ensure_ascii=False), json.dumps(r.get("penalties"), ensure_ascii=False),
+                     json.dumps(r.get("features"), ensure_ascii=False, default=str),
+                     json.dumps(r.get("context"), ensure_ascii=False, default=str)]
+            conn.execute(sql, vals)
+            n += 1
+        conn.commit()
+    return n
+
+
+def list_pending_chart_signals(database_url, since):
+    """事後価格が未完了の行（logged_at >= since）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT id, code, logged_at, current_price, day_high, price_5m, price_15m, price_30m, max_30m, min_30m, "
+                        "new_high_after_sec FROM chart_signal_log WHERE outcome_done = FALSE AND logged_at >= %s "
+                        "ORDER BY logged_at", [since])
+            return cur.fetchall()
+
+
+_CHART_SIGNAL_UPDATE_COLS = ("price_5m", "price_15m", "price_30m", "max_30m", "min_30m", "new_high_after_sec", "outcome_done")
+
+
+def update_chart_signal_outcomes(database_url, updates):
+    """updates: [{"id":.., "price_5m":.., ...}]。渡されたキーだけ更新する。"""
+    pool = _get_pool(database_url)
+    if pool is None or not updates:
+        return 0
+    n = 0
+    with pool.connection() as conn:
+        for u in updates:
+            keys = [k for k in _CHART_SIGNAL_UPDATE_COLS if k in u]
+            if not keys:
+                continue
+            conn.execute(f"UPDATE chart_signal_log SET {', '.join(k + ' = %s' for k in keys)} WHERE id = %s",
+                         [u[k] for k in keys] + [u["id"]])
+            n += 1
+        conn.commit()
+    return n
+
+
+def list_chart_signals(database_url, user_id, trade_date, code=None, limit=5000):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    where, params = ["user_id = %s", "trade_date = %s"], [user_id, trade_date]
+    if code:
+        where.append("code = %s")
+        params.append(code)
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SELECT * FROM chart_signal_log WHERE {' AND '.join(where)} ORDER BY logged_at LIMIT %s", params + [limit])
+            rows = cur.fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["reasons"], d["penalties"] = d.pop("reasons_json", None), d.pop("penalties_json", None)
+        d["features"], d["context"] = d.pop("features_json", None), d.pop("context_json", None)
+        out.append(d)
+    return out
 
 
 def update_shadow_watch_check(database_url, user_id, code, trigger=None, status=None):

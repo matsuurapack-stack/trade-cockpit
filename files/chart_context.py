@@ -174,6 +174,7 @@ def compute_features(bars, quote=None, vwap=None, day_high=None, day_low=None, l
                 broke_idx = i
                 break
     f["brokeRecently"] = broke_idx is not None
+    f["brokeBarsAgo"] = (n - 1 - broke_idx) if broke_idx is not None else None   # ログ用：ブレイク後の滞在（本数）
     f["breakoutHeld"] = bool(pre and broke_idx is not None and c[-1] >= pre * 0.999)
     f["failedBreakout"] = False
     if pre and broke_idx is not None:
@@ -376,7 +377,9 @@ def evaluate_chart_context(bars, quote=None, vwap=None, day_high=None, day_low=N
             "barCount": n, "reasons": reasons, "penalties": penalties, "flags": flags, "earlySession": early,
             "features": {k: (round(v, 3) if isinstance(v, float) else v) for k, v in f.items()
                          if k in ("chg5m", "chg15m", "chg30m", "vwapDistPct", "consecGreen", "consecRed", "upperWick",
-                                  "lowerWick", "bodyRatio", "breakoutVolRatio", "volRatioLast", "distFromDayHighPct",
+                                  "lowerWick", "bodyRatio", "breakoutVolRatio", "upperWickAvg3", "upperWickRising",
+                                  "brokeRecently", "brokeBarsAgo", "breakoutHeld", "failedBreakout", "retake", "volPeakout",
+                                  "greenRunGainPct", "breakoutLevel", "volRatioLast", "distFromDayHighPct",
                                   "slope3", "slope6", "slope12", "higherHighs", "higherLows", "aboveVwap", "vwapReclaim",
                                   "vwapLoss", "opensApprox")}}
 
