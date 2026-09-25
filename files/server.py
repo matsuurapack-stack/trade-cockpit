@@ -6637,7 +6637,12 @@ def _tdnet_day(date_str):
         return by_code
 
 
-def _catalyst_tdnet_fetch(code):
+def _catalyst_tdnet_recent(code):
+    """急変時は「当日〜前営業日」の開示を最優先で確定する（古い分は後追い）。"""
+    return _catalyst_tdnet_fetch(code, business_days=2)
+
+
+def _catalyst_tdnet_fetch(code, business_days=6):
     out = []
     now = datetime.datetime.now(_JST)
     failed_today = False
@@ -6653,8 +6658,8 @@ def _catalyst_tdnet_fetch(code):
         else:
             for r in by_code.get(code, []):
                 out.append({"title": r.get("title"), "published_at": _jst_dt(ds, r.get("time")), "url": r.get("url"), "source": "TDNET"})
-        if covered >= 6 and i >= 5:
-            break                                                        # 直近6営業日ぶん（連休を挟んでも遡る）
+        if covered >= business_days and (business_days < 6 or i >= 5):
+            break                                                        # 直近N営業日ぶん（連休を挟んでも遡る）
     if failed_today:
         raise RuntimeError("TDnet当日一覧を取得できない")
     return out
@@ -6785,10 +6790,10 @@ def catalyst_service(user_id):
         svc = _CATALYST_SVC.get(user_id)
         if svc is None:
             svc = catalyst_lookup.CatalystLookup(
-                {"tdnet": _catalyst_tdnet_fetch, "news": _catalyst_news_fetch, "db": _catalyst_db_fetch_for(user_id),
+                {"tdnet": _catalyst_tdnet_fetch, "tdnet_recent": _catalyst_tdnet_recent, "news": _catalyst_news_fetch, "db": _catalyst_db_fetch_for(user_id),
                  "earnings_next": _catalyst_earnings_for(user_id), "regulation": _catalyst_regulation},
                 now_fn=lambda: datetime.datetime.now(_JST), ttl_sec=600, cooldown_sec=120, max_queue=100,
-                on_snapshot=_catalyst_on_snapshot_for(user_id),
+                on_snapshot=_catalyst_on_snapshot_for(user_id), async_regulation=True,
                 bdays_fn=lambda a, b: sum(1 for i in range((b - a).days) if _is_jp_market_business_day(
                     datetime.datetime.combine(a + datetime.timedelta(days=i + 1), datetime.time(12), tzinfo=_JST))))
             svc.start()
