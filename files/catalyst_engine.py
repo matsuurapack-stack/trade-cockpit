@@ -208,6 +208,10 @@ def margin_restriction_from_flags(flags, prev_active=None):
     if flags is None:
         return {"state": "UNKNOWN", "kinds": [], "active": None, "unavailable_kinds": ["貸株注意喚起", "空売り規制"]}
     kinds = []
+    # 立花APIの応答は「停止区分が0以外の項目がある銘柄」を全て含む（2026-09-26実測：611銘柄）。うち信用区分(sSinyouC)=3（一般信用のみ。TPM・プロ向け等）は
+    # 制度信用・現物の停止が構造的な非対応であって規制ではないため、停止系の判定から除く。信用区分が取れない（"?"）場合も停止系は判定しない。
+    # 信用区分が渡されない（None）場合は従来どおり判定する。
+    structural = str(flags.get("_sinyouC")) in ("3", "?")
 
     def nz(k):
         return str(flags.get(k) or "0") not in ("0", "", "None")
@@ -219,13 +223,16 @@ def margin_restriction_from_flags(flags, prev_active=None):
         kinds.append("MARGIN_CONCENTRATION")
     if str(flags.get("sZizenCyouseiC") or "0") == "1":
         kinds.append("PRE_ADJUSTMENT")
-    if any(nz(k) for k in ("sSeidoSinyouSinkiKaitate", "sIppanSinyouSinkiKaitate")):
-        kinds.append("MARGIN_NEW_BUY_HALT")
-    if any(nz(k) for k in ("sSeidoSinyouSinkiUritate", "sIppanSinyouSinkiUritate")):
-        kinds.append("MARGIN_NEW_SELL_HALT")               # 売禁（新規売建停止）
-    if nz("sTeisiKubun"):
-        kinds.append("TRADING_HALT")
-    active = bool(kinds)
+    if not structural:
+        if any(nz(k) for k in ("sSeidoSinyouSinkiKaitate", "sIppanSinyouSinkiKaitate")):
+            kinds.append("MARGIN_NEW_BUY_HALT")
+        if any(nz(k) for k in ("sSeidoSinyouSinkiUritate", "sIppanSinyouSinkiUritate")):
+            kinds.append("MARGIN_NEW_SELL_HALT")               # 売禁（新規売建停止）
+        if nz("sTeisiKubun"):
+            kinds.append("TRADING_HALT")
+    # 新規売建停止（貸株側の制限）だけの銘柄は、買い目線のモメンタムにとっての信用規制（増し担保系）ではないため状態には含めない（kindsには残す）。
+    # 実測(2026-09-26)：貸借銘柄でも約350銘柄が売建停止のため、これを規制扱いにするとACTIVEが大量に出て意味を失う。
+    active = any(k != "MARGIN_NEW_SELL_HALT" for k in kinds)
     if active and prev_active is False:
         state = "NEW_RESTRICTION"
     elif active:

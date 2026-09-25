@@ -37,7 +37,33 @@ API_VERSION = "v4r10"
 DEMO_LOGIN_URL = "https://demo-kabuka.e-shiten.jp/e_api_v4r10/auth/"
 PROD_LOGIN_URL = "https://kabuka.e-shiten.jp/e_api_v4r10/auth/"
 
-_http = urllib3.PoolManager(timeout=urllib3.Timeout(connect=10, read=15))
+_raw_http = urllib3.PoolManager(timeout=urllib3.Timeout(connect=10, read=15))
+_req_lock = threading.Lock()
+_pno_lock = threading.Lock()
+
+
+class _SerializedHttp:
+    """REQUEST I/Fは「一問一答」（マニュアル：並列送信は動作保証なし）で、p_noは前要求より大きくないと p_errno=6 で拒否される。
+    複数スレッド（価格・Catalystのワーカー・規制の後追い等）から同時に送ると、採番後に追い越されて拒否される（2026-09-26実測）。
+    そのため認証以外のリクエストは1件ずつ送り、p_no・p_sd_dateは「送信する瞬間」に採番する（呼び出し側の採番値は上書き）。
+    ロックは1リクエストごと：ニュースの複数日取得などでも間に価格リクエストが割り込める。"""
+
+    def request(self, method, url, body=None, **kw):
+        if body is not None and "/auth/" not in url:
+            with _req_lock:
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                    if isinstance(payload, dict) and "p_no" in payload:
+                        payload["p_no"] = str(_next_p_no())
+                        payload["p_sd_date"] = _now_p_sd_date()
+                        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                except (ValueError, UnicodeDecodeError):
+                    pass
+                return _raw_http.request(method, url, body=body, **kw)
+        return _raw_http.request(method, url, body=body, **kw)
+
+
+_http = _SerializedHttp()
 
 
 def _num(v):
@@ -159,7 +185,7 @@ def _ensure_session(use_prod=True, force=False):
 
 def _next_p_no():
     global _p_no
-    with _session_lock:
+    with _pno_lock:                      # セッションロックとは分離（ロック順序の入れ違いによるデッドロック回避）
         _p_no += 1
         return _p_no
 

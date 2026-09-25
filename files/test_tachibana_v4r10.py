@@ -156,5 +156,77 @@ class LogoutTests(unittest.TestCase):
         self.assertIsNone(t._session)
 
 
+class EngineStructuralStopTests(unittest.TestCase):
+    """実測(2026-09-26)：停止区分が0以外の銘柄611件のうち、信用区分=3（一般信用のみ）等は構造的な非対応で規制ではない。"""
+
+    def test_structural_stops_are_not_restrictions(self):
+        import catalyst_engine as ce
+        stop = {"sSeidoSinyouSinkiKaitate": "1", "sSeidoSinyouSinkiUritate": "1", "sTeisiKubun": "1"}
+        self.assertEqual(ce.margin_restriction_from_flags(dict(stop, _sinyouC="3"))["state"], "NONE")
+        self.assertEqual(ce.margin_restriction_from_flags(dict(stop, _sinyouC="?"))["state"], "NONE")
+        self.assertEqual(ce.margin_restriction_from_flags(dict(stop, _sinyouC="2"))["state"], "ACTIVE")
+        self.assertEqual(ce.margin_restriction_from_flags(stop)["state"], "ACTIVE")            # 信用区分なし＝従来どおり
+
+    def test_hard_kinds_apply_regardless_of_sinyou_class(self):
+        import catalyst_engine as ce
+        r = ce.margin_restriction_from_flags({"sSokuzituNyukinC": "1", "sSinyouSyutyuKubun": "2", "_sinyouC": "3"})
+        self.assertEqual(r["state"], "ACTIVE")
+        self.assertEqual(set(r["kinds"]), {"MARGIN_DEPOSIT_SAME_DAY", "DAILY_PUBLICATION"})
+
+
+class SerializedRequestTests(unittest.TestCase):
+    """p_errno=6（p_noが前要求以下）の再発防止：スレッド並列でもp_noは送信順に単調増加し、リクエストは同時に1件だけ。"""
+
+    def test_p_no_assigned_at_send_time_and_monotonic_under_threads(self):
+        import threading
+        import time
+        seen, active, maxactive = [], [0], [0]
+        lk = threading.Lock()
+
+        class Raw:
+            def request(self, method, url, body=None, **kw):
+                with lk:
+                    active[0] += 1
+                    maxactive[0] = max(maxactive[0], active[0])
+                time.sleep(0.005)
+                seen.append(int(json.loads(body.decode("utf-8"))["p_no"]))
+                with lk:
+                    active[0] -= 1
+                return Resp({"p_errno": "0"})
+
+        def worker():
+            for _ in range(15):
+                # 呼び出し側の採番（古い値）でも、送信の瞬間に採番し直される
+                t._http.request("POST", "https://m/", body=json.dumps({"sCLMID": "X", "p_no": str(t._next_p_no()), "p_sd_date": "x"}).encode("utf-8"))
+        with mock.patch.object(t, "_raw_http", Raw()):
+            ths = [threading.Thread(target=worker) for _ in range(6)]
+            [x.start() for x in ths]
+            [x.join() for x in ths]
+        self.assertEqual(len(seen), 90)
+        self.assertEqual(seen, sorted(seen))                       # 送信順にp_noが増える（追い越しなし）
+        self.assertEqual(len(set(seen)), 90)
+        self.assertEqual(maxactive[0], 1)                          # 一問一答
+
+    def test_auth_url_is_not_serialized_or_rewritten(self):
+        got = {}
+
+        class Raw:
+            def request(self, method, url, body=None, **kw):
+                got["body"] = json.loads(body.decode("utf-8"))
+                return Resp({})
+        with mock.patch.object(t, "_raw_http", Raw()):
+            t._http.request("POST", "https://x/e_api_v4r10/auth/", body=json.dumps({"p_no": "1", "sCLMID": "CLMAuthLoginRequest"}).encode("utf-8"))
+        self.assertEqual(got["body"]["p_no"], "1")
+
+
+class SellHaltOnlyTests(unittest.TestCase):
+    def test_sell_halt_alone_is_not_a_margin_restriction_for_long_momentum(self):
+        import catalyst_engine as ce
+        r = ce.margin_restriction_from_flags({"sSeidoSinyouSinkiUritate": "1", "_sinyouC": "1"})
+        self.assertEqual((r["state"], r["active"], r["kinds"]), ("NONE", False, ["MARGIN_NEW_SELL_HALT"]))
+        r2 = ce.margin_restriction_from_flags({"sSeidoSinyouSinkiUritate": "1", "sSeidoSinyouSinkiKaitate": "1", "_sinyouC": "2"})
+        self.assertEqual(r2["state"], "ACTIVE")                                   # 新規買建も停止＝規制
+
+
 if __name__ == "__main__":
     unittest.main()

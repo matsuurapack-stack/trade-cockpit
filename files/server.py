@@ -6966,6 +6966,12 @@ def _regulation_load(force=False):
             _REGULATION.update({"date": today, "flags": None, "error": str(e)[:200], "failed_at": time.time(),
                                 "duration_ms": round((time.time() - t0) * 1000)})
             raise
+        sinyou, master_err = {}, None
+        try:
+            sinyou = {c: (v.get("sSinyouC") or "?") for c, v in tachibana_api.get_issue_market_master_kabu().items()}   # 信用区分（構造的な非対応の除外用）
+        except Exception as e:
+            master_err = str(e)[:120]                                          # 取れない間は停止系を判定しない（"?"）
+        flags = {c: dict(f, _sinyouC=sinyou.get(c, "?")) for c, f in flags.items()}
         active = {c: catalyst_engine.margin_restriction_from_flags(f)["kinds"] for c, f in flags.items()
                   if catalyst_engine.margin_restriction_from_flags(f)["active"]}
         prev_known, prev_active = False, {}
@@ -6978,7 +6984,8 @@ def _regulation_load(force=False):
                 print("  [Catalyst] 規制スナップショットの保存/比較で例外（続行）", e)
         _REGULATION.update({"date": today, "flags": flags, "prev_active": set(prev_active), "prev_known": prev_known,
                             "fetched_at": datetime.datetime.now(_JST).isoformat(), "error": None,
-                            "duration_ms": round((time.time() - t0) * 1000), "count": len(flags), "active": len(active)})
+                            "duration_ms": round((time.time() - t0) * 1000), "count": len(flags), "active": len(active),
+                            "sinyou_master_error": master_err})
 
 
 def _catalyst_regulation(code):
