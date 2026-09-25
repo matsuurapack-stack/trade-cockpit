@@ -6925,6 +6925,19 @@ def _enable_catalyst_autostart():
     _CATALYST_AUTOSTART = True
     for u in list(_morning_check_scheduler_users()):
         catalyst_service(u)
+    threading.Thread(target=_catalyst_news_warmup, daemon=True).start()
+
+
+def _catalyst_news_warmup():
+    """v4r10のニュースは1日分ずつ取得する（銘柄別の問合せは廃止）ため、直近7日分を起動直後にキャッシュしておく
+    （初回のCatalyst調査が数秒余計にかからないように）。失敗しても無視（通常の調査時に再取得される）。"""
+    try:
+        if tachibana_api is None:
+            return
+        now = datetime.datetime.now(_JST)
+        tachibana_api._news_range((now - datetime.timedelta(days=7)).strftime("%Y%m%d"), now.strftime("%Y%m%d"))
+    except Exception as e:
+        print("  [Catalyst] ニュースの事前取得に失敗（無視して続行）", e)
 
 
 def catalyst_service(user_id):
@@ -6944,19 +6957,6 @@ def catalyst_service(user_id):
 
 
 def _catalyst_holdings(user_id):
-    threading.Thread(target=_catalyst_news_warmup, daemon=True).start()
-
-
-def _catalyst_news_warmup():
-    """v4r10のニュースは1日分ずつ取得する（銘柄別の問合せは廃止）ため、直近7日分を起動直後にキャッシュしておく
-    （初回のCatalyst調査が数秒余計にかからないように）。失敗しても無視（通常の調査時に再取得される）。"""
-    try:
-        if tachibana_api is None:
-            return
-        now = datetime.datetime.now(_JST)
-        tachibana_api._news_range((now - datetime.timedelta(days=7)).strftime("%Y%m%d"), now.strftime("%Y%m%d"))
-    except Exception as e:
-        print("  [Catalyst] ニュースの事前取得に失敗（無視して続行）", e)
     c = _CATALYST_HOLDINGS.get(user_id)
     if c is not None and time.time() - c[0] < 60:
         return c[1]
