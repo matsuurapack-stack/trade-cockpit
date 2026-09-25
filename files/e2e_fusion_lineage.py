@@ -57,7 +57,17 @@ def main():
             print(f"    candidate: current={cand.get('current')} quoteAt={hms(cand.get('quoteAt'))} scoredAt={hms(cand.get('scoredAt'))} vwap-source={'exchange pVWAP' if q.get('vwap') else 'n/a'}")
             print(f"    chart: pattern={cc_.get('pattern')} timing={cc_.get('entry_timing_score')} bars={cc_.get('barCount')} confidence={cc_.get('confidence')}")
             print(f"    lineage: {lin.get('intraday_source')} internal_bars={lin.get('internal_bars')} yf_bars_used={lin.get('yf_bars_used')} "
-                  f"gap_bars={lin.get('gap_bars')} stale={lin.get('stale')} reasons={lin.get('reasons')}")
+                  f"gap_bars={lin.get('gap_bars')} volume_gap_bars={lin.get('volume_gap_bars')} stale={lin.get('stale')} reasons={lin.get('reasons')}")
+            print(f"    movement: rec={cand.get('movementRecommendation')} activity={cand.get('activityState')} score={cand.get('movementScore')} "
+                  f"preBreakout={cand.get('preBreakout')} tooLate={cand.get('tooLate')} | radar={cand.get('radarState')} rolling={cand.get('rollingState')}")
+            ss = cand.get("structureShadow")
+            if ss:
+                print(f"    structureShadow(旧遅延足→立花足): structure {ss.get('oldStructure')}→{ss.get('newStructure')} "
+                      f"score {ss.get('oldStructureScore')}→{ss.get('newStructureScore')}(Δ{ss.get('structureScoreDelta')}) "
+                      f"entry_score {ss.get('oldEntryScore')}→{ss.get('newEntryScore')}(Δ{ss.get('entryScoreDelta')}) "
+                      f"state {ss.get('oldEntryState')}→{ss.get('newEntryState')} rank {ss.get('rankOld')}→{ss.get('rankNew')}")
+            else:
+                print("    structureShadow: なし（構造は上書きされていない＝立花足が未接続/古い）")
             print(f"    fusion: score={tfz.get('score')} level={tfz.get('level')} setup={tfz.get('setupType')} state={tfz.get('technicalState')} "
                   f"rec={tfz.get('recommendation')} flags={tfz.get('flags')} confidence={tfz.get('confidence')}")
             print(f"    source: intraday={src.get('intraday_source')} daily={src.get('daily_source')} quote_at={hms(src.get('quote_at'))} "
@@ -74,6 +84,9 @@ def main():
             ok.append(("intraday_source is Tachibana", (src.get("intraday_source") or "").find("TACHIBANA") >= 0))
             ok.append(("not stale", src.get("stale_intraday") is False))
             print("    checks:", {k: v for k, v in ok})
+        dbg = (live.get("debug") or {}).get("structureShadow")
+        if dbg:
+            print(f"  [StructureShadow summary] {dbg}")
         if i < samples - 1:
             time.sleep(interval)
 

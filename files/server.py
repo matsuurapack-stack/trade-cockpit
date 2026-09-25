@@ -639,10 +639,19 @@ def _record_quote_tick(code, q):
                 st = _INTRADAY_BAR_STORE[code] = {"date": date, "bars": {}, "lastVol": None, "firstTickAt": ts,
                                                    "lastTickAt": ts, "ticks": 0}
             dv = None
+            seg = 0 if mins < 12 * 60 else 1                         # 前場/後場
+            last_dt = st.get("lastDt")
+            volume_gap = False
             if vol is not None and st["lastVol"] is not None and vol >= st["lastVol"]:
                 dv = vol - st["lastVol"]
+                # 累積出来高の差分が「複数本分の出来高」になり得るケースは偽の巨大バーを作らない：
+                # ①前回tickから6分超（プロセス停止・取得抜け）②前場→後場をまたぐ（昼休み明け）。
+                # この場合は今回の増分をどのバーにも加算せず、そのバーをvolume_gapとして印を付ける。
+                if last_dt is not None and ((dt - last_dt).total_seconds() > 360 or st.get("lastSeg") != seg):
+                    dv, volume_gap = None, True
             if vol is not None:
                 st["lastVol"] = vol
+            st["lastDt"], st["lastSeg"] = dt, seg
             b = st["bars"].get(slot)
             if b is None:
                 start = dt.replace(hour=slot * 5 // 60, minute=slot * 5 % 60, second=0, microsecond=0)
@@ -652,6 +661,8 @@ def _record_quote_tick(code, q):
             b["low"] = min(b["low"], t)
             b["close"] = t
             b["ticks"] += 1
+            if volume_gap:
+                b["volume_gap"] = True
             if dv:
                 b["volume"] += dv
             st["lastTickAt"] = ts
@@ -695,17 +706,26 @@ def _slots_between(a, b):
     return n
 
 
+def _to_jst(text):
+    d = datetime.datetime.fromisoformat(text)
+    return d.replace(tzinfo=_JST) if d.tzinfo is None else d.astimezone(_JST)
+
+
 def build_chart_bars(code, yf_bars, now=None):
     """Chart Context/Movement/Radar/Technical Fusionへ渡す5分足を組み立てる。戻り値：(bars, lineage)。
     立花の内部5分足があれば、yfinance履歴のうち内部足より前のものだけを残してその後ろに接続する。
-    lineage={intraday_source, internal_bars, yf_bars_used, gap_bars, bar_at, yf_last_bar_at, stale, reasons}"""
+    境界の扱い：時刻はJSTへ正規化して比較／同じスロットに両方ある場合は1本に統合（重複しない）／
+    昼休みは欠落として数えない／出来高は累積差分で偽の巨大バーを作らない（_record_quote_tick）。
+    lineage={intraday_source, internal_bars, yf_bars_used, gap_bars, bar_at, yf_last_bar_at, stale,
+             volume_gap_bars, reasons}"""
     now = now or datetime.datetime.now(_JST)
     try:
         internal = (get_internal_intraday_bars(code) or {}).get("bars") or []
     except Exception:
         internal = []
     lin = {"intraday_source": "NONE", "internal_bars": len(internal), "yf_bars_used": 0, "gap_bars": None,
-           "bar_at": None, "yf_last_bar_at": None, "stale": False, "reasons": []}
+           "bar_at": None, "yf_last_bar_at": None, "stale": False, "reasons": [],
+           "volume_gap_bars": sum(1 for b in internal if b.get("volume_gap"))}
     starts = (yf_bars or {}).get("starts")
     n_yf = len((yf_bars or {}).get("closes") or [])
     if starts:
@@ -723,25 +743,26 @@ def build_chart_bars(code, yf_bars, now=None):
         else:
             lin["intraday_source"] = "UNTIMED_BARS"      # 時刻不明の足（呼び出し元が既に用意したもの。鮮度は判定しない）
         return yf_bars, lin
-    first = internal[0].get("start")
-    last = internal[-1].get("start")
+    first, last = internal[0].get("start"), internal[-1].get("start")
     lin["bar_at"] = last
     try:
-        first_dt = datetime.datetime.fromisoformat(first)
-        last_dt = datetime.datetime.fromisoformat(last)
+        first_dt, last_dt = _to_jst(first), _to_jst(last)
     except Exception:
         first_dt = last_dt = None
-    keep = []
+    keep, same_slot = [], None
     if starts and first_dt is not None and len(starts) == n_yf:
-        for i, s in enumerate(starts):
+        for i, st_ in enumerate(starts):
             try:
-                if datetime.datetime.fromisoformat(s) < first_dt:
-                    keep.append(i)
+                sdt = _to_jst(st_)
             except Exception:
                 break
+            if sdt < first_dt:
+                keep.append(i)
+            elif sdt == first_dt:
+                same_slot = i
     if keep and n_yf:
         try:
-            lin["gap_bars"] = _slots_between(datetime.datetime.fromisoformat(starts[keep[-1]]), first_dt)
+            lin["gap_bars"] = _slots_between(_to_jst(starts[keep[-1]]), first_dt)
         except Exception:
             lin["gap_bars"] = None
     elif not keep and n_yf and not starts:
@@ -752,6 +773,17 @@ def build_chart_bars(code, yf_bars, now=None):
         lin["intraday_source"] = "UNTIMED_BARS"
         return yf_bars, lin
     merged = _internal_to_arrays(internal)
+    if same_slot is not None:
+        # 同じスロットにyfinanceの完成足と立花の（途中から始まり得る）足がある：1本に統合する。
+        # open/high/lowはyfinance（スロット全体）と立花の外側、closeは立花（最新）、出来高は大きい方（二重計上しない）。
+        i = same_slot
+        have_o = bool(yf_bars.get("opens")) and len(yf_bars["opens"]) == n_yf
+        merged["highs"][0] = max(merged["highs"][0], yf_bars["highs"][i])
+        merged["lows"][0] = min(merged["lows"][0], yf_bars["lows"][i])
+        if have_o:
+            merged["opens"][0] = yf_bars["opens"][i]
+        merged["volumes"][0] = max(merged["volumes"][0], yf_bars["volumes"][i])
+        lin["reasons"].append("先頭スロットをyfinance足と統合（重複なし）")
     if keep:
         have_o = bool(yf_bars.get("opens")) and len(yf_bars["opens"]) == n_yf
         for key in ("highs", "lows", "closes", "volumes"):
@@ -774,6 +806,8 @@ def build_chart_bars(code, yf_bars, now=None):
         lin["reasons"].append(f"最新の立花5分足が{STALE_INTRADAY_MIN}分以上前")
     if lin["gap_bars"] and lin["gap_bars"] > 2:
         lin["stale"] = True
+    if lin["volume_gap_bars"]:
+        lin["reasons"].append(f"出来高を確定できない足{lin['volume_gap_bars']}本（取得抜け/昼休み明けの累積差分は加算しない）")
     return merged, lin
 
 
@@ -4822,6 +4856,7 @@ def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, 
         lineage = {"intraday_source": "CALLER_SUPPLIED", "stale": False, "reasons": []}
     lineage["quote_at"] = row.get("_quoteAt")
     intraday = chart_bars if chart_bars is not None else bars
+    snapshot_orig = snapshot
     if snapshot is not None and lineage.get("intraday_source") in ("TACHIBANA_INTERNAL_5M", "YF_HISTORY+TACHIBANA_INTERNAL_5M") \
             and not lineage.get("stale"):
         _rg = _regime_from_bars(intraday)
@@ -4875,6 +4910,24 @@ def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, 
     entry_state_pre_chart = entry_state
     entry_state, chart_gate_reasons = chart_context.apply_chart_gate(entry_state, strength, entry_score, chart)
     decision = chart_context.entry_decision(strength, chart)
+    # 5分足構造の入力をyfinance遅延足→立花足へ切り替えたことの影響を、本番判定とは分離して比較ログに残す
+    # （旧遅延足の構造を本番へ戻すことはしない。比較のためだけに旧入力でscore/stateを再計算する）。
+    structure_shadow = None
+    if snapshot_orig is not snapshot and snapshot_orig is not None:
+        comp_old = _entry_score_components(
+            row, stage2, snapshot_orig, shared["auto_rs_current"], shared["auto_sector_current"], catalysts, event_signals,
+            entry_risk=entry_risk, range_metrics=range_metrics, momentum_state=momentum_state, event_guard=event_guard)
+        state_old, _x = _classify_entry_state(
+            comp_old["total"], row, stage2, snapshot_orig, data_quality, event_signals, bool(comp_old["negativeCatalysts"]),
+            shared["nikkei_chg"], entry_risk=entry_risk, momentum_state=momentum_state, event_guard=event_guard)
+        state_old, _x = chart_context.apply_chart_gate(state_old, chart_context.stock_strength_score(comp_old), comp_old["total"], chart)
+        structure_shadow = {
+            "oldStructure": snapshot_orig.get("fiveMinStructure"), "newStructure": snapshot.get("fiveMinStructure"),
+            "oldStructureScore": comp_old["fiveMinStructure"], "newStructureScore": comp["fiveMinStructure"],
+            "structureScoreDelta": round(comp["fiveMinStructure"] - comp_old["fiveMinStructure"], 1),
+            "oldEntryScore": round(comp_old["total"]), "newEntryScore": round(entry_score),
+            "entryScoreDelta": round(entry_score) - round(comp_old["total"]),
+            "oldEntryState": state_old, "newEntryState": entry_state, "source": lineage.get("intraday_source")}
     # Phase D（shadow）：値幅を見た評価。既存のentry_state（Phase C適用後）は変えず、並行して保存する。
     movement = movement_potential.evaluate_movement(
         chart_bars, quote={"t": row.get("current")}, vwap=(snapshot or {}).get("vwap"),
@@ -4952,13 +5005,36 @@ def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, 
             analyzed_at=datetime.datetime.now(_JST).isoformat())
     except Exception as e:
         print("  technical_fusion評価で例外（shadowのため無視して続行）", code, e)
-    return {"fusion": fusion, "chart_lineage": lineage, "rolling": rolling, "radar": radar, "spread_pct": spread_pct, "movement": movement, "movement_recommendation": movement_recommendation,
+    return {"fusion": fusion, "chart_lineage": lineage, "structure_shadow": structure_shadow, "rolling": rolling, "radar": radar, "spread_pct": spread_pct, "movement": movement, "movement_recommendation": movement_recommendation,
             "chart_context": chart, "stock_strength_score": strength, "entry_timing_score": chart["entry_timing_score"],
             "entry_decision": decision, "entry_state_pre_chart": entry_state_pre_chart, "range_metrics": range_metrics, "tradeable_range_score": tradeable_range_score,
             "room_to_move": room_to_move, "momentum_state": momentum_state, "reversal_info": reversal_info,
             "setup_type": setup_type, "event_guard": event_guard, "comp": comp,
             "neg_cat_present": neg_cat_present, "entry_score": entry_score, "entry_state": entry_state,
             "exception_applied": exception_applied, "resilience": resilience, "reasons": reasons, "risks": risks}
+
+
+def summarize_structure_shadow(candidates):
+    """5分足構造の入力切替（yfinance遅延足→立花足）のshadow比較。candidates（新入力でentryScore降順に
+    ソート済み）へ旧入力での順位（rankOld/rankNew）を書き込み、件数と旧/新のscoreベースTOP5を返す。
+    本番の判定・順位は変えない（ログ専用）。"""
+    old_sorted = sorted(candidates, key=lambda c: -((c.get("structureShadow") or {}).get("oldEntryScore", c["entryScore"])))
+    old_rank = {c["code"]: i + 1 for i, c in enumerate(old_sorted)}
+    for i, c in enumerate(candidates):
+        ss = c.get("structureShadow")
+        if ss:
+            c["structureShadow"] = {**ss, "rankOld": old_rank[c["code"]], "rankNew": i + 1}
+    ovr = [c for c in candidates if c.get("structureShadow")]
+    old_view = [{**c, "entryScore": c["structureShadow"]["oldEntryScore"], "entryState": c["structureShadow"]["oldEntryState"]}
+                if c.get("structureShadow") else c for c in candidates]
+    old_top5 = [c["code"] for c in _select_entry_ready_top5(old_view)[0]]
+    new_top5 = [c["code"] for c in _select_entry_ready_top5(candidates)[0]]
+    return {"overridden": len(ovr),
+            "structureChanged": sum(1 for c in ovr if c["structureShadow"]["oldStructure"] != c["structureShadow"]["newStructure"]),
+            "entryScoreChanged": sum(1 for c in ovr if c["structureShadow"]["entryScoreDelta"]),
+            "entryStateChanged": sum(1 for c in ovr if c["structureShadow"]["oldEntryState"] != c["structureShadow"]["newEntryState"]),
+            "rankChanged": sum(1 for c in ovr if c["structureShadow"]["rankOld"] != c["structureShadow"]["rankNew"]),
+            "top5Old": old_top5, "top5New": new_top5, "top5Changed": old_top5 != new_top5}
 
 
 def _score_entry_candidates(database_url, user_id):
@@ -5337,7 +5413,7 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
             "entryDecision": pd_fields["entry_decision"], "chartPattern": pd_fields["chart_context"]["pattern"],
             "chartConfidence": pd_fields["chart_context"]["confidence"], "chartContext": pd_fields["chart_context"],
             "technicalFusion": technical_fusion.compact(pd_fields["fusion"]),
-            "chartLineage": pd_fields["chart_lineage"],
+            "chartLineage": pd_fields["chart_lineage"], "structureShadow": pd_fields["structure_shadow"],
             "entryStatePreChart": pd_fields["entry_state_pre_chart"],
             "legacyEntryState": pd_fields["entry_state_pre_chart"], "chartEntryState": pd_fields["entry_state"],
             **_movement_candidate_fields(pd_fields), "isManual": w.get("manual_registered") is not False,
@@ -5360,6 +5436,13 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
     _t = time.time()
     candidates.sort(key=lambda c: -c["entryScore"])
     section_ms["sortRank"] = round((time.time() - _t) * 1000)
+    # 5分足構造の入力切替（yfinance遅延足→立花足）のshadow比較：旧入力でのscore/state/順位/TOP5と比べる（ログのみ）
+    structure_shadow_summary = None
+    try:
+        structure_shadow_summary = summarize_structure_shadow(candidates)
+        print(f"  [StructureShadow] {structure_shadow_summary}")
+    except Exception as e:
+        print("  structure shadow比較で例外（無視して続行）", e)
     # 軽量再スコア用の候補pool（Phase B-1）：entry_score上位＋反転候補だけ保持し、それ以外は
     # 次のフルスキャンまで再スコアしない（289銘柄を高頻度で再計算しない）。
     _pool_codes = [c["code"] for c in candidates[:ENTRY_RESCORE_POOL_SIZE]]
@@ -5440,6 +5523,7 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
     # 場中リアルタイム化指示書 STEP2・20：ENTRY_TOP5_DIAGNOSTICS用の追加専用フィールド
     # （watchlist_count/intraday_ready相当）。既存のscanned等の集計ロジックには一切影響しない。
     debug["watchlistCount"] = len(watchlist)
+    debug["structureShadow"] = structure_shadow_summary
     debug["readyCount"] = snapshot_ready_count
     # Event Risk Guard（2026-09-17新規）：運用確認用の要約（HIGH/MEDIUM/LOW件数とmarket分）。
     # byCode自体（全銘柄分のscore/level/reasons）はeventRiskGuard.byCodeに既に含まれているため、
@@ -7149,7 +7233,7 @@ def rescore_entry_candidate_with_quote(ctx, shared, q):
         "entryDecision": f["entry_decision"], "chartPattern": f["chart_context"]["pattern"],
         "chartConfidence": f["chart_context"]["confidence"], "chartContext": f["chart_context"],
         "technicalFusion": technical_fusion.compact(f["fusion"]),
-        "chartLineage": f["chart_lineage"],
+        "chartLineage": f["chart_lineage"], "structureShadow": f["structure_shadow"],
         "entryStatePreChart": f["entry_state_pre_chart"],
         "legacyEntryState": f["entry_state_pre_chart"], "chartEntryState": f["entry_state"],
         **_movement_candidate_fields(f), "momentumState": f["momentum_state"],

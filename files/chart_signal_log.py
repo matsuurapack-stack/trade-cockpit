@@ -120,7 +120,8 @@ def build_signal_record(user_id, cand, now, source, top5_codes=None):
         "breakout_volume_ratio": _num(ft.get("breakoutVolRatio")),
         "reasons": list(cc.get("reasons") or []), "penalties": list(cc.get("penalties") or []),
         "features": ft,
-        "context": {"technicalFusion": cand.get("technicalFusion"),   # Phase G（shadow）：7グループconfluence（DB追加なし、context_jsonへ）
+        "context": {"structureShadow": cand.get("structureShadow"), "chartLineage": cand.get("chartLineage"),
+                    "technicalFusion": cand.get("technicalFusion"),   # Phase G（shadow）：7グループconfluence（DB追加なし、context_jsonへ）
                     "marketRS": cand.get("marketRS"), "changePct": cand.get("changePct"), "barCount": cc.get("barCount"),
                     "scoreBreakdown": cand.get("scoreBreakdown"), "entryScore": cand.get("entryScore"),
                     "top5": sorted(k for k, codes in top5.items() if cand["code"] in codes)},
