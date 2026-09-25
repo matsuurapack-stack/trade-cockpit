@@ -2093,6 +2093,21 @@ const ACTION_STATUS_META = {
 // Market Intelligence Timeline Phase2-C（今買い時TOP5、2026-09-10新規）：ENTRY_STATE（9種、
 // サーバー側entry_score算出とセットで返る）の表示ラベル・色。既存のACTION_STATUS_META
 // （RISK/WAIT/ENTRY_READY、enrichWatchRow()由来の別軸）とは別物、混同しないこと。
+// Phase C（2026-09-25）：Chart Context Engineのチャートパターン表示（カードには1つの状態だけ出す）。
+const CHART_PATTERN_META = {
+  EARLY_BREAKOUT:     {label:"EARLY BREAKOUT",  color:"var(--up)"},
+  BREAKOUT_CONFIRMED: {label:"BREAKOUT確認",     color:"var(--up)"},
+  PULLBACK_READY:     {label:"PULLBACK READY",  color:"var(--up)"},
+  VWAP_RECLAIM:       {label:"VWAP RECLAIM",    color:"var(--up)"},
+  BASE_BUILDING:      {label:"WAIT BREAKOUT",   color:"var(--accent)"},
+  EXTENDED:           {label:"EXTENDED",        color:"var(--down)"},
+  CHASE:              {label:"CHASE",           color:"var(--down)"},
+  FAILED_BREAKOUT:    {label:"FAILED BREAKOUT", color:"var(--down)"},
+  EXHAUSTION:         {label:"EXHAUSTION",      color:"var(--down)"},
+  VWAP_LOSS:          {label:"VWAP割れ",         color:"var(--down)"},
+};
+const ENTRY_DECISION_LABEL = {ENTRY_READY:"ENTRY READY", WATCH:"WATCH", WAIT_PULLBACK:"WAIT PULLBACK", WAIT_BREAKOUT:"WAIT BREAKOUT",
+  NO_ENTRY_CHASE:"NO ENTRY（走りすぎ）", NO_ENTRY_FAILED_BREAK:"NO ENTRY（ダマシ）"};
 const ENTRY_STATE_META = {
   NOW_BUYABLE:   {label:"今すぐ買える",     color:"var(--up)"},
   ENTRY_READY:   {label:"準備完了",         color:"var(--up)"},
@@ -5535,6 +5550,11 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                       </span>
                       <span style={{fontSize:12,fontWeight:800,color:"var(--accent)",border:"1px solid var(--accent)",borderRadius:3,padding:"1px 6px"}}>SCORE {c.entryScore}</span>
                       <span style={{fontSize:10.5,fontWeight:700,color:stMeta.color,border:`1px solid ${stMeta.color}`,borderRadius:3,padding:"1px 6px",whiteSpace:"nowrap"}}>{stMeta.label}</span>
+                      {/* Phase C：ENTRYタイミング（銘柄の強さとは別軸）とチャートパターンを1つだけ表示 */}
+                      {c.chartPattern && CHART_PATTERN_META[c.chartPattern] && <span style={{fontSize:10.5,fontWeight:700,whiteSpace:"nowrap",
+                          color:CHART_PATTERN_META[c.chartPattern].color}} title={((c.chartContext&&c.chartContext.reasons)||[]).concat((c.chartContext&&c.chartContext.penalties)||[]).join(" / ")}>
+                        {CHART_PATTERN_META[c.chartPattern].label}{c.entryTimingScore!=null?` ・ENTRY ${c.entryTimingScore}`:""}
+                      </span>}
                       {/* Market Intelligence Phase9新規（指示書21・38番）：entry_score自体は
                           不変、隣に並べるだけの追加専用表示。 */}
                       {c.eventSupport && <span style={{fontSize:10,fontWeight:700,whiteSpace:"nowrap",
@@ -5614,6 +5634,18 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                         {m.label} {bd[m.key]!=null?bd[m.key]:0}{m.max!=null?`/${m.max}`:""}
                       </span>)}
                       <span className="mono" style={{fontWeight:800}}>合計 {c.entryScore}</span>
+                      {c.chartContext && <div style={{flexBasis:"100%",borderTop:"1px dotted var(--rule)",paddingTop:4,marginTop:2}} className="mono">
+                        <div>銘柄の強さ {c.stockStrengthScore??"—"} ／ ENTRYタイミング {c.entryTimingScore??"—"} ／ 判定 {ENTRY_DECISION_LABEL[c.entryDecision]||c.entryDecision}
+                          ／ パターン {c.chartPattern} ／ 信頼度 {c.chartConfidence}（{c.chartContext.barCount}本）
+                          {c.entryStatePreChart&&c.entryStatePreChart!==c.entryState && <span style={{color:"var(--down)"}}>　既存判定 {c.entryStatePreChart} → チャートで {c.entryState}</span>}</div>
+                        {c.chartContext.features && <div>VWAP乖離 {c.chartContext.features.vwapDistPct!=null?c.chartContext.features.vwapDistPct.toFixed(2)+"%":"—"}
+                          ／ 15分 {c.chartContext.features.chg15m!=null?c.chartContext.features.chg15m.toFixed(2)+"%":"—"}
+                          ／ 連続陽線 {c.chartContext.features.consecGreen??"—"}
+                          ／ 上ヒゲ {c.chartContext.features.upperWick??"—"} 下ヒゲ {c.chartContext.features.lowerWick??"—"}
+                          ／ ブレイク出来高 {c.chartContext.features.breakoutVolRatio??"—"}</div>}
+                        {(c.chartContext.reasons||[]).length>0 && <div>理由：{c.chartContext.reasons.join("・")}</div>}
+                        {(c.chartContext.penalties||[]).length>0 && <div style={{color:"var(--down)"}}>減点：{c.chartContext.penalties.join("・")}</div>}
+                      </div>}
                     </div>}
                   </div>;
                 })}

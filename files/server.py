@@ -188,6 +188,7 @@ try:
 except ImportError:
     investment_db = None
 import capital_ranking  # 買付余力・IPO・shadow_watchの純粋ロジック（2026-09-24新規）
+import chart_context  # Chart Context Engine（Phase C：5分足の時系列形状・entry_timing_score）
 
 INDEX = {
     "usdjpy": "JPY=X", "nikkei": "^N225", "dow": "^DJI",
@@ -3514,13 +3515,17 @@ def _fetch_intraday(tk, interval):
         highs = h["High"].dropna().tolist()
         lows = h["Low"].dropna().tolist()
         volumes = h["Volume"].dropna().tolist()
+        opens = h["Open"].dropna().tolist()
         if len(closes) < 2:
             return None
         try:
             last_bar_at = h["Close"].dropna().index[-1].isoformat()
         except Exception:
             last_bar_at = None
-        return {"closes": closes, "highs": highs, "lows": lows, "volumes": volumes, "lastBarAt": last_bar_at}
+        out = {"closes": closes, "highs": highs, "lows": lows, "volumes": volumes, "lastBarAt": last_bar_at}
+        if len(opens) == len(closes):
+            out["opens"] = opens  # Chart Context Engine（足の形）用。長さが揃わない場合は付けない
+        return out
     except Exception:
         return None
 
@@ -3648,9 +3653,13 @@ def _parse_intraday_bars_frame(h):
     highs = h["High"].dropna().tolist()
     lows = h["Low"].dropna().tolist()
     volumes = h["Volume"].dropna().tolist()
+    opens = h["Open"].dropna().tolist() if "Open" in h else []
     if len(closes) < 2:
         return None
-    return {"closes": closes, "highs": highs, "lows": lows, "volumes": volumes}
+    out = {"closes": closes, "highs": highs, "lows": lows, "volumes": volumes}
+    if len(opens) == len(closes):
+        out["opens"] = opens  # Chart Context Engine（足の形）用
+    return out
 
 
 def _intraday_regime_batch_prefetch(symbols, interval="5m", ttl=None):
@@ -4630,8 +4639,41 @@ def _summarize_per_symbol_ms(per_symbol_ms):
     }
 
 
+def _minutes_since_open(now_jst=None):
+    """前場の寄り付き（9:00）からの経過分。前場（9:00〜11:30）以外はNone（時刻依存の調整をしない）。"""
+    now_jst = now_jst or datetime.datetime.now(_JST)
+    m = now_jst.hour * 60 + now_jst.minute
+    return (m - 540) if 540 <= m <= 690 else None
+
+
+def _chart_bars_for_rescore(code, ctx_bars):
+    """軽量再スコア用の5分足。内部生成5分足（立花quoteのtickから作成）が、スキャン時のバー数以上
+    あればそれを、無ければスキャン時のバーを使う（最終足は最新quoteで更新される）。"""
+    try:
+        ib = (get_internal_intraday_bars(code) or {}).get("bars") or []
+    except Exception:
+        ib = []
+    if len(ib) >= max(6, len((ctx_bars or {}).get("closes") or [])):
+        return ib
+    return ctx_bars
+
+
+def load_chart_rule_penalties(database_url, user_id):
+    """既存のLearning Rule（trade_rules）から、エントリー失敗パターン（高値追い・上昇後横ばい・
+    微下落撤退・breakout失敗・エントリー遅れ）のentry_penaltyを読み込む（固定値をコードへ直書き
+    せず、DBのルール本文から導く）。取得失敗時は空（ペナルティなし）。"""
+    if investment_db is None or not database_url:
+        return {"byPattern": {}, "sources": []}
+    try:
+        rules = investment_db.relevant_trade_rules_for(database_url, user_id, categories=["ENTRY", "BEHAVIOR", "EXECUTION"], limit=40)
+        return chart_context.derive_rule_penalties(rules)
+    except Exception as e:
+        print("  Chart Context: Learning Rule読み込みで例外（ペナルティなしで続行）", e)
+        return {"byPattern": {}, "sources": []}
+
+
 def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, catalysts, event_signals,
-                                          entry_risk, data_quality, shared, related_events):
+                                          entry_risk, data_quality, shared, related_events, chart_bars=None):
     """今買い時TOP5：現在値に依存するスコア・状態・理由リスクの算出（2026-09-25、Phase B-1）。
     フルスキャン（_score_entry_candidates_impl）と軽量再スコア（rescore_entry_candidate_with_quote）の
     両方が同じこの関数を呼ぶ——スコアロジックの二重実装を避け、同じ入力なら必ず同じ結果になる
@@ -4667,6 +4709,22 @@ def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, 
         entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present, shared["nikkei_chg"],
         entry_risk=entry_risk, momentum_state=momentum_state, event_guard=event_guard)
     resilience = _rs_resilience_tier({"changePct": row.get("changePct"), "marketRS": row.get("marketRS")}, shared["nikkei_chg"])
+
+    # Phase C：Chart Context Engine。銘柄の強さ(stock_strength)とENTRYタイミング(entry_timing)を分離し、
+    # 5分足の形（CHASE/FAILED_BREAKOUT/PULLBACK_READY等）で既存のENTRY_STATEを安全側へ補正する。
+    # 既存のentry_score・状態判定は削除せず、その上にチャート判定を重ねる（二重実装しない）。
+    strength = chart_context.stock_strength_score(comp)
+    chart = chart_context.evaluate_chart_context(
+        chart_bars if chart_bars is not None else bars, quote={"t": row.get("current")},
+        vwap=(snapshot or {}).get("vwap"), day_high=row.get("high"), day_low=row.get("low"),
+        existing_signals={"structure": (snapshot or {}).get("fiveMinStructure"), "overheat": comp["overheat"] < 0,
+                          "momentumState": momentum_state,
+                          "recentHighBreak": bool(stage2 and stage2.get("aboveRecentHigh"))},
+        minutes_since_open=shared.get("minutes_since_open", _minutes_since_open()),
+        rule_penalties=shared.get("chart_rule_penalties"))
+    entry_state_pre_chart = entry_state
+    entry_state, chart_gate_reasons = chart_context.apply_chart_gate(entry_state, strength, entry_score, chart)
+    decision = chart_context.entry_decision(strength, chart)
 
     reasons = []
     if comp["momentum"] > 0:
@@ -4704,7 +4762,13 @@ def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, 
         risks.append("値幅余地LOW（ここから取れる値幅が乏しい可能性）")
     if reversal_info and reversal_info.get("reversalState") == "REVERSAL_CONFIRMED":
         reasons.append(f"当日安値から+{reversal_info['bounceFromLowPct']}%反転（{'/'.join(reversal_info['reversalReasons'])}）")
-    return {"range_metrics": range_metrics, "tradeable_range_score": tradeable_range_score,
+    # Chart Context：ゲートで状態が変わった理由は必ず表示する（ブラックボックス化しない）
+    for gr in chart_gate_reasons:
+        (reasons if entry_state in ("NOW_BUYABLE", "ENTRY_READY") else risks).append(gr)
+    if chart["pattern"] in chart_context.BAD_PATTERNS:
+        risks.append(f"チャート {chart['pattern']}（ENTRYタイミングスコア{chart['entry_timing_score']}）")
+    return {"chart_context": chart, "stock_strength_score": strength, "entry_timing_score": chart["entry_timing_score"],
+            "entry_decision": decision, "entry_state_pre_chart": entry_state_pre_chart, "range_metrics": range_metrics, "tradeable_range_score": tradeable_range_score,
             "room_to_move": room_to_move, "momentum_state": momentum_state, "reversal_info": reversal_info,
             "setup_type": setup_type, "event_guard": event_guard, "comp": comp,
             "neg_cat_present": neg_cat_present, "entry_score": entry_score, "entry_state": entry_state,
@@ -4941,7 +5005,8 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
     candidates = []
     rescore_ctx_by_code = {}  # 軽量再スコア用（Phase B-1）：上位候補pool分だけ後で残す
     shared_scoring = {"auto_rs_current": auto_rs_current, "auto_sector_current": auto_sector_current,
-                      "nikkei_chg": nikkei_chg, "event_guard_market": event_guard_market}
+                      "nikkei_chg": nikkei_chg, "event_guard_market": event_guard_market,
+                      "chart_rule_penalties": load_chart_rule_penalties(database_url, user_id)}
     quality_counts = {"FULL": 0, "PARTIAL": 0, "DEGRADED": 0}
     snapshot_ready_count = 0  # 場中リアルタイム化指示書 STEP1・20：5分足スナップショットが取得できた銘柄数（"intraday_ready"の実体）
     for w in scan_list:
@@ -5081,6 +5146,11 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
             "eventRiskLevel": event_guard["level"], "eventRiskScore": event_guard["score"],
             "eventRiskReasons": event_guard["reasons"],
             "volumeRatio": (stage2 or {}).get("timeAdjustedVolumeRatio"),  # IPOスコア（出来高）用
+            # Phase C：銘柄の強さ／ENTRYタイミング／チャートパターン（entryStateはゲート適用後）
+            "stockStrengthScore": pd_fields["stock_strength_score"], "entryTimingScore": pd_fields["entry_timing_score"],
+            "entryDecision": pd_fields["entry_decision"], "chartPattern": pd_fields["chart_context"]["pattern"],
+            "chartConfidence": pd_fields["chart_context"]["confidence"], "chartContext": pd_fields["chart_context"],
+            "entryStatePreChart": pd_fields["entry_state_pre_chart"],
         })
         _d = (stage2 or {}).get("distanceFromHighPct")
         rescore_ctx_by_code[code] = {
@@ -6086,8 +6156,13 @@ def rescore_entry_candidate_with_quote(ctx, shared, q):
             snapshot["aboveVwap"] = bool(t > snapshot["vwap"])  # VWAPが無い場合は判定を変えない（推測しない）
     f = _compute_price_dependent_entry_fields(
         ctx["w"].get("code"), ctx["w"], row, stage2, snapshot, ctx.get("bars"), ctx["catalysts"], ctx["event_signals"],
-        ctx["entry_risk"], ctx["data_quality"], shared, ctx["related_events"])
+        ctx["entry_risk"], ctx["data_quality"], shared, ctx["related_events"],
+        chart_bars=_chart_bars_for_rescore(ctx["w"].get("code"), ctx.get("bars")))
     return {
+        "stockStrengthScore": f["stock_strength_score"], "entryTimingScore": f["entry_timing_score"],
+        "entryDecision": f["entry_decision"], "chartPattern": f["chart_context"]["pattern"],
+        "chartConfidence": f["chart_context"]["confidence"], "chartContext": f["chart_context"],
+        "entryStatePreChart": f["entry_state_pre_chart"],
         "current": t, "quoteAt": q.get("quote_timestamp"), "priceSource": "LATEST_QUOTE",
         "changePct": round(row["changePct"], 2) if row.get("changePct") is not None else None,
         "marketRS": round(row["marketRS"], 2) if row.get("marketRS") is not None else None,
