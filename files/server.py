@@ -5351,6 +5351,27 @@ def _jst_today():
     return datetime.datetime.now(_JST).date()
 
 
+def _cash_response(rec):
+    """買付余力APIの応答。cash_available＝実効余力（基準余力＋基準点以降の確定済み税引後実現損益）。
+    内訳（manual_cash_anchor / anchor_at / realized_pnl_since_anchor）も返す。"""
+    return {"cash_available": rec.get("cash_available"), "effective_cash": rec.get("cash_available"),
+            "manual_cash_anchor": rec.get("manual_cash_anchor"), "anchor_at": rec.get("anchor_at"),
+            "realized_pnl_since_anchor": rec.get("realized_pnl_since_anchor"),
+            "currency": rec.get("currency") or "JPY", "source": rec.get("source"),
+            "updated_at": rec.get("updated_at"), "auto_reference": rec.get("auto_reference")}
+
+
+def refresh_cash_dependent_ranking(user_id):
+    """実現損益が確定した（決済した）直後に、キャッシュ済みTOP5を新しい実効余力・ポジション数で
+    即時に再ランキングする（フルスキャンは待たない）。失敗しても決済自体には影響させない。"""
+    try:
+        rec = get_capital_context(DATABASE_URL, user_id)
+        if rec:
+            recompute_entry_top5_cache_for_cash(user_id, rec, get_position_summary(DATABASE_URL, user_id))
+    except Exception as e:
+        print("  決済後の買付余力・TOP5再計算で例外（決済は成功、次回スキャンで反映）", e)
+
+
 # ---- IPO 業績データの自動結合（新しい業績DBは作らず、既存データを再利用する） ----
 
 IPO_FUNDAMENTALS_REFRESH_HOURS = 24
@@ -26265,9 +26286,7 @@ class Handler(SimpleHTTPRequestHandler):
             if rec is None:
                 self._send_json({"cash_available": None, "currency": "JPY", "source": None, "updated_at": None})
             else:
-                self._send_json({"cash_available": rec.get("cash_available"), "currency": rec.get("currency") or "JPY",
-                                 "source": rec.get("source"), "updated_at": rec.get("updated_at"),
-                                 "auto_reference": rec.get("auto_reference")})
+                self._send_json(_cash_response(rec))
         elif self.path.startswith("/api/ipo-stocks"):
             items = investment_db.list_ipo_stocks(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else []
             for it in items:
@@ -27431,9 +27450,7 @@ class Handler(SimpleHTTPRequestHandler):
                     self.current_user, rec, get_position_summary(DATABASE_URL, self.current_user))
             except Exception as e:
                 print("  買付余力変更後の即時再ランキングで例外（保存は成功、次回スキャンで反映）", e)
-            self._send_json({"cash_available": rec.get("cash_available"), "currency": rec.get("currency") or "JPY",
-                             "source": rec.get("source"), "updated_at": rec.get("updated_at"),
-                             "rerankedImmediately": rerank})
+            self._send_json({**_cash_response(rec), "rerankedImmediately": rerank})
         elif self.path == "/api/ipo-stocks/save":
             # IPO銘柄メタ情報・ファンダメンタル指標の登録（akippa等）。登録時にLearning Ruleも冪等に登録する。
             if not self._investment_db_ready():
@@ -27569,6 +27586,7 @@ class Handler(SimpleHTTPRequestHandler):
             # ベストエフォートでplaybook実績を更新する（add_position_exit自体は無変更、
             # 失敗してもここで例外を握りつぶし売却結果のレスポンスには影響させない）。
             if result and "error" not in result and result.get("trade"):
+                refresh_cash_dependent_ranking(self.current_user)  # 実現損益→実効買付余力→TOP5
                 try:
                     investment_db.record_trade_outcome_for_playbooks(
                         DATABASE_URL, self.current_user, body.get("code"), result["trade"])

@@ -7524,7 +7524,7 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
   const [exitModalFor,setExitModalFor]=useState(null); // portfolio 1件
   const [exitPriceOverride,setExitPriceOverride]=useState(null); // リアルタイム詳細から開いた場合の最新現在値
   const afterEntrySaved=()=>{load();};
-  const afterExitSaved=()=>{load();loadTotals();loadTrades();};
+  const afterExitSaved=()=>{load();loadTotals();loadTrades();loadCash();window.dispatchEvent(new CustomEvent("cash-updated"));};
   // item12/13：リアルタイム詳細エリアの「💰 売却」から開く場合は、そこで取得した最新の現在値を
   // 売値の初期値に使う（一覧の一括stockQuotesより新しいことが多いため）。通常の一覧行から開く
   // 場合は従来通りstockQuotesを使う（openExitの第2引数省略）。売却処理自体はどちらもこの同じ
@@ -7780,7 +7780,7 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
     })()}
     {/* 買付余力（2026-09-24新規）：今買い時TOP5・注目候補の「実際に買える銘柄」判定に使う手動設定値。 */}
     <div style={{background:"var(--card)",border:"1px solid var(--rule)",borderRadius:4,padding:"12px 14px",marginBottom:10}}>
-      <div style={{fontSize:11,color:"var(--inkSoft)"}}>買付余力（手動設定・TOP5の「買える銘柄」判定に使用）</div>
+      <div style={{fontSize:11,color:"var(--inkSoft)"}}>買付余力（基準余力＋その後に確定した税引後実現損益。含み損益は含みません）</div>
       {editingCash
         ? <div style={{display:"flex",gap:8,alignItems:"center",marginTop:4,flexWrap:"wrap"}}>
             <input type="number" autoFocus value={cashDraft} onChange={e=>setCashDraft(e.target.value)}
@@ -7794,9 +7794,14 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
               {cashInfo===null?"読込中…":cashInfo.cash_available!=null?Math.round(cashInfo.cash_available).toLocaleString()+"円":"未設定"}
             </span>
             <button className="iconbtn" style={{fontSize:11}}
-              onClick={()=>{setCashDraft(cashInfo&&cashInfo.cash_available!=null?String(Math.round(cashInfo.cash_available)):"");setEditingCash(true);}}>編集</button>
+              title="今の実際の買付余力を入力すると、それが新しい基準点になります（以後の確定損益が加算されます）"
+              onClick={()=>{setCashDraft(cashInfo&&cashInfo.cash_available!=null?String(Math.round(cashInfo.cash_available)):"");setEditingCash(true);}}>編集（新しい基準）</button>
+            {cashInfo&&cashInfo.manual_cash_anchor!=null && <span style={{fontSize:10.5,color:"var(--inkSoft)"}} className="mono">
+              基準 {Math.round(cashInfo.manual_cash_anchor).toLocaleString()}円
+              {" "}{(cashInfo.realized_pnl_since_anchor||0)>=0?"+":""}{Math.round(cashInfo.realized_pnl_since_anchor||0).toLocaleString()}円（基準日時以降の確定損益）
+            </span>}
             {cashInfo&&cashInfo.updated_at && <span style={{fontSize:10.5,color:"var(--inkFaint)"}}>
-              最終更新：{new Date(cashInfo.updated_at).toLocaleString("ja-JP",{timeZone:"Asia/Tokyo",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"})}
+              基準を設定した日時：{new Date(cashInfo.updated_at).toLocaleString("ja-JP",{timeZone:"Asia/Tokyo",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"})}
               （{cashInfo.source==="AUTO"?"自動":"手動"}）
             </span>}
             {cashInfo&&cashInfo.auto_reference!=null&&cashInfo.source==="MANUAL" && <span style={{fontSize:10.5,color:"var(--inkFaint)"}}>

@@ -706,6 +706,9 @@ CREATE TABLE IF NOT EXISTS portfolio_cash_balance (
     auto_reference  NUMERIC,
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- 2026-09-25追加：手動設定した時点を「新しい余力の基準点」とする（実効余力＝基準余力＋anchor_at以降に
+-- 確定した税引後実現損益）。既存行はanchor_at NULL＝updated_at（最後に手動設定した時刻）を基準点とみなす。
+ALTER TABLE portfolio_cash_balance ADD COLUMN IF NOT EXISTS anchor_at TIMESTAMPTZ;
 
 -- IPO銘柄メタ情報＋監視段階（WATCH_LOW/WATCH/BUY_CANDIDATE）。akippa事例：朝の下落で監視解除→
 -- ストップ高の機会損失。IPO後20営業日は完全削除せず段階として残す。
@@ -10927,24 +10930,38 @@ def set_initial_realized_pnl(database_url, user_id, value):
 # ============================================================
 
 def get_cash_balance(database_url, user_id):
-    """現在の買付余力（1ユーザー1行）。未設定ならNone。"""
+    """実効買付余力を返す。実効余力(cash_available) ＝ 基準余力(manual_cash_anchor)
+    ＋ 基準点(anchor_at)より後に確定した税引後実現損益の合計(realized_pnl_since_anchor)。
+    含み損益は一切加算しない（現金化されていない資金でTOP5の購入可能判定を過大評価しないため）。
+    税引後損益が無い旧レコードはpnlで代用（get_investment_totalsと同じCOALESCE）。未設定ならNone。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT cash_available, currency, source, auto_reference, updated_at "
+            cur.execute("SELECT cash_available, currency, source, auto_reference, updated_at, "
+                        "COALESCE(anchor_at, updated_at) AS anchor_at "
                         "FROM portfolio_cash_balance WHERE user_id = %s", [user_id])
             row = cur.fetchone()
-    if not row:
-        return None
+            if not row:
+                return None
+            cur.execute("SELECT COALESCE(SUM(COALESCE(net_pnl, pnl)), 0) AS realized FROM trade_history "
+                        "WHERE user_id = %s AND closed_at > %s", [user_id, row["anchor_at"]])
+            realized = float((cur.fetchone() or {}).get("realized") or 0)
+    anchor = float(row["cash_available"])
+    row = dict(row)
+    row["manual_cash_anchor"] = anchor
+    row["realized_pnl_since_anchor"] = round(realized)
+    row["cash_available"] = anchor + realized  # 実効買付余力（ランキングが使う値）
     return _row_to_json(row)
 
 
 def set_cash_balance(database_url, user_id, cash_available, source="MANUAL", auto_reference=None,
                      currency="JPY"):
-    """UPSERT（増殖させない）。MANUALが最優先：AUTO更新はMANUAL設定値を上書きしない
-    （auto_referenceだけ更新する）。"""
+    """UPSERT（増殖させない）。MANUALは「新しい基準点」：cash_available＝基準余力、anchor_at＝今。
+    それ以前の実現損益は基準に含まれている前提で、以後の実現損益だけが加算される。
+    MANUALが最優先：AUTO更新はMANUAL設定値を上書きしない（auto_referenceだけ更新する）。
+    戻り値は実効余力つき（get_cash_balance）。"""
     pool = _get_pool(database_url)
     if pool is None:
         return None
@@ -10952,26 +10969,25 @@ def set_cash_balance(database_url, user_id, cash_available, source="MANUAL", aut
         with conn.cursor(row_factory=dict_row) as cur:
             if source == "AUTO":
                 cur.execute(
-                    "INSERT INTO portfolio_cash_balance (user_id, cash_available, currency, source, auto_reference) "
-                    "VALUES (%s, %s, %s, 'AUTO', %s) "
+                    "INSERT INTO portfolio_cash_balance (user_id, cash_available, currency, source, auto_reference, anchor_at) "
+                    "VALUES (%s, %s, %s, 'AUTO', %s, now()) "
                     "ON CONFLICT (user_id) DO UPDATE SET auto_reference = EXCLUDED.auto_reference, "
                     "cash_available = CASE WHEN portfolio_cash_balance.source = 'MANUAL' "
                     "THEN portfolio_cash_balance.cash_available ELSE EXCLUDED.cash_available END, "
+                    "anchor_at = CASE WHEN portfolio_cash_balance.source = 'MANUAL' "
+                    "THEN portfolio_cash_balance.anchor_at ELSE now() END, "
                     "updated_at = CASE WHEN portfolio_cash_balance.source = 'MANUAL' "
-                    "THEN portfolio_cash_balance.updated_at ELSE now() END "
-                    "RETURNING cash_available, currency, source, auto_reference, updated_at",
+                    "THEN portfolio_cash_balance.updated_at ELSE now() END",
                     [user_id, cash_available, currency, cash_available if auto_reference is None else auto_reference])
             else:
                 cur.execute(
-                    "INSERT INTO portfolio_cash_balance (user_id, cash_available, currency, source, auto_reference) "
-                    "VALUES (%s, %s, %s, 'MANUAL', %s) "
+                    "INSERT INTO portfolio_cash_balance (user_id, cash_available, currency, source, auto_reference, anchor_at) "
+                    "VALUES (%s, %s, %s, 'MANUAL', %s, now()) "
                     "ON CONFLICT (user_id) DO UPDATE SET cash_available = EXCLUDED.cash_available, "
-                    "currency = EXCLUDED.currency, source = 'MANUAL', updated_at = now() "
-                    "RETURNING cash_available, currency, source, auto_reference, updated_at",
+                    "currency = EXCLUDED.currency, source = 'MANUAL', anchor_at = now(), updated_at = now()",
                     [user_id, cash_available, currency, auto_reference])
-            row = cur.fetchone()
         conn.commit()
-    return _row_to_json(row) if row else None
+    return get_cash_balance(database_url, user_id)
 
 
 def upsert_ipo_stock(database_url, user_id, code, name=None, listing_date=None, offer_price=None,
