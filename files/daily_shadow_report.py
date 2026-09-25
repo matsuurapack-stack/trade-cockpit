@@ -74,6 +74,22 @@ def main():
             if t in (r.get("transition_type") or "").split(","):
                 print(_line(r))
 
+    mv = day_sum["movement"]
+    print("\n--- Phase D shadow：既存の推奨 vs 値幅を見た推奨（movement-aware）---")
+    print("活動状態の件数:", mv["activity_states"], "/ PRE_BREAKOUT:", mv["pre_breakout_count"], "/ TOO_LATE:", mv["too_late_count"])
+    for name, g in mv["comparison"].items():
+        print(f"{name}: n={g['n']} +5m={g['avg_ret_5m']} +15m={g['avg_ret_15m']}(n={g['n_15m']}) +30m={g['avg_ret_30m']} "
+              f"+15mプラス率={g['plus_rate_15m']} MFE={g['avg_mfe_30m']} MAE={g['avg_mae_30m']}")
+    print("\nモメンタムENTRY（shadow）:", len(mv["momentum_entries"]), "件 / 逆指値評価:", mv["stop_evaluation"])
+    for m in mv["momentum_entries"]:
+        print(f"  {str(m['at'])[11:16]}(UTC) {m['code']} ENTRY {m['entry_price']} STOP {m['stop']}(-{m['stop_distance_pct']}%) RR={m['rr']} "
+              f"+5/+15/+30={_r(m['ret_5m'])}/{_r(m['ret_15m'])}/{_r(m['ret_30m'])} MFE={m['mfe_30m']} MAE={m['mae_30m']} "
+              f"評価={m['stop_evaluation']} | {m['entry_reason']}")
+    print("\nマイルストーン（いつ EXPANDING / PRE_BREAKOUT / EARLY_BREAKOUT / CHASE になったか, UTC）:")
+    for t in mv["milestone_timeline"][:20]:
+        print("  " + t["code"] + " " + " ".join(f"{k.replace('first_', '').replace('_at', '')}={str(t[k])[11:16]}"
+                                                for k, _ in sl.MILESTONES if t.get(k)))
+
     print("\n--- outcome delay（実取得時刻 − 目標時刻, 秒）---")
     for h, q in day_sum["outcome_quality"].items():
         print(h, q)

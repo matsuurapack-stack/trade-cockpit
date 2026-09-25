@@ -190,6 +190,8 @@ except ImportError:
 import capital_ranking  # 買付余力・IPO・shadow_watchの純粋ロジック（2026-09-24新規）
 import chart_context  # Chart Context Engine（Phase C：5分足の時系列形状・entry_timing_score）
 import chart_signal_log  # Phase C shadow運用：判定ログ・事後リターン・日次集計（記録専用、判定へは戻さない）
+import movement_potential  # Phase D：Movement Potential（今日これから値幅が出る可能性。shadow運用）
+import dynamic_watch  # Phase D：dynamic_watchlist（動いている銘柄のオーバーレイ。手動watchlistとは別）
 
 INDEX = {
     "usdjpy": "JPY=X", "nikkei": "^N225", "dow": "^DJI",
@@ -4673,6 +4675,18 @@ def load_chart_rule_penalties(database_url, user_id):
         return {"byPattern": {}, "sources": []}
 
 
+def _movement_candidate_fields(f):
+    """Phase D（shadow）：_compute_price_dependent_entry_fieldsの結果 → 候補dictへ載せる値幅系フィールド。
+    既存のentryState・順位は変えない（並行保存のみ）。"""
+    mv = f["movement"]
+    return {"movementScore": mv["movement_potential_score"], "recentActivityScore": mv["recent_activity_score"],
+            "activityState": mv["activity_state"], "preBreakout": mv["pre_breakout"], "tooLate": mv["too_late"],
+            "tooLateReasons": mv["too_late_reasons"], "momentumMode": mv["momentum_mode"], "momentumFlags": mv["momentum_flags"],
+            "recommendedStop": mv["recommended_stop"], "riskReward": mv["risk_reward"],
+            "movementRecommendation": f["movement_recommendation"], "movementReasons": mv["reasons"][:5],
+            "movementBreakdown": mv["breakdown"], "movementFeatures": mv["features"], "movementConfidence": mv["confidence"]}
+
+
 def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, catalysts, event_signals,
                                           entry_risk, data_quality, shared, related_events, chart_bars=None):
     """今買い時TOP5：現在値に依存するスコア・状態・理由リスクの算出（2026-09-25、Phase B-1）。
@@ -4726,6 +4740,13 @@ def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, 
     entry_state_pre_chart = entry_state
     entry_state, chart_gate_reasons = chart_context.apply_chart_gate(entry_state, strength, entry_score, chart)
     decision = chart_context.entry_decision(strength, chart)
+    # Phase D（shadow）：値幅を見た評価。既存のentry_state（Phase C適用後）は変えず、並行して保存する。
+    movement = movement_potential.evaluate_movement(
+        chart_bars if chart_bars is not None else bars, quote={"t": row.get("current")}, vwap=(snapshot or {}).get("vwap"),
+        day_high=row.get("high"), day_low=row.get("low"), rel_volume=(stage2 or {}).get("timeAdjustedVolumeRatio"),
+        market_rs=row.get("marketRS"), sector_lead=comp["autoSector"] > 0, chart=chart,
+        minutes_since_open=shared.get("minutes_since_open", _minutes_since_open()))
+    movement_recommendation = movement_potential.movement_recommendation(entry_state_pre_chart, entry_state, movement, chart)
 
     reasons = []
     if comp["momentum"] > 0:
@@ -4768,7 +4789,8 @@ def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, 
         (reasons if entry_state in ("NOW_BUYABLE", "ENTRY_READY") else risks).append(gr)
     if chart["pattern"] in chart_context.BAD_PATTERNS:
         risks.append(f"チャート {chart['pattern']}（ENTRYタイミングスコア{chart['entry_timing_score']}）")
-    return {"chart_context": chart, "stock_strength_score": strength, "entry_timing_score": chart["entry_timing_score"],
+    return {"movement": movement, "movement_recommendation": movement_recommendation,
+            "chart_context": chart, "stock_strength_score": strength, "entry_timing_score": chart["entry_timing_score"],
             "entry_decision": decision, "entry_state_pre_chart": entry_state_pre_chart, "range_metrics": range_metrics, "tradeable_range_score": tradeable_range_score,
             "room_to_move": room_to_move, "momentum_state": momentum_state, "reversal_info": reversal_info,
             "setup_type": setup_type, "event_guard": event_guard, "comp": comp,
@@ -5153,6 +5175,8 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
             "chartConfidence": pd_fields["chart_context"]["confidence"], "chartContext": pd_fields["chart_context"],
             "entryStatePreChart": pd_fields["entry_state_pre_chart"],
             "legacyEntryState": pd_fields["entry_state_pre_chart"], "chartEntryState": pd_fields["entry_state"],
+            **_movement_candidate_fields(pd_fields), "isManual": w.get("manual_registered") is not False,
+            "momentumState": pd_fields["momentum_state"],
         })
         _d = (stage2 or {}).get("distanceFromHighPct")
         rescore_ctx_by_code[code] = {
@@ -6076,6 +6100,7 @@ def _run_entry_top5_scan(database_url, user_id, trigger="AUTO", wait_for_lock=Fa
             cache_entry["shadowRecheck"] = []
         with _ENTRY_TOP5_CACHE_LOCK:
             _ENTRY_TOP5_CACHE[user_id] = cache_entry
+        refresh_shadow_movement(database_url, user_id)
         log_chart_signals(database_url, user_id, "SCAN")
         print(f"  [EntryTop5Scan] trigger={trigger} user={user_id} duration={cache_entry['durationMs']}ms "
               f"watchlist={cache_entry['watchlistCount']} ready={cache_entry['readyCount']} "
@@ -6097,6 +6122,8 @@ def _run_entry_top5_scan(database_url, user_id, trigger="AUTO", wait_for_lock=Fa
 # 価格依存項目（現在値・前日比・対市場RS・高値乖離・VWAP位置・値幅余地・モメンタム・イベントガード
 # ・entry_score・ENTRY状態）だけを再計算する。
 # ============================================================
+_DYNAMIC_WATCH = {}       # user_id -> {code: dynamic_watchlist行}（ACTIVE集合）
+_MOVEMENT_MILESTONES = {}  # (user_id, code) -> {"_date", "first_movement_at", ...}（最初にその状態になった時刻）
 _CHART_SIGNAL_LAST = {}   # (user_id, code) -> chart_signal_log.last_state()（最後に記録した状態。重複ログ抑止）
 _CHART_SIGNAL_MEM = {}    # (user_id, code) -> 観測メモリ（遷移タイプ検出用。記録の有無に関わらず毎回更新）
 
@@ -6104,6 +6131,58 @@ _CHART_SIGNAL_MEM = {}    # (user_id, code) -> 観測メモリ（遷移タイプ
 def _in_jp_session(now_jst):
     hm = now_jst.hour * 60 + now_jst.minute
     return (9 * 60 <= hm < 11 * 60 + 30) or (12 * 60 + 30 <= hm < 15 * 60 + 30)
+
+
+def refresh_shadow_movement(database_url, user_id):
+    """Phase D（shadow）：候補poolから、movement-awareな並び（注目TOP5・買い時ボード・TOO_LATE・PRE_BREAKOUT・
+    EXPANDING）とdynamic_watchlistを更新し、cacheのshadowMovementへ載せる。既存のTOP5（analysisTop5・
+    actionableTop5・entryReadyTop5）は一切変更しない。"""
+    try:
+        with _ENTRY_TOP5_CACHE_LOCK:
+            entry = _ENTRY_TOP5_CACHE.get(user_id)
+            if not entry:
+                return None
+            pool = list(entry.get("_candidatePool") or [])
+            analysis = [c.get("code") for c in (entry.get("analysisTop5") or [])]
+        now = datetime.datetime.now(_JST)
+        cands = []
+        for c in pool:
+            if c.get("movementScore") is None:
+                continue
+            c["movementEntryReason"] = movement_potential.entry_reason_line(c) if c.get("movementRecommendation") == "ENTRY_READY" else None
+            mv_like = {"movement_potential_score": c["movementScore"], "recent_activity_score": c.get("recentActivityScore"),
+                       "activity_state": c.get("activityState"), "pre_breakout": c.get("preBreakout")}
+            cands.append({"code": c["code"], "name": c.get("name"), "movement": c["movementScore"],
+                          "recent_activity": c.get("recentActivityScore"), "activity_state": c.get("activityState"),
+                          "pre_breakout": c.get("preBreakout"), "above_vwap": (c.get("movementFeatures") or {}).get("aboveVwap"),
+                          "momentum_state": c.get("momentumState"), "is_manual": c.get("isManual", True),
+                          "rank": movement_potential.attention_rank_score(mv_like)})
+        can_write = bool(investment_db is not None and database_url and WRITE_E2E_ALLOWED)
+        state = _DYNAMIC_WATCH.get(user_id)
+        if state is None:
+            state = investment_db.load_dynamic_watch(database_url, user_id) if can_write else {}
+        res = dynamic_watch.update_dynamic_watch(state, cands, now)
+        if can_write and _in_jp_session(now):
+            pool_updates = [{"code": k, "pool": v["pool"], "last_seen_at": v.get("last_seen_at") or now, "weak_since": v.get("weak_since")}
+                            for k, v in res["state"].items()
+                            if k in state and (state[k].get("pool") != v["pool"] or state[k].get("weak_since") != v.get("weak_since"))]
+            try:
+                investment_db.sync_dynamic_watch(database_url, user_id, res["adds"], res["removes"], pool_updates)
+            except Exception as e:
+                print("  [DynamicWatch] DB保存で例外（メモリ上は更新済み）", e)
+        _DYNAMIC_WATCH[user_id] = res["state"]
+        shadow = movement_potential.build_shadow_lists(pool, analysis, res["hot"])
+        shadow["dynamicWatch"] = {"active": len(res["state"]), "hot": res["hot"], "added": [a["code"] for a in res["adds"]],
+                                  "removed": res["removes"], "updatedAt": now.isoformat(),
+                                  "note": "shadow：既存のTOP5・監視対象には反映していない"}
+        with _ENTRY_TOP5_CACHE_LOCK:
+            cur = _ENTRY_TOP5_CACHE.get(user_id)
+            if cur is not None:
+                cur["shadowMovement"] = shadow
+        return shadow
+    except Exception as e:
+        print("  [ShadowMovement] 更新で例外（無視して続行）", e)
+        return None
 
 
 def log_chart_signals(database_url, user_id, source):
@@ -6121,12 +6200,17 @@ def log_chart_signals(database_url, user_id, source):
             pool = list(entry.get("_candidatePool") or [])
             top5 = {k: {c.get("code") for c in (entry.get(k) or [])}
                     for k in ("entryReadyTop5", "actionableTop5", "analysisTop5", "watchCandidates")}
+            sm = entry.get("shadowMovement") or {}
+            top5["movementAttention"] = {c.get("code") for c in (sm.get("attentionTop5") or [])}
+            top5["movementEntryBoard"] = {c.get("code") for c in (sm.get("entryBoard") or [])}
+            top5["hotPool"] = set(sm.get("hotPool") or [])
         recs = []
         for c in pool:
             rec = chart_signal_log.build_signal_record(user_id, c, now, source, top5)
             if rec is None:
                 continue
             key = (user_id, rec["code"])
+            chart_signal_log.update_milestones(_MOVEMENT_MILESTONES, key, rec, now)
             trans, origin = chart_signal_log.detect_transition(_CHART_SIGNAL_MEM, key, rec, now)
             if not chart_signal_log.is_loggable(rec):
                 continue
@@ -6279,6 +6363,7 @@ def rescore_entry_candidate_with_quote(ctx, shared, q):
         "chartConfidence": f["chart_context"]["confidence"], "chartContext": f["chart_context"],
         "entryStatePreChart": f["entry_state_pre_chart"],
         "legacyEntryState": f["entry_state_pre_chart"], "chartEntryState": f["entry_state"],
+        **_movement_candidate_fields(f), "momentumState": f["momentum_state"],
         "current": t, "quoteAt": q.get("quote_timestamp"), "priceSource": "LATEST_QUOTE",
         "changePct": round(row["changePct"], 2) if row.get("changePct") is not None else None,
         "marketRS": round(row["marketRS"], 2) if row.get("marketRS") is not None else None,
@@ -6357,6 +6442,7 @@ def rescore_entry_top5_cache(database_url, user_id):
     diag["rankChanged"] = before != after
     diag["before"], diag["after"] = before, after
     if diag["rescored"]:
+        refresh_shadow_movement(database_url, user_id)
         log_chart_signals(database_url, user_id, "RESCORE")
     diag["elapsedMs"] = round((time.time() - t0) * 1000)
     if diag["rescored"]:

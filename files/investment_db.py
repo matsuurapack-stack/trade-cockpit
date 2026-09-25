@@ -794,6 +794,37 @@ ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS at_15m TIMESTAMPTZ;
 ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS at_30m TIMESTAMPTZ;
 ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS transition_type TEXT;
 ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS transition_origin TEXT;
+-- Phase D（Movement Potential・shadow）
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS movement_score DOUBLE PRECISION;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS recent_activity DOUBLE PRECISION;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS activity_state TEXT;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS pre_breakout BOOLEAN;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS too_late BOOLEAN;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS momentum_mode BOOLEAN;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS recommended_stop DOUBLE PRECISION;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS stop_distance_pct DOUBLE PRECISION;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS risk_reward DOUBLE PRECISION;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS movement_recommendation TEXT;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS movement_json JSONB;
+
+-- 動いている銘柄だけのオーバーレイ（手動のwatchlistとは別。watchlistテーブルには触れない）
+CREATE TABLE IF NOT EXISTS dynamic_watchlist (
+    id                SERIAL PRIMARY KEY,
+    user_id           TEXT NOT NULL,
+    code              TEXT NOT NULL,
+    name              TEXT,
+    is_manual         BOOLEAN NOT NULL DEFAULT FALSE,
+    source            TEXT,
+    pool              TEXT NOT NULL DEFAULT 'ACTIVE',
+    status            TEXT NOT NULL DEFAULT 'ACTIVE',
+    movement_at_add   DOUBLE PRECISION,
+    added_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at      TIMESTAMPTZ,
+    weak_since        TIMESTAMPTZ,
+    removed_at        TIMESTAMPTZ,
+    removed_reason    TEXT,
+    UNIQUE (user_id, code)
+);
 CREATE INDEX IF NOT EXISTS idx_chart_signal_log_user_date ON chart_signal_log (user_id, trade_date, code);
 CREATE INDEX IF NOT EXISTS idx_chart_signal_log_pending ON chart_signal_log (outcome_done, logged_at);
 """
@@ -11122,7 +11153,8 @@ _CHART_SIGNAL_INSERT_COLS = (
     "user_id", "logged_at", "trade_date", "code", "name", "source", "current_price", "day_high", "stock_strength",
     "entry_timing", "chart_pattern", "chart_confidence", "legacy_entry_state", "chart_entry_state", "entry_decision",
     "vwap", "vwap_distance", "change_15m", "consecutive_green", "upper_wick_ratio", "breakout_volume_ratio",
-    "transition_type", "transition_origin")
+    "transition_type", "transition_origin", "movement_score", "recent_activity", "activity_state", "pre_breakout",
+    "too_late", "momentum_mode", "recommended_stop", "stop_distance_pct", "risk_reward", "movement_recommendation")
 
 
 def insert_chart_signals(database_url, records):
@@ -11131,15 +11163,16 @@ def insert_chart_signals(database_url, records):
     if pool is None or not records:
         return 0
     jst = datetime.timezone(datetime.timedelta(hours=9))
-    cols = _CHART_SIGNAL_INSERT_COLS + ("reasons_json", "penalties_json", "features_json", "context_json")
+    cols = _CHART_SIGNAL_INSERT_COLS + ("reasons_json", "penalties_json", "features_json", "context_json", "movement_json")
     sql = (f"INSERT INTO chart_signal_log ({', '.join(cols)}) VALUES ("
-           + ", ".join(["%s"] * len(_CHART_SIGNAL_INSERT_COLS) + ["%s::jsonb"] * 4) + ")")
+           + ", ".join(["%s"] * len(_CHART_SIGNAL_INSERT_COLS) + ["%s::jsonb"] * 5) + ")")
     params = []
     for r in records:
         vals = [r.get(c) if c != "trade_date" else r["logged_at"].astimezone(jst).date() for c in _CHART_SIGNAL_INSERT_COLS]
         vals += [json.dumps(r.get("reasons"), ensure_ascii=False), json.dumps(r.get("penalties"), ensure_ascii=False),
                  json.dumps(r.get("features"), ensure_ascii=False, default=str),
-                 json.dumps(r.get("context"), ensure_ascii=False, default=str)]
+                 json.dumps(r.get("context"), ensure_ascii=False, default=str),
+                 json.dumps(r.get("movement"), ensure_ascii=False, default=str)]
         params.append(vals)
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -11185,6 +11218,44 @@ def update_chart_signal_outcomes(database_url, updates):
     return len(updates)
 
 
+def load_dynamic_watch(database_url, user_id):
+    """dynamic_watchlistのACTIVE行 → {code: {...}}（datetimeはそのまま。dynamic_watch.update_dynamic_watch用）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return {}
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT code, name, is_manual, source, pool, movement_at_add, added_at, last_seen_at, weak_since "
+                        "FROM dynamic_watchlist WHERE user_id = %s AND status = 'ACTIVE'", [user_id])
+            return {r["code"]: dict(r) for r in cur.fetchall()}
+
+
+def sync_dynamic_watch(database_url, user_id, adds, removes, pool_updates):
+    """追加/削除/pool(HOT・ACTIVE)変更だけを反映する。watchlist（手動監視）テーブルには触れない。"""
+    pool = _get_pool(database_url)
+    if pool is None or not (adds or removes or pool_updates):
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            if adds:
+                cur.executemany(
+                    "INSERT INTO dynamic_watchlist (user_id, code, name, is_manual, source, pool, movement_at_add, added_at, last_seen_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (user_id, code) DO UPDATE SET status = 'ACTIVE', "
+                    "source = EXCLUDED.source, pool = EXCLUDED.pool, added_at = EXCLUDED.added_at, last_seen_at = EXCLUDED.last_seen_at, "
+                    "weak_since = NULL, removed_at = NULL, removed_reason = NULL",
+                    [[user_id, a["code"], a.get("name"), bool(a.get("is_manual")), a.get("source"), a.get("pool", "ACTIVE"),
+                      a.get("movement_at_add"), a["added_at"], a["last_seen_at"]] for a in adds])
+            if removes:
+                cur.executemany("UPDATE dynamic_watchlist SET status = 'REMOVED', removed_at = now(), removed_reason = %s "
+                                "WHERE user_id = %s AND code = %s", [[r["reason"], user_id, r["code"]] for r in removes])
+            if pool_updates:
+                cur.executemany("UPDATE dynamic_watchlist SET pool = %s, last_seen_at = %s, weak_since = %s "
+                                "WHERE user_id = %s AND code = %s AND status = 'ACTIVE'",
+                                [[u["pool"], u["last_seen_at"], u.get("weak_since"), user_id, u["code"]] for u in pool_updates])
+        conn.commit()
+    return len(adds) + len(removes) + len(pool_updates)
+
+
 def list_chart_signals(database_url, user_id, trade_date, code=None, limit=5000):
     pool = _get_pool(database_url)
     if pool is None:
@@ -11202,6 +11273,7 @@ def list_chart_signals(database_url, user_id, trade_date, code=None, limit=5000)
         d = _row_to_json(r)   # datetime/Decimalをそのままjson化できる形へ
         d["reasons"], d["penalties"] = d.pop("reasons_json", None), d.pop("penalties_json", None)
         d["features"], d["context"] = d.pop("features_json", None), d.pop("context_json", None)
+        d["movement"] = d.pop("movement_json", None)
         out.append(d)
     return out
 

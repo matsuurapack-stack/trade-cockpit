@@ -31,6 +31,13 @@ DECLINE_PCT = -0.3
 UP_PCT = 0.7                       # backtest_chart_context の QUICK_WIN と同じ
 FAILED_BREAK_MISJUDGE_PCT = 4.0    # 「FAILED_BREAKOUT判定→30分後+4%以上」を誤判定とみなす（指示）
 
+# Phase D（Movement Potential）：値幅を見た推奨（shadow）で「注目すべき」状態
+MOVEMENT_NOTABLE_RECS = ("ENTRY_READY", "TOO_LATE", "PRE_BREAKOUT", "WATCH_EXPANDING", "BLOCKED_LOW_ACTIVITY")
+MILESTONES = (("first_movement_at", "値幅拡大の始まり（movement>=65またはEXPANDING）"),
+              ("first_expanding_at", "EXPANDING"), ("first_pre_breakout_at", "PRE_BREAKOUT"),
+              ("first_early_breakout_at", "EARLY_BREAKOUT"), ("first_chase_at", "CHASE/EXTENDED/EXHAUSTION"),
+              ("first_movement_entry_at", "movement-aware ENTRY_READY"))
+
 ENTRY_STATES = ("NOW_BUYABLE", "ENTRY_READY")
 CHASE_PATTERNS = ("CHASE", "EXTENDED", "EXHAUSTION")
 
@@ -60,6 +67,16 @@ def build_signal_record(user_id, cand, now, source, top5_codes=None):
     top5 = top5_codes or {}
     return {
         "transition_type": None, "transition_origin": None,
+        "movement_score": cand.get("movementScore"), "recent_activity": cand.get("recentActivityScore"),
+        "activity_state": cand.get("activityState"), "pre_breakout": cand.get("preBreakout"),
+        "too_late": cand.get("tooLate"), "momentum_mode": cand.get("momentumMode"),
+        "recommended_stop": (cand.get("recommendedStop") or {}).get("price"),
+        "stop_distance_pct": (cand.get("recommendedStop") or {}).get("distancePct"),
+        "risk_reward": (cand.get("riskReward") or {}).get("rr"), "movement_recommendation": cand.get("movementRecommendation"),
+        "movement": {"breakdown": cand.get("movementBreakdown"), "reasons": cand.get("movementReasons"),
+                     "tooLateReasons": cand.get("tooLateReasons"), "momentumFlags": cand.get("momentumFlags"),
+                     "stop": cand.get("recommendedStop"), "riskReward": cand.get("riskReward"),
+                     "features": cand.get("movementFeatures"), "entryReason": cand.get("movementEntryReason")},
         "user_id": user_id, "logged_at": now, "code": str(cand["code"]), "name": cand.get("name"), "source": source,
         "current_price": price, "day_high": day_high,
         "stock_strength": cand.get("stockStrengthScore"), "entry_timing": cc.get("entry_timing_score"),
@@ -79,16 +96,46 @@ def build_signal_record(user_id, cand, now, source, top5_codes=None):
     }
 
 
+def movement_notable(rec):
+    return bool(rec.get("movement_recommendation") in MOVEMENT_NOTABLE_RECS or rec.get("activity_state") == "EXPANDING"
+                or rec.get("pre_breakout") or rec.get("momentum_mode"))
+
+
+def update_milestones(mem, key, rec, now):
+    """銘柄×日ごとに「最初にその状態になった時刻」を記録し、今回新しく付いたマイルストーンのリストを返す。
+    アキッパ型（後でストップ高まで行った銘柄）が、いつEXPANDING/PRE_BREAKOUT/EARLY_BREAKOUT/CHASEになったかを
+    後から検証するための記録（未来データは使わない）。"""
+    ms = mem.get(key)
+    if ms is None or ms.get("_date") != now.date():
+        ms = {"_date": now.date()}
+        mem[key] = ms
+    new = []
+
+    def mark(name, cond):
+        if cond and name not in ms:
+            ms[name] = now.isoformat()
+            new.append(name)
+    mark("first_movement_at", (rec.get("movement_score") or 0) >= 65 or rec.get("activity_state") == "EXPANDING")
+    mark("first_expanding_at", rec.get("activity_state") == "EXPANDING")
+    mark("first_pre_breakout_at", bool(rec.get("pre_breakout")))
+    mark("first_early_breakout_at", rec.get("chart_pattern") == "EARLY_BREAKOUT")
+    mark("first_chase_at", rec.get("chart_pattern") in CHASE_PATTERNS)
+    mark("first_movement_entry_at", rec.get("movement_recommendation") == "ENTRY_READY")
+    rec.setdefault("context", {})["milestones"] = {k: v for k, v in ms.items() if not k.startswith("_")}
+    rec["context"]["newMilestones"] = new
+    return new
+
+
 def is_priority(rec):
     ctx = rec.get("context") or {}
-    return bool(ctx.get("top5") or rec.get("legacy_entry_state") != rec.get("chart_entry_state")
+    return bool(ctx.get("top5") or movement_notable(rec) or rec.get("legacy_entry_state") != rec.get("chart_entry_state")
                 or rec.get("chart_entry_state") in ENTRY_STATES or rec.get("legacy_entry_state") in ENTRY_STATES
                 or "CHASE_RISK" in (rec.get("chart_entry_state"), rec.get("legacy_entry_state"))
                 or rec.get("chart_pattern") in PRIORITY_PATTERNS)
 
 
 def is_loggable(rec):
-    if (rec.get("context") or {}).get("top5"):
+    if (rec.get("context") or {}).get("top5") or movement_notable(rec) or (rec.get("context") or {}).get("newMilestones"):
         return True
     return rec.get("legacy_entry_state") in LOGGED_STATES or rec.get("chart_entry_state") in LOGGED_STATES
 
@@ -98,7 +145,8 @@ def last_state(rec, now):
     ft = rec.get("features") or {}
     return {"pattern": rec["chart_pattern"], "chart": rec["chart_entry_state"], "legacy": rec["legacy_entry_state"],
             "at": now, "timing": rec.get("entry_timing"), "vdist": rec.get("vwap_distance"), "chg15": rec.get("change_15m"),
-            "prio": is_priority(rec), "top5": tuple((rec.get("context") or {}).get("top5") or ())}
+            "prio": is_priority(rec), "top5": tuple((rec.get("context") or {}).get("top5") or ()),
+            "mrec": rec.get("movement_recommendation"), "act": rec.get("activity_state"), "pre": bool(rec.get("pre_breakout"))}
 
 
 def _moved(a, b, th):
@@ -116,6 +164,11 @@ def should_log(last, rec, now):
     top5 = tuple((rec.get("context") or {}).get("top5") or ())
     if top5 != last.get("top5"):
         return True
+    if (rec.get("context") or {}).get("newMilestones"):
+        return True       # 最初にEXPANDING/PRE_BREAKOUT/EARLY_BREAKOUT/CHASEになった瞬間は必ず残す
+    if (last.get("mrec"), last.get("act"), last.get("pre")) != (rec.get("movement_recommendation"), rec.get("activity_state"),
+                                                              bool(rec.get("pre_breakout"))) and (prio or last.get("prio")):
+        return True       # 値幅を見た推奨・活動状態・PRE_BREAKOUTの変化
     if last["pattern"] != rec["chart_pattern"] and (prio or last.get("prio"))             and (now - last["at"]).total_seconds() >= PATTERN_FLAP_MIN_SEC:
         return True       # 優先パターンへ/から変わった瞬間（BASE_BUILDING↔NEUTRAL等の非優先間の揺れは継続扱い）
     age = (now - last["at"]).total_seconds()
@@ -397,4 +450,96 @@ def summarize_day(rows):
         "transition_types": transition_summary(rows),          # 厳密：状態が変わった瞬間に記録した遷移タイプ
         "transitions_loose": transition_chains(rows),          # 参考：履歴列からの緩い推測（厳密な集計には使わない）
         "outcome_quality": outcome_quality(rows),
+        "movement": summarize_movement(rows),                  # Phase D（shadow）：existing vs movement-aware
     }
+
+
+# ---------------------------------------------------------------- Phase D：existing vs movement-aware の比較（shadow）
+STOP_DEEP_RATIO = 0.4    # 逆指値に掛からず、最大逆行(MAE)が逆指値幅のこの割合未満 → 「深すぎた」（集計上の定義）
+
+
+def stop_evaluation(row):
+    """推奨逆指値の事後評価（集計専用。ENTRYの判定には戻さない）。
+      TOO_SHALLOW  30分内に逆指値へ届いたが、30分後は建値以上に戻った（浅すぎて刈られた）
+      APPROPRIATE  届いて30分後も建値未満（適切）／届かず、逆行が逆指値幅の40%以上（適切に機能しうる幅）
+      TOO_DEEP     届かず、逆行が逆指値幅の40%未満（必要以上に深かった）
+    max/min_30mは約20秒間隔のquote標本なので、瞬間的なヒゲは拾えない。"""
+    entry, stop = _num(row.get("current_price")), _num(row.get("recommended_stop"))
+    lo, p30 = _num(row.get("min_30m")), _num(row.get("price_30m"))
+    if not entry or not stop or stop >= entry or lo is None:
+        return None
+    if lo <= stop:
+        if p30 is None:
+            return None
+        return "TOO_SHALLOW" if p30 >= entry else "APPROPRIATE"
+    mae, dist = entry - lo, entry - stop
+    return "TOO_DEEP" if mae < dist * STOP_DEEP_RATIO else "APPROPRIATE"
+
+
+def _mfe_mae(r):
+    e = _num(r.get("current_price"))
+    if not e:
+        return None, None
+    hi, lo = _num(r.get("max_30m")), _num(r.get("min_30m"))
+    return (round((hi / e - 1) * 100, 3) if hi is not None else None), (round((lo / e - 1) * 100, 3) if lo is not None else None)
+
+
+def _group_stats(rows):
+    def avg(vals):
+        v = [x for x in vals if x is not None]
+        return (round(sum(v) / len(v), 3), len(v)) if v else (None, 0)
+    out = {"n": len(rows)}
+    for h in HORIZONS_MIN:
+        a, n = avg([r.get(f"ret_{h}m") for r in rows])
+        out[f"avg_ret_{h}m"], out[f"n_{h}m"] = a, n
+    out["plus_rate_15m"] = _rate(sum(1 for r in rows if (r.get("ret_15m") or 0) > 0), sum(1 for r in rows if r.get("ret_15m") is not None))
+    out["avg_mfe_30m"] = avg([_mfe_mae(r)[0] for r in rows])[0]
+    out["avg_mae_30m"] = avg([_mfe_mae(r)[1] for r in rows])[0]
+    return out
+
+
+def summarize_movement(rows):
+    """existing recommendation（chart_entry_state）と movement-aware recommendation の並行比較、
+    モメンタムENTRYのshadow記録（逆指値・MFE/MAE・逆指値評価）、マイルストーン（いつEXPANDING/PRE_BREAKOUT/…になったか）。"""
+    rr = _with_ret(rows)
+    seen, events = set(), []
+    for r in sorted(rr, key=lambda x: str(x["logged_at"])):     # 同一状態の重複行は初出のみ
+        k = (r["code"], r.get("chart_entry_state"), r.get("movement_recommendation"), r.get("activity_state"), bool(r.get("pre_breakout")))
+        if k in seen:
+            continue
+        seen.add(k)
+        events.append(r)
+    ex_entry = [r for r in events if _is_entry(r.get("chart_entry_state"))]
+    groups = {
+        "existing_ENTRY_and_movement_ENTRY": [r for r in ex_entry if r.get("movement_recommendation") == "ENTRY_READY"],
+        "existing_ENTRY_but_movement_TOO_LATE": [r for r in ex_entry if r.get("movement_recommendation") == "TOO_LATE"],
+        "existing_ENTRY_but_movement_LOW_ACTIVITY": [r for r in ex_entry if r.get("movement_recommendation") == "BLOCKED_LOW_ACTIVITY"],
+        "movement_ENTRY_but_existing_not_ENTRY": [r for r in events if r.get("movement_recommendation") == "ENTRY_READY"
+                                                  and not _is_entry(r.get("chart_entry_state"))],
+        "movement_PRE_BREAKOUT": [r for r in events if r.get("movement_recommendation") == "PRE_BREAKOUT"],
+        "movement_WATCH_EXPANDING": [r for r in events if r.get("movement_recommendation") == "WATCH_EXPANDING"],
+    }
+    mom = [r for r in events if r.get("momentum_mode") and r.get("movement_recommendation") == "ENTRY_READY"]
+    momentum = []
+    for r in mom:
+        mfe, mae = _mfe_mae(r)
+        momentum.append({"code": r["code"], "at": str(r["logged_at"]), "entry_price": r.get("current_price"),
+                         "stop": r.get("recommended_stop"), "stop_distance_pct": r.get("stop_distance_pct"),
+                         "rr": r.get("risk_reward"), "ret_5m": r.get("ret_5m"), "ret_15m": r.get("ret_15m"),
+                         "ret_30m": r.get("ret_30m"), "mfe_30m": mfe, "mae_30m": mae, "stop_evaluation": stop_evaluation(r),
+                         "entry_reason": (r.get("movement") or {}).get("entryReason")})
+    ev = [m["stop_evaluation"] for m in momentum if m["stop_evaluation"]]
+    stop_eval = {k: ev.count(k) for k in ("TOO_SHALLOW", "APPROPRIATE", "TOO_DEEP")}
+    last_ms = {}
+    for r in sorted(rr, key=lambda x: str(x["logged_at"])):
+        ms = (r.get("context") or {}).get("milestones")
+        if ms:
+            last_ms[r["code"]] = ms
+    timeline = [dict(code=c, **ms) for c, ms in last_ms.items()]
+    timeline.sort(key=lambda d: d.get("first_movement_at") or "9999")
+    return {"comparison": {k: _group_stats(v) for k, v in groups.items()},
+            "activity_states": {s: sum(1 for r in events if r.get("activity_state") == s)
+                                for s in ("EXPANDING", "ACTIVE", "COILING", "LOW_ACTIVITY", "FADING", "UNKNOWN")},
+            "pre_breakout_count": sum(1 for r in events if r.get("pre_breakout")),
+            "too_late_count": sum(1 for r in events if r.get("too_late")),
+            "momentum_entries": momentum, "stop_evaluation": stop_eval, "milestone_timeline": timeline}

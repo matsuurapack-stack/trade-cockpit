@@ -2106,6 +2106,15 @@ const CHART_PATTERN_META = {
   EXHAUSTION:         {label:"EXHAUSTION",      color:"var(--down)"},
   VWAP_LOSS:          {label:"VWAP割れ",         color:"var(--down)"},
 };
+// Phase D（Movement Potential・shadow）：値幅を見た活動状態と推奨の表示ラベル。既存のentryStateは変えず、
+// 並行して表示するだけ（30〜50件のshadow検証が済むまで本番の順位・判定には反映しない）。
+const ACTIVITY_STATE_META = {
+  EXPANDING:{label:"📈 値幅拡大中",color:"var(--up)"}, ACTIVE:{label:"動いている",color:"var(--inkSoft)"},
+  COILING:{label:"収束中",color:"var(--inkSoft)"}, LOW_ACTIVITY:{label:"😴 動かない",color:"var(--inkFaint)"},
+  FADING:{label:"📉 失速",color:"var(--down)"}, UNKNOWN:{label:"—",color:"var(--inkFaint)"}};
+const MOVEMENT_REC_LABEL = {
+  ENTRY_READY:"🎯 ENTRY条件成立", TOO_LATE:"⚠️ 強いが遅い／押し目待ち", BLOCKED_LOW_ACTIVITY:"😴 動かないため見送り",
+  PRE_BREAKOUT:"🔥 ブレイク接近", WATCH_EXPANDING:"📈 値幅拡大を監視", NONE:"—"};
 const ENTRY_DECISION_LABEL = {ENTRY_READY:"ENTRY READY", WATCH:"WATCH", WAIT_PULLBACK:"WAIT PULLBACK", WAIT_BREAKOUT:"WAIT BREAKOUT",
   NO_ENTRY_CHASE:"NO ENTRY（走りすぎ）", NO_ENTRY_FAILED_BREAK:"NO ENTRY（ダマシ）"};
 const ENTRY_STATE_META = {
@@ -5555,6 +5564,12 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                           color:CHART_PATTERN_META[c.chartPattern].color}} title={((c.chartContext&&c.chartContext.reasons)||[]).concat((c.chartContext&&c.chartContext.penalties)||[]).join(" / ")}>
                         {CHART_PATTERN_META[c.chartPattern].label}{c.entryTimingScore!=null?` ・ENTRY ${c.entryTimingScore}`:""}
                       </span>}
+                      {/* Phase D（shadow）：ブレイク接近／TOO LATE（理由つき）／活動状態。既存の判定は変えない。 */}
+                      {c.preBreakout && <span style={{fontSize:10.5,fontWeight:800,whiteSpace:"nowrap",color:"var(--warn)"}}>🔥 ブレイク接近</span>}
+                      {c.tooLate && <span style={{fontSize:10.5,fontWeight:800,whiteSpace:"nowrap",color:"var(--down)"}}
+                          title={(c.tooLateReasons||[]).join(" / ")}>⚠️ TOO LATE{(c.tooLateReasons||[]).length>0?`（${c.tooLateReasons.slice(0,2).join(" / ")}）`:""}</span>}
+                      {c.activityState && ACTIVITY_STATE_META[c.activityState] && ["EXPANDING","LOW_ACTIVITY","FADING"].includes(c.activityState) &&
+                        <span style={{fontSize:10.5,fontWeight:700,whiteSpace:"nowrap",color:ACTIVITY_STATE_META[c.activityState].color}}>{ACTIVITY_STATE_META[c.activityState].label}</span>}
                       {/* Market Intelligence Phase9新規（指示書21・38番）：entry_score自体は
                           不変、隣に並べるだけの追加専用表示。 */}
                       {c.eventSupport && <span style={{fontSize:10,fontWeight:700,whiteSpace:"nowrap",
@@ -5629,6 +5644,11 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                       詳細分析：{confirmationOverrideReasons.join("・")}
                       {confirmationUnblockConditions&&confirmationUnblockConditions.length>0 && <span style={{color:"var(--inkSoft)"}}>　／　ENTRY解禁：{confirmationUnblockConditions.join("・")}</span>}
                     </div>}
+                    {c.movementRecommendation==="ENTRY_READY" && (c.movementEntryReason||c.recommendedStop) && <div className="mono" style={{fontSize:11,marginTop:4,color:"var(--accent)",fontWeight:700}}>
+                      ENTRY理由：{c.movementEntryReason||"—"}
+                      {c.recommendedStop && <span>　／　ENTRY {c.current!=null?Math.round(c.current).toLocaleString():"—"}　STOP {Math.round(c.recommendedStop.price).toLocaleString()}（-{c.recommendedStop.distancePct}%・{c.recommendedStop.method}）</span>}
+                      {c.riskReward && <span>　RR {c.riskReward.rr}</span>}
+                    </div>}
                     {expanded && <div style={{marginTop:6,paddingTop:6,borderTop:"1px dashed var(--rule)",display:"flex",flexWrap:"wrap",gap:"4px 14px",fontSize:11}}>
                       {ENTRY_SCORE_COMPONENT_META.map(m=><span key={m.key} className="mono">
                         {m.label} {bd[m.key]!=null?bd[m.key]:0}{m.max!=null?`/${m.max}`:""}
@@ -5646,6 +5666,16 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                         {(c.chartContext.reasons||[]).length>0 && <div>理由：{c.chartContext.reasons.join("・")}</div>}
                         {(c.chartContext.penalties||[]).length>0 && <div style={{color:"var(--down)"}}>減点：{c.chartContext.penalties.join("・")}</div>}
                       </div>}
+                      {c.movementScore!=null && <div style={{flexBasis:"100%",borderTop:"1px dotted var(--rule)",paddingTop:4,marginTop:2}} className="mono">
+                        <div>Movement Potential {c.movementScore}／100 ・直近の活動 {c.recentActivityScore??"—"}／100 ・状態 {(ACTIVITY_STATE_META[c.activityState]||{}).label||c.activityState}
+                          {c.momentumMode && <span style={{color:"var(--warn)"}}>　🚀 モメンタム候補（逆指値必須）</span>}</div>
+                        <div>既存の推奨 {c.chartEntryState||c.entryState}（旧 {c.legacyEntryState||"—"}）／ 値幅を見た推奨 {MOVEMENT_REC_LABEL[c.movementRecommendation]||c.movementRecommendation}
+                          <span style={{color:"var(--inkFaint)"}}>　（shadow：順位・判定には未反映）</span></div>
+                        {c.recommendedStop && <div>推奨逆指値 {c.recommendedStop.price}（-{c.recommendedStop.distancePct}%・{c.recommendedStop.method}）
+                          {c.riskReward && <span>　ターゲット {c.riskReward.targetPrice}（+{c.riskReward.targetPct}%）RR {c.riskReward.rr}</span>}</div>}
+                        {(c.movementReasons||[]).length>0 && <div>理由：{c.movementReasons.join("・")}</div>}
+                        {c.movementBreakdown && <div style={{color:"var(--inkFaint)"}}>内訳：{Object.entries(c.movementBreakdown).filter(([k,v])=>v).map(([k,v])=>`${k} ${v>0?"+":""}${v}`).join(" / ")}</div>}
+                      </div>}
                     </div>}
                   </div>;
                 })}
@@ -5654,6 +5684,26 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
               余力不足・再注目・WATCH_LOW・監視候補・反転候補）は通常画面では描画しない。内部計算・
               APIは無変更、明示的なデバッグ表示（🔧デバッグ）を開いたときだけ表示する。 */}
           {entryDebugOpen && <>
+          {entryResult.shadowMovement && <div style={{marginBottom:10,padding:"6px 8px",border:"1px dashed var(--rule)",borderRadius:4}}>
+            <div style={{fontSize:11.5,fontWeight:800,marginBottom:4}}>🔬 Phase D shadow：値幅を見た並び（既存のTOP5・順位は変更していません）</div>
+            {[["attentionTop5","🔥 今日これから値幅が出そうな銘柄"],["entryBoard","🎯 今ENTRY条件が整った銘柄"],["preBreakout","🔥 ブレイク接近"],
+              ["expanding","📈 値幅拡大中（EXPANDING）"],["tooLate","⚠️ 強いが遅い／動かない（押し目待ち）"]].map(([key,title])=>{
+              const rows=entryResult.shadowMovement[key]||[];
+              return <div key={key} style={{marginBottom:4}}>
+                <div style={{fontSize:11,fontWeight:700,color:"var(--inkSoft)"}}>{title}（{rows.length}）</div>
+                {rows.map(d=><div key={d.code} className="mono" style={{fontSize:10.5}}>
+                  {d.rank!=null&&key==="attentionTop5"?`#${d.rank} `:""}{d.code} {d.name} ・Movement {d.movementScore??"—"} ・直近 {d.recentActivityScore??"—"} ・{(ACTIVITY_STATE_META[d.activityState]||{}).label||d.activityState}
+                  {key==="attentionTop5" && <span>　既存の分析順位 {d.existingRank!=null?`${d.existingRank}位`:"圏外"}</span>}
+                  {d.entryReason && <span>　理由：{d.entryReason}</span>}
+                  {d.recommendedStop && (key==="entryBoard") && <span>　STOP {d.recommendedStop.price}（-{d.recommendedStop.distancePct}%）{d.riskReward?` RR ${d.riskReward.rr}`:""}</span>}
+                  {key==="tooLate" && (d.tooLateReasons||[]).length>0 && <span style={{color:"var(--down)"}}>　{d.tooLateReasons.join(" / ")}</span>}
+                </div>)}
+              </div>;
+            })}
+            {entryResult.shadowMovement.dynamicWatch && <div className="mono" style={{fontSize:10.5,color:"var(--inkSoft)"}}>
+              dynamic watch：active {entryResult.shadowMovement.dynamicWatch.active}／hot {(entryResult.shadowMovement.dynamicWatch.hot||[]).length}
+              （手動の監視銘柄とは別管理・shadow）</div>}
+          </div>}
           {entryResult.capital&&entryResult.capital.applied && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:6}}>
             上の一覧は<b>実戦TOP5</b>（現在の買付余力
             <span className="mono" style={{fontWeight:800}}> {Math.round(entryResult.capital.cashAvailable).toLocaleString()}円 </span>
