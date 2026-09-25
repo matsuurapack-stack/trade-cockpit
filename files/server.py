@@ -592,6 +592,80 @@ _fast_quote_cache = {}  # code -> {"value": {...FAST QUOTE dict...}, "at": epoch
 LATEST_QUOTE_REUSE_SEC = 5
 
 
+# ============================================================
+# 場中5分足・VWAPの国内ソース化（2026-09-25、Phase B-2）。
+# ・VWAP：立花のCLMMfdsGetMarketPriceにpVWAP（取引所算出の当日VWAP）があり、PRICE_COLUMNSへ追加して
+#   quoteに同梱する（yfinanceの遅延5分足に依存しない）。取得不能ならNone＋理由を明示し、0や古い値で
+#   代用しない。
+# ・5分足：立花に分足APIは無いため、get_fast_quotesが立花から取得するたびにquoteをtickとして記録し、
+#   5分barを内部生成する（open/high/low/close/出来高増分）。サンプリング粒度（数秒〜30秒）と、
+#   プロセス起動が場中の途中だった場合は起動前の値動きを含まない旨（partial）をメタ情報で明示する。
+#   quoteAt（最新tick）・barAt（最新bar開始）・analyzedAtは別々に保持する。
+# ============================================================
+_INTRADAY_BAR_STORE = {}  # code -> {"date","bars":{slot:{...}},"lastVol","firstTickAt","lastTickAt","ticks"}
+_INTRADAY_BAR_LOCK = threading.Lock()
+
+
+def _in_jp_session_minutes(mins):
+    return (9 * 60 <= mins < 11 * 60 + 30) or (12 * 60 + 30 <= mins < 15 * 60 + 30)
+
+
+def _record_quote_tick(code, q):
+    """立花から実際に取得できたquoteを内部5分barへ反映する。場中（前場・後場）のみ記録。"""
+    try:
+        t, ts = q.get("t"), q.get("quote_timestamp")
+        if t is None or not ts:
+            return
+        dt = datetime.datetime.fromisoformat(ts)
+        mins = dt.hour * 60 + dt.minute
+        if not _in_jp_session_minutes(mins):
+            return
+        slot = mins // 5
+        vol = q.get("volume")
+        date = dt.date().isoformat()
+        with _INTRADAY_BAR_LOCK:
+            st = _INTRADAY_BAR_STORE.get(code)
+            if st is None or st["date"] != date:
+                st = _INTRADAY_BAR_STORE[code] = {"date": date, "bars": {}, "lastVol": None, "firstTickAt": ts,
+                                                   "lastTickAt": ts, "ticks": 0}
+            dv = None
+            if vol is not None and st["lastVol"] is not None and vol >= st["lastVol"]:
+                dv = vol - st["lastVol"]
+            if vol is not None:
+                st["lastVol"] = vol
+            b = st["bars"].get(slot)
+            if b is None:
+                start = dt.replace(hour=slot * 5 // 60, minute=slot * 5 % 60, second=0, microsecond=0)
+                b = st["bars"][slot] = {"start": start.isoformat(), "open": t, "high": t, "low": t, "close": t,
+                                         "volume": 0.0, "ticks": 0}
+            b["high"] = max(b["high"], t)
+            b["low"] = min(b["low"], t)
+            b["close"] = t
+            b["ticks"] += 1
+            if dv:
+                b["volume"] += dv
+            st["lastTickAt"] = ts
+            st["ticks"] += 1
+    except Exception as e:
+        print("  内部5分足tick記録で例外（無視して続行）", code, e)
+
+
+def get_internal_intraday_bars(code):
+    """内部生成した当日5分bar一覧とメタ情報を返す。tickが無い場合はbars=[]・reasonを明示する。"""
+    with _INTRADAY_BAR_LOCK:
+        st = _INTRADAY_BAR_STORE.get(code)
+        if not st or st["date"] != datetime.datetime.now(_JST).date().isoformat() or not st["bars"]:
+            return {"bars": [], "barAt": None, "source": "INTERNAL_TICKS", "partial": None, "tickCount": 0,
+                    "unavailableReason": "場中のquote tick未蓄積（このプロセスでまだ取得していない、または場外）"}
+        bars = [dict(st["bars"][k]) for k in sorted(st["bars"])]
+        first = datetime.datetime.fromisoformat(st["firstTickAt"])
+        partial = (first.hour * 60 + first.minute) > (9 * 60 + 2) and not (12 * 60 + 30 <= first.hour * 60 + first.minute)
+        return {"bars": bars, "barAt": bars[-1]["start"], "source": "INTERNAL_TICKS", "partial": partial,
+                "firstTickAt": st["firstTickAt"], "lastTickAt": st["lastTickAt"], "tickCount": st["ticks"],
+                "unavailableReason": None}
+
+
+
 def _fetch_fast_quote_chunk_with_retry(chunk):
     """立花証券APIから1チャンク（最大FAST_QUOTE_CHUNK件）分の時価を取得する。
     tachibana_api.get_market_price()内部では「セッション切れ等は1回だけ再ログイン再試行」
@@ -664,11 +738,12 @@ def get_fast_quotes(watchlist):
             out[code] = {
                 "t": v.get("t"), "p": v.get("p"), "change": v.get("change"), "changePct": v.get("changePct"),
                 "volume": v.get("volume"), "open": v.get("open"), "high": v.get("high"), "low": v.get("low"),
-                "ask": v.get("ask"), "bid": v.get("bid"),
+                "ask": v.get("ask"), "bid": v.get("bid"), "vwap": v.get("vwap"),
                 "source": "tachibana", "quote_timestamp": now_iso, "fetched_at": now_iso, "is_stale": False,
             }
             stats["tachibana"] += 1
             _fast_quote_cache[code] = {"value": out[code], "at": time.time()}
+            _record_quote_tick(code, out[code])
         else:
             still_missing.append(code)
 
@@ -746,7 +821,7 @@ def overlay_latest_quotes_on_stage1_rows(stage1_rows, codes, nikkei_chg=None):
             "volume": volume if volume is not None else base.get("volume"),
             "ask": q.get("ask"), "bid": q.get("bid"),
             "_priceSource": "LATEST_QUOTE", "_quoteAt": q.get("quote_timestamp"),
-            "_quoteIsStale": bool(q.get("is_stale")),
+            "_quoteIsStale": bool(q.get("is_stale")), "_vwap": q.get("vwap"),
         })
         vol = new.get("volume")
         new["turnover"] = (t * vol) if (t is not None and vol is not None) else base.get("turnover")
@@ -3831,6 +3906,17 @@ def _previous_intraday_reference(database_url, user_id, trade_date, report_type,
     return (morning_check, "morning_check") if morning_check else (None, None)
 
 
+def _apply_exchange_vwap_to_snapshot(snap, row):
+    """5分足スナップショットのVWAP・VWAP上下判定を、立花の取引所算出VWAP（quoteに同梱）で上書きする
+    （yfinance 5分足は遅延して場中に取得できないことがあるため）。VWAPが無ければsnapshotを変えない
+    （0や古い値で代用しない、vwapSourceで由来を区別できる）。"""
+    v = (row or {}).get("_vwap")
+    cur = (row or {}).get("current")
+    if not v or cur is None:
+        return snap
+    return {**snap, "vwap": v, "aboveVwap": bool(cur > v), "vwapSource": "TACHIBANA_EXCHANGE"}
+
+
 def _intraday_stock_snapshot(watchlist_item, prefetched=None):
     """TOP5銘柄1件分の「今」の状態（現在値・当日騰落率・VWAP位置・5分足構造）を取得する。
     既存の_intraday_regime()（セクターETFの当日レジーム判定で既に使っている5分足取得＋VWAP計算）
@@ -4544,6 +4630,87 @@ def _summarize_per_symbol_ms(per_symbol_ms):
     }
 
 
+def _compute_price_dependent_entry_fields(code, w, row, stage2, snapshot, bars, catalysts, event_signals,
+                                          entry_risk, data_quality, shared, related_events):
+    """今買い時TOP5：現在値に依存するスコア・状態・理由リスクの算出（2026-09-25、Phase B-1）。
+    フルスキャン（_score_entry_candidates_impl）と軽量再スコア（rescore_entry_candidate_with_quote）の
+    両方が同じこの関数を呼ぶ——スコアロジックの二重実装を避け、同じ入力なら必ず同じ結果になる
+    （テストで固定）。shared＝{auto_rs_current, auto_sector_current, nikkei_chg, event_guard_market}。
+    副作用（event_risk_by_code等の集計dictへの書き込み）は持たない、呼び出し側が行う。"""
+    day_change = row.get("changePct")
+    range_metrics = compute_tradeable_range_metrics(bars, current=row.get("current"), day_high=row.get("high"))
+    tradeable_range_score, room_to_move = compute_tradeable_range_score(range_metrics)
+    momentum_state = classify_momentum_state(range_metrics, day_change)
+    reversal_info = None
+    if day_change is not None and day_change <= 0:
+        reversal_info = detect_intraday_reversal(bars, row.get("current"), row.get("low"))
+    setup_type = None
+    if day_change is not None and day_change > 0:
+        setup_type = "PULLBACK_REENTRY" if momentum_state in ("RANGE_COMPRESSION", "MOMENTUM_DECAY") \
+            else "MOMENTUM_CONTINUATION"
+    elif reversal_info and reversal_info.get("reversalState"):
+        setup_type = "REVERSAL_MOMENTUM"
+
+    # Event Risk Guard（2026-09-17新規）：市場共通分（event_guard_market）＋この銘柄固有分
+    # （GU/高値圏/VWAP乖離/関連銘柄イベント/確認材料の減点）を合算する。stage2/snapshotは
+    # このループが既に取得済みの値をそのまま使い、新規の取得経路は追加しない。
+    event_guard = compute_event_risk_guard_for_symbol(
+        code, shared["event_guard_market"], row, stage2, snapshot or {}, watchlist_row=w,
+        todays_related_events=related_events)
+
+    comp = _entry_score_components(row, stage2, snapshot or {}, shared["auto_rs_current"], shared["auto_sector_current"], catalysts,
+                                    event_signals, entry_risk=entry_risk, range_metrics=range_metrics,
+                                    momentum_state=momentum_state, event_guard=event_guard)
+    neg_cat_present = bool(comp["negativeCatalysts"])
+    entry_score = comp["total"]
+    entry_state, exception_applied = _classify_entry_state(
+        entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present, shared["nikkei_chg"],
+        entry_risk=entry_risk, momentum_state=momentum_state, event_guard=event_guard)
+    resilience = _rs_resilience_tier({"changePct": row.get("changePct"), "marketRS": row.get("marketRS")}, shared["nikkei_chg"])
+
+    reasons = []
+    if comp["momentum"] > 0:
+        reasons.append(f"当日+{row.get('changePct'):.1f}%の勢い")
+    if comp["vwap"] > 0:
+        reasons.append("VWAP上を維持")
+    if comp["fiveMinStructure"] >= 15:
+        reasons.append("5分足で高値切り上げ")
+    if comp["marketRelative"] > 0:
+        reasons.append(f"対市場+{row.get('marketRS'):.1f}pt")
+    if comp["autoRs"] > 0:
+        reasons.append("AUTO_RS選出中")
+    if comp["autoSector"] > 0:
+        reasons.append("セクター内優位（AUTO_SECTOR_LEADER）")
+    if comp["positiveCatalysts"]:
+        reasons.append(f"好材料：{comp['positiveCatalysts'][0].get('title','')[:20]}")
+    if exception_applied:
+        reasons.append("⚠逆行耐性例外（地合い逆風下でも対市場優位・VWAP回復・反転構造・出来高増を確認）")
+    risks = []
+    if comp["negativeCatalysts"]:
+        risks.append(f"悪材料：{comp['negativeCatalysts'][0].get('title','')[:20]}")
+    if comp["riskEvent"] < 0 and not comp["negativeCatalysts"]:
+        risks.append("重要イベント接近")
+    if comp["overheat"] < 0:
+        risks.append("直近高値からの乖離が大きい（高値掴み注意）")
+    # 指示書4番：「何が似ているのか」「過去何件中何件失敗したか」を具体的に表示する。
+    if entry_risk and entry_risk.get("risk_level") in ("HIGH", "MEDIUM") and entry_risk.get("explanation"):
+        risks.append(f"⚠ 過去の損切りパターンと類似：{entry_risk['explanation']}")
+    # 値幅余地・反転モメンタム選考（2026-09-16新規、指示書2・3番）。
+    if momentum_state == "MOMENTUM_DECAY":
+        risks.append("値幅縮小（高値圏で伸び悩み、MOMENTUM_DECAY）")
+    elif momentum_state == "MOMENTUM_REACCELERATING":
+        reasons.append("高値更新継続・値幅再拡大（MOMENTUM_REACCELERATING）")
+    if room_to_move == "LOW" and range_metrics.get("dataQuality") == "OK":
+        risks.append("値幅余地LOW（ここから取れる値幅が乏しい可能性）")
+    if reversal_info and reversal_info.get("reversalState") == "REVERSAL_CONFIRMED":
+        reasons.append(f"当日安値から+{reversal_info['bounceFromLowPct']}%反転（{'/'.join(reversal_info['reversalReasons'])}）")
+    return {"range_metrics": range_metrics, "tradeable_range_score": tradeable_range_score,
+            "room_to_move": room_to_move, "momentum_state": momentum_state, "reversal_info": reversal_info,
+            "setup_type": setup_type, "event_guard": event_guard, "comp": comp,
+            "neg_cat_present": neg_cat_present, "entry_score": entry_score, "entry_state": entry_state,
+            "exception_applied": exception_applied, "resilience": resilience, "reasons": reasons, "risks": risks}
+
+
 def _score_entry_candidates(database_url, user_id):
     """今買い時TOP5の公開入口（シグネチャは不変：news/X系の引数を増やさないガードテストあり）。
     買付余力の制約を適用する（余力未設定なら従来どおり）。実体は_score_entry_candidates_impl。"""
@@ -4772,6 +4939,9 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
                   "_intraday_stock_snapshot": {"calls": 0, "total_ms": 0.0, "max_ms": 0.0}}
     _t_loop = time.time()
     candidates = []
+    rescore_ctx_by_code = {}  # 軽量再スコア用（Phase B-1）：上位候補pool分だけ後で残す
+    shared_scoring = {"auto_rs_current": auto_rs_current, "auto_sector_current": auto_sector_current,
+                      "nikkei_chg": nikkei_chg, "event_guard_market": event_guard_market}
     quality_counts = {"FULL": 0, "PARTIAL": 0, "DEGRADED": 0}
     snapshot_ready_count = 0  # 場中リアルタイム化指示書 STEP1・20：5分足スナップショットが取得できた銘柄数（"intraday_ready"の実体）
     for w in scan_list:
@@ -4822,7 +4992,7 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
             func_stats["_intraday_stock_snapshot"]["max_ms"] = max(func_stats["_intraday_stock_snapshot"]["max_ms"], fn_ms)
             market_data_cache_status = snap.get("cacheStatus", "failed")
             if snap.get("dataStatus") != "failed":
-                snapshot = snap
+                snapshot = _apply_exchange_vwap_to_snapshot(snap, row)
                 snapshot_ready_count += 1
         except Exception as e:
             print("  entry-candidates: 5分足スナップショット失敗", code, e)
@@ -4849,34 +5019,18 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
         # "bars"（regimeと同じバッチダウンロードから流用、新規取得なし）からTRADEABLE_
         # RANGE_SCORE・MOMENTUM_STATE・（マイナス銘柄のみ）REVERSAL_MOMENTUMを算出する。
         bars = (prefetched_md or {}).get("bars")
-        day_change = row.get("changePct")
-        range_metrics = compute_tradeable_range_metrics(bars, current=row.get("current"), day_high=row.get("high"))
-        tradeable_range_score, room_to_move = compute_tradeable_range_score(range_metrics)
-        momentum_state = classify_momentum_state(range_metrics, day_change)
-        reversal_info = None
-        if day_change is not None and day_change <= 0:
-            reversal_info = detect_intraday_reversal(bars, row.get("current"), row.get("low"))
-        setup_type = None
-        if day_change is not None and day_change > 0:
-            setup_type = "PULLBACK_REENTRY" if momentum_state in ("RANGE_COMPRESSION", "MOMENTUM_DECAY") \
-                else "MOMENTUM_CONTINUATION"
-        elif reversal_info and reversal_info.get("reversalState"):
-            setup_type = "REVERSAL_MOMENTUM"
-
-        # Event Risk Guard（2026-09-17新規）：市場共通分（event_guard_market）＋この銘柄固有分
-        # （GU/高値圏/VWAP乖離/関連銘柄イベント/確認材料の減点）を合算する。stage2/snapshotは
-        # このループが既に取得済みの値をそのまま使い、新規の取得経路は追加しない。
         related_events = compute_related_events_for_stock(w, macro.get("events", []))
-        event_guard = compute_event_risk_guard_for_symbol(
-            code, event_guard_market, row, stage2, snapshot or {}, watchlist_row=w,
-            todays_related_events=related_events)
+        pd_fields = _compute_price_dependent_entry_fields(
+            code, w, row, stage2, snapshot, bars, catalysts, event_signals, entry_risk, data_quality,
+            shared_scoring, related_events)
+        range_metrics, tradeable_range_score = pd_fields["range_metrics"], pd_fields["tradeable_range_score"]
+        room_to_move, momentum_state = pd_fields["room_to_move"], pd_fields["momentum_state"]
+        reversal_info, setup_type = pd_fields["reversal_info"], pd_fields["setup_type"]
+        event_guard, comp = pd_fields["event_guard"], pd_fields["comp"]
+        neg_cat_present, entry_score = pd_fields["neg_cat_present"], pd_fields["entry_score"]
+        entry_state, exception_applied = pd_fields["entry_state"], pd_fields["exception_applied"]
+        resilience, reasons, risks = pd_fields["resilience"], pd_fields["reasons"], pd_fields["risks"]
         event_risk_by_code[code] = event_guard
-
-        comp = _entry_score_components(row, stage2, snapshot or {}, auto_rs_current, auto_sector_current, catalysts,
-                                        event_signals, entry_risk=entry_risk, range_metrics=range_metrics,
-                                        momentum_state=momentum_state, event_guard=event_guard)
-        neg_cat_present = bool(comp["negativeCatalysts"])
-        entry_score = comp["total"]
         ipo_signals_by_code[code] = capital_ranking.derive_signals(row, stage2, snapshot, comp)
         # 朝9:00〜9:30の値動きだけで完全除外しない対象（IPO・決算直後・材料・前日出来高急増・
         # ストップ高経験・前日大幅高・寄り前GU/GD大）。既に取得済みの日足/材料を使い新規取得なし。
@@ -4884,47 +5038,6 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
             row, daily_arrays_by_code.get(code), stage2, comp["positiveCatalysts"],
             is_ipo=code in ipo_in_window_codes, recent_limit_up=code in limit_up_codes,
             recent_earnings=any(("決算" in str(cc.get("title") or "")) for cc in (catalysts or [])))
-        entry_state, exception_applied = _classify_entry_state(
-            entry_score, row, stage2, snapshot, data_quality, event_signals, neg_cat_present, nikkei_chg,
-            entry_risk=entry_risk, momentum_state=momentum_state, event_guard=event_guard)
-        resilience = _rs_resilience_tier({"changePct": row.get("changePct"), "marketRS": row.get("marketRS")}, nikkei_chg)
-
-        reasons = []
-        if comp["momentum"] > 0:
-            reasons.append(f"当日+{row.get('changePct'):.1f}%の勢い")
-        if comp["vwap"] > 0:
-            reasons.append("VWAP上を維持")
-        if comp["fiveMinStructure"] >= 15:
-            reasons.append("5分足で高値切り上げ")
-        if comp["marketRelative"] > 0:
-            reasons.append(f"対市場+{row.get('marketRS'):.1f}pt")
-        if comp["autoRs"] > 0:
-            reasons.append("AUTO_RS選出中")
-        if comp["autoSector"] > 0:
-            reasons.append("セクター内優位（AUTO_SECTOR_LEADER）")
-        if comp["positiveCatalysts"]:
-            reasons.append(f"好材料：{comp['positiveCatalysts'][0].get('title','')[:20]}")
-        if exception_applied:
-            reasons.append("⚠逆行耐性例外（地合い逆風下でも対市場優位・VWAP回復・反転構造・出来高増を確認）")
-        risks = []
-        if comp["negativeCatalysts"]:
-            risks.append(f"悪材料：{comp['negativeCatalysts'][0].get('title','')[:20]}")
-        if comp["riskEvent"] < 0 and not comp["negativeCatalysts"]:
-            risks.append("重要イベント接近")
-        if comp["overheat"] < 0:
-            risks.append("直近高値からの乖離が大きい（高値掴み注意）")
-        # 指示書4番：「何が似ているのか」「過去何件中何件失敗したか」を具体的に表示する。
-        if entry_risk and entry_risk.get("risk_level") in ("HIGH", "MEDIUM") and entry_risk.get("explanation"):
-            risks.append(f"⚠ 過去の損切りパターンと類似：{entry_risk['explanation']}")
-        # 値幅余地・反転モメンタム選考（2026-09-16新規、指示書2・3番）。
-        if momentum_state == "MOMENTUM_DECAY":
-            risks.append("値幅縮小（高値圏で伸び悩み、MOMENTUM_DECAY）")
-        elif momentum_state == "MOMENTUM_REACCELERATING":
-            reasons.append("高値更新継続・値幅再拡大（MOMENTUM_REACCELERATING）")
-        if room_to_move == "LOW" and range_metrics.get("dataQuality") == "OK":
-            risks.append("値幅余地LOW（ここから取れる値幅が乏しい可能性）")
-        if reversal_info and reversal_info.get("reversalState") == "REVERSAL_CONFIRMED":
-            reasons.append(f"当日安値から+{reversal_info['bounceFromLowPct']}%反転（{'/'.join(reversal_info['reversalReasons'])}）")
 
         # Market Intelligence Phase9新規（指示書21・38番）：entry_score自体には一切加点も
         # 減点もしない、隣に並べるだけの追加専用表示。
@@ -4945,6 +5058,7 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
             "code": code, "name": w.get("name"), "sector": w.get("sector"),
             "current": row.get("current"),
             "quoteAt": row.get("_quoteAt"), "priceSource": row.get("_priceSource"),
+            "scoredAt": datetime.datetime.now(_JST).isoformat(), "scoredPrice": row.get("current"),
             # 3値デバッグ（candidate price / latest quote / score calculation price）。スコア計算は
             # overlay後のrowだけを見るため、正常なら3値は必ず一致する。
             "priceTrace": {"candidatePrice": row.get("current"),
@@ -4968,6 +5082,13 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
             "eventRiskReasons": event_guard["reasons"],
             "volumeRatio": (stage2 or {}).get("timeAdjustedVolumeRatio"),  # IPOスコア（出来高）用
         })
+        _d = (stage2 or {}).get("distanceFromHighPct")
+        rescore_ctx_by_code[code] = {
+            "w": w, "row": row, "stage2": stage2, "snapshot": snapshot, "bars": bars, "catalysts": catalysts,
+            "event_signals": event_signals, "entry_risk": entry_risk, "data_quality": data_quality,
+            "related_events": related_events, "scoredPrice": row.get("current"), "baseHigh": row.get("high"),
+            "recentHigh": (row["current"] / (1 + _d / 100.0)) if (_d is not None and row.get("current")) else None,
+            "rescoreCount": 0}
         per_symbol_ms.append((code, (time.time() - _t_symbol) * 1000))
 
     section_ms["candidateLoopTotal"] = round((time.time() - _t_loop) * 1000)
@@ -4977,6 +5098,15 @@ def _score_entry_candidates_impl(database_url, user_id, apply_capital=True):
     _t = time.time()
     candidates.sort(key=lambda c: -c["entryScore"])
     section_ms["sortRank"] = round((time.time() - _t) * 1000)
+    # 軽量再スコア用の候補pool（Phase B-1）：entry_score上位＋反転候補だけ保持し、それ以外は
+    # 次のフルスキャンまで再スコアしない（289銘柄を高頻度で再計算しない）。
+    _pool_codes = [c["code"] for c in candidates[:ENTRY_RESCORE_POOL_SIZE]]
+    _pool_codes += [c["code"] for c in candidates
+                    if (c.get("reversalInfo") or {}).get("reversalState") and c["code"] not in _pool_codes][:10]
+    with _ENTRY_TOP5_CACHE_LOCK:
+        _ENTRY_RESCORE_CTX[user_id] = {
+            "byCode": {c: rescore_ctx_by_code[c] for c in _pool_codes if c in rescore_ctx_by_code},
+            "shared": shared_scoring, "builtAt": time.time()}
 
     _t = time.time()
     _pt = [c["priceTrace"] for c in candidates if c.get("priceTrace")]
@@ -5685,6 +5815,7 @@ def overlay_latest_quotes_on_entry_result(result):
         print("  ENTRY TOP5 live：latest quote取得失敗（スキャン時点の価格のまま返す）", e)
         quotes = {}
     scored_at = result.get("generatedAt")
+    now_dt = datetime.datetime.now(_JST)
     out = dict(result)
     for key in _ENTRY_RESULT_CANDIDATE_LISTS:
         lst = result.get(key)
@@ -5697,16 +5828,29 @@ def overlay_latest_quotes_on_entry_result(result):
                 chg = q.get("changePct")
                 if chg is None and q.get("p"):
                     chg = (q["t"] - q["p"]) / q["p"] * 100
-                c = {**c, "scoredPrice": c.get("current"), "scoredAt": scored_at, "current": q["t"],
+                sp = c.get("scoredPrice") if c.get("scoredPrice") is not None else c.get("current")
+                sat = c.get("scoredAt") or scored_at
+                ver = c.get("scoreVerifiedAt") or sat
+                drift = round((q["t"] - sp) / sp * 100, 2) if sp else None
+                try:
+                    age = (now_dt - datetime.datetime.fromisoformat(ver)).total_seconds()
+                except Exception:
+                    age = None
+                stale_reason = None
+                if drift is not None and abs(drift) >= ENTRY_SCORE_STALE_DRIFT_PCT:
+                    stale_reason = "score_price_drift"
+                elif age is not None and age > ENTRY_SCORE_STALE_SEC:
+                    stale_reason = "score_age"
+                c = {**c, "scoredPrice": sp, "scoredAt": sat, "current": q["t"],
                      "changePct": round(chg, 2) if chg is not None else c.get("changePct"),
                      "quoteAt": q.get("quote_timestamp"), "quoteIsStale": bool(q.get("is_stale")),
-                     "priceOverlaid": True,
-                     # スコア算出時の価格からの乖離（スキャンは数分かかるため、表示価格は最新でもスコアは
-                     # 算出時点の価格に基づく——その乖離をUIが警告できるようにする）
-                     "priceDriftPct": (round((q["t"] - c["current"]) / c["current"] * 100, 2)
-                                        if c.get("current") else None)}
+                     "priceOverlaid": True, "priceDriftPct": drift,
+                     "scoreAgeSec": round(age) if age is not None else None, "scoreStale": stale_reason is not None}
+                # 価格だけ最新でスコアが古い状態を「今すぐ買える」と表示しない（再評価中扱いへ降格）
+                if stale_reason and c.get("entryState") in ("NOW_BUYABLE", "ENTRY_READY"):
+                    c = {**c, "entryState": "WAIT_DATA_STALE", "staleDowngraded": True, "staleReason": stale_reason}
             elif isinstance(c, dict):
-                c = {**c, "priceOverlaid": False, "scoredAt": scored_at}
+                c = {**c, "priceOverlaid": False, "scoredAt": c.get("scoredAt") or scored_at}
             new_list.append(c)
         out[key] = new_list
     out["quotesOverlaidAt"] = datetime.datetime.now(_JST).isoformat()
@@ -5772,6 +5916,7 @@ def _apply_entry_top5_staleness(cache_entry):
         "durationMs": cache_entry["durationMs"],
         "trigger": cache_entry["trigger"],
         "rankingAgeSec": round(age_sec),
+        "lastRescoreAt": cache_entry.get("lastRescoreAt"),  # 軽量再スコアの最終実行時刻（Phase B-1）
         "dataStale": stale,
         "anySymbolMarketDataStale": any_symbol_stale,  # 指示書STEP9：ranking全体は新しくても個別銘柄のmarket dataがstale fallbackだった場合にTrue
         "updateDelayWarning": delayed,
@@ -5845,6 +5990,180 @@ def _run_entry_top5_scan(database_url, user_id, trigger="AUTO", wait_for_lock=Fa
         return get_entry_top5_cached(user_id)
     finally:
         _ENTRY_TOP5_SCAN_LOCK.release()
+
+
+# ============================================================
+# 今買い時TOP5 軽量再スコア（2026-09-25、Phase B-1）。フルスキャン（289銘柄・数分）を毎回
+# 走らせず、Stage1後の上位候補poolだけを最新quoteで再スコアして順位を更新する。スコアロジックは
+# フルスキャンと同じ_compute_price_dependent_entry_fields()を呼ぶ（二重実装しない）。STATIC要素
+# （日足由来のstage2出来高倍率・材料・イベント・過去経験・5分足構造）はスキャン時の値を保持し、
+# 価格依存項目（現在値・前日比・対市場RS・高値乖離・VWAP位置・値幅余地・モメンタム・イベントガード
+# ・entry_score・ENTRY状態）だけを再計算する。
+# ============================================================
+ENTRY_RESCORE_POOL_SIZE = 50
+ENTRY_RESCORE_DRIFT_PCT = 0.3      # scoredPriceからこの%以上動いたら再スコア
+ENTRY_RESCORE_INTERVAL_SEC = 15    # 再スコアloopの周期（フロントの30秒pollと合わせ順位遅延<=60秒）
+ENTRY_SCORE_STALE_SEC = 120        # 再検証(scoreVerifiedAt)がこれより古い候補は「今すぐ買える」と表示しない
+ENTRY_SCORE_STALE_DRIFT_PCT = 0.7  # 算出価格からの乖離がこれ以上なら再評価中扱い（低位株の1〜2ティックでは点滅させない）
+_ENTRY_RESCORE_CTX = {}  # user_id -> {"byCode": {code: ctx}, "shared": {...}, "builtAt": epoch}
+
+
+def entry_rescore_trigger(ctx, q):
+    """軽量再スコアを発火する理由を返す（不要ならNone）。価格変化が小さくても、BREAKOUT水準
+    通過・VWAP跨ぎ・当日高値更新は即発火する。PULLBACK水準到達はスキャン側に水準を持たない
+    （フロントのenrichWatchRow由来）ため、価格変化%とVWAP/高値水準の判定で代替する。"""
+    t, sp = q.get("t"), ctx.get("scoredPrice")
+    if t is None or not sp:
+        return None
+    if abs(t - sp) / sp * 100 >= ENTRY_RESCORE_DRIFT_PCT:
+        return "PRICE_DRIFT"
+    rh = ctx.get("recentHigh")
+    if rh and ((sp > rh) != (t > rh)):
+        return "BREAKOUT_CROSS"
+    vw = q.get("vwap") or (ctx.get("snapshot") or {}).get("vwap")
+    if vw and ((sp > vw) != (t > vw)):
+        return "VWAP_CROSS"
+    if ctx.get("baseHigh") and t > ctx["baseHigh"]:
+        return "NEW_DAY_HIGH"
+    return None
+
+
+def rescore_entry_candidate_with_quote(ctx, shared, q):
+    """スキャン時のctx＋最新quoteから、価格依存フィールドを再計算して返す（候補dictへマージ用）。"""
+    base = ctx["row"]
+    t = q["t"]
+    p = q.get("p")
+    chg = q.get("changePct")
+    if chg is None and p:
+        chg = (t - p) / p * 100
+    hi = max([x for x in (q.get("high"), base.get("high"), t) if x is not None])
+    lo = min([x for x in (q.get("low"), base.get("low"), t) if x is not None])
+    row = dict(base)
+    vol = q.get("volume") if q.get("volume") is not None else base.get("volume")
+    row.update({"current": t, "changePct": chg if chg is not None else base.get("changePct"), "high": hi, "low": lo,
+                "volume": vol, "ask": q.get("ask"), "bid": q.get("bid"), "_quoteAt": q.get("quote_timestamp"),
+                "_priceSource": "LATEST_QUOTE"})
+    row["turnover"] = (t * vol) if (vol is not None) else base.get("turnover")
+    row["highRetention"] = (t / hi) if hi else base.get("highRetention")
+    if row.get("changePct") is not None and shared.get("nikkei_chg") is not None:
+        row["marketRS"] = row["changePct"] - shared["nikkei_chg"]
+    stage2 = dict(ctx["stage2"]) if ctx.get("stage2") else None
+    if stage2 is not None and ctx.get("recentHigh"):
+        rh = ctx["recentHigh"]
+        stage2["aboveRecentHigh"] = bool(t > rh)
+        stage2["distanceFromHighPct"] = (t - rh) / rh * 100
+        if base.get("low") is not None and lo < base["low"]:
+            stage2["makingNewLowToday"] = True
+    snapshot = dict(ctx["snapshot"]) if ctx.get("snapshot") else None
+    if snapshot is not None:
+        snapshot["current"] = t
+        snapshot["currentChangePct"] = round(chg, 2) if chg is not None else snapshot.get("currentChangePct")
+        if q.get("vwap"):
+            snapshot["vwap"] = q["vwap"]
+            snapshot["vwapSource"] = "TACHIBANA_EXCHANGE"
+        if snapshot.get("vwap"):
+            snapshot["aboveVwap"] = bool(t > snapshot["vwap"])  # VWAPが無い場合は判定を変えない（推測しない）
+    f = _compute_price_dependent_entry_fields(
+        ctx["w"].get("code"), ctx["w"], row, stage2, snapshot, ctx.get("bars"), ctx["catalysts"], ctx["event_signals"],
+        ctx["entry_risk"], ctx["data_quality"], shared, ctx["related_events"])
+    return {
+        "current": t, "quoteAt": q.get("quote_timestamp"), "priceSource": "LATEST_QUOTE",
+        "changePct": round(row["changePct"], 2) if row.get("changePct") is not None else None,
+        "marketRS": round(row["marketRS"], 2) if row.get("marketRS") is not None else None,
+        "entryScore": round(f["entry_score"]), "entryState": f["entry_state"], "resilience": f["resilience"],
+        "scoreBreakdown": f["comp"], "reasons": f["reasons"] or ["総合スコア上位"], "risks": f["risks"],
+        "setupType": f["setup_type"], "roomToMove": f["room_to_move"], "momentumState": f["momentum_state"],
+        "rangeMetrics": f["range_metrics"], "reversalInfo": f["reversal_info"],
+        "eventRiskLevel": f["event_guard"]["level"], "eventRiskScore": f["event_guard"]["score"],
+        "eventRiskReasons": f["event_guard"]["reasons"],
+        "scoredAt": datetime.datetime.now(_JST).isoformat(), "scoredPrice": t,
+        "scoreVerifiedAt": datetime.datetime.now(_JST).isoformat(),
+        "priceTrace": {"candidatePrice": t, "latestQuotePrice": t, "scoreCalcPrice": t},
+    }
+
+
+def rescore_entry_top5_cache(database_url, user_id):
+    """キャッシュ済み候補poolを最新quoteで軽量再スコアし、既存の再ランキング関数
+    （recompute_entry_top5_cache_for_cash、余力変更時と同じ入口）でTOP5順位を更新する。
+    戻り値：診断dict（quote件数・再スコア件数・トリガー内訳・所要時間・順位変化）。"""
+    t0 = time.time()
+    diag = {"pool": 0, "quotes": 0, "rescored": 0, "triggers": {}, "rankChanged": False, "elapsedMs": 0}
+    with _ENTRY_TOP5_CACHE_LOCK:
+        entry = _ENTRY_TOP5_CACHE.get(user_id)
+        pool = list(entry.get("_candidatePool") or []) if entry else []
+        rc = _ENTRY_RESCORE_CTX.get(user_id)
+    if not entry or not pool or not rc:
+        return diag
+    by_code = rc["byCode"]
+    codes = [c["code"] for c in pool if c["code"] in by_code]
+    diag["pool"] = len(codes)
+    if not codes:
+        return diag
+    quotes, _st = get_fast_quotes([{"code": c, "market": "JP"} for c in codes])
+    diag["quotes"] = len(quotes)
+    before = [c["code"] for c in (entry.get("entryReadyTop5") or [])]
+    new_pool, changed = [], False
+    for c in pool:
+        ctx = by_code.get(c["code"])
+        q = quotes.get(c["code"])
+        if ctx is None or not q or q.get("t") is None:
+            new_pool.append(c)
+            continue
+        reason = entry_rescore_trigger(ctx, q)
+        if reason is None:
+            # 再スコア不要でも表示用の最新価格・quote時刻だけは反映する（スコア/順位は不変）
+            new_pool.append({**c, "current": q["t"], "quoteAt": q.get("quote_timestamp"),
+                              "scoreVerifiedAt": datetime.datetime.now(_JST).isoformat()})
+            continue
+        try:
+            fields = rescore_entry_candidate_with_quote(ctx, rc["shared"], q)
+        except Exception as e:
+            print("  [EntryRescore] 再スコア失敗（前回スコアのまま）", c.get("code"), e)
+            new_pool.append(c)
+            continue
+        ctx["scoredPrice"] = q["t"]
+        ctx["baseHigh"] = max(x for x in (ctx.get("baseHigh"), q.get("high"), q["t"]) if x is not None)
+        ctx["rescoreCount"] = ctx.get("rescoreCount", 0) + 1
+        new_pool.append({**c, **fields, "rescored": True, "rescoreReason": reason,
+                          "rescoreCount": ctx["rescoreCount"]})
+        diag["rescored"] += 1
+        diag["triggers"][reason] = diag["triggers"].get(reason, 0) + 1
+        changed = True
+    with _ENTRY_TOP5_CACHE_LOCK:
+        cur = _ENTRY_TOP5_CACHE.get(user_id)
+        if cur is None or cur.get("_candidatePool") is None:
+            return diag
+        cur["_candidatePool"] = new_pool
+        cur["lastRescoreAt"] = datetime.datetime.now(_JST).isoformat()
+    if changed:
+        try:
+            recompute_entry_top5_cache_for_cash(user_id, get_capital_context(database_url, user_id))
+        except Exception as e:
+            print("  [EntryRescore] 再ランキング失敗", e)
+    with _ENTRY_TOP5_CACHE_LOCK:
+        after = [c["code"] for c in ((_ENTRY_TOP5_CACHE.get(user_id) or {}).get("entryReadyTop5") or [])]
+    diag["rankChanged"] = before != after
+    diag["before"], diag["after"] = before, after
+    diag["elapsedMs"] = round((time.time() - t0) * 1000)
+    if diag["rescored"]:
+        print(f"  [EntryRescore] pool={diag['pool']} quotes={diag['quotes']} rescored={diag['rescored']} "
+              f"triggers={diag['triggers']} rankChanged={diag['rankChanged']} elapsed={diag['elapsedMs']}ms")
+    return diag
+
+
+def _entry_rescore_loop():
+    """市場時間中ENTRY_RESCORE_INTERVAL_SEC秒ごとに、キャッシュ済み候補poolを軽量再スコアする。"""
+    while True:
+        try:
+            now_jst = datetime.datetime.now(_JST)
+            hm = now_jst.hour * 60 + now_jst.minute
+            in_session = (9 * 60 <= hm < 11 * 60 + 30) or (12 * 60 + 30 <= hm < 15 * 60 + 30)
+            if in_session and _is_jp_market_business_day(now_jst):
+                for user_id in list(_ENTRY_TOP5_CACHE.keys()):
+                    rescore_entry_top5_cache(DATABASE_URL, user_id)
+        except Exception as e:
+            print("  [EntryRescore] loopで例外", e)
+        time.sleep(ENTRY_RESCORE_INTERVAL_SEC)
 
 
 def _entry_top5_scheduler_loop():
@@ -5946,7 +6265,7 @@ def compute_light_trade_analysis_snapshot(database_url, user_id, code, market="J
     try:
         snap = _intraday_stock_snapshot(w)
         if snap.get("dataStatus") != "failed":
-            snapshot = snap
+            snapshot = _apply_exchange_vwap_to_snapshot(snap, row)
     except Exception as e:
         print("  trade-analysis/live: 5分足スナップショット失敗", code, e)
     data_quality = "FULL" if (stage2 is not None and snapshot is not None) else (
@@ -21132,6 +21451,64 @@ def run_volume_scan(database_url, user_id, force=False):
 # （出来高の方向判定、新規スキャンなし・Stage1キャッシュも使わず単体銘柄のみ計算）をそのまま
 # 再利用する。ポジション本体（entries/trade_history/実現損益）には一切書き込まない、
 # 読み取り専用の参考情報API。失敗しても売買機能自体には影響しない設計にする。
+# ============================================================
+# 実ポジションの売却判断ログ（2026-09-25、Phase B-3）。売却判断（derivePositionStatus）自体は
+# フロントエンドが保有判断の独立エンジンとして持つため、判断が変わった瞬間（TRANSITION）と
+# 定期スナップショット（SNAPSHOT）をフロントが送り、ここでJSONL追記する。ポジション約定の記録
+# （portfolio/trade_history）には一切書き込まない、読み取り専用の診断ログ。
+# 1行 = {quoteAt, analysisAt, entryPrice, currentPrice, unrealizedPct, highSinceEntry, distanceFromHighPct,
+# exitRule, exitDecision, riskState, profitThenDeterioration, kind(TRANSITION|SNAPSHOT), prevDecision,...}
+# ============================================================
+POSITION_DECISION_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "position_decision_log.jsonl")
+_POSITION_DECISION_LOG_LOCK = threading.Lock()
+_POSITION_DECISION_KEYS = ("code", "market", "kind", "quoteAt", "analysisAt", "renderedAt", "entryPrice", "currentPrice",
+                            "unrealizedPct", "highSinceEntry", "distanceFromHighPct", "peakPnlPct", "exitRule",
+                            "exitDecision", "prevDecision", "riskState", "profitThenDeterioration", "reasons",
+                            "quoteToUiMs", "tradeStyle")
+
+
+def append_position_decision_log(records, path=None):
+    """フロントから届いた判断ログ（list of dict）をJSONLへ追記する。許可キーだけを保存し、TRANSITIONは
+    コンソールにも1行出す（HOLD→RISK→SAME_PRICE_EXIT→SELL等の状態遷移、利益が出た後の悪化を追える）。
+    戻り値：書き込み件数。"""
+    path = path or POSITION_DECISION_LOG_PATH
+    rows = []
+    for r in (records or [])[:50]:
+        if not isinstance(r, dict) or not r.get("code"):
+            continue
+        row = {k: r.get(k) for k in _POSITION_DECISION_KEYS}
+        row["receivedAt"] = datetime.datetime.now(_JST).isoformat()
+        rows.append(row)
+    if not rows:
+        return 0
+    with _POSITION_DECISION_LOG_LOCK:
+        with open(path, "a", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    for row in rows:
+        if row.get("kind") == "TRANSITION":
+            print(f"  [PositionDecision] {row['code']} {row.get('prevDecision')}→{row.get('exitDecision')} "
+                  f"現在{row.get('currentPrice')} 損益{row.get('unrealizedPct')}% 高値比{row.get('distanceFromHighPct')}% "
+                  f"利益後悪化={row.get('profitThenDeterioration')} quoteAt={row.get('quoteAt')} analysisAt={row.get('analysisAt')}")
+    return len(rows)
+
+
+def read_position_decision_log(limit=100, path=None):
+    path = path or POSITION_DECISION_LOG_PATH
+    if not os.path.exists(path):
+        return []
+    with _POSITION_DECISION_LOG_LOCK:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()[-max(1, min(int(limit), 1000)):]
+    out = []
+    for ln in lines:
+        try:
+            out.append(json.loads(ln))
+        except Exception:
+            continue
+    return out
+
+
 def get_position_live_detail(code, market="JP"):
     # latest quoteを先に取得する（yfinance履歴取得の待ち時間の後だと共有窓を過ぎ、他画面と別時刻の
     # 価格になってしまうため）。
@@ -21157,6 +21534,7 @@ def get_position_live_detail(code, market="JP"):
             if _fqv.get(k) is not None:
                 result[k] = _fqv[k]
         result["quoteAt"] = _fqv.get("quote_timestamp")
+        result["vwap"] = _fqv.get("vwap")
         result["quoteSource"] = _fqv.get("source")
         result["quoteIsStale"] = bool(_fqv.get("is_stale"))
         quote = result
@@ -22304,9 +22682,35 @@ def _attach_latest_quotes_to_watchlist(watchlist):
     return items, quotes
 
 
+def _apply_quote_derived_fields(r, w):
+    """quote由来のVWAP・内部5分bar情報を付ける。VWAPが無い場合は0や古い値を入れず、理由を明示する。
+    quoteAt（最新tick）/barAt（最新bar開始）/analyzedAtは別々の値。"""
+    q = w.get("_quote")
+    cur = r.get("current")
+    vwap = (q or {}).get("vwap")
+    if vwap:
+        r["vwap"], r["vwapSource"], r["vwapUnavailableReason"] = vwap, "TACHIBANA_EXCHANGE", None
+        r["vwapDistPct"] = round((cur - vwap) / vwap * 100, 2) if cur is not None else None
+    else:
+        r["vwap"], r["vwapSource"], r["vwapDistPct"] = None, None, None
+        r["vwapUnavailableReason"] = ("VWAP unavailable（立花quoteにVWAPが無い／フォールバック値）"
+                                      if q else "VWAP unavailable（latest quote未取得）")
+    if "yfBarAt" not in r:
+        r["yfBarAt"] = r.get("barAt")  # analyze_stockが使うyfinance 5分足の最終bar時刻（遅延あり、別物として保持）
+    ib = get_internal_intraday_bars(w.get("code")) if q else None
+    if ib and ib["bars"]:
+        r["barAt"], r["barSource"], r["barsPartial"] = ib["barAt"], "INTERNAL_TICKS", ib["partial"]
+        r["barUnavailableReason"] = None
+    else:
+        r["barAt"], r["barSource"], r["barsPartial"] = None, None, None
+        r["barUnavailableReason"] = (ib or {}).get("unavailableReason") or "5分足unavailable（quote未取得）"
+    return r
+
+
 def _stamp_analysis_with_quote(r, w, now_iso):
     q = w.get("_quote")
     r["analyzedAt"] = now_iso
+    _apply_quote_derived_fields(r, w)
     if q:
         r["currentSource"] = "SERVER_LATEST_QUOTE"
         r["quoteAt"] = q.get("quote_timestamp")
@@ -22347,6 +22751,7 @@ def build_analysis(watchlist, dynamic_only=False):
                 if q:
                     r["quoteAt"] = q.get("quote_timestamp")
                     r["quoteIsStale"] = bool(q.get("is_stale"))
+                _apply_quote_derived_fields(r, w)
                 return code, r
             r = analyze_stock({k: v for k, v in w.items() if k != "_quote"}, market_env)
             if r:
@@ -25914,6 +26319,9 @@ class Handler(SimpleHTTPRequestHandler):
             # 2026-09-07新規：通算実現損益（初期値＋trade_history合計、毎回再計算）。
             totals = investment_db.get_investment_totals(DATABASE_URL, self.current_user) if (investment_db is not None and DATABASE_URL) else {"initialRealizedPnl":0,"totalRealizedPnl":0}
             self._send_json(totals)
+        elif self.path.startswith("/api/position-decision-log"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            self._send_json({"records": read_position_decision_log(int((qs.get("limit", ["100"])[0]) or 100))})
         elif self.path.startswith("/api/position-live"):
             # 2026-09-07新規（ポジション→リアルタイム売却判断画面 Phase1）：ポジションカードの
             # 「リアルタイム」展開エリアを開いている間だけ、その1銘柄だけをオンデマンドで取得する。
@@ -27114,6 +27522,11 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception:
                 pass
             self._send_json({"position": updated})
+        elif self.path == "/api/position-decision-log":
+            # Phase B-3：フロントが送る売却判断の状態遷移・スナップショットをJSONLへ追記する（診断ログ専用）。
+            body = self._read_json_body()
+            n = append_position_decision_log(body.get("records") if isinstance(body, dict) else None)
+            self._send_json({"ok": True, "written": n})
         elif self.path == "/api/portfolio/peak-update":
             # 2026-09-18新規（保有中撤退判断支援アラート Phase A）：high-water mark（最大含み益）
             # の更新。フロント側が既存のstockQuotes変化での再評価ループの中で「改善した時だけ」
@@ -27423,6 +27836,7 @@ def main():
         # スケジューラと同じくサービス分離方針（指示書31番）で別スレッドにする。既存の
         # _restart_time_morning_warmup・281銘柄warmupガードには一切触れない（別経路）。
         threading.Thread(target=_entry_top5_scheduler_loop, daemon=True).start()
+        threading.Thread(target=_entry_rescore_loop, daemon=True).start()  # 2026-09-25 Phase B-1：候補poolの軽量再スコア
         # 2026-09-10新規（にこそく@nicosokufx X投稿連携、指示書2番）：X_API_BEARER_TOKEN
         # 未設定なら_nicosoku_poll_scheduler_loop内で即returnする（アプリ本体には影響しない）。
         threading.Thread(target=_nicosoku_poll_scheduler_loop, daemon=True).start()

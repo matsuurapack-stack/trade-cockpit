@@ -5529,7 +5529,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                       <div style={{fontSize:13,fontWeight:800,color:"var(--inkFaint)",width:16,textAlign:"center"}}>{c.rank}</div>
                       <div style={{width:56,fontSize:11.5,color:"var(--inkSoft)"}} className="mono">{c.code}</div>
                       <div style={{flex:"0 0 auto",minWidth:90,fontSize:12.5,fontWeight:700}}>{c.name}</div>
-                      <div className="mono" style={{width:70,fontSize:12.5,textAlign:"right"}} title={`株価 ${fmtHms(c.quoteAt)||"--"}${c.priceOverlaid?"（最新quoteで更新済み）":""} ／ スコア算出 ${fmtHms(c.scoredAt||entryResult?.generatedAt)||"--"}${c.scoredPrice!=null?`（算出時の価格 ${c.scoredPrice.toLocaleString()}）`:""}`}>{c.current!=null?c.current.toLocaleString():"—"}{c.priceDriftPct!=null&&Math.abs(c.priceDriftPct)>=0.5&&<span style={{display:"block",fontSize:9.5,color:"var(--down)"}}>算出時比{c.priceDriftPct>0?"+":""}{c.priceDriftPct}%</span>}</div>
+                      <div className="mono" style={{width:70,fontSize:12.5,textAlign:"right"}} title={`株価 ${fmtHms(c.quoteAt)||"--"}${c.priceOverlaid?"（最新quoteで更新済み）":""} ／ スコア算出 ${fmtHms(c.scoredAt||entryResult?.generatedAt)||"--"}${c.scoredPrice!=null?`（算出時の価格 ${c.scoredPrice.toLocaleString()}）`:""}`}>{c.current!=null?c.current.toLocaleString():"—"}{(c.scoreStale||(c.priceDriftPct!=null&&Math.abs(c.priceDriftPct)>=0.5))&&<span style={{display:"block",fontSize:9.5,color:"var(--down)"}}>{c.scoreStale?"再評価中":""}{c.priceDriftPct!=null&&c.priceDriftPct!==0?`（算出から${c.priceDriftPct>0?"+":""}${c.priceDriftPct}%）`:""}</span>}</div>
                       <span className="mono" style={{width:56,fontSize:12,textAlign:"right",color:c.changePct==null?"var(--inkFaint)":c.changePct>0?"var(--up)":c.changePct<0?"var(--down)":"var(--inkFaint)"}}>
                         {c.changePct!=null?(c.changePct>0?"+":"")+c.changePct.toFixed(2)+"%":"—"}
                       </span>
@@ -5705,6 +5705,7 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                 </div>;
               })}
             </div>
+          </>}
           </>}
         </>}
       {/* 指示書18・19番：📊 朝TOP5結果。08:50 MorningMarketCheckで確定したentry_ready_top5
@@ -7537,6 +7538,27 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
   // だけがこのmapに値を持ち、優先順位は「liveQuotes（実測） > stockQuotes（30秒バッチ） >
   // なし」とする（指示書の優先順位：live > market quote > DB/cache）。
   const [liveQuotes,setLiveQuotes]=useState({}); // key: code+market -> {price, fetchedAt}
+  // Phase B-3：売却判断ログ。判断(exitDecision)が変わった瞬間はTRANSITION、変わらなくても60秒毎に
+  // SNAPSHOTを/api/position-decision-logへ送る（サーバーはposition_decision_log.jsonlへ追記）。
+  // 利益が出た後の条件悪化(profitThenDeterioration)もここで検出できる。
+  const lastPosDecisionRef=useRef({});
+  useEffect(()=>{
+    const snaps=window.__posDecisionSnap||{};
+    const now=Date.now(), out=[];
+    Object.entries(snaps).forEach(([k,sn])=>{
+      const last=lastPosDecisionRef.current[k];
+      if(!last||last.decision!==sn.exitDecision){
+        out.push({...sn,kind:"TRANSITION",prevDecision:last?last.decision:null,
+          quoteToUiMs:sn.quoteAt?now-new Date(sn.quoteAt).getTime():null});
+        lastPosDecisionRef.current[k]={decision:sn.exitDecision,at:now};
+      }else if(now-last.at>=60000){
+        out.push({...sn,kind:"SNAPSHOT",prevDecision:last.decision,
+          quoteToUiMs:sn.quoteAt?now-new Date(sn.quoteAt).getTime():null});
+        last.at=now;
+      }
+    });
+    if(out.length)fetch("/api/position-decision-log",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({records:out})}).catch(()=>{});
+  });
   const reportLiveQuote=useCallback((key,price,quoteAt)=>{
     if(price==null)return;
     setLiveQuotes(p=>((p[key]?.price===price&&p[key]?.quoteAt===(quoteAt||null))?p:{...p,[key]:{price,quoteAt:quoteAt||null,fetchedAt:new Date().toISOString()}}));
@@ -7937,6 +7959,23 @@ function PortfolioPanel({stockQuotes,analysisData,analysisEnrichedMap,marketEven
                 positionFlags:posFlags,pnlPct,indicators:posIndicators,enrStatus:enr?.status,
                 ask:boardAsk,bid:boardBid,eventRiskLevel:eventRiskGuard?.byCode?.[it.code]?.level});
               const posMeta=POSITION_STATUS_META[posResult.status];
+              // Phase B-3（2026-09-25）：売却判断の追跡スナップショット。renderごとに最新値を
+              // window側へ置き、下のuseEffect(usePositionDecisionLogger)が状態遷移時／60秒毎に送信する。
+              {
+                const _a=analysisData?.[it.code];
+                const _peak=it.peak_price!=null?Math.max(it.peak_price,current??0):current;
+                const _peakPnl=it.peak_pnl_pct??null;
+                (window.__posDecisionSnap=window.__posDecisionSnap||{})[it.code+(it.market||"JP")]={
+                  code:it.code,market:it.market||"JP",tradeStyle:it.trade_style,
+                  quoteAt:_a?.quoteAt||stockQuotes?.[it.code]?.quote_timestamp||liveQuotes[liveKey]?.quoteAt||null,
+                  analysisAt:_a?.analyzedAt||null,renderedAt:new Date().toISOString(),
+                  entryPrice:it.average_price??null,currentPrice:current??null,unrealizedPct:pnlPct!=null?Math.round(pnlPct*100)/100:null,
+                  highSinceEntry:_peak??null,distanceFromHighPct:(_peak&&current!=null)?Math.round((current-_peak)/_peak*10000)/100:null,
+                  peakPnlPct:_peakPnl,exitRule:evaluatePositionRiskRule(pnlPct),exitDecision:posResult.status,
+                  riskState:(positionAlerts[it.code+(it.market||"JP")]||{}).tier||null,
+                  profitThenDeterioration:(_peakPnl!=null&&_peakPnl>=0.5&&pnlPct!=null&&(pnlPct<=0.1||pnlPct<_peakPnl*0.5)),
+                  reasons:(posResult.reasons||[]).slice(0,6)};
+              }
               // v3-8 Step8（UIカード再設計）：表示順を「取引タイプ→ポジションStatus→取得値/現在値/
               // 損益→HARD STOP/現在SL→Trailing/利確候補→チャート・出来高警戒（Statusの理由として
               // 既に列挙）→判断理由→操作」に統一。既存のENTRY READY等（enr、銘柄分析用の参考情報）
@@ -12553,7 +12592,7 @@ function App(){
       entryLiveFetchingRef.current=false;
     };
     fetchLive();
-    const id=setInterval(()=>{if(isJstMarketHours())fetchLive();},45*1000);
+    const id=setInterval(()=>{if(isJstMarketHours())fetchLive();},30*1000); // 2026-09-25：サーバー側15秒再スコアに合わせ30秒（順位遅延<=60秒）
     // 買付余力を手動変更した直後は、サーバー側でキャッシュ済み候補から即時再ランキングされる
     // ため、次のポーリングを待たずに再取得する（2026-09-24新規）。
     const onCash=()=>{setTimeout(fetchLive,300);};

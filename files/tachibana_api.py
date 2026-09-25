@@ -135,7 +135,7 @@ _session = None
 _session_date = None
 _p_no = 1
 
-PRICE_COLUMNS = "pDPP,pPRP,pDYWP,pDYRP,pDV,pDHP,pDLP,pDOP,pQAP,pQBP"
+PRICE_COLUMNS = "pDPP,pPRP,pDYWP,pDYRP,pDV,pDHP,pDLP,pDOP,pQAP,pQBP,pVWAP"  # pVWAP：取引所算出の当日VWAP（2026-09-25実測で取得可を確認）
 PRICE_CHUNK = 40  # 一括問い合わせの銘柄数上限（未検証の上限に余裕を持たせた保守的な値）
 
 
@@ -222,6 +222,7 @@ def get_market_price(codes, use_prod=True):
                 "volume": _num(row.get("pDV")),
                 "ask": _num(row.get("pQAP")),  # 売気配（最良気配。板の全体深度は未取得）
                 "bid": _num(row.get("pQBP")),  # 買気配
+                "vwap": _num(row.get("pVWAP")),  # 当日VWAP（取引所算出）。未約定・取得不能ならNone
             }
     return out
 

@@ -133,6 +133,7 @@ class ComputeLightTradeAnalysisSnapshotTests(unittest.TestCase):
     def test_does_not_call_analyze_stock(self):
         stage1 = {"rows": {"4440": {"current": 2624, "changePct": 2.1, "code": "4440"}}, "nikkeiChangePct": -0.5}
         with mock.patch.object(server, "run_momentum_stage1", return_value=stage1), \
+             mock.patch.object(server, "get_fast_quotes", return_value=({}, {})), \
              mock.patch.object(server, "investment_db") as mock_db, \
              mock.patch.object(server, "_volume_stage2_detail", return_value=None), \
              mock.patch.object(server, "_intraday_stock_snapshot", return_value={"dataStatus": "failed"}), \
@@ -159,6 +160,7 @@ class ComputeLightTradeAnalysisSnapshotTests(unittest.TestCase):
         snapshot = {"current": 2624, "currentChangePct": 9.0, "vwap": 2600, "aboveVwap": True,
                     "fiveMinStructure": "higher_highs", "dataStatus": "ok"}
         with mock.patch.object(server, "run_momentum_stage1", return_value=stage1), \
+             mock.patch.object(server, "get_fast_quotes", return_value=({}, {})), \
              mock.patch.object(server, "investment_db") as mock_db, \
              mock.patch.object(server, "_volume_stage2_detail", return_value=stage2), \
              mock.patch.object(server, "_intraday_stock_snapshot", return_value=snapshot), \
