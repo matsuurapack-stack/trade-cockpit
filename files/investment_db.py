@@ -792,6 +792,8 @@ CREATE TABLE IF NOT EXISTS chart_signal_log (
 ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS at_5m TIMESTAMPTZ;
 ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS at_15m TIMESTAMPTZ;
 ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS at_30m TIMESTAMPTZ;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS transition_type TEXT;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS transition_origin TEXT;
 CREATE INDEX IF NOT EXISTS idx_chart_signal_log_user_date ON chart_signal_log (user_id, trade_date, code);
 CREATE INDEX IF NOT EXISTS idx_chart_signal_log_pending ON chart_signal_log (outcome_done, logged_at);
 """
@@ -10714,6 +10716,7 @@ def update_position_peak(database_url, user_id, position_id, peak_price, peak_pn
         conn.commit()
     if not row:
         return None
+    row = _row_to_json(row)   # NUMERIC列はDecimalで返りjson化できないため既存の共通変換を通す
     return {"peakPrice": row["peak_price"], "peakPnlPct": row["peak_pnl_pct"]}
 
 
@@ -11118,7 +11121,8 @@ def list_shadow_watch(database_url, user_id, status=None, active_on=None):
 _CHART_SIGNAL_INSERT_COLS = (
     "user_id", "logged_at", "trade_date", "code", "name", "source", "current_price", "day_high", "stock_strength",
     "entry_timing", "chart_pattern", "chart_confidence", "legacy_entry_state", "chart_entry_state", "entry_decision",
-    "vwap", "vwap_distance", "change_15m", "consecutive_green", "upper_wick_ratio", "breakout_volume_ratio")
+    "vwap", "vwap_distance", "change_15m", "consecutive_green", "upper_wick_ratio", "breakout_volume_ratio",
+    "transition_type", "transition_origin")
 
 
 def insert_chart_signals(database_url, records):

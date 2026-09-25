@@ -6097,7 +6097,8 @@ def _run_entry_top5_scan(database_url, user_id, trigger="AUTO", wait_for_lock=Fa
 # 価格依存項目（現在値・前日比・対市場RS・高値乖離・VWAP位置・値幅余地・モメンタム・イベントガード
 # ・entry_score・ENTRY状態）だけを再計算する。
 # ============================================================
-_CHART_SIGNAL_LAST = {}   # (user_id, code) -> {"pattern","chart","legacy","at"}（重複ログ抑止）
+_CHART_SIGNAL_LAST = {}   # (user_id, code) -> chart_signal_log.last_state()（最後に記録した状態。重複ログ抑止）
+_CHART_SIGNAL_MEM = {}    # (user_id, code) -> 観測メモリ（遷移タイプ検出用。記録の有無に関わらず毎回更新）
 
 
 def _in_jp_session(now_jst):
@@ -6123,13 +6124,17 @@ def log_chart_signals(database_url, user_id, source):
         recs = []
         for c in pool:
             rec = chart_signal_log.build_signal_record(user_id, c, now, source, top5)
-            if rec is None or not chart_signal_log.is_loggable(rec):
+            if rec is None:
                 continue
             key = (user_id, rec["code"])
-            if not chart_signal_log.should_log(_CHART_SIGNAL_LAST.get(key), rec, now):
+            trans, origin = chart_signal_log.detect_transition(_CHART_SIGNAL_MEM, key, rec, now)
+            if not chart_signal_log.is_loggable(rec):
                 continue
-            _CHART_SIGNAL_LAST[key] = {"pattern": rec["chart_pattern"], "chart": rec["chart_entry_state"],
-                                       "legacy": rec["legacy_entry_state"], "at": now}
+            if trans:   # 状態が変わった瞬間に遷移タイプを記録（後から履歴列で推測しない）
+                rec["transition_type"], rec["transition_origin"] = ",".join(trans), origin
+            elif not chart_signal_log.should_log(_CHART_SIGNAL_LAST.get(key), rec, now):
+                continue
+            _CHART_SIGNAL_LAST[key] = chart_signal_log.last_state(rec, now)
             recs.append(rec)
         return investment_db.insert_chart_signals(database_url, recs)
     except Exception as e:

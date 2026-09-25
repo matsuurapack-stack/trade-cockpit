@@ -48,16 +48,13 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(rec["context"]["top5"], ["actionableTop5"])
         self.assertAlmostEqual(rec["vwap"], 1000 / 1.015, places=1)
 
-    def test_loggable_scope_and_idle_heartbeat(self):
+    def test_loggable_scope(self):
         weak = sl.build_signal_record("u", cand(legacy="WEAK", chart="WEAK", pattern="BASE_BUILDING"), T0, "SCAN")
         self.assertFalse(sl.is_loggable(weak))
         weak_top5 = sl.build_signal_record("u", cand(legacy="WEAK", chart="WEAK"), T0, "SCAN", {"analysisTop5": {"5301"}})
         self.assertTrue(sl.is_loggable(weak_top5))
         watch = sl.build_signal_record("u", cand(legacy="WATCH", chart="WATCH", pattern="BASE_BUILDING"), T0, "SCAN")
         self.assertTrue(sl.is_loggable(watch))
-        last = {"pattern": "BASE_BUILDING", "chart": "WATCH", "legacy": "WATCH", "at": T0}
-        self.assertFalse(sl.should_log(last, watch, T0 + datetime.timedelta(seconds=400)))   # WATCHは15分ごと
-        self.assertTrue(sl.should_log(last, watch, T0 + datetime.timedelta(seconds=901)))
 
     def test_no_chart_or_price_gives_none(self):
         self.assertIsNone(sl.build_signal_record("u", {"code": "1", "current": 1.0}, T0, "SCAN"))
@@ -65,14 +62,51 @@ class RecordTests(unittest.TestCase):
         c["current"] = None
         self.assertIsNone(sl.build_signal_record("u", c, T0, "SCAN"))
 
-    def test_should_log_dedupe_change_and_heartbeat(self):
-        rec = sl.build_signal_record("u", cand(), T0, "SCAN")
-        last = {"pattern": "CHASE", "chart": "WAIT_PULLBACK", "legacy": "ENTRY_READY", "at": T0}
+
+
+def mk(pattern="BASE_BUILDING", legacy="WATCH", chart="WATCH", top5=None, timing=50, vdist=0.5, chg15=0.5):
+    c = cand(pattern=pattern, legacy=legacy, chart=chart)
+    c["chartContext"]["entry_timing_score"] = timing
+    c["chartContext"]["features"].update({"vwapDistPct": vdist, "chg15m": chg15})
+    return sl.build_signal_record("u", c, T0, "SCAN", {"actionableTop5": {"5301"}} if top5 else None)
+
+
+class ShouldLogTests(unittest.TestCase):
+    def at(self, sec):
+        return T0 + datetime.timedelta(seconds=sec)
+
+    def test_first_observation_and_plain_continuation_are_reduced(self):
+        rec = mk()
+        last = sl.last_state(rec, T0)
         self.assertTrue(sl.should_log(None, rec, T0))
-        self.assertFalse(sl.should_log(last, rec, T0 + datetime.timedelta(seconds=60)))
-        self.assertTrue(sl.should_log(last, rec, T0 + datetime.timedelta(seconds=301)))
-        rec2 = sl.build_signal_record("u", cand(pattern="PULLBACK_READY"), T0, "RESCORE")
-        self.assertTrue(sl.should_log(last, rec2, T0 + datetime.timedelta(seconds=10)))
+        self.assertFalse(sl.should_log(last, mk(timing=55, vdist=0.9), self.at(400)))      # 小さな変化・別5分足slot→省略
+        self.assertFalse(sl.should_log(last, rec, self.at(3000)))                            # 非優先はハートビート1時間
+        self.assertTrue(sl.should_log(last, rec, self.at(3601)))
+
+    def test_material_feature_move_is_logged_but_not_within_same_bar(self):
+        last = sl.last_state(mk(), T0)
+        moved = mk(timing=80)
+        self.assertFalse(sl.should_log(last, moved, self.at(120)))    # 5分以内の同一bar重複は不可
+        self.assertTrue(sl.should_log(last, moved, self.at(320)))
+
+    def test_state_top5_diff_and_priority_pattern_changes_are_logged(self):
+        last = sl.last_state(mk(), T0)
+        self.assertTrue(sl.should_log(last, mk(top5=True), self.at(60)))                                 # TOP5採用
+        self.assertTrue(sl.should_log(sl.last_state(mk(top5=True), T0), mk(), self.at(60)))              # TOP5脱落
+        self.assertTrue(sl.should_log(last, mk(legacy="ENTRY_READY", chart="WAIT_PULLBACK"), self.at(60)))  # 差分発生
+        self.assertTrue(sl.should_log(last, mk(legacy="ENTRY_READY", chart="ENTRY_READY"), self.at(60)))    # ENTRY_READY
+        self.assertTrue(sl.should_log(last, mk(pattern="CHASE"), self.at(700)))                          # 優先パターンへ
+        self.assertTrue(sl.should_log(last, mk(pattern="VWAP_RECLAIM"), self.at(700)))
+        self.assertTrue(sl.should_log(last, mk(pattern="PULLBACK_READY"), self.at(700)))
+
+    def test_watch_wait_flapping_between_nonpriority_states_is_not_logged(self):
+        last = sl.last_state(mk(legacy="WATCH", chart="WATCH"), T0)
+        self.assertFalse(sl.should_log(last, mk(pattern="NEUTRAL", legacy="WAIT_PULLBACK", chart="WAIT_PULLBACK"), self.at(400)))
+
+    def test_priority_pattern_flap_needs_min_gap(self):
+        last = sl.last_state(mk(pattern="VWAP_RECLAIM"), T0)
+        self.assertFalse(sl.should_log(last, mk(pattern="BASE_BUILDING"), self.at(320)))
+        self.assertTrue(sl.should_log(last, mk(pattern="BASE_BUILDING"), self.at(620)))
 
 
 class OutcomeTests(unittest.TestCase):
@@ -151,7 +185,7 @@ class SummaryTests(unittest.TestCase):
         seq = [("CHASE", "ENTRY_READY", "WAIT_PULLBACK"), ("CHASE", "ENTRY_READY", "WAIT_PULLBACK"),
                ("BASE_BUILDING", "WAIT_PULLBACK", "WAIT_PULLBACK"), ("PULLBACK_READY", "WAIT_PULLBACK", "ENTRY_READY")]
         rows = [row("5301", at=i * 5, pattern=p, legacy=lg, chart=ch) for i, (p, lg, ch) in enumerate(seq)]
-        t = sl.summarize_day(rows)["transitions"]
+        t = sl.summarize_day(rows)["transitions_loose"]
         self.assertEqual(len(t["completed_chase_to_entry"]), 1)
         self.assertEqual(t["completed_chase_to_entry"][0]["steps"][0], ("CHASE", "WAIT_PULLBACK"))
         self.assertEqual(t["completed_chase_to_entry"][0]["steps"][-1], ("PULLBACK_READY", "ENTRY_READY"))

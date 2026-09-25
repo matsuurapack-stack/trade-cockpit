@@ -11,10 +11,20 @@ import datetime
 
 HORIZONS_MIN = (5, 15, 30)
 OUTCOME_TOLERANCE_SEC = 240        # 目標時刻からこの秒数以内に取れた価格だけを事後価格として採用
-HEARTBEAT_SEC = 300                # TOP5・ENTRY状態の銘柄は、状態が変わらなくても5分ごとに1行残す（追跡用）
-HEARTBEAT_IDLE_SEC = 900           # それ以外のWATCH/WAIT系は15分ごと（Neon容量対策。状態変化は常に即記録）
+# ログ件数抑制（Neon容量）。「状態変化・TOP5採用/脱落・legacyとchartの差分・優先パターン」は必ず残し、
+# 同一状態の継続は特徴量が実質動いた時か、ハートビート時だけ残す。
+PRIO_HEARTBEAT_SEC = 900           # 優先状態（ENTRY_READY/CHASE系/FAILED_BREAKOUT/PULLBACK_READY/VWAP_RECLAIM/TOP5/差分）
+IDLE_HEARTBEAT_SEC = 3600          # それ以外のWATCH/WAIT系の継続
+PATTERN_FLAP_MIN_SEC = 600         # 優先パターンの出入りが5分足ごとに揺れる場合の最小間隔（遷移タイプ・状態変化は別枠で即記録）
+MATERIAL_MIN_GAP_SEC = 300         # 特徴量が動いた場合でも同一銘柄は5分以内に再記録しない（同一bar内の重複防止）
+MATERIAL_TIMING = 20               # entry_timing の変化（点）
+MATERIAL_VWAP_DIST = 1.0           # VWAP乖離の変化（%pt）
+MATERIAL_CHG15 = 2.0               # 15分変化率の変化（%pt）
 # 記録対象：TOP5系リスト、または旧/新どちらかが「注目状態」。WEAK/INVALID等の圏外は記録しない。
 LOGGED_STATES = ("NOW_BUYABLE", "ENTRY_READY", "WATCH", "WAIT_PULLBACK", "WAIT_BREAKOUT", "CHASE_RISK")
+PRIORITY_PATTERNS = ("CHASE", "EXTENDED", "EXHAUSTION", "FAILED_BREAKOUT", "PULLBACK_READY", "VWAP_RECLAIM")
+RECOVERY_PATTERNS = ("PULLBACK_READY", "VWAP_RECLAIM", "EARLY_BREAKOUT", "BREAKOUT_CONFIRMED")
+TRANSITION_WINDOW_SEC = 90 * 60    # CHASE/FAILED_BREAKOUT を起点とした遷移として数える最大経過時間（定義。判定には使わない）
 
 # 結果分類（集計専用）：15分後リターンで 下落 / 横横 / 上昇 に分ける
 DECLINE_PCT = -0.3
@@ -49,6 +59,7 @@ def build_signal_record(user_id, cand, now, source, top5_codes=None):
     day_high = round(price / (1 + dist_hi / 100.0), 2) if (dist_hi is not None and price) else None
     top5 = top5_codes or {}
     return {
+        "transition_type": None, "transition_origin": None,
         "user_id": user_id, "logged_at": now, "code": str(cand["code"]), "name": cand.get("name"), "source": source,
         "current_price": price, "day_high": day_high,
         "stock_strength": cand.get("stockStrengthScore"), "entry_timing": cc.get("entry_timing_score"),
@@ -68,23 +79,102 @@ def build_signal_record(user_id, cand, now, source, top5_codes=None):
     }
 
 
+def is_priority(rec):
+    ctx = rec.get("context") or {}
+    return bool(ctx.get("top5") or rec.get("legacy_entry_state") != rec.get("chart_entry_state")
+                or rec.get("chart_entry_state") in ENTRY_STATES or rec.get("legacy_entry_state") in ENTRY_STATES
+                or "CHASE_RISK" in (rec.get("chart_entry_state"), rec.get("legacy_entry_state"))
+                or rec.get("chart_pattern") in PRIORITY_PATTERNS)
+
+
 def is_loggable(rec):
     if (rec.get("context") or {}).get("top5"):
         return True
     return rec.get("legacy_entry_state") in LOGGED_STATES or rec.get("chart_entry_state") in LOGGED_STATES
 
 
-def should_log(last, rec, now, heartbeat_sec=None):
-    """last: 直前に記録した {"pattern","chart","legacy","at"}。状態が変わった／ハートビート時のみTrue。"""
+def last_state(rec, now):
+    """直前に記録した状態のスナップショット（should_logの比較用）。"""
+    ft = rec.get("features") or {}
+    return {"pattern": rec["chart_pattern"], "chart": rec["chart_entry_state"], "legacy": rec["legacy_entry_state"],
+            "at": now, "timing": rec.get("entry_timing"), "vdist": rec.get("vwap_distance"), "chg15": rec.get("change_15m"),
+            "prio": is_priority(rec), "top5": tuple((rec.get("context") or {}).get("top5") or ())}
+
+
+def _moved(a, b, th):
+    return a is not None and b is not None and abs(a - b) >= th
+
+
+def should_log(last, rec, now):
+    """last: last_state()の戻り値。状態変化・TOP5採用/脱落・差分発生は即記録。同一状態の継続は
+    特徴量が実質動いた時（5分以上空いて）かハートビート時のみ。"""
     if not last:
         return True
-    if heartbeat_sec is None:
-        hot = (rec.get("context") or {}).get("top5") or rec.get("chart_entry_state") in ENTRY_STATES             or rec.get("legacy_entry_state") in ENTRY_STATES
-        heartbeat_sec = HEARTBEAT_SEC if hot else HEARTBEAT_IDLE_SEC
-    if (last.get("pattern"), last.get("chart"), last.get("legacy")) != \
-            (rec["chart_pattern"], rec["chart_entry_state"], rec["legacy_entry_state"]):
+    prio = is_priority(rec)
+    if (last["chart"], last["legacy"]) != (rec["chart_entry_state"], rec["legacy_entry_state"]) and (prio or last.get("prio")):
+        return True       # 優先状態へ/からの変化。WATCH↔WAIT_PULLBACK等の非優先間の揺れは継続扱い（特徴量が動けば記録）
+    top5 = tuple((rec.get("context") or {}).get("top5") or ())
+    if top5 != last.get("top5"):
         return True
-    return (now - last["at"]).total_seconds() >= heartbeat_sec
+    if last["pattern"] != rec["chart_pattern"] and (prio or last.get("prio"))             and (now - last["at"]).total_seconds() >= PATTERN_FLAP_MIN_SEC:
+        return True       # 優先パターンへ/から変わった瞬間（BASE_BUILDING↔NEUTRAL等の非優先間の揺れは継続扱い）
+    age = (now - last["at"]).total_seconds()
+    if age < MATERIAL_MIN_GAP_SEC:
+        return False
+    material = (_moved(last.get("timing"), rec.get("entry_timing"), MATERIAL_TIMING)
+                or _moved(last.get("vdist"), rec.get("vwap_distance"), MATERIAL_VWAP_DIST)
+                or _moved(last.get("chg15"), rec.get("change_15m"), MATERIAL_CHG15))
+    if prio:
+        return material or age >= PRIO_HEARTBEAT_SEC
+    return material or age >= IDLE_HEARTBEAT_SEC
+
+
+def detect_transition(mem, key, rec, now):
+    """状態が変わった「その瞬間」に厳密な遷移タイプを返す（履歴列からの後付け推測はしない）。
+    mem: 呼び出し側が保持するdict（key=(user,code)ごとの観測メモリ。ここで更新する）。
+    戻り値: (遷移タイプのリスト, origin)。origin＝押し目/エントリー復帰の起点（CHASE/FAILED_BREAKOUT/None）。
+      CHASE_TO_PULLBACK_READY        直近90分内にCHASE/EXTENDED/EXHAUSTIONが出た後、PULLBACK_READYになった
+      PULLBACK_READY_TO_ENTRY_READY  PULLBACK_READYのままENTRY系stateへ入った（originに起点）
+      FAILED_BREAKOUT_TO_RECOVERY    直近90分内のFAILED_BREAKOUT後、回復系パターン（押し目/VWAP奪回/ブレイク）になった
+      ENTRY_READY_TO_CHASE           ENTRY系stateだった銘柄がCHASE/EXTENDED/EXHAUSTIONになった
+      ENTRY_READY_TO_FAILED_BREAKOUT ENTRY系stateだった銘柄がFAILED_BREAKOUTになった"""
+    pat, chart = rec["chart_pattern"], rec["chart_entry_state"]
+    m = mem.get(key)
+    if m is None or m.get("date") != now.date():
+        m = {"date": now.date(), "pattern": None, "chart": None, "chase_at": None, "chase_pb": False, "fb_at": None}
+        mem[key] = m
+
+    def within(ts):
+        return ts is not None and (now - ts).total_seconds() <= TRANSITION_WINDOW_SEC
+
+    out, origin = [], None
+    prev_entry = m["chart"] in ENTRY_STATES
+    is_entry = chart in ENTRY_STATES
+    if m["pattern"] is not None:
+        if prev_entry and pat in CHASE_PATTERNS and m["pattern"] not in CHASE_PATTERNS:
+            out.append("ENTRY_READY_TO_CHASE")
+        if prev_entry and pat == "FAILED_BREAKOUT" and m["pattern"] != "FAILED_BREAKOUT":
+            out.append("ENTRY_READY_TO_FAILED_BREAKOUT")
+    if pat == "PULLBACK_READY" and m["pattern"] != "PULLBACK_READY":
+        if within(m["chase_at"]) and not m["chase_pb"]:
+            out.append("CHASE_TO_PULLBACK_READY")
+            m["chase_pb"] = True
+    if pat == "PULLBACK_READY" and is_entry and not prev_entry:
+        out.append("PULLBACK_READY_TO_ENTRY_READY")
+        origin = "CHASE" if within(m["chase_at"]) else ("FAILED_BREAKOUT" if within(m["fb_at"]) else None)
+        m["chase_at"] = None
+    if within(m["fb_at"]) and pat in RECOVERY_PATTERNS and m["pattern"] not in RECOVERY_PATTERNS:
+        out.append("FAILED_BREAKOUT_TO_RECOVERY")
+        origin = origin or "FAILED_BREAKOUT"
+        m["fb_at"] = None
+    if pat in CHASE_PATTERNS:
+        if not within(m["chase_at"]) or m["pattern"] not in CHASE_PATTERNS:
+            m["chase_pb"] = False
+        m["chase_at"] = now
+    if pat == "FAILED_BREAKOUT":
+        m["fb_at"] = now
+    m["pattern"], m["chart"] = pat, chart
+    return out, origin
 
 
 def return_pct(entry, later):
@@ -167,6 +257,64 @@ def transition_chains(rows):
     return {"edges": edges, "completed_chase_to_entry": full, "codes": len(chains)}
 
 
+def _pctile(vals, q):
+    v = sorted(vals)
+    if not v:
+        return None
+    k = (len(v) - 1) * q
+    lo, hi = int(k), min(int(k) + 1, len(v) - 1)
+    return round(v[lo] + (v[hi] - v[lo]) * (k - lo), 1)
+
+
+def _parse_dt(x):
+    if isinstance(x, datetime.datetime):
+        return x
+    try:
+        return datetime.datetime.fromisoformat(x) if x else None
+    except (TypeError, ValueError):
+        return None
+
+
+def outcome_quality(rows):
+    """+5/+15/+30分の due_at / fetched_at(at_Xm) / actual_delay_sec の分布。at_Xm列が無い行
+    （列追加前の行）は遅延を測れないため対象外にして、その件数をmeasurable/priceで示す。"""
+    out = {}
+    for h in HORIZONS_MIN:
+        delays, priced, missed = [], 0, 0
+        for r in rows:
+            logged, fetched = _parse_dt(r.get("logged_at")), _parse_dt(r.get(f"at_{h}m"))
+            if r.get(f"price_{h}m") is not None:
+                priced += 1
+            elif r.get("outcome_done"):
+                missed += 1
+            if logged and fetched:
+                delays.append((fetched - logged).total_seconds() - h * 60)   # due_at = logged_at + h分
+        out[f"{h}m"] = {"priced": priced, "missed(done but no price)": missed, "measurable": len(delays),
+                        "delay_sec_median": _pctile(delays, 0.5), "delay_sec_p95": _pctile(delays, 0.95),
+                        "delay_sec_max": round(max(delays), 1) if delays else None}
+    return out
+
+
+def transition_summary(rows):
+    """状態が変わった瞬間に記録したtransition_type別の件数・origin・15/30分後の平均リターン。"""
+    by = {}
+    for r in rows:
+        for t in [x for x in (r.get("transition_type") or "").split(",") if x]:
+            d = by.setdefault(t, {"count": 0, "origins": {}, "_r15": [], "_r30": []})
+            d["count"] += 1
+            o = r.get("transition_origin") or "NONE"
+            d["origins"][o] = d["origins"].get(o, 0) + 1
+            for h, key in ((15, "_r15"), (30, "_r30")):
+                if r.get(f"ret_{h}m") is not None:
+                    d[key].append(r[f"ret_{h}m"])
+    for d in by.values():
+        for key, name in (("_r15", "avg_ret_15m"), ("_r30", "avg_ret_30m")):
+            v = d.pop(key)
+            d[name] = round(sum(v) / len(v), 3) if v else None
+            d["n_" + name[-3:]] = len(v)
+    return by
+
+
 def _rate(num, den):
     return None if not den else round(num / den, 3)
 
@@ -246,5 +394,7 @@ def summarize_day(rows):
              "sector": ((r.get("context") or {}).get("scoreBreakdown") or {}).get("autoSector")}
             for r in fb_ev],
         "legacy_vs_chart_diff": diffs,
-        "transitions": transition_chains(rows),
+        "transition_types": transition_summary(rows),          # 厳密：状態が変わった瞬間に記録した遷移タイプ
+        "transitions_loose": transition_chains(rows),          # 参考：履歴列からの緩い推測（厳密な集計には使わない）
+        "outcome_quality": outcome_quality(rows),
     }
