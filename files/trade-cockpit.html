@@ -5618,6 +5618,10 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                   </div>;
                 })}
               </div>}
+          {/* 2026-09-25 UI簡素化：銘柄カード以外の補足ブロック（実戦TOP5説明・分析TOP5・組み合わせ・
+              余力不足・再注目・WATCH_LOW・監視候補・反転候補）は通常画面では描画しない。内部計算・
+              APIは無変更、明示的なデバッグ表示（🔧デバッグ）を開いたときだけ表示する。 */}
+          {entryDebugOpen && <>
           {entryResult.capital&&entryResult.capital.applied && <div style={{fontSize:11,color:"var(--inkSoft)",marginBottom:6}}>
             上の一覧は<b>実戦TOP5</b>（現在の買付余力
             <span className="mono" style={{fontWeight:800}}> {Math.round(entryResult.capital.cashAvailable).toLocaleString()}円 </span>
