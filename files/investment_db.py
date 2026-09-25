@@ -11130,17 +11130,18 @@ def insert_chart_signals(database_url, records):
     cols = _CHART_SIGNAL_INSERT_COLS + ("reasons_json", "penalties_json", "features_json", "context_json")
     sql = (f"INSERT INTO chart_signal_log ({', '.join(cols)}) VALUES ("
            + ", ".join(["%s"] * len(_CHART_SIGNAL_INSERT_COLS) + ["%s::jsonb"] * 4) + ")")
-    n = 0
+    params = []
+    for r in records:
+        vals = [r.get(c) if c != "trade_date" else r["logged_at"].astimezone(jst).date() for c in _CHART_SIGNAL_INSERT_COLS]
+        vals += [json.dumps(r.get("reasons"), ensure_ascii=False), json.dumps(r.get("penalties"), ensure_ascii=False),
+                 json.dumps(r.get("features"), ensure_ascii=False, default=str),
+                 json.dumps(r.get("context"), ensure_ascii=False, default=str)]
+        params.append(vals)
     with pool.connection() as conn:
-        for r in records:
-            vals = [r.get(c) if c != "trade_date" else r["logged_at"].astimezone(jst).date() for c in _CHART_SIGNAL_INSERT_COLS]
-            vals += [json.dumps(r.get("reasons"), ensure_ascii=False), json.dumps(r.get("penalties"), ensure_ascii=False),
-                     json.dumps(r.get("features"), ensure_ascii=False, default=str),
-                     json.dumps(r.get("context"), ensure_ascii=False, default=str)]
-            conn.execute(sql, vals)
-            n += 1
+        with conn.cursor() as cur:
+            cur.executemany(sql, params)   # 1行ずつのINSERTだとNeonの往復待ちでスキャンが遅れるためpipeline化
         conn.commit()
-    return n
+    return len(params)
 
 
 def list_pending_chart_signals(database_url, since):
@@ -11156,25 +11157,28 @@ def list_pending_chart_signals(database_url, since):
             return cur.fetchall()
 
 
-_CHART_SIGNAL_UPDATE_COLS = ("price_5m", "price_15m", "price_30m", "at_5m", "at_15m", "at_30m", "max_30m", "min_30m", "new_high_after_sec", "outcome_done")
-
-
 def update_chart_signal_outcomes(database_url, updates):
-    """updates: [{"id":.., "price_5m":.., ...}]。渡されたキーだけ更新する。"""
+    """updates: [{"id":.., "price_5m":.., "at_5m":.., "max_30m":.., ...}]。渡されたキーだけ反映する
+    （未指定＝NULLは既存値を保持）。1回のUPDATE（unnest）で全行を更新し、Neonの往復回数を1回にする。"""
     pool = _get_pool(database_url)
     if pool is None or not updates:
         return 0
-    n = 0
+    def col(key):
+        return [u.get(key) for u in updates]
+    sql = ("UPDATE chart_signal_log t SET "
+           "price_5m = COALESCE(v.p5, t.price_5m), price_15m = COALESCE(v.p15, t.price_15m), price_30m = COALESCE(v.p30, t.price_30m), "
+           "at_5m = COALESCE(v.a5, t.at_5m), at_15m = COALESCE(v.a15, t.at_15m), at_30m = COALESCE(v.a30, t.at_30m), "
+           "max_30m = COALESCE(v.mx, t.max_30m), min_30m = COALESCE(v.mn, t.min_30m), "
+           "new_high_after_sec = COALESCE(t.new_high_after_sec, v.nh), outcome_done = (t.outcome_done OR COALESCE(v.dn, FALSE)) "
+           "FROM (SELECT unnest(%s::int[]) AS id, unnest(%s::float8[]) AS p5, unnest(%s::float8[]) AS p15, "
+           "unnest(%s::float8[]) AS p30, unnest(%s::timestamptz[]) AS a5, unnest(%s::timestamptz[]) AS a15, "
+           "unnest(%s::timestamptz[]) AS a30, unnest(%s::float8[]) AS mx, unnest(%s::float8[]) AS mn, "
+           "unnest(%s::int[]) AS nh, unnest(%s::bool[]) AS dn) v WHERE t.id = v.id")
     with pool.connection() as conn:
-        for u in updates:
-            keys = [k for k in _CHART_SIGNAL_UPDATE_COLS if k in u]
-            if not keys:
-                continue
-            conn.execute(f"UPDATE chart_signal_log SET {', '.join(k + ' = %s' for k in keys)} WHERE id = %s",
-                         [u[k] for k in keys] + [u["id"]])
-            n += 1
+        conn.execute(sql, [col("id"), col("price_5m"), col("price_15m"), col("price_30m"), col("at_5m"), col("at_15m"),
+                           col("at_30m"), col("max_30m"), col("min_30m"), col("new_high_after_sec"), col("outcome_done")])
         conn.commit()
-    return n
+    return len(updates)
 
 
 def list_chart_signals(database_url, user_id, trade_date, code=None, limit=5000):
