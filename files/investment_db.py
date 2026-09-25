@@ -11265,6 +11265,18 @@ def sync_dynamic_watch(database_url, user_id, adds, removes, pool_updates):
     return len(adds) + len(removes) + len(pool_updates)
 
 
+def list_dynamic_watch_history(database_url, user_id, since):
+    """dynamic_watchlistの、since以降に追加された行（追加理由別の件数集計用。読み取り専用）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT code, source, pool, status, added_at, removed_at, removed_reason FROM dynamic_watchlist "
+                        "WHERE user_id = %s AND added_at >= %s ORDER BY added_at", [user_id, since])
+            return [_row_to_json(r) for r in cur.fetchall()]
+
+
 def list_chart_signals(database_url, user_id, trade_date, code=None, limit=5000):
     pool = _get_pool(database_url)
     if pool is None:

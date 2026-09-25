@@ -43,6 +43,7 @@ MILESTONES = (("first_movement_at", "値幅拡大の始まり（movement>=65ま�
 RADAR_NOTABLE = ("RADAR_SURGE", "RADAR_EXPANDING", "RADAR_PRE_BREAKOUT")
 ROLLING_HOT = ("ROLLING_SURGE", "SINGLE_BAR_SURGE", "ROLLING_PRE_BREAKOUT")
 ROLLING_NOTABLE = ROLLING_HOT + ("ROLLING_EXPANDING", "RADAR_WEAK")
+EPISODE_TRACK_SEC = 90 * 60     # Radar発生から、その後の遷移（待ち→押し目→ENTRY／CHASE）を追跡する最大時間（観測用の定義）
 # Rolling Radar検出の後始末（false positiveの定義。集計専用で判定には使わない）：30分後が+0.5%以下、かつ30分内の最大上昇(MFE)が+1.0%以下
 FP_RET_30M = 0.5
 FP_MFE_30M = 1.0
@@ -150,6 +151,59 @@ def update_milestones(mem, key, rec, now):
     return new
 
 
+def _radar_snapshot(rec):
+    """Radar発生時の特徴量（良いRadarと悪いRadarの違いを後から比較するため）。"""
+    rf = ((rec.get("movement") or {}).get("rolling") or {}).get("features") or {}
+    ctx = rec.get("context") or {}
+    return {"state": rec.get("rolling_state"), "aboveVwap": rf.get("aboveVwap"), "vwapDistPct": rf.get("vwapDistPct"),
+            "newHigh": rf.get("newHigh"), "newHigh3": rf.get("newHigh3"), "marketRS": ctx.get("marketRS"),
+            "spreadPct": rec.get("spread_pct"), "sector": (ctx.get("scoreBreakdown") or {}).get("autoSector"),
+            "volSurge": rf.get("volSurge"), "rangeSurge": rf.get("rangeSurge"), "turnoverSurge": rf.get("turnoverSurge"),
+            "distFromHighPct": rf.get("distFromHighPct"), "price": rec.get("current_price")}
+
+
+def update_radar_episode(mem, key, rec, now):
+    """Rolling Radar発生（ROLLING_NOTABLE）から始まる『エピソード』を銘柄ごとに追跡する（観測専用・判定には使わない）。
+      ・寿命：Radar状態がNONEに戻った時点で終了（radar_end）。radar_age_minutes＝発生からの経過分。
+      ・その後の遷移時刻：expanding / wait（WAIT系・WATCH）/ pullback_or_pre（PULLBACK_READYまたはPRE_BREAKOUT）/
+        entry_ready（ENTRY系）/ chase を初回だけ記録 → 「Radar→WAIT→押し目→ENTRY_READY」と「Radar→CHASE」を分けて集計できる。
+      ・発生時のsnapshotを保存。新しい出来事があれば context.newEpisodeSteps に入れ、ログを強制的に残す。"""
+    state = rec.get("rolling_state")
+    notable = state in ROLLING_NOTABLE
+    ep = mem.get(key)
+    if ep is not None and (ep["date"] != now.date() or (now - ep["start"]).total_seconds() > EPISODE_TRACK_SEC
+                           or (ep["ended"] and notable)):
+        ep = None
+    new = []
+    if ep is None:
+        if not notable:
+            mem.pop(key, None)
+            return []
+        ep = {"date": now.date(), "start": now, "startedAt": now.isoformat(), "startState": state, "steps": {}, "ended": False,
+              "endedAt": None, "lifeMinutes": None, "snapshot": _radar_snapshot(rec)}
+        mem[key] = ep
+        new.append("radar_start")
+    age = round((now - ep["start"]).total_seconds() / 60.0, 1)
+    if not ep["ended"] and state == "NONE" and age > 0:
+        ep["ended"], ep["endedAt"], ep["lifeMinutes"] = True, now.isoformat(), age
+        new.append("radar_end")
+    chart_state, pattern = rec.get("chart_entry_state"), rec.get("chart_pattern")
+    checks = (("expanding_at", rec.get("activity_state") == "EXPANDING"),
+              ("wait_at", chart_state in ("WAIT_PULLBACK", "WAIT_BREAKOUT", "WATCH")),
+              ("pullback_or_pre_at", pattern == "PULLBACK_READY" or bool(rec.get("pre_breakout"))),
+              ("entry_ready_at", rec.get("movement_recommendation") == "ENTRY_READY" or chart_state in ENTRY_STATES),
+              ("chase_at", pattern in CHASE_PATTERNS))
+    for name, cond in checks:
+        if cond and name not in ep["steps"]:
+            ep["steps"][name] = now.isoformat()
+            new.append("step:" + name)
+    rec.setdefault("context", {})["radarEpisode"] = {
+        "startedAt": ep["startedAt"], "startState": ep["startState"], "ageMinutes": age, "ended": ep["ended"],
+        "lifeMinutes": ep["lifeMinutes"], "steps": dict(ep["steps"]), "snapshot": ep["snapshot"]}
+    rec["context"]["newEpisodeSteps"] = new
+    return new
+
+
 def is_priority(rec):
     ctx = rec.get("context") or {}
     return bool(ctx.get("top5") or movement_notable(rec) or rec.get("legacy_entry_state") != rec.get("chart_entry_state")
@@ -159,7 +213,8 @@ def is_priority(rec):
 
 
 def is_loggable(rec):
-    if (rec.get("context") or {}).get("top5") or movement_notable(rec) or (rec.get("context") or {}).get("newMilestones"):
+    if (rec.get("context") or {}).get("top5") or movement_notable(rec) or (rec.get("context") or {}).get("newMilestones") \
+            or (rec.get("context") or {}).get("newEpisodeSteps"):
         return True
     return rec.get("legacy_entry_state") in LOGGED_STATES or rec.get("chart_entry_state") in LOGGED_STATES
 
@@ -189,6 +244,8 @@ def should_log(last, rec, now):
     top5 = tuple((rec.get("context") or {}).get("top5") or ())
     if top5 != last.get("top5"):
         return True
+    if (rec.get("context") or {}).get("newEpisodeSteps"):
+        return True       # Radarの発生・終了・その後の遷移（待ち→押し目→ENTRY／CHASE）は必ず残す
     if (rec.get("context") or {}).get("newMilestones"):
         return True       # 最初にEXPANDING/PRE_BREAKOUT/EARLY_BREAKOUT/CHASEになった瞬間は必ず残す
     if (last.get("mrec"), last.get("act"), last.get("pre"), last.get("radar"), last.get("rolling")) != (
@@ -525,6 +582,89 @@ def _group_stats(rows):
     return out
 
 
+def _mins(a, b):
+    ta, tb = _parse_dt(a), _parse_dt(b)
+    return round((tb - ta).total_seconds() / 60.0, 1) if (ta and tb) else None
+
+
+def _avg(v):
+    v = [x for x in v if x is not None]
+    return (round(sum(v) / len(v), 2), len(v)) if v else (None, 0)
+
+
+def summarize_radar_episodes(rows):
+    """Rolling Radarのエピソード集計（観測専用）。
+    ・Radar→EXPANDING / →ENTRY_READY / →CHASE を分けて（先行時間・件数）
+    ・『Radar→WAIT→PULLBACK_READY/PRE_BREAKOUT→ENTRY_READY』になった（待てば買えた）件数
+    ・寿命（5分以内/15分以内/15〜30分/30分以上）とradar_age_minutes分布
+    ・良いRadar（30分後に+0.5%超 または 最大上昇+1.0%超）と誤検出の、発生時特徴量の平均の比較"""
+    rr_ = _with_ret(rows)
+    groups = {}
+    for r in sorted(rr_, key=lambda x: str(x["logged_at"])):
+        ep = (r.get("context") or {}).get("radarEpisode")
+        if not ep:
+            continue
+        g = groups.setdefault((r["code"], ep["startedAt"]), {"rows": [], "ep": ep})
+        g["rows"].append(r)
+        if (ep.get("ageMinutes") or 0) >= (g["ep"].get("ageMinutes") or 0):
+            g["ep"] = ep
+    episodes = []
+    for (code, started), g in groups.items():
+        ep = g["ep"]
+        st = ep.get("steps") or {}
+        start_row = next((r for r in g["rows"] if r.get("rolling_state") in ROLLING_NOTABLE), g["rows"][0])
+        mfe, mae = _mfe_mae(start_row)
+        r30 = start_row.get("ret_30m")
+        fp = None if (r30 is None or mfe is None) else bool(r30 <= FP_RET_30M and mfe <= FP_MFE_30M)
+        lead = {k: _mins(started, st.get(k)) for k in ("expanding_at", "wait_at", "pullback_or_pre_at", "entry_ready_at", "chase_at")}
+        waited = bool(st.get("wait_at") and st.get("pullback_or_pre_at") and st.get("entry_ready_at")
+                      and _parse_dt(st["wait_at"]) <= _parse_dt(st["pullback_or_pre_at"]) <= _parse_dt(st["entry_ready_at"])
+                      and (lead["entry_ready_at"] or 0) > 0)
+        age = ep.get("ageMinutes") or 0
+        life = ep.get("lifeMinutes")
+        if ep.get("ended"):
+            bucket = "expired_within_5m" if life <= 5 else ("expired_within_15m" if life <= 15 else ("expired_15_30m" if life < 30 else "persisted_30m_plus"))
+        else:
+            bucket = "persisted_30m_plus" if age >= 30 else "open_under_30m"
+        episodes.append({"code": code, "startedAt": started, "startState": ep.get("startState"), "ageMinutes": age, "ended": ep.get("ended"),
+                         "lifeMinutes": life, "lifespan": bucket, "lead_minutes": lead, "waited_then_entry": waited,
+                         "ret_5m": start_row.get("ret_5m"), "ret_15m": start_row.get("ret_15m"), "ret_30m": r30, "mfe_30m": mfe,
+                         "mae_30m": mae, "false_positive": fp, "snapshot": ep.get("snapshot")})
+    def stat(name, key):
+        v = [e["lead_minutes"][key] for e in episodes if e["lead_minutes"].get(key) is not None]
+        a, n = _avg(v)
+        return {"n": n, "avg_minutes": a}
+    def snap_means(eps):
+        out = {"n": len(eps)}
+        for k in ("volSurge", "rangeSurge", "turnoverSurge", "marketRS", "spreadPct", "sector", "vwapDistPct", "distFromHighPct"):
+            out["avg_" + k] = _avg([(e["snapshot"] or {}).get(k) for e in eps])[0]
+        for k in ("aboveVwap", "newHigh", "newHigh3"):
+            vals = [(e["snapshot"] or {}).get(k) for e in eps if (e["snapshot"] or {}).get(k) is not None]
+            out["rate_" + k] = _rate(sum(1 for x in vals if x), len(vals))
+        return out
+    fp_eps = [e for e in episodes if e["false_positive"] is True]
+    good_eps = [e for e in episodes if e["false_positive"] is False]
+    ages = sorted(e["ageMinutes"] for e in episodes)
+    buckets = {}
+    for e in episodes:
+        buckets[e["lifespan"]] = buckets.get(e["lifespan"], 0) + 1
+    by_state = {}
+    for e in episodes:
+        by_state[e["startState"]] = by_state.get(e["startState"], 0) + 1
+    return {"total": len(episodes), "by_start_state": by_state,
+            "hot_started": sum(1 for e in episodes if e["startState"] in ROLLING_HOT),
+            "lead_to_expanding": stat("expanding", "expanding_at"), "lead_to_pullback_or_pre": stat("pullback", "pullback_or_pre_at"),
+            "lead_to_entry_ready": stat("entry", "entry_ready_at"), "lead_to_chase": stat("chase", "chase_at"),
+            "radar_to_chase_count": sum(1 for e in episodes if e["lead_minutes"].get("chase_at") is not None),
+            "radar_to_entry_ready_count": sum(1 for e in episodes if e["lead_minutes"].get("entry_ready_at") is not None),
+            "waited_then_entry_count": sum(1 for e in episodes if e["waited_then_entry"]),
+            "waited_then_entry": [e for e in episodes if e["waited_then_entry"]][:20],
+            "lifespan": buckets, "age_minutes": {"min": ages[0] if ages else None, "median": _pctile(ages, 0.5), "p95": _pctile(ages, 0.95),
+                                                  "max": ages[-1] if ages else None},
+            "snapshot_compare": {"false_positive": snap_means(fp_eps), "good": snap_means(good_eps)},
+            "episodes": sorted(episodes, key=lambda e: e["startedAt"])[:60]}
+
+
 def summarize_movement(rows):
     """existing recommendation（chart_entry_state）と movement-aware recommendation の並行比較、
     モメンタムENTRYのshadow記録（逆指値・MFE/MAE・逆指値評価）、マイルストーン（いつEXPANDING/PRE_BREAKOUT/…になったか）。"""
@@ -619,7 +759,7 @@ def summarize_movement(rows):
             rolling_events.append({"code": r["code"], "at": str(r["logged_at"]), "state": r["rolling_state"], "score": r.get("rolling_score"),
                                    "price": r.get("current_price"), "ret_5m": r.get("ret_5m"), "ret_15m": r.get("ret_15m"),
                                    "ret_30m": r.get("ret_30m"), "mfe_30m": mfe, "mae_30m": mae, "false_positive": is_fp(r),
-                                   "confirmations_failed": ((r.get("movement") or {}).get("rolling") or {}).get("confirmations", {}).get("failed")})
+                                   "confirmations_failed": (((r.get("movement") or {}).get("rolling") or {}).get("confirmations") or {}).get("failed")})
     rolling_lead = []
     for c, ms in last_ms.items():
         t0 = ms.get("first_rolling_at")
@@ -631,7 +771,8 @@ def summarize_movement(rows):
                              "minutes_before_pre_breakout": mins2("first_pre_breakout_at"),
                              "minutes_before_early_breakout": mins2("first_early_breakout_at"),
                              "minutes_before_movement_entry": mins2("first_movement_entry_at"), "minutes_before_chase": mins2("first_chase_at")})
-    return {"rolling": {"states": rolling_states, "events": rolling_events[:60], "lead_times": rolling_lead,
+    return {"radar_episodes": summarize_radar_episodes(rows),
+            "rolling": {"states": rolling_states, "events": rolling_events[:60], "lead_times": rolling_lead,
                         "false_positive_definition": f"30分後が+{FP_RET_30M}%以下 かつ 30分内の最大上昇が+{FP_MFE_30M}%以下"},
             "radar": {"states": {s: _group_stats(v) for s, v in radar_groups.items()}, "lead_times": lead},
             "stop_quality": stop_quality,

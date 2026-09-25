@@ -6149,6 +6149,7 @@ def _run_entry_top5_scan(database_url, user_id, trigger="AUTO", wait_for_lock=Fa
 # ・entry_score・ENTRY状態）だけを再計算する。
 # ============================================================
 _DYNAMIC_WATCH = {}       # user_id -> {code: dynamic_watchlist行}（ACTIVE集合）
+_RADAR_EPISODES = {}      # (user_id, code) -> Rolling Radarエピソード（寿命・その後の遷移。観測専用）
 _MOVEMENT_MILESTONES = {}  # (user_id, code) -> {"_date", "first_movement_at", ...}（最初にその状態になった時刻）
 _CHART_SIGNAL_LAST = {}   # (user_id, code) -> chart_signal_log.last_state()（最後に記録した状態。重複ログ抑止）
 _CHART_SIGNAL_MEM = {}    # (user_id, code) -> 観測メモリ（遷移タイプ検出用。記録の有無に関わらず毎回更新）
@@ -6203,6 +6204,9 @@ def refresh_shadow_movement(database_url, user_id):
         shadow = movement_potential.build_shadow_lists([c for c in pool if c.get("movementScore") is not None], analysis, res["hot"])
         shadow["earlyRadar"] = early_radar.build_early_radar_list(pool)      # 初動監視（🚨）最大5銘柄。買い判定ではない
         shadow["rollingRadar"] = rolling_radar.build_rolling_radar_list(pool)   # 警戒レーダー（📡）最大5銘柄。買い判定ではない
+        for d in shadow["rollingRadar"]:      # radar_age_minutes（観測のみ。並び順・hot pool優先度にはまだ使わない）
+            ep = _RADAR_EPISODES.get((user_id, d["code"]))
+            d["radarAgeMinutes"] = round((now - ep["start"]).total_seconds() / 60.0, 1) if (ep and not ep["ended"]) else None
         shadow["dynamicWatch"] = {"active": len(res["state"]), "hot": res["hot"], "added": [a["code"] for a in res["adds"]],
                                   "removed": res["removes"], "updatedAt": now.isoformat(),
                                   "note": "shadow：既存のTOP5・監視対象には反映していない"}
@@ -6242,6 +6246,7 @@ def log_chart_signals(database_url, user_id, source):
                 continue
             key = (user_id, rec["code"])
             chart_signal_log.update_milestones(_MOVEMENT_MILESTONES, key, rec, now)
+            chart_signal_log.update_radar_episode(_RADAR_EPISODES, (user_id, rec["code"]), rec, now)
             trans, origin = chart_signal_log.detect_transition(_CHART_SIGNAL_MEM, key, rec, now)
             if not chart_signal_log.is_loggable(rec):
                 continue

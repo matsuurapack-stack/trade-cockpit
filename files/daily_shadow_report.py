@@ -110,6 +110,28 @@ def main():
     for e in rl["events"][:40]:
         print(f"  {str(e['at'])[11:16]}(UTC) {e['code']} {e['state']}({e['score']}) ¥{e['price']} +5/+15/+30={_r(e['ret_5m'])}/{_r(e['ret_15m'])}/{_r(e['ret_30m'])} "
               f"MFE={e['mfe_30m']} MAE={e['mae_30m']} 誤検出={e['false_positive']} 確認不足={e['confirmations_failed']}")
+    ep = mv["radar_episodes"]
+    print("\n--- Rolling Radar エピソード（Radar後の推移・寿命。観測専用）---")
+    print(f"Radar総件数(エピソード) {ep['total']} / 状態別 {ep['by_start_state']} / hot状態で開始 {ep['hot_started']}")
+    print(f"Radar→EXPANDING 平均先行 {ep['lead_to_expanding']} / Radar→PULLBACK_READYまたはPRE_BREAKOUT {ep['lead_to_pullback_or_pre']}")
+    print(f"Radar→ENTRY_READY {ep['radar_to_entry_ready_count']}件 平均 {ep['lead_to_entry_ready']} ／ Radar→CHASE {ep['radar_to_chase_count']}件 平均 {ep['lead_to_chase']}")
+    print(f"『Radar後に待って押し目ENTRYできた』件数: {ep['waited_then_entry_count']}")
+    for e in ep["waited_then_entry"]:
+        print("   ", e["code"], e["startedAt"][11:16], e["startState"], e["lead_minutes"])
+    print("寿命:", ep["lifespan"], "/ radar age(分):", ep["age_minutes"])
+    print("発生時の特徴量の平均（誤検出 vs 良いRadar）:")
+    print("   誤検出:", ep["snapshot_compare"]["false_positive"])
+    print("   良い  :", ep["snapshot_compare"]["good"])
+    try:
+        import datetime as _dt
+        since = _dt.datetime.fromisoformat(day + "T00:00:00+09:00")
+        hist = db.list_dynamic_watch_history(server.DATABASE_URL, "matsuura", since)
+        by_src = {}
+        for h in hist:
+            by_src[h["source"]] = by_src.get(h["source"], 0) + 1
+        print("dynamic watch 追加件数（理由別）:", by_src, "/ 合計", len(hist))
+    except Exception as e:
+        print("dynamic watch履歴を取得できません:", e)
     sq = mv["stop_quality"]
     print("推奨逆指値の品質（movement ENTRY_READY全イベント）:", sq)
 
