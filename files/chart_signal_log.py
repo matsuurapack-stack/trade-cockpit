@@ -37,8 +37,15 @@ MILESTONES = (("first_movement_at", "値幅拡大の始まり（movement>=65ま�
               ("first_expanding_at", "EXPANDING"), ("first_pre_breakout_at", "PRE_BREAKOUT"),
               ("first_early_breakout_at", "EARLY_BREAKOUT"), ("first_chase_at", "CHASE/EXTENDED/EXHAUSTION"),
               ("first_movement_entry_at", "movement-aware ENTRY_READY"),
-              ("first_radar_at", "RADAR_SURGE/EXPANDING/PRE_BREAKOUT（初動監視）"), ("first_radar_surge_at", "RADAR_SURGE"))
+              ("first_radar_at", "RADAR_SURGE/EXPANDING/PRE_BREAKOUT（初動監視）"), ("first_radar_surge_at", "RADAR_SURGE"),
+              ("first_rolling_at", "Rolling Radar hot（SURGE/SINGLE_BAR_SURGE/PRE_BREAKOUT）"),
+              ("first_single_bar_surge_at", "SINGLE_BAR_SURGE"), ("first_rolling_weak_at", "RADAR_WEAK"))
 RADAR_NOTABLE = ("RADAR_SURGE", "RADAR_EXPANDING", "RADAR_PRE_BREAKOUT")
+ROLLING_HOT = ("ROLLING_SURGE", "SINGLE_BAR_SURGE", "ROLLING_PRE_BREAKOUT")
+ROLLING_NOTABLE = ROLLING_HOT + ("ROLLING_EXPANDING", "RADAR_WEAK")
+# Rolling Radar検出の後始末（false positiveの定義。集計専用で判定には使わない）：30分後が+0.5%以下、かつ30分内の最大上昇(MFE)が+1.0%以下
+FP_RET_30M = 0.5
+FP_MFE_30M = 1.0
 
 ENTRY_STATES = ("NOW_BUYABLE", "ENTRY_READY")
 CHASE_PATTERNS = ("CHASE", "EXTENDED", "EXHAUSTION")
@@ -69,6 +76,7 @@ def build_signal_record(user_id, cand, now, source, top5_codes=None):
     top5 = top5_codes or {}
     return {
         "transition_type": None, "transition_origin": None,
+        "rolling_state": cand.get("rollingState"), "rolling_score": cand.get("rollingScore"),
         "radar_state": cand.get("radarState"), "early_momentum_score": cand.get("earlyMomentumScore"),
         "spread_pct": cand.get("spreadPct"), "atr5_pct": cand.get("atr5Pct"),
         "movement_score": cand.get("movementScore"), "recent_activity": cand.get("recentActivityScore"),
@@ -83,7 +91,10 @@ def build_signal_record(user_id, cand, now, source, top5_codes=None):
                      "features": cand.get("movementFeatures"), "entryReason": cand.get("movementEntryReason"),
                      "radar": {"state": cand.get("radarState"), "score": cand.get("earlyMomentumScore"),
                                "confidence": cand.get("radarConfidence"), "reasons": cand.get("radarReasons"),
-                               "features": cand.get("radarFeatures")}},
+                               "features": cand.get("radarFeatures")},
+                     "rolling": {"state": cand.get("rollingState"), "baseState": cand.get("rollingBaseState"),
+                                 "score": cand.get("rollingScore"), "reasons": cand.get("rollingReasons"),
+                                 "confirmations": cand.get("rollingConfirm"), "features": cand.get("rollingFeatures")}},
         "user_id": user_id, "logged_at": now, "code": str(cand["code"]), "name": cand.get("name"), "source": source,
         "current_price": price, "day_high": day_high,
         "stock_strength": cand.get("stockStrengthScore"), "entry_timing": cc.get("entry_timing_score"),
@@ -105,7 +116,8 @@ def build_signal_record(user_id, cand, now, source, top5_codes=None):
 
 def movement_notable(rec):
     return bool(rec.get("movement_recommendation") in MOVEMENT_NOTABLE_RECS or rec.get("activity_state") == "EXPANDING"
-                or rec.get("pre_breakout") or rec.get("momentum_mode") or rec.get("radar_state") in RADAR_NOTABLE)
+                or rec.get("pre_breakout") or rec.get("momentum_mode") or rec.get("radar_state") in RADAR_NOTABLE
+                or rec.get("rolling_state") in ROLLING_NOTABLE)
 
 
 def update_milestones(mem, key, rec, now):
@@ -130,6 +142,9 @@ def update_milestones(mem, key, rec, now):
     mark("first_movement_entry_at", rec.get("movement_recommendation") == "ENTRY_READY")
     mark("first_radar_at", rec.get("radar_state") in RADAR_NOTABLE)
     mark("first_radar_surge_at", rec.get("radar_state") == "RADAR_SURGE")
+    mark("first_rolling_at", rec.get("rolling_state") in ROLLING_HOT)
+    mark("first_single_bar_surge_at", rec.get("rolling_state") == "SINGLE_BAR_SURGE")
+    mark("first_rolling_weak_at", rec.get("rolling_state") == "RADAR_WEAK")
     rec.setdefault("context", {})["milestones"] = {k: v for k, v in ms.items() if not k.startswith("_")}
     rec["context"]["newMilestones"] = new
     return new
@@ -156,7 +171,7 @@ def last_state(rec, now):
             "at": now, "timing": rec.get("entry_timing"), "vdist": rec.get("vwap_distance"), "chg15": rec.get("change_15m"),
             "prio": is_priority(rec), "top5": tuple((rec.get("context") or {}).get("top5") or ()),
             "mrec": rec.get("movement_recommendation"), "act": rec.get("activity_state"), "pre": bool(rec.get("pre_breakout")),
-            "radar": rec.get("radar_state")}
+            "radar": rec.get("radar_state"), "rolling": rec.get("rolling_state")}
 
 
 def _moved(a, b, th):
@@ -176,8 +191,9 @@ def should_log(last, rec, now):
         return True
     if (rec.get("context") or {}).get("newMilestones"):
         return True       # 最初にEXPANDING/PRE_BREAKOUT/EARLY_BREAKOUT/CHASEになった瞬間は必ず残す
-    if (last.get("mrec"), last.get("act"), last.get("pre"), last.get("radar")) != (
-            rec.get("movement_recommendation"), rec.get("activity_state"), bool(rec.get("pre_breakout")), rec.get("radar_state")) \
+    if (last.get("mrec"), last.get("act"), last.get("pre"), last.get("radar"), last.get("rolling")) != (
+            rec.get("movement_recommendation"), rec.get("activity_state"), bool(rec.get("pre_breakout")), rec.get("radar_state"),
+            rec.get("rolling_state")) \
             and (prio or last.get("prio")):
         return True       # 値幅を見た推奨・活動状態・PRE_BREAKOUTの変化
     if last["pattern"] != rec["chart_pattern"] and (prio or last.get("prio"))             and (now - last["at"]).total_seconds() >= PATTERN_FLAP_MIN_SEC:
@@ -580,7 +596,44 @@ def summarize_movement(rows):
                      "minutes_before_early_breakout": mins("first_early_breakout_at"),
                      "minutes_before_movement_entry": mins("first_movement_entry_at"),
                      "minutes_before_chase": mins("first_chase_at")})
-    return {"radar": {"states": {s: _group_stats(v) for s, v in radar_groups.items()}, "lead_times": lead},
+    # Rolling Radar（D.2）：状態別の成績・false positive・先行時間・個別の検出イベント（検出後の+5/+15/+30分・MFE/MAE）
+    rolling_groups = {s: [r for r in events if r.get("rolling_state") == s] for s in
+                      ("SINGLE_BAR_SURGE", "ROLLING_SURGE", "ROLLING_PRE_BREAKOUT", "ROLLING_EXPANDING", "RADAR_WEAK")}
+
+    def is_fp(r):
+        mfe, _ = _mfe_mae(r)
+        r30 = r.get("ret_30m")
+        return None if (r30 is None or mfe is None) else bool(r30 <= FP_RET_30M and mfe <= FP_MFE_30M)
+
+    rolling_states = {}
+    for s, rs_ in rolling_groups.items():
+        g = _group_stats(rs_)
+        judged = [is_fp(r) for r in rs_ if is_fp(r) is not None]
+        g["judged"], g["false_positive"] = len(judged), sum(1 for x in judged if x)
+        g["false_positive_rate"] = _rate(g["false_positive"], len(judged))
+        rolling_states[s] = g
+    rolling_events = []
+    for r in events:
+        if r.get("rolling_state") in ROLLING_NOTABLE:
+            mfe, mae = _mfe_mae(r)
+            rolling_events.append({"code": r["code"], "at": str(r["logged_at"]), "state": r["rolling_state"], "score": r.get("rolling_score"),
+                                   "price": r.get("current_price"), "ret_5m": r.get("ret_5m"), "ret_15m": r.get("ret_15m"),
+                                   "ret_30m": r.get("ret_30m"), "mfe_30m": mfe, "mae_30m": mae, "false_positive": is_fp(r),
+                                   "confirmations_failed": ((r.get("movement") or {}).get("rolling") or {}).get("confirmations", {}).get("failed")})
+    rolling_lead = []
+    for c, ms in last_ms.items():
+        t0 = ms.get("first_rolling_at")
+        if not t0:
+            continue
+        def mins2(k, t0=t0, ms=ms):
+            return round((_parse_dt(ms[k]) - _parse_dt(t0)).total_seconds() / 60, 1) if ms.get(k) and _parse_dt(t0) and _parse_dt(ms[k]) else None
+        rolling_lead.append({"code": c, "first_rolling_at": t0, "minutes_before_expanding": mins2("first_expanding_at"),
+                             "minutes_before_pre_breakout": mins2("first_pre_breakout_at"),
+                             "minutes_before_early_breakout": mins2("first_early_breakout_at"),
+                             "minutes_before_movement_entry": mins2("first_movement_entry_at"), "minutes_before_chase": mins2("first_chase_at")})
+    return {"rolling": {"states": rolling_states, "events": rolling_events[:60], "lead_times": rolling_lead,
+                        "false_positive_definition": f"30分後が+{FP_RET_30M}%以下 かつ 30分内の最大上昇が+{FP_MFE_30M}%以下"},
+            "radar": {"states": {s: _group_stats(v) for s, v in radar_groups.items()}, "lead_times": lead},
             "stop_quality": stop_quality,
             "comparison": {k: _group_stats(v) for k, v in groups.items()},
             "activity_states": {s: sum(1 for r in events if r.get("activity_state") == s)

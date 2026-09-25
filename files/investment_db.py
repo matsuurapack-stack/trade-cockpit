@@ -811,6 +811,9 @@ ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS radar_state TEXT;
 ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS early_momentum_score DOUBLE PRECISION;
 ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS spread_pct DOUBLE PRECISION;
 ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS atr5_pct DOUBLE PRECISION;
+-- Phase D.2（Rolling Momentum Radar・shadow）
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS rolling_state TEXT;
+ALTER TABLE chart_signal_log ADD COLUMN IF NOT EXISTS rolling_score DOUBLE PRECISION;
 
 -- 動いている銘柄だけのオーバーレイ（手動のwatchlistとは別。watchlistテーブルには触れない）
 CREATE TABLE IF NOT EXISTS dynamic_watchlist (
@@ -11160,7 +11163,7 @@ _CHART_SIGNAL_INSERT_COLS = (
     "vwap", "vwap_distance", "change_15m", "consecutive_green", "upper_wick_ratio", "breakout_volume_ratio",
     "transition_type", "transition_origin", "movement_score", "recent_activity", "activity_state", "pre_breakout",
     "too_late", "momentum_mode", "recommended_stop", "stop_distance_pct", "risk_reward", "movement_recommendation",
-    "radar_state", "early_momentum_score", "spread_pct", "atr5_pct")
+    "radar_state", "early_momentum_score", "spread_pct", "atr5_pct", "rolling_state", "rolling_score")
 
 
 def insert_chart_signals(database_url, records):

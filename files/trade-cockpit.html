@@ -5568,6 +5568,8 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
                       {c.preBreakout && <span style={{fontSize:10.5,fontWeight:800,whiteSpace:"nowrap",color:"var(--warn)"}}>🔥 ブレイク接近</span>}
                       {["RADAR_SURGE","RADAR_EXPANDING","RADAR_PRE_BREAKOUT"].includes(c.radarState) && <span style={{fontSize:10.5,fontWeight:800,whiteSpace:"nowrap",color:"var(--warn)"}}
                           title={(c.radarReasons||[]).join(" / ")+"（初動監視のみ。買い判定ではありません）"}>🚨 初動監視{c.radarText?`（${c.radarText}）`:""}</span>}
+                      {["ROLLING_SURGE","SINGLE_BAR_SURGE","ROLLING_PRE_BREAKOUT"].includes(c.rollingState) && <span style={{fontSize:10.5,fontWeight:800,whiteSpace:"nowrap",color:"var(--warn)"}}
+                          title={(c.rollingReasons||[]).join(" / ")+"（警戒レーダーのみ。買い判定ではありません）"}>📡 {c.rollingState==="SINGLE_BAR_SURGE"?"単発急伸":c.rollingState==="ROLLING_SURGE"?"急な活性化":"ブレイク接近"}（警戒）</span>}
                       {c.tooLate && <span style={{fontSize:10.5,fontWeight:800,whiteSpace:"nowrap",color:"var(--down)"}}
                           title={(c.tooLateReasons||[]).join(" / ")}>⚠️ TOO LATE{(c.tooLateReasons||[]).length>0?`（${c.tooLateReasons.slice(0,2).join(" / ")}）`:""}</span>}
                       {c.activityState && ACTIVITY_STATE_META[c.activityState] && ["EXPANDING","LOW_ACTIVITY","FADING"].includes(c.activityState) &&
@@ -5688,13 +5690,14 @@ function WatchTargetsPanel({items,stockQuotes,analysisTargets,onToggleAnalysis,o
           {entryDebugOpen && <>
           {entryResult.shadowMovement && <div style={{marginBottom:10,padding:"6px 8px",border:"1px dashed var(--rule)",borderRadius:4}}>
             <div style={{fontSize:11.5,fontWeight:800,marginBottom:4}}>🔬 Phase D shadow：値幅を見た並び（既存のTOP5・順位は変更していません）</div>
-            {[["earlyRadar","🚨 初動監視（寄り直後の早期検出・買い判定ではありません）"],["attentionTop5","🔥 今日これから値幅が出そうな銘柄"],["entryBoard","🎯 今ENTRY条件が整った銘柄"],["preBreakout","🔥 ブレイク接近"],
+            {[["earlyRadar","🚨 初動監視（寄り直後の早期検出・買い判定ではありません）"],["rollingRadar","📡 警戒レーダー（場中の急な活性化・買い判定ではありません）"],["attentionTop5","🔥 今日これから値幅が出そうな銘柄"],["entryBoard","🎯 今ENTRY条件が整った銘柄"],["preBreakout","🔥 ブレイク接近"],
               ["expanding","📈 値幅拡大中（EXPANDING）"],["tooLate","⚠️ 強いが遅い／動かない（押し目待ち）"]].map(([key,title])=>{
               const rows=entryResult.shadowMovement[key]||[];
               return <div key={key} style={{marginBottom:4}}>
                 <div style={{fontSize:11,fontWeight:700,color:"var(--inkSoft)"}}>{title}（{rows.length}）</div>
                 {rows.map(d=><div key={d.code} className="mono" style={{fontSize:10.5}}>
                   {d.rank!=null&&key==="attentionTop5"?`#${d.rank} `:""}{d.code} {d.name} ・Movement {d.movementScore??"—"} ・直近 {d.recentActivityScore??"—"} ・{(ACTIVITY_STATE_META[d.activityState]||{}).label||d.activityState}
+                  {key==="rollingRadar" && <span>　{d.rollingState}（{d.rollingScore}）{(d.reasons||[]).join("・")}{d.confirmations&&d.confirmations.failed&&d.confirmations.failed.length>0?` ／確認不足：${d.confirmations.failed.join("・")}`:""}</span>}
                   {key==="earlyRadar" && <span>　{d.radarState} ・Radar {d.earlyMomentumScore}（{d.confidence}）・{d.text}</span>}
                   {key==="attentionTop5" && <span>　既存の分析順位 {d.existingRank!=null?`${d.existingRank}位`:"圏外"}</span>}
                   {d.entryReason && <span>　理由：{d.entryReason}</span>}

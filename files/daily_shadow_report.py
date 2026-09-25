@@ -97,6 +97,19 @@ def main():
     print("Radar先行時間（分。Radar初検出→各イベント）:")
     for t in rd["lead_times"]:
         print("  ", t)
+    rl = mv["rolling"]
+    print("\n--- Phase D.2 Rolling Momentum Radar（shadow・警戒レーダー。買い判定ではない）---")
+    print("false positiveの定義:", rl["false_positive_definition"])
+    for name, g in rl["states"].items():
+        print(f"{name}: n={g['n']} +5m={g['avg_ret_5m']} +15m={g['avg_ret_15m']}(n={g['n_15m']}) +30m={g['avg_ret_30m']} MFE={g['avg_mfe_30m']} "
+              f"MAE={g['avg_mae_30m']} 誤検出={g['false_positive']}/{g['judged']}（率 {g['false_positive_rate']}）")
+    print("Rolling先行時間（分。Rolling初検出→各イベント）:")
+    for t in rl["lead_times"]:
+        print("  ", t)
+    print("検出イベント（検出後の+5/+15/+30分・MFE/MAE）:")
+    for e in rl["events"][:40]:
+        print(f"  {str(e['at'])[11:16]}(UTC) {e['code']} {e['state']}({e['score']}) ¥{e['price']} +5/+15/+30={_r(e['ret_5m'])}/{_r(e['ret_15m'])}/{_r(e['ret_30m'])} "
+              f"MFE={e['mfe_30m']} MAE={e['mae_30m']} 誤検出={e['false_positive']} 確認不足={e['confirmations_failed']}")
     sq = mv["stop_quality"]
     print("推奨逆指値の品質（movement ENTRY_READY全イベント）:", sq)
 
