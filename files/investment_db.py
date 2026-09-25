@@ -11188,7 +11188,7 @@ def list_chart_signals(database_url, user_id, trade_date, code=None, limit=5000)
             rows = cur.fetchall()
     out = []
     for r in rows:
-        d = dict(r)
+        d = _row_to_json(r)   # datetime/Decimalをそのままjson化できる形へ
         d["reasons"], d["penalties"] = d.pop("reasons_json", None), d.pop("penalties_json", None)
         d["features"], d["context"] = d.pop("features_json", None), d.pop("context_json", None)
         out.append(d)

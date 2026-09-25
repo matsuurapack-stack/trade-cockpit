@@ -146,6 +146,13 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(t["completed_chase_to_entry"][0]["steps"][-1], ("PULLBACK_READY", "ENTRY_READY"))
         self.assertEqual(t["edges"]["CHASE→BASE_BUILDING"], 1)
 
+    def test_summary_is_json_serializable_with_iso_string_timestamps(self):
+        import json
+        rows = [row("4440", at=i, pattern=p, legacy="ENTRY_READY", chart=c, p30=1043.0,
+                    logged_at=(T0 + datetime.timedelta(minutes=i)).isoformat())
+                for i, (p, c) in enumerate([("FAILED_BREAKOUT", "WATCH"), ("CHASE", "WAIT_PULLBACK")])]
+        json.dumps(sl.summarize_day(rows), ensure_ascii=False)
+
     def test_empty_day(self):
         s = sl.summarize_day([])
         self.assertEqual(s["events"], 0)
