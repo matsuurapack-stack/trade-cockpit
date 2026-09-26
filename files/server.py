@@ -271,6 +271,34 @@ CACHE_TTL = {  # 用途別キャッシュTTL（秒）。指示書2番の目安�
 _CACHE_LOCK = threading.Lock()
 _CACHE_STORE = {}  # key -> {"value": ..., "ts": epoch秒}
 
+# ---- 全ユーザー共通の市場データ取得（2026-09-26 MU-Multi Release Gate STEP5）----
+# 同じ市場データを利用者ごとに取りに行かない：TTL内は結果を再利用し、同時に来た同一要求は1回に
+# まとめる（single-flight）。個人ポジションに依存する処理には使わない（市場データ専用）。
+# 計測（load_measure_users.py）で、6人同時にyfinance/RSS/TDnetが約6倍になっていた箇所に適用。
+_SHARED_FLIGHT = {}
+_SHARED_FLIGHT_LOCK = threading.Lock()
+_SHARED_FLIGHT_MAX = 600
+
+
+def _shared_fetch(key, ttl, fn):
+    import copy
+    with _SHARED_FLIGHT_LOCK:
+        ent = _SHARED_FLIGHT.get(key)
+        if ent is None:
+            if len(_SHARED_FLIGHT) >= _SHARED_FLIGHT_MAX:  # 古い順に間引く（無限に増やさない）
+                for k in sorted(_SHARED_FLIGHT, key=lambda x: _SHARED_FLIGHT[x]["ts"])[:_SHARED_FLIGHT_MAX // 4]:
+                    _SHARED_FLIGHT.pop(k, None)
+            ent = _SHARED_FLIGHT[key] = {"lock": threading.Lock(), "value": None, "ts": 0.0, "has": False}
+    if ent["has"] and time.time() - ent["ts"] < ttl:
+        return copy.deepcopy(ent["value"])
+    with ent["lock"]:
+        if ent["has"] and time.time() - ent["ts"] < ttl:
+            return copy.deepcopy(ent["value"])
+        value = fn()  # 例外はキャッシュしない（次の要求で再試行）
+        ent["value"], ent["ts"], ent["has"] = value, time.time(), True
+        return copy.deepcopy(value)
+
+
 
 def _cache_get(key):
     with _CACHE_LOCK:
@@ -408,6 +436,11 @@ STOCK_QUOTES_CHUNK = 80  # 一括ダウンロード1回あたりの銘柄数（�
 
 
 def _download_chunk(symbols):
+    """（共有ラッパー）同じ銘柄集合の7日分一括取得は全ユーザーで10秒共有する（市場データ）。"""
+    return _shared_fetch(("yf_dl7d", tuple(symbols)), 10, lambda: _download_chunk_impl(symbols))
+
+
+def _download_chunk_impl(symbols):
     """yf.downloadで複数銘柄をまとめて取得する。個別Ticker().history()を数百件連続で呼ぶと
     Yahoo側のレート制限に引っかかり、後半の銘柄ほど失敗しやすくなるため、まとめて取得することで
     速度・成功率の両方を改善する（実測：個別逐次は285件で数分＋失敗多発、一括は80件で約3秒・成功率100%）。
@@ -446,7 +479,20 @@ def _parse_stock_quote_frame(h):
     }
 
 
+STOCK_QUOTES_SHARED_TTL_SEC = 10  # yfinance系の時価は元々遅延があるため、10秒の共有は実質影響なし
+
+
 def get_stock_quotes(watchlist, cache_ttl=0, status_out=None):
+    """（共有ラッパー）既定呼び出し（cache_ttl=0・status_out無し＝メインダッシュボード）だけ、
+    同じ銘柄集合の結果を全ユーザーで10秒共有し、同時要求は1回にまとめる。cache_ttl指定・status_out指定の
+    呼び出し（Market Intelligence等の独自キャッシュ経路）は従来どおり直接実行する。"""
+    if cache_ttl or status_out is not None:
+        return _get_stock_quotes_impl(watchlist, cache_ttl=cache_ttl, status_out=status_out)
+    key = ("stock_quotes", tuple(sorted((w.get("code", ""), w.get("market", "JP")) for w in (watchlist or []))))
+    return _shared_fetch(key, STOCK_QUOTES_SHARED_TTL_SEC, lambda: _get_stock_quotes_impl(watchlist))
+
+
+def _get_stock_quotes_impl(watchlist, cache_ttl=0, status_out=None):
     """登録銘柄それぞれの現在値(t)・前日終値(p)・当日高値(high)・当日安値(low)・売買代金(turnover)を返す。
     売買代金は 終値×出来高 で概算（セクターの並び替え用。4章の時価総額ソートから変更）。
     価格履歴と同じ history() の出来高列から計算するため、追加のAPI呼び出しは不要。
@@ -862,7 +908,17 @@ def _fetch_fast_quote_chunk_with_retry(chunk):
     return result
 
 
+_FAST_QUOTE_FLIGHT_LOCK = threading.Lock()
+
+
 def get_fast_quotes(watchlist):
+    """（共有ラッパー）複数ユーザーが同時に現在値を取りに来ても、Tachibanaへの要求は1回にまとまるよう直列化する
+    （先頭の呼び出しが埋めた5秒の共有キャッシュを、後続が再利用する）。"""
+    with _FAST_QUOTE_FLIGHT_LOCK:
+        return _get_fast_quotes_impl(watchlist)
+
+
+def _get_fast_quotes_impl(watchlist):
     """FAST QUOTE経路：立花証券APIを主ソースとしたリアルタイム時価取得（指示書4番の
     ソース優先順位＝TACHIBANA→fallback（直近キャッシュ）→yfinance→last known value）。
     yfinanceの日足履歴取得（get_stock_quotesが行うもの）は一切呼ばない——呼ぶのは
@@ -1059,7 +1115,16 @@ def _is_recent(entry, max_age_days=NEWS_MAX_AGE_DAYS):
     return (time.time() - ts) <= max_age_days * 86400
 
 
+GOOGLE_NEWS_SHARED_TTL_SEC = 120
+
+
 def google_news(query, n=2, max_age_days=NEWS_MAX_AGE_DAYS):
+    """（共有ラッパー）同じ検索クエリのGoogleニュースRSSは全ユーザーで120秒共有する。"""
+    return _shared_fetch(("google_news", query, n, max_age_days), GOOGLE_NEWS_SHARED_TTL_SEC,
+                         lambda: _google_news_impl(query, n, max_age_days))
+
+
+def _google_news_impl(query, n=2, max_age_days=NEWS_MAX_AGE_DAYS):
     """GoogleニュースRSSは検索クエリ単位では関連度寄りの順序で返り、必ずしも新しい順ではないため、
     ここで公開日時の降順（新しい記事が先頭）に並べ替えてから返す。古い記事（max_age_days超）は
     ここで除外する。複数クエリの結果を連結して使う呼び出し元（build_stock_news/build_macro_news）でも、
@@ -1621,6 +1686,13 @@ def _tdnet_sort_key(time_str):
 
 
 def _tdnet_disclosures_for_date(date_str):
+    """（共有ラッパー）同じ日付のTDnet開示一覧は全ユーザーで共有（当日=60秒、過去日=10分）。"""
+    today = datetime.date.today().strftime("%Y%m%d")
+    return _shared_fetch(("tdnet_day", date_str), 60 if date_str == today else 600,
+                         lambda: _tdnet_disclosures_for_date_impl(date_str))
+
+
+def _tdnet_disclosures_for_date_impl(date_str):
     """指定日(YYYYMMDD)にTDnetに開示された情報を、証券コード(4桁)をキーにした辞書（値はリスト、
     1コードに複数開示があることもある）で返す。取得失敗時は空辞書（分析全体は失敗させない方針）。"""
     by_code = {}
@@ -3845,6 +3917,12 @@ def _intraday_regime(symbol, interval="5m", cache_ttl=0):
 # ============================================================
 
 def _download_intraday_chunk(symbols, interval="5m", period="1d"):
+    """（共有ラッパー）同じ銘柄集合の短期足一括取得は全ユーザーで15秒共有する（市場データ）。"""
+    return _shared_fetch(("yf_dl_intraday", tuple(symbols), interval, period), 15,
+                         lambda: _download_intraday_chunk_impl(symbols, interval, period))
+
+
+def _download_intraday_chunk_impl(symbols, interval="5m", period="1d"):
     """_download_chunk()の5分足版。個別Ticker().history()を銘柄数だけ連続で呼ぶ代わりに、
     yf.downloadで一括取得する（指示書Phase E：batch取得の実測比較）。"""
     try:
@@ -4024,6 +4102,13 @@ SECTOR_PROXY_METRICS = {"nikkei_semi": "200A.T"}
 # 「初期表示範囲＋スクロール用の余裕」を確保できるperiodを明示的に渡す
 # （例：5分足→"5d"で直近数営業日分を取得しておき、表示は当日〜直近2営業日にズームする）。
 def _fetch_intraday_bars(symbol, interval="5m", period=None):
+    """（共有ラッパー）同じ銘柄・足種・期間の短期足取得は全ユーザーで15秒共有する（市場データ）。
+    ENTRY TOP5スキャン・チャート・場中分析がユーザーごとに同じyfinance取得を繰り返さないための共通入口。"""
+    return _shared_fetch(("intraday_bars", symbol, interval, period), INTRADAY_CHART_SHARED_TTL_SEC,
+                         lambda: _fetch_intraday_bars_impl(symbol, interval, period))
+
+
+def _fetch_intraday_bars_impl(symbol, interval="5m", period=None):
     """指定期間・時間足のOHLCVをローソク足チャート用の形式（古い順のリスト、要素は
     {time, open, high, low, close, volume}、timeはUNIX秒）で返す。市場時間外・取得失敗時は
     空リストを返す（推測値・補完値は作らない）。periodを省略すると"1d"（当日のみ、既存動作）。"""
@@ -6958,6 +7043,12 @@ def _catalyst_tdnet_fetch(code, business_days=6):
 
 
 def _catalyst_news_fetch(code):
+    """（共有ラッパー）Catalystの外部取得（TDnet/ニュース/規制）は銘柄単位の市場データ。利用者ごとにCatalyst
+    サービスが動いても、同じ銘柄の外部取得は全ユーザーで120秒共有し、同時要求は1回にまとめる。"""
+    return _shared_fetch(("_catalyst_news_fetch", code), 120, lambda: _catalyst_news_fetch_impl(code))
+
+
+def _catalyst_news_fetch_impl(code):
     if tachibana_api is None:
         raise RuntimeError("tachibana_api unavailable")
     now = datetime.datetime.now(_JST)
@@ -22823,7 +22914,16 @@ def get_position_live_detail(code, market="JP"):
 INTRADAY_CHART_ALLOWED_PERIODS = {"1d", "5d", "1mo", "3mo"}
 
 
+INTRADAY_CHART_SHARED_TTL_SEC = 15
+
+
 def get_position_intraday_chart(code, market="JP", interval="5m", period=None):
+    """（共有ラッパー）同じ銘柄・足種・期間の短期足は全ユーザーで15秒共有（市場データ。ポジションには依存しない）。"""
+    return _shared_fetch(("intraday_chart", code, market, interval, period), INTRADAY_CHART_SHARED_TTL_SEC,
+                         lambda: _get_position_intraday_chart_impl(code, market, interval, period))
+
+
+def _get_position_intraday_chart_impl(code, market="JP", interval="5m", period=None):
     symbol = _yf_symbol({"code": code, "market": market})
     if period is not None and period not in INTRADAY_CHART_ALLOWED_PERIODS:
         period = None  # 未知のperiodは無視して既定値(1d)にフォールバック（不正値を素通ししない）

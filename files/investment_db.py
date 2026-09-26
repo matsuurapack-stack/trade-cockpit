@@ -103,8 +103,9 @@ SHARED_TABLES = frozenset({
     "market_events", "expert_views", "news_catalysts", "morning_market_checks", "market_intelligence_reports",
     "entry_candidate_snapshots", "auto_signal_events", "limit_up_events", "theme_momentum_history",
     "next_day_theme_candidates", "trade_playbooks", "market_discovery_pool",
+    "stock_theses",  # 朝TOP5の仮説（共通）。起動時の共有化マイグレーション(MU-S1)の対象で、実態は全て共有
 })
-MIXED_TABLES = frozenset({"watchlist", "stock_theses"})
+MIXED_TABLES = frozenset({"watchlist"})
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS daily_log (
@@ -1613,16 +1614,9 @@ ALTER TABLE market_sources ADD COLUMN IF NOT EXISTS last_duplicate_count INTEGER
 # 仕様も含めてそのまま踏襲）。定数_SHARED_SCOPEの値を変更した場合はここも合わせて
 # 変更すること（あえて直接リテラル'_shared'で書いている）。
 _MIGRATE_SHARED_SCOPE_SQL = """
--- watchlist（自然キー: code, market）
-DELETE FROM watchlist a USING watchlist b
-WHERE a.user_id <> '_shared' AND b.user_id = '_shared'
-  AND a.code = b.code AND a.market = b.market;
-DELETE FROM watchlist a USING watchlist b
-WHERE a.user_id <> '_shared' AND b.user_id <> '_shared' AND a.id <> b.id
-  AND a.code = b.code AND a.market = b.market
-  AND ((b.user_id = 'matsuura' AND a.user_id <> 'matsuura')
-       OR (a.user_id <> 'matsuura' AND b.user_id <> 'matsuura' AND a.id > b.id));
-UPDATE watchlist SET user_id = '_shared' WHERE user_id <> '_shared';
+-- 2026-09-26 MU-Multi：watchlistの共有化(MU-S1)はここから削除した。この移行は起動のたびに実行されるため、
+-- 個人の手動watchlist(user_id=本人)を毎回_sharedへ戻し、重複する個人行を削除してしまう。watchlistは
+-- system(_shared)とuser(本人)の分離運用になったため、絶対に再共有しない（test_mu_multi_privacyで検査）。
 
 -- market_events（自然キー: event_date, title）
 DELETE FROM market_events a USING market_events b

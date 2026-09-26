@@ -1,0 +1,123 @@
+{
+  "users": 1,
+  "external_calls_total": {
+    "tachibana": 107,
+    "yfinance": 19,
+    "urllib_urlopen": 1
+  },
+  "external_calls_detail": {
+    "tachibana:CLMMfdsGetMarketPrice": 101,
+    "yfinance:get": 19,
+    "tachibana:CLMMfdsGetMarketPriceHistory": 6
+  },
+  "per_workload": {
+    "quotes_fast": {
+      "tachibana": 1
+    },
+    "quotes": {
+      "yfinance": 6,
+      "tachibana": 1
+    },
+    "top5_scan": {
+      "tachibana": 105,
+      "yfinance": 11
+    },
+    "news": {
+      "urllib_urlopen": 1
+    },
+    "catalyst": {},
+    "radar": {},
+    "chart": {
+      "yfinance": 2
+    },
+    "discovery": {}
+  },
+  "latency_ms": {
+    "quotes_fast": {
+      "n": 1,
+      "p50": 2,
+      "max": 2
+    },
+    "quotes": {
+      "n": 1,
+      "p50": 2014,
+      "max": 2014
+    },
+    "top5_scan": {
+      "n": 1,
+      "p50": 1485,
+      "max": 1485
+    },
+    "news": {
+      "n": 1,
+      "p50": 414,
+      "max": 414
+    },
+    "catalyst": {
+      "n": 1,
+      "p50": 0,
+      "max": 0
+    },
+    "radar": {
+      "n": 1,
+      "p50": 0,
+      "max": 0
+    },
+    "chart": {
+      "n": 1,
+      "p50": 620,
+      "max": 620
+    },
+    "discovery": {
+      "n": 1,
+      "p50": 0,
+      "max": 0
+    }
+  },
+  "errors": {},
+  "yfinance_sites_top5": [
+    [
+      "load_measure_users.py:f > load_measure_users.py:bump",
+      6
+    ],
+    [
+      "server.py:_index_trend > load_measure_users.py:f > load_measure_users.py:bump",
+      5
+    ]
+  ],
+  "db_function_calls_total": 27,
+  "db_function_calls_top": [
+    [
+      "relevant_catalysts_for",
+      6
+    ],
+    [
+      "upcoming_event_signals",
+      6
+    ],
+    [
+      "list_market_events",
+      3
+    ],
+    [
+      "get_codes_with_auto_tag",
+      2
+    ],
+    [
+      "list_watchlist",
+      1
+    ],
+    [
+      "get_cash_balance",
+      1
+    ],
+    [
+      "list_portfolio",
+      1
+    ],
+    [
+      "list_shadow_watch",
+      1
+    ]
+  ]
+}

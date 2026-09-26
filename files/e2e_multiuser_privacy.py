@@ -83,6 +83,7 @@ def cleanup():
                 conn.rollback()
         conn.execute("DELETE FROM watchlist WHERE user_id=%s AND code=%s", [investment_db._SHARED_SCOPE, "E2ESYS"])
         conn.execute("DELETE FROM app_sessions WHERE username LIKE %s", [PREFIX + "%"])
+        conn.execute("DELETE FROM app_sessions WHERE user_agent = %s", ["e2e-release-gate"])
         conn.execute("DELETE FROM app_users WHERE username LIKE %s", [PREFIX + "%"])
         conn.commit()
     return total
@@ -259,6 +260,43 @@ def main():
         check("C3 システム監視銘柄は6人全員に見える", all(seen_sys.values()), str(seen_sys))
         check("C4 個人追加の監視銘柄は追加した本人だけ", seen_priv[NAMES[2]] and not any(v for k, v in seen_priv.items() if k != NAMES[2]),
               str(seen_priv))
+
+        # ---------- C+. 共有画面(TOP5/Discovery/朝一共通部)は全員同じ、移行後のowner監視銘柄は本人だけ ----------
+        def fetch_shared(n):
+            c = clients[n]
+            disc = (c.req("GET", "/api/market-discovery")[1] or {})
+            mc = ((c.req("GET", "/api/morning-check")[1] or {}).get("check") or {})
+            top = (c.req("GET", "/api/entry-candidates/live")[1] or {})
+            top_codes = sorted([x.get("code") for x in (top.get("entryReadyTop5") or top.get("top5") or [])])
+            return {"disc_pool": json.dumps(disc.get("pool"), sort_keys=True), "disc_list": json.dumps(disc.get("list"), sort_keys=True),
+                    "mc_regime": mc.get("market_regime"), "mc_strategy": mc.get("strategy_text"),
+                    "mc_top": sorted([x.get("code") for x in (mc.get("watchlist_top5_json") or [])]), "top5": top_codes}
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            shared = dict(zip(NAMES, ex.map(fetch_shared, NAMES)))
+        for key, label in (("disc_pool", "Market Discovery(pool)"), ("disc_list", "Market Discovery(list)"),
+                           ("mc_regime", "共通朝一チェック(regime)"), ("mc_strategy", "共通朝一チェック(strategy)"),
+                           ("mc_top", "共通朝一チェック(TOP5銘柄)"), ("top5", "今買い時TOP5(銘柄)")):
+            vals = {json.dumps(shared[n][key], sort_keys=True) for n in NAMES}
+            check("C5 共有: %s は6人とも同一" % label, len(vals) == 1, str(list(vals))[:150])
+
+        # owner(matsuura)の移行済み監視銘柄：APIレベルで、本人だけに見えること
+        import hashlib
+        tok = secrets.token_urlsafe(16)
+        investment_db.auth_create_session(DB, "matsuura", hashlib.sha256(tok.encode()).hexdigest(), "csrf-gate",
+                                          (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)).isoformat(),
+                                          "e2e-release-gate", "127.0.0.1")
+        oc = Client(port); oc.cookie = "tc_session=" + tok
+        _, ojs, _, _, _ = oc.req("GET", "/api/watchlist")
+        oitems = (ojs or {}).get("items") or []
+        with pool.connection() as conn:
+            owner_codes = {r[0] for r in conn.execute("SELECT code FROM watchlist WHERE user_id='matsuura'").fetchall()}
+        check("C6 matsuuraには移行済みの監視銘柄が全件見える(APIレベル)",
+              len(owner_codes) >= 300 and owner_codes <= {i.get("code") for i in oitems}, "owner_db=%d api=%d" % (len(owner_codes), len(oitems)))
+        leak_wl = []
+        for n in NAMES:
+            codes = {i.get("code") for i in (clients[n].req("GET", "/api/watchlist")[1] or {}).get("items") or []}
+            leak_wl.append((n, len(codes & owner_codes)))
+        check("C7 user1〜5・owner役の一時ユーザーにmatsuuraの監視銘柄は1件も見えない", all(c == 0 for _, c in leak_wl), str(leak_wl))
 
         # ---------- D. ログアウト ----------
         c3 = clients[NAMES[3]]

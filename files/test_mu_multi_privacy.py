@@ -356,5 +356,18 @@ class FrontendAuthWiringTests(unittest.TestCase):
         self.assertIn('autocomplete="current-password"', self.login)
 
 
+class StartupMigrationNeverReSharesPersonalDataTests(unittest.TestCase):
+    """起動のたびに実行されるinit_schema()内のSQLが、個人/混合テーブルを_sharedへ戻したり重複行を
+    削除したりしないこと（2026-09-26 Release Gate：旧MU-S1のwatchlist共有化が再起動のたびに個人watchlist
+    を共有へ戻していた実バグの再発防止）。"""
+
+    def test_no_startup_sql_reshares_or_dedupes_private_or_mixed_tables(self):
+        src = _db_source()
+        reshared = set(re.findall(r"UPDATE\s+(\w+)\s+SET\s+user_id\s*=\s*'_shared'", src))
+        deduped = set(re.findall(r"DELETE FROM\s+(\w+)\s+a\s+USING", src))
+        bad = (reshared | deduped) & (investment_db.PRIVATE_TABLES | investment_db.MIXED_TABLES)
+        self.assertEqual(bad, set(), "起動時SQLが個人/混合テーブルを共有化・重複削除しています: %s" % sorted(bad))
+
+
 if __name__ == "__main__":
     unittest.main()

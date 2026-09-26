@@ -42,9 +42,29 @@ class GetStockQuotesOverlayCachingTests(unittest.TestCase):
              mock.patch.object(server.tachibana_api, "get_market_price",
                                 return_value={"7203": {"t": 3050, "p": None, "open": None,
                                                          "high": None, "low": None, "volume": None}}) as mock_gmp:
-            server.get_stock_quotes(wl)  # cache_ttl=0
-            server.get_stock_quotes(wl)  # 2回目
-        self.assertEqual(mock_gmp.call_count, 2)  # 毎回呼ばれる（既存動作）
+            # 2026-09-26 MU-Multi：get_stock_quotes()の既定呼び出しは全ユーザー共通の10秒共有ラッパーになった
+            # （下のテスト参照）。cache_ttl=0の実体(_get_stock_quotes_impl)の「毎回オーバーレイ」は不変。
+            server._get_stock_quotes_impl(wl)  # cache_ttl=0
+            server._get_stock_quotes_impl(wl)  # 2回目
+        self.assertEqual(mock_gmp.call_count, 2)  # 毎回呼ばれる（実体の既存動作）
+
+    def test_default_call_is_shared_across_users_within_ttl_and_concurrent_calls_merge(self):
+        """MU-Multi Release Gate：同じ銘柄集合の既定呼び出しは、複数ユーザーで10秒共有され、
+        同時要求は1回にまとまる（外部API呼び出しがユーザー数倍にならない）。"""
+        import threading
+        server._SHARED_FLIGHT.clear()
+        wl = self._watchlist(["7203"])
+        frame = make_frame(3000, 3010, 2990, 2995, 10000)
+        results = []
+        with mock.patch.object(server, "_download_chunk", return_value={"7203.T": frame}) as dl,              mock.patch.object(server.tachibana_api, "get_market_price",
+                                return_value={"7203": {"t": 3050, "p": None, "open": None,
+                                                         "high": None, "low": None, "volume": None}}):
+            ts = [threading.Thread(target=lambda: results.append(server.get_stock_quotes(wl))) for _ in range(6)]
+            [t.start() for t in ts]; [t.join() for t in ts]
+            server.get_stock_quotes(wl)  # TTL内の後続もキャッシュ
+        self.assertEqual(dl.call_count, 1)
+        self.assertEqual(len(results), 6)
+        server._SHARED_FLIGHT.clear()
 
     def test_cache_ttl_positive_skips_overlay_on_cache_hit(self):
         """指示書STEP5〜6：cache_ttl>0の場合、2回目の呼び出し（cache hit）では
