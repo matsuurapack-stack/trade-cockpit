@@ -40,7 +40,11 @@
     `_yf_symbol()`（JP: code+".T"、US: codeそのまま、IDX: `IDX_YF_OVERRIDE` で上書き）。
   - `POST /api/news` … body の watchlist を受け、登録銘柄ニュース＋マクロニュースを返す。
     優先/通常/様子見でソートし上位12件。マクロは固定クエリ5種。
-  - CORS 全許可。静的ファイル（HTML）も同サーバーが配信。
+  - 認証はログイン画面＋Cookieセッション（2026-09-26 MU-Multi、Basic認証は廃止）。パスワードはPBKDF2ハッシュ、
+    書き込みAPIはCSRFトークン必須、CORSは許可しない（same-origin専用）。user_idは常にセッションから決まり、
+    リクエストの値は信用しない。個人/共有データの区分は `files/investment_db.py` の PRIVATE_TABLES/SHARED_TABLES、
+    運用手順は `docs/admin/manual_admin.md`、6人プライバシー確認は `files/e2e_multiuser_privacy.py`。
+    静的ファイルは許可リスト方式（ログイン画面・manifest・アイコン・本体HTMLのみ）。
 - **files/trade-cockpit.html** — 本体（約500行）。CDN の React/ReactDOM/Babel を
   `type="text/babel"` でその場コンパイル。ビルド工程なし。状態は localStorage キー
   `trade-cockpit-v1` に自動保存。フロントは相対パス `/api/quotes`・`/api/news` を叩く。
