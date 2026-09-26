@@ -1,6 +1,6 @@
 """マニュアル生成ツール（2026-09-26 MU-Multi）。
 
-1) docs/users/_template.md から manual_user1.md 〜 manual_user5.md を作る
+1) docs/users/_template.md から manual_user1.md 〜 manual_user6.md を作る
    （利用者名が決まったら、_template.md 内の「利用者{{N}}さん」を実名へ置き換える手順は manual_admin.md 参照）
 2) --html を付けると、docs 内の全 .md を印刷しやすい .html にも変換する
    （ブラウザで開いて「印刷 → PDFとして保存」でPDF版になります。追加ソフト不要）
@@ -18,7 +18,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 USERS = os.path.join(BASE, "users")
 
 
-def gen_user_manuals(count=5):
+def gen_user_manuals(count=6):
     tpl = open(os.path.join(USERS, "_template.md"), encoding="utf-8").read()
     for n in range(1, count + 1):
         path = os.path.join(USERS, "manual_user%d.md" % n)

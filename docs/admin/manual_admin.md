@@ -41,16 +41,13 @@
   ```
   　移さないままだと、新しい利用者にもあなたの監視銘柄が「共通」として見えてしまいます。
 
-### 1-3. 利用者アカウントを作る
+### 1-3. 利用者アカウント（現在7人：matsuura＋user1〜user6）
 
 `files` フォルダで実行します（サーバーPC上）。
 
 ```
 python manage_users.py create user1 --generate
-python manage_users.py create user2 --generate
-python manage_users.py create user3 --generate
-python manage_users.py create user4 --generate
-python manage_users.py create user5 --generate
+（user2〜user6も同様。現在は user1〜user6 を作成済みです）
 ```
 
 - `--generate` を付けると、ランダムな**初期パスワードがその1回だけ**画面に表示されます。**その場で控えてください**（再表示はできません）。
@@ -182,3 +179,40 @@ python e2e_multiuser_privacy.py
 - **共通監視銘柄をユーザーが「削除」しても、共通のものは消えません**（自分が追加したものだけ削除できます）。
 - ENTRY TOP5・場中の一部スキャン（shadow movement／dynamic watch／ENTRY再採点など）は、まだ**ユーザーごとに動きます**。株価・5分足には共通キャッシュがありますが、「利用者が増えても外部APIの呼び出しが増えない」ことの**実測はまだ行っていません**（未確認事項）。Market Discovery（yfinanceスクリーナー＋立花quote確認）だけは**全員で1回だけ**計算するよう修正済みです。
 - 6人が同時に重い画面（日次レビュー詳細など）を開くと、遅くなることがあります。
+
+
+---
+
+## 7. 7人構成（matsuura＋user1〜user6）と PowerPoint/PDF マニュアル
+
+### 7-1. 利用者一覧
+| ユーザー名 | 役割 | 備考 |
+|---|---|---|
+| matsuura | owner（管理者本人） | 従来のあなたのアカウント。個人データは本人だけ |
+| user1〜user6 | 利用者 | 配布対象の6人。初期パスワードは管理者だけが保管 |
+
+確認：`python manage_users.py list`
+
+### 7-2. 共通監視銘柄と個人監視銘柄
+- **共通監視銘柄**（system/shared）：7人全員が最初から見る監視銘柄です（現在319件、matsuuraの旧監視銘柄から作成）。
+  利用者が「削除」しても全体からは消えません（自分の行だけが対象のため）。
+- **個人監視銘柄**：各自が画面から追加した銘柄で、**本人だけ**に見えます。
+- 共通化の際、個人メモ（メモ・追加理由・タグ・優先度）は共有側へ持ち込んでいません。個人メモのある8件は、matsuura側の個人行に残っています。
+- 共通監視銘柄を後から増減したいときは、管理者が `_shared` の行を直接操作します（一般の利用者は変更できません）。
+
+### 7-3. 配布物の作り方と保管場所
+- 場所：`docs/distribution/user1/` 〜 `user6/`（各フォルダに `manual_userN.pptx` と `manual_userN.pdf`）。
+  **各人のURL・ユーザー名・初期パスワード入りの機密ファイルです。Gitには入りません。**
+- 作り直し：`python docs/build_pptx_manuals.py`（クラウド公開などでURLが変わったら `--url https://…/` を付ける）。
+  パスワードは `files/backups/initial_passwords*.txt`（管理者専用）から読み込みます。
+- 渡し方：各人に、その人のフォルダの **PDF（またはPPTX）1つだけ** を渡します（他の人のフォルダは渡さない）。URLとパスワードを同じ連絡手段で送る場合は、PDFをパスワード付きにするか、パスワードだけ別経路にしてください。
+
+### 7-4. 配布後の片付け（必須）
+1. 全員がログインできたら `files/backups/initial_passwords*.txt` を**削除**する（OneDrive同期フォルダ内です）。
+2. `docs/distribution/` の PPTX/PDF は、配布後に安全な場所へ移すか削除する（パスワードが入っています）。
+3. 利用者に、最初のログイン後にパスワードを控え直す必要はない旨と、他人に教えないことを伝える。
+
+### 7-5. user6追加後の確認方法
+1. `python manage_users.py list` に user6 が「有効」で出る。
+2. `python e2e_multiuser_privacy.py` が「全て合格」（7人で実施。個人データの分離・共通データの同一性・共通監視銘柄が削除で消えないこと、を確認）。
+3. user6でログインし、共通監視銘柄が見える／他人のポジションが見えない、を確認する。

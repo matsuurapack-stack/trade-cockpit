@@ -23,7 +23,7 @@ from socketserver import ThreadingTCPServer
 
 DB = server.DATABASE_URL
 PREFIX = "e2etmp_"
-NAMES = [PREFIX + n for n in ("owner", "user1", "user2", "user3", "user4", "user5")]
+NAMES = [PREFIX + n for n in ("owner", "user1", "user2", "user3", "user4", "user5", "user6")]  # 7人構成
 RESULTS = []
 
 
@@ -188,7 +188,7 @@ def main():
                 for variant in (ep, ep + "?user_id=" + NAMES[1] + "&userId=" + NAMES[2]):
                     res[variant] = clients[n].req("GET", variant)[2]
             return res
-        with ThreadPoolExecutor(max_workers=6) as ex:
+        with ThreadPoolExecutor(max_workers=7) as ex:
             fetched = dict(zip(NAMES, ex.map(read_all, NAMES)))
         leaks = []
         for n in NAMES:
@@ -224,13 +224,13 @@ def main():
             return found
         pairs = [(NAMES[i], NAMES[(i + 1) % len(NAMES)]) for i in range(len(NAMES))]
         idor = []
-        with ThreadPoolExecutor(max_workers=6) as ex:
+        with ThreadPoolExecutor(max_workers=7) as ex:
             for f in ex.map(attack, pairs):
                 idor += f
 
         def verify(b):
             return b, clients[b].req("GET", "/api/trade-reflections")[2], clients[b].req("GET", "/api/portfolio")[2]
-        with ThreadPoolExecutor(max_workers=6) as ex:
+        with ThreadPoolExecutor(max_workers=7) as ex:
             for b, raw_r, raw_p in ex.map(verify, NAMES):
                 if "HACKED_BY_" in raw_r:
                     idor.append(("update-reflection", b))
@@ -271,7 +271,7 @@ def main():
             return {"disc_pool": json.dumps(disc.get("pool"), sort_keys=True), "disc_list": json.dumps(disc.get("list"), sort_keys=True),
                     "mc_regime": mc.get("market_regime"), "mc_strategy": mc.get("strategy_text"),
                     "mc_top": sorted([x.get("code") for x in (mc.get("watchlist_top5_json") or [])]), "top5": top_codes}
-        with ThreadPoolExecutor(max_workers=6) as ex:
+        with ThreadPoolExecutor(max_workers=7) as ex:
             shared = dict(zip(NAMES, ex.map(fetch_shared, NAMES)))
         for key, label in (("disc_pool", "Market Discovery(pool)"), ("disc_list", "Market Discovery(list)"),
                            ("mc_regime", "共通朝一チェック(regime)"), ("mc_strategy", "共通朝一チェック(strategy)"),
@@ -288,15 +288,36 @@ def main():
         oc = Client(port); oc.cookie = "tc_session=" + tok
         _, ojs, _, _, _ = oc.req("GET", "/api/watchlist")
         oitems = (ojs or {}).get("items") or []
+        # 共通監視銘柄（owner由来の共通化済み）：7人全員が同じ集合を見る／個人メモは共有側に無い／共通は削除しても消えない
         with pool.connection() as conn:
-            owner_codes = {r[0] for r in conn.execute("SELECT code FROM watchlist WHERE user_id='matsuura'").fetchall()}
-        check("C6 matsuuraには移行済みの監視銘柄が全件見える(APIレベル)",
-              len(owner_codes) >= 300 and owner_codes <= {i.get("code") for i in oitems}, "owner_db=%d api=%d" % (len(owner_codes), len(oitems)))
-        leak_wl = []
+            shared_codes = {r[0] for r in conn.execute("SELECT code FROM watchlist WHERE user_id='_shared' AND code <> 'E2ESYS'").fetchall()}
+            owner_personal = conn.execute("SELECT code, coalesce(note,''), coalesce(added_reason,'') FROM watchlist WHERE user_id='matsuura'").fetchall()
+        check("C6 共通監視銘柄が存在する(>=300件)", len(shared_codes) >= 300, str(len(shared_codes)))
+        _, ojs, _, _, _ = oc.req("GET", "/api/watchlist")
+        oitems = (ojs or {}).get("items") or []
+        check("C6b matsuuraは共通監視銘柄を全件見られる(APIレベル・個人行が優先)", shared_codes <= {i.get("code") for i in oitems},
+              "api=%d shared=%d" % (len(oitems), len(shared_codes)))
+        sets, scopes, raws = {}, {}, {}
         for n in NAMES:
-            codes = {i.get("code") for i in (clients[n].req("GET", "/api/watchlist")[1] or {}).get("items") or []}
-            leak_wl.append((n, len(codes & owner_codes)))
-        check("C7 user1〜5・owner役の一時ユーザーにmatsuuraの監視銘柄は1件も見えない", all(c == 0 for _, c in leak_wl), str(leak_wl))
+            _, wjs, raw, _, _ = clients[n].req("GET", "/api/watchlist")
+            its = (wjs or {}).get("items") or []
+            sets[n] = {i.get("code") for i in its if i.get("scope") == "system"}
+            scopes[n] = {i.get("scope") for i in its}
+            raws[n] = raw
+        check("C7 共通監視銘柄は7人全員が同じ集合で見える", all(shared_codes <= sets[n] for n in NAMES), str({n: len(sets[n]) for n in NAMES}))
+        memos = [t for _, note, reason in owner_personal for t in (note, reason) if t]
+        leaked_memo = [n for n in NAMES if any(m in raws[n] for m in memos)]
+        check("C8 matsuuraの個人メモは他ユーザーに見えない", not leaked_memo and len(memos) >= 1, str(leaked_memo))
+        # 共通銘柄を利用者が削除しても全体から消えない
+        victim = sorted(shared_codes)[0]
+        clients[NAMES[3]].req("POST", "/api/watchlist/delete", {"code": victim, "market": "JP"})
+        after = {}
+        for n in (NAMES[0], NAMES[1], NAMES[4]):
+            _, wjs, _, _, _ = clients[n].req("GET", "/api/watchlist")
+            after[n] = victim in {i.get("code") for i in (wjs or {}).get("items") or []}
+        with pool.connection() as conn:
+            still = conn.execute("SELECT count(*) FROM watchlist WHERE user_id='_shared' AND code=%s", [victim]).fetchone()[0]
+        check("C9 共通監視銘柄は利用者が削除しても全体から消えない", still == 1 and all(after.values()), str(after))
 
         # ---------- D. ログアウト ----------
         c3 = clients[NAMES[3]]

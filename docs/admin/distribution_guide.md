@@ -1,4 +1,4 @@
-# 5人へ渡すもの（1ページ・管理者専用）
+# 6人へ渡すもの（1ページ・管理者専用）
 
 **渡すものは、この4つだけです。** それ以上の設定を、利用者にお願いする必要はありません。
 （このページに、URL・パスワードの実値は書かないでください。Gitに保存されます）
@@ -6,9 +6,9 @@
 | # | 渡すもの | 中身・渡し方 |
 |---|---|---|
 | 1 | **アプリのURL** | 例：`https://（あなたのアプリ）/`　LINEやメールで送れば、押すだけで開けます |
-| 2 | **ユーザー名** | 例：`user1`〜`user5`（英数字） |
+| 2 | **ユーザー名** | 例：`user1`〜`user6`（英数字） |
 | 3 | **初期パスワード** | **URLとは別の連絡手段**で。渡したあとは、控えを残さない（紙メモは破棄） |
-| 4 | **その人用マニュアル** | `docs/users/manual_user1.md`〜`manual_user5.md`（印刷する場合は `python docs/generate_docs.py --html` で作った `.html` をブラウザで開き、「印刷 → PDFとして保存」） |
+| 4 | **その人用マニュアル** | `docs/distribution/userN/manual_userN.pdf`（PowerPoint版 `.pptx` もあり）。各人専用のURL・ユーザー名・初期パスワード入りなので、**その人のものだけ**を渡します |
 
 利用者にしてもらうことは、**「URLを開く → ユーザー名とパスワードを入れる → ログイン」** だけです。
 アプリのインストールも、Wi-Fiの設定も、アカウント作成も要りません。
@@ -17,9 +17,9 @@
 ## 渡す前の確認（管理者、5分）
 
 1. アカウントを作る：`files` フォルダで
-   `python manage_users.py create user1 --generate`（user2〜user5も同様）。
+   `python manage_users.py create user1 --generate`（user2〜user6も同様）。
    **表示される初期パスワードはその場で控え、画面の履歴やチャットに残さない**（再表示できません）。
-2. `python manage_users.py list` で5人が「有効」になっている。
+2. `python manage_users.py list` で6人が「有効」になっている。
 3. `python e2e_multiuser_privacy.py` が「全て合格」。
 4. URLが **https**（インターネット公開の場合）になっている。自宅Wi-Fi限定なら、その旨を利用者に伝える。
 5. `docs/admin/user_setup_checklist.md` に進み具合を記録する。

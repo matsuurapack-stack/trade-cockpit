@@ -31,3 +31,4 @@ backups/
 docs/**/*.html
 files/e2e_multiuser_result.txt
 files/watchlist_audit_report.txt
+docs/distribution/

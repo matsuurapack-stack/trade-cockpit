@@ -1,5 +1,5 @@
 {
-  "users": 1,
+  "users": 7,
   "external_calls_total": {
     "tachibana": 107,
     "yfinance": 19,
@@ -34,42 +34,42 @@
   },
   "latency_ms": {
     "quotes_fast": {
-      "n": 1,
-      "p50": 2,
+      "n": 7,
+      "p50": 1,
       "max": 2
     },
     "quotes": {
-      "n": 1,
-      "p50": 1332,
-      "max": 1332
+      "n": 7,
+      "p50": 1427,
+      "max": 1428
     },
     "top5_scan": {
-      "n": 1,
-      "p50": 1952,
-      "max": 1952
+      "n": 7,
+      "p50": 1707,
+      "max": 1734
     },
     "news": {
-      "n": 1,
-      "p50": 821,
-      "max": 821
+      "n": 7,
+      "p50": 368,
+      "max": 369
     },
     "catalyst": {
-      "n": 1,
+      "n": 7,
       "p50": 0,
       "max": 0
     },
     "radar": {
-      "n": 1,
+      "n": 7,
       "p50": 0,
       "max": 0
     },
     "chart": {
-      "n": 1,
-      "p50": 687,
-      "max": 687
+      "n": 7,
+      "p50": 454,
+      "max": 454
     },
     "discovery": {
-      "n": 1,
+      "n": 7,
       "p50": 0,
       "max": 0
     }
@@ -85,39 +85,39 @@
       5
     ]
   ],
-  "db_function_calls_total": 27,
+  "db_function_calls_total": 189,
   "db_function_calls_top": [
     [
       "relevant_catalysts_for",
-      6
+      42
     ],
     [
       "upcoming_event_signals",
-      6
+      42
     ],
     [
       "list_market_events",
-      3
+      21
     ],
     [
       "get_codes_with_auto_tag",
-      2
+      14
     ],
     [
       "list_watchlist",
-      1
+      7
     ],
     [
       "get_cash_balance",
-      1
+      7
     ],
     [
       "list_portfolio",
-      1
+      7
     ],
     [
       "list_shadow_watch",
-      1
+      7
     ]
   ]
 }
