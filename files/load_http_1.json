@@ -1,0 +1,70 @@
+{
+  "users": 1,
+  "duration_s": 123,
+  "requests": 35,
+  "http_5xx": 0,
+  "errors_non200": [],
+  "latency_ms": {
+    "p50": 2098,
+    "p95": 3730,
+    "max": 5096
+  },
+  "per_endpoint_p50_p95": {
+    "me": [
+      3658,
+      3658,
+      1
+    ],
+    "watchlist": [
+      5096,
+      5096,
+      1
+    ],
+    "portfolio": [
+      3353,
+      3383,
+      3
+    ],
+    "events": [
+      3489,
+      3489,
+      1
+    ],
+    "morning": [
+      3271,
+      3271,
+      1
+    ],
+    "discovery": [
+      1717,
+      2095,
+      7
+    ],
+    "entry_live": [
+      1738,
+      1941,
+      7
+    ],
+    "quotes_fast": [
+      2098,
+      2922,
+      7
+    ],
+    "quotes": [
+      2746,
+      3091,
+      3
+    ],
+    "review_latest": [
+      3498,
+      3730,
+      4
+    ]
+  },
+  "requests_per_user_per_min": 17.1,
+  "server_log_delta": {
+    "p_errno6": 0,
+    "p_errno2": 0,
+    "fastquote_lines": 7
+  }
+}

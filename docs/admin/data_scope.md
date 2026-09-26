@@ -19,7 +19,7 @@
 
 `market_events`（イベント）、`expert_views`（有識者見解）、`news_catalysts`、`morning_market_checks`（朝一チェックの共通部分）、
 `market_intelligence_reports`（場中4レポート）、`entry_candidate_snapshots`、`auto_signal_events`、`limit_up_events`、`theme_momentum_history`、
-`next_day_theme_candidates`、`trade_playbooks`（共通の売買定義。個人の成績は `trade_playbook_user_stats`）、
+`next_day_theme_candidates`、`stock_theses`（朝TOP5の仮説）、`trade_playbooks`（共通の売買定義。個人の成績は `trade_playbook_user_stats`）、
 `market_discovery_pool`（Market Discovery。今回、全員で1回だけ計算するよう変更）、
 `watchlist`（`_shared` の行＝システム自動登録・共通分析用）。
 ユーザー列を持たないX/ニュース系（`social_market_posts` など）も全員共通です。
@@ -28,16 +28,17 @@
 
 - `watchlist`：見える範囲は「システム(`_shared`)＋自分の行」。同じ銘柄が両方にあれば自分の設定が優先。
   手動追加・削除・表示対象ON/OFFは本人の行だけを変更し、他の利用者には影響しません。
-- `stock_theses`：朝TOP5の仮説（共通）と個人の記録。
 
 ## 今回修正した危険箇所
 
 1. `trade_reflections`（反省メモ）が全員共有になっていた → 個人専用へ。既存1件はownerへ移行（バックアップ済み・削除なし）。
 2. `watchlist` が全員共有だった → system と user に分離（手動追加は本人だけ）。
-3. Basic認証（パスワード平文・ログアウト不可・CORS `*`）→ ログイン画面＋ハッシュ＋Cookieセッション＋CSRF。
+3. 以前のログイン方式（パスワード平文・ログアウト不可・CORS `*`）→ ログイン画面＋ハッシュ＋Cookieセッション＋CSRF。
 4. `market_discovery_pool` をユーザーごとに6回計算していた → `_shared` で1回だけ。
+5. **起動のたびに個人watchlistが共有へ戻る実バグ**（旧MU-S1の共有化マイグレーションが `init_schema()` に残っていた）を修正。テストで再発を検出します。
+6. 同じ市場データを利用者ごとに取りに行っていた外部API呼び出し（株価・ニュース・TDnet・短期足・Catalyst用ニュース）を、全員で共有するキャッシュへ（1人→6人で呼び出し数が増えないことを計測済み）。
 
 ## 既存の共有watchlistの棚卸し結果（2026-09-26時点）
 
 `_shared` 319件はすべて「ownerが手動登録」（`manual_registered=true`、自動登録タグなし）でした。
-配布前に owner 個人へ移すことを推奨します（`migrate_watchlist_manual_to_owner.py`、手順は管理者マニュアル1-2）。
+**2026-09-26に owner(matsuura) 個人へ全件移行済み**（`migrate_watchlist_manual_to_owner.py`、バックアップ・削除0件）。以後、システム共通の監視銘柄は自動登録エンジンが `_shared` に作るものだけです。
