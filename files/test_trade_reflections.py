@@ -1,7 +1,7 @@
 # trade_reflections（2026-09-17新規、Event Risk Guard＋トレード反省メモ Phase A）テスト。
 #
 # 「今日の反省・気づき」の自由記述からのルールベース構造化（structure_trade_reflection）、
-# Smart Import TRADE_REFLECTION型の分類・normalize、DB CRUD（SHARED scope）、
+# Smart Import TRADE_REFLECTION型の分類・normalize、DB CRUD（本人専用）、
 # find_similar_reflectionsの類似度閾値（レビュー指摘4：タグ1個一致だけではノイズ警告にしない）
 # を検証する。
 #
@@ -178,9 +178,9 @@ class _FakePool:
 
 
 class CreateTradeReflectionDbTests(unittest.TestCase):
-    """DB CRUD：SHARED scope強制・JSON列のシリアライズを検証する（trade_rules等と同じ書き味）。"""
+    """DB CRUD：本人専用scope・JSON列のシリアライズを検証する（trade_rules等と同じ書き味）。"""
 
-    def test_create_forces_shared_scope_and_serializes_json_cols(self):
+    def test_create_uses_caller_user_id_private_and_serializes_json_cols(self):
         saved_row = {"id": 1, "trade_date": "2026-09-17", "reflection_text": USER_2026_09_17_TEXT,
                      "tags": ["FOMC", "BOJ"], "category": ["EVENT"], "event_types": ["FOMC", "BOJ"]}
         # fetchoneは2回呼ばれる：①重複チェックSELECT（既存なし=None）②INSERT RETURNINGの結果
@@ -195,7 +195,8 @@ class CreateTradeReflectionDbTests(unittest.TestCase):
         self.assertTrue(conn.committed)
         insert_sql, insert_params = cursor.executed[-1]  # 最後の実行文=INSERT（先頭は重複チェックSELECT）
         self.assertIn("INSERT INTO trade_reflections", insert_sql)
-        self.assertEqual(insert_params[0], investment_db._SHARED_SCOPE)  # user_idは強制的にSHARED
+        self.assertEqual(insert_params[0], "matsuura")  # 2026-09-26 MU-Multi: 本人専用（呼び出し元user_idをそのまま使う）
+        self.assertNotEqual(insert_params[0], investment_db._SHARED_SCOPE)
 
     def test_duplicate_same_date_and_text_returns_existing_without_insert(self):
         # 2026-09-17追記：同一trade_date＋完全一致reflection_textの再保存は新規行を作らない。

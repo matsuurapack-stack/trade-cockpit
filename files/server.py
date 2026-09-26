@@ -27,6 +27,7 @@ import urllib.parse
 import urllib.request
 from http.server import SimpleHTTPRequestHandler
 from socketserver import ThreadingTCPServer
+import auth_core  # 2026-09-26 MU-Multi：ログイン認証（パスワードハッシュ・セッション・CSRF）
 
 try:
     from pypdf import PdfReader
@@ -149,7 +150,23 @@ def compute_write_e2e_policy(users, test_database_url, secrets_database_url):
 
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL") or ""
-_WRITE_POLICY = compute_write_e2e_policy(USERS, TEST_DATABASE_URL, DATABASE_URL)
+def _probe_app_users_enabled(database_url):
+    """app_users（ログインアカウント）に有効なユーザーが1人でもいるか（起動時の軽量確認）。
+    テーブル未作成・DB未接続・psycopg無しはFalse（認証なしの検証環境と区別するためだけに使う）。"""
+    if not database_url:
+        return False
+    try:
+        import psycopg
+        with psycopg.connect(database_url, connect_timeout=8) as conn:
+            return bool(conn.execute("SELECT count(*) FROM app_users WHERE enabled = true").fetchone()[0])
+    except Exception:
+        return False
+
+
+# 認証が必要なモードか：従来のUSERS（平文、移行元）／DBのapp_users／クラウド(Render)のいずれか。
+# クラウドでは認証なし(auth_bypass)を絶対に許可しない（アカウント未作成なら誰もログインできないだけ）。
+_AUTH_ACCOUNTS_PRESENT = bool(USERS) or IS_CLOUD or _probe_app_users_enabled(DATABASE_URL)
+_WRITE_POLICY = compute_write_e2e_policy(_AUTH_ACCOUNTS_PRESENT, TEST_DATABASE_URL, DATABASE_URL)
 AUTH_BYPASS = _WRITE_POLICY["auth_bypass"]
 WRITE_E2E_ALLOWED = _WRITE_POLICY["write_e2e_allowed"]
 DATABASE_URL = _WRITE_POLICY["database_url"]
@@ -3421,11 +3438,52 @@ def generate_morning_market_check(database_url, user_id, snapshot_time):
     return saved
 
 
+_LOGIN_USERS_CACHE = {"at": 0.0, "users": []}
+
+
+def _all_login_usernames():
+    """定時処理の対象になるログインユーザー名（有効なアカウント）。DBのapp_usersを優先し、無ければ
+    移行元の旧USERSのキー。60秒キャッシュ。"""
+    now = time.time()
+    if now - _LOGIN_USERS_CACHE["at"] < 60:
+        return list(_LOGIN_USERS_CACHE["users"])
+    users = []
+    if investment_db is not None and DATABASE_URL and not AUTH_BYPASS:
+        try:
+            users = [u["username"] for u in investment_db.auth_list_users(DATABASE_URL) if u.get("enabled")]
+        except Exception as e:
+            print("  auth: ユーザー一覧取得で例外", e)
+    if not users and USERS:
+        users = list(USERS.keys())
+    _LOGIN_USERS_CACHE.update({"at": now, "users": users})
+    return list(users)
+
+
+def migrate_legacy_users_to_db(database_url):
+    """初回移行（2026-09-26 MU-Multi）：secrets.json/APP_USERSの平文パスワード（旧Basic認証用USERS）を、
+    ハッシュ化してapp_usersへ取り込む（既にDBにいるユーザーは触らない）。平文はDBに保存しない。
+    移行後は secrets.json の "users" を削除すること（管理者マニュアル参照）。戻り値：新規移行したユーザー名。"""
+    if investment_db is None or not database_url or not USERS:
+        return []
+    migrated = []
+    for i, (username, plain) in enumerate(USERS.items()):
+        ok, _ = auth_core.validate_username(username)
+        if not ok or not isinstance(plain, str) or not plain:
+            print(f"  auth: 旧USERSの「{username}」は形式不正のため移行しません")
+            continue
+        role = "owner" if i == 0 else "user"
+        if investment_db.auth_upsert_user(database_url, username, auth_core.hash_password(plain), role=role,
+                                          create_only=True):
+            migrated.append(username)
+    return migrated
+
+
 def _morning_check_scheduler_users():
     """定時生成の対象ユーザー一覧。マルチユーザー設定（USERS）があればその全員、
     無ければ既存の後方互換ユーザー名（"matsuura"）1人だけ（既存の_LEGACY_OWNERと同じ値）。"""
-    if USERS:
-        return list(USERS.keys())
+    _u = _all_login_usernames()
+    if _u:
+        return _u
     return ["matsuura"]
 
 
@@ -6413,7 +6471,7 @@ def refresh_shadow_movement(database_url, user_id):
                           "rank": (movement_potential.attention_rank_score(mv_like)
                                    if c.get("movementScore") is not None else (c.get("radarRankScore") or c.get("rollingScore") or 0))})
         with _DISCOVERY_LOCK:
-            dpool = dict(_DISCOVERY_POOL.get(user_id) or {})
+            dpool = dict(_DISCOVERY_POOL.get(_DISCOVERY_SCOPE) or {})
         have = {c["code"] for c in cands}
         for code, e in dpool.items():                     # Phase E：登録外から発見した銘柄（既存の登録銘柄とは重複しない）
             if code in have:
@@ -6580,6 +6638,10 @@ _DISCOVERY_POOL = {}     # user_id -> {code: entry}
 _DISCOVERY_HIST = {}     # code -> [(epoch, price, volume)]（立花quote履歴）
 _DISCOVERY_STATS = {"broad": [], "rt": [], "errors": {"tachibana": 0, "yfinance": 0}}
 _DISCOVERY_LOCK = threading.RLock()
+# 2026-09-26 MU-Multi：Market Discovery（登録外銘柄の発見。yfinance screener＋立花quote）は市場全体で
+# 同じ結果になる共通処理のため、ユーザーごとに6回動かさず「_shared」で1回だけ計算し、全員が同じpoolを見る
+# （利用者数が増えても外部API呼び出しが増えない）。個人の手動watchlistの内容はpoolの計算に使わない。
+_DISCOVERY_SCOPE = "_shared"
 DISCOVERY_RT_INTERVAL_SEC = 30
 DISCOVERY_BROAD_MINUTES = 10
 
@@ -6626,6 +6688,7 @@ def _mark_dirty(entries):
 
 def _persist_discovery(database_url, user_id, now=None):
     """変更のあったDiscovery pool行だけをmarket_discovery_poolへ保存（DB書き込み許可環境・寄り前〜場中のみ）。"""
+    user_id = _DISCOVERY_SCOPE  # 共通処理は常に_shared（呼び出し元のuser_idは使わない）
     if investment_db is None or not database_url or not WRITE_E2E_ALLOWED:
         return 0
     now = now or datetime.datetime.now(_JST)
@@ -6646,14 +6709,17 @@ def _persist_discovery(database_url, user_id, now=None):
 
 def discovery_broad_refresh(database_url, user_id, fetcher=None, now=None):
     """Tier 1 Broad Discovery：screener → 複数要素を満たす登録外銘柄 → Discovery Pool（最大300）。"""
+    user_id = _DISCOVERY_SCOPE  # 共通処理は常に_shared（screener取得も全ユーザーで1回だけ）
     fetcher = fetcher or _fetch_yf_broad
     now = now or datetime.datetime.now(_JST)
     raw, st = fetcher()
     registered, ipo_codes = set(), set()
     try:
         if investment_db is not None and database_url:
-            registered = {w.get("code") for w in investment_db.list_watchlist(database_url, user_id, market="JP")}
-            ipo_codes = {r.get("code") for r in investment_db.list_ipo_stocks(database_url, user_id)}
+            # 「登録済み」はシステム(共通)監視銘柄だけで判定する（個人の手動watchlistは共通poolの計算に使わない）。
+            registered = {w.get("code") for w in investment_db.list_watchlist(database_url, _DISCOVERY_SCOPE, market="JP")}
+            for _u in _morning_check_scheduler_users():  # IPO銘柄は市場情報（上場日等）のため全ユーザー分の和集合
+                ipo_codes |= {r.get("code") for r in investment_db.list_ipo_stocks(database_url, _u)}
     except Exception as e:
         print("  [Discovery] 登録銘柄/IPO取得で例外（続行）", e)
     minutes = _trading_minutes_elapsed(now)
@@ -6696,6 +6762,7 @@ def discovery_broad_refresh(database_url, user_id, fetcher=None, now=None):
 def discovery_realtime_cycle(database_url, user_id, quote_fn=None, now=None):
     """Tier 2 Real-time Discovery：pool（最大120）を立花quoteで確認し、加速・高値接近・spread・movementが揃えば昇格する。
     昇格した銘柄は内部5分足（立花quote由来）で既存のRolling Radar / Chart Context / Movementに通し、マイルストーン時刻を保存する。"""
+    user_id = _DISCOVERY_SCOPE  # 共通処理は常に_shared（立花quote確認も全ユーザーで1回だけ）
     quote_fn = quote_fn or get_fast_quotes
     now = now or datetime.datetime.now(_JST)
     with _DISCOVERY_LOCK:
@@ -6737,7 +6804,11 @@ def discovery_realtime_cycle(database_url, user_id, quote_fn=None, now=None):
         if err or (st.get("failed") or 0) > 0:
             _DISCOVERY_STATS["errors"]["tachibana"] += 1
     if events or expired:
-        refresh_shadow_movement(database_url, user_id)              # 昇格・失効をdynamic watch（shadow）へ反映
+        for _u in list(_ENTRY_TOP5_CACHE.keys()):                    # 昇格・失効を各ユーザーのdynamic watch（shadow）へ反映
+            try:
+                refresh_shadow_movement(database_url, _u)
+            except Exception as e:
+                print("  [Discovery] dynamic watch反映で例外（続行）", _u, e)
         _persist_discovery(database_url, user_id, now)
     return rec
 
@@ -6761,8 +6832,7 @@ def _discovery_broad_loop():
                     slot = (now.date(), hm)
                 if slot and slot not in fired:
                     fired.add(slot)
-                    for user_id in (list(_ENTRY_TOP5_CACHE.keys()) or list(_morning_check_scheduler_users())):
-                        discovery_broad_refresh(DATABASE_URL, user_id)
+                    discovery_broad_refresh(DATABASE_URL, _DISCOVERY_SCOPE)  # 全ユーザー共通：1回だけ
         except Exception as e:
             print("  [Discovery/Broad] loopで例外", e)
         time.sleep(30)
@@ -6773,8 +6843,7 @@ def _discovery_realtime_loop():
         try:
             now = datetime.datetime.now(_JST)
             if _in_jp_session(now) and _is_jp_market_business_day(now):
-                for user_id in _discovery_users():
-                    discovery_realtime_cycle(DATABASE_URL, user_id)
+                discovery_realtime_cycle(DATABASE_URL, _DISCOVERY_SCOPE)  # 全ユーザー共通：1回だけ
         except Exception as e:
             print("  [Discovery/Realtime] loopで例外", e)
         time.sleep(DISCOVERY_RT_INTERVAL_SEC)
@@ -6799,6 +6868,7 @@ def discovery_manual_run(database_url, user_id, broad_fetcher=None, quote_fn=Non
 
 
 def discovery_api_payload(user_id):
+    user_id = _DISCOVERY_SCOPE  # 6人とも同じpoolを見る（共通データ）
     with _DISCOVERY_LOCK:
         pool = _DISCOVERY_POOL.get(user_id) or {}
         now = datetime.datetime.now(_JST)
@@ -17307,8 +17377,9 @@ DAILY_REVIEW_RETRY_DEADLINE_HHMM = "15:35"
 
 def _daily_review_scheduler_users():
     """定時生成の対象ユーザー一覧（_morning_check_scheduler_users()と同じ考え方）。"""
-    if USERS:
-        return list(USERS.keys())
+    _u = _all_login_usernames()
+    if _u:
+        return _u
     return ["matsuura"]
 
 
@@ -19694,8 +19765,9 @@ def build_theme_daily_learning(database_url, user_id, review_date):
 
 def _yaaman_scheduler_users():
     """既存_daily_review_scheduler_users()と同じ考え方（マルチユーザー対応）。"""
-    if USERS:
-        return list(USERS.keys())
+    _u = _all_login_usernames()
+    if _u:
+        return _u
     return ["matsuura"]
 
 
@@ -26372,6 +26444,12 @@ def smart_import_recent_activity(database_url, user_id, limit=15):
     return items[:limit]
 
 
+AUTH_COOKIE_NAME = "tc_session"
+_login_throttle = auth_core.LoginThrottle()
+_DUMMY_PASSWORD_HASH = auth_core.hash_password("dummy-password-for-timing")  # 存在しないユーザーでも同じ計算時間にする
+_SESSION_TOUCH_CACHE = {}  # token_hash -> 最後にDBの有効期限を更新した時刻（書き込み頻度の抑制用）
+
+
 class Handler(SimpleHTTPRequestHandler):
     def log_message(self, *a):
         pass  # アクセスログは静かに
@@ -26380,7 +26458,7 @@ class Handler(SimpleHTTPRequestHandler):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # 2026-09-26 MU-Multi：CORS "*" を廃止（same-origin専用）。Access-Control-Allow-Originは出さない。
         self.end_headers()
         self.wfile.write(body)
 
@@ -26395,47 +26473,229 @@ class Handler(SimpleHTTPRequestHandler):
             return {}
 
     def do_OPTIONS(self):
+        # 2026-09-26 MU-Multi：same-origin専用。CORSプリフライトには許可ヘッダを返さない
+        # （他サイトからのクロスオリジン書き込みはブラウザ側で拒否される）。
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
-    def _authorized(self):
-        """複数ユーザー対応のBasic認証（2026-09-02 マルチユーザー化）。USERS
-        （{"ユーザー名":"パスワード"}、secrets.jsonの"users"またはRenderの環境変数APP_USERS）が
-        空なら、従来通り認証なしで動作する（ローカル/LAN限定利用向け。この場合self.current_userは
-        "local"固定＝Neon側のuser_id）。USERSが1件でも設定されていれば、必ずユーザー名・
-        パスワードでのログインが必要になる（マルチユーザー化以降は「誰が使っているか」を
-        user_idとしてNeon側の各テーブルに記録するため、ローカル/LANかどうかを問わず必須）。"""
-        if not USERS:
-            self.current_user = "local"
-            return True
-        header = self.headers.get("Authorization", "")
-        if header.startswith("Basic "):
+    # ---------------- ログイン認証（2026-09-26 MU-Multi） ----------------
+    # Basic認証（パスワード平文・ログアウト不可）を廃止し、ハッシュ保存のアカウント＋DBセッション
+    # （HttpOnly/SameSite Cookie）へ。user_idは常にセッションから決定し、リクエスト値は一切信用しない。
+    def _is_https(self):
+        return bool(IS_CLOUD or os.environ.get("COOKIE_SECURE") == "1"
+                    or self.headers.get("X-Forwarded-Proto", "").lower() == "https")
+
+    def _client_ip(self):
+        if IS_CLOUD:
+            fwd = self.headers.get("X-Forwarded-For", "")
+            if fwd:
+                return fwd.split(",")[0].strip()
+        return self.client_address[0] if self.client_address else ""
+
+    def _cookie_token(self):
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == AUTH_COOKIE_NAME and v:
+                return v
+        return None
+
+    def _session_cookie_header(self, token, max_age):
+        parts = [f"{AUTH_COOKIE_NAME}={token}", "Path=/", "HttpOnly", "SameSite=Lax", f"Max-Age={max_age}"]
+        if self._is_https():
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def _load_session(self):
+        """有効なセッションを返す（無ければNone）。認証なしの検証環境(AUTH_BYPASS)は固定ユーザー"local"。"""
+        if AUTH_BYPASS:
+            return {"username": "local", "csrf_token": "", "role": "owner", "must_change_password": False}
+        token = self._cookie_token()
+        if not token or investment_db is None or not DATABASE_URL:
+            return None
+        digest = auth_core.token_digest(token)
+        try:
+            sess = investment_db.auth_get_session(DATABASE_URL, digest)
+        except Exception as e:
+            print("  auth: セッション取得で例外", e)
+            return None
+        if not sess:
+            return None
+        now = time.time()
+        last = _SESSION_TOUCH_CACHE.get(digest, 0)
+        if now - last > 600:  # 書き込み負荷を避けるため10分に1回だけ有効期限をスライド更新
+            created = sess["created_at"].timestamp() if hasattr(sess["created_at"], "timestamp") else now
+            new_exp = auth_core.session_expiry(created, now)
             try:
-                decoded = base64.b64decode(header[6:]).decode("utf-8", errors="replace")
-                username, _, pw = decoded.partition(":")
-                expected = USERS.get(username)
-                if expected is not None and secrets.compare_digest(pw, expected):
-                    self.current_user = username
-                    return True
-            except Exception:
-                pass
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="Trade Cockpit"')
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write("ユーザー名とパスワードが必要です。".encode("utf-8"))
+                investment_db.auth_touch_session(
+                    DATABASE_URL, digest, datetime.datetime.fromtimestamp(new_exp, datetime.timezone.utc).isoformat())
+                _SESSION_TOUCH_CACHE[digest] = now
+            except Exception as e:
+                print("  auth: セッション更新で例外", e)
+        return sess
+
+    def _authorized(self):
+        """ログイン済みか。未ログインは、API(/api/*)や書き込みなら401 JSON、それ以外は/loginへ302。
+        ログイン済みならself.current_user（＝業務データのuser_id）・self.sessionを設定する。"""
+        sess = self._load_session()
+        if sess:
+            self.current_user = sess["username"]
+            self.session = sess
+            return True
+        path = self.path.split("?")[0]
+        if path.startswith("/api/") or self.command != "GET":
+            self._send_json({"error": "login_required", "login": "/login"}, status=401)
+        else:
+            self.send_response(302)
+            self.send_header("Location", "/login")
+            self.end_headers()
         return False
+
+    def _csrf_ok(self):
+        """書き込み(POST/PUT)のCSRF対策：①Originがあれば同一オリジン ②X-CSRF-Tokenがセッションの値と一致。
+        認証なし検証環境(AUTH_BYPASS)は対象外。"""
+        if AUTH_BYPASS:
+            return True
+        if not auth_core.same_origin(self.headers.get("Origin"), self.headers.get("Host")):
+            return False
+        return auth_core.constant_time_equal(self.headers.get("X-CSRF-Token"),
+                                             (getattr(self, "session", None) or {}).get("csrf_token"))
+
+    def _serve_static_file(self, filename, content_type):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+        try:
+            with open(path, "rb") as f:
+                body = f.read()
+        except OSError:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_app_html(self):
+        """本体HTMLを配信する。ログイン中のユーザー名・CSRFトークンを<head>へ埋め込む
+        （画面の「ログイン中：○○」表示と、書き込みAPIのX-CSRF-Tokenに使う）。"""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade-cockpit.html")
+        try:
+            with open(path, encoding="utf-8") as f:
+                html = f.read()
+        except OSError:
+            self.send_response(404)
+            self.end_headers()
+            return
+        sess = getattr(self, "session", None) or {}
+        boot = json.dumps({"user": sess.get("username"), "csrf": sess.get("csrf_token") or "",
+                           "role": sess.get("role"), "auth": (not AUTH_BYPASS)}, ensure_ascii=True).replace("</", "<\\/")
+        html = html.replace("<head>", "<head><script>window.__TC__=" + boot + ";</script>", 1)
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_public_get(self):
+        """未ログインでも見られるGET（ログイン画面・PWAのmanifest/アイコン・セッション確認）。処理したらTrue。"""
+        path = self.path.split("?", 1)[0]
+        if path in ("/login", "/login.html"):
+            if not AUTH_BYPASS and self._load_session():
+                self.send_response(302)
+                self.send_header("Location", "/trade-cockpit.html")
+                self.end_headers()
+            else:
+                self._serve_static_file("login.html", "text/html; charset=utf-8")
+            return True
+        if path == "/api/auth/me":
+            sess = self._load_session()
+            if not sess:
+                self._send_json({"error": "login_required"}, status=401)
+            else:
+                self._send_json({"username": sess["username"], "role": sess.get("role"),
+                                 "displayName": sess.get("display_name"), "csrfToken": sess.get("csrf_token") or "",
+                                 "mustChangePassword": bool(sess.get("must_change_password"))})
+            return True
+        if path == "/manifest.json":
+            self._serve_static_file("manifest.json", "application/manifest+json; charset=utf-8")
+            return True
+        if path == "/trade_icon_512.png":
+            self._serve_static_file("trade_icon_512.png", "image/png")
+            return True
+        return False
+
+    def _handle_login(self):
+        """POST /api/auth/login。ユーザー名/パスワードを検証し、成功ならセッションCookieを発行する。
+        失敗理由（存在しない/無効/パスワード違い）は区別せず同じメッセージ（アカウント存在の探索防止）。"""
+        if investment_db is None or not DATABASE_URL:
+            self._send_json({"error": "認証DBが未設定です"}, status=503)
+            return
+        if not auth_core.same_origin(self.headers.get("Origin"), self.headers.get("Host")):
+            self._send_json({"error": "不正なリクエストです"}, status=403)
+            return
+        body = self._read_json_body()
+        username = str(body.get("username") or "").strip()
+        password = str(body.get("password") or "")
+        ip = self._client_ip()
+        if _login_throttle.is_locked(username, ip):
+            self._send_json({"error": "ログインに続けて失敗したため、10分ほど時間をおいてからお試しください"}, status=429)
+            return
+        user = None
+        try:
+            user = investment_db.auth_get_user(DATABASE_URL, username)
+        except Exception as e:
+            print("  auth: ユーザー取得で例外", e)
+        stored = user["password_hash"] if user else _DUMMY_PASSWORD_HASH
+        verified = auth_core.verify_password(password, stored)
+        if not (user and user["enabled"] and verified):
+            _login_throttle.record_failure(username, ip)
+            self._send_json({"error": "ユーザー名またはパスワードが違います"}, status=401)
+            return
+        _login_throttle.record_success(username, ip)
+        token, csrf = auth_core.new_session_token(), auth_core.new_csrf_token()
+        now = time.time()
+        expires = datetime.datetime.fromtimestamp(auth_core.session_expiry(now, now), datetime.timezone.utc).isoformat()
+        investment_db.auth_create_session(DATABASE_URL, user["username"], auth_core.token_digest(token), csrf, expires,
+                                          self.headers.get("User-Agent"), ip)
+        investment_db.auth_touch_login(DATABASE_URL, user["username"])
+        out = json.dumps({"ok": True, "username": user["username"], "csrfToken": csrf,
+                          "mustChangePassword": bool(user.get("must_change_password"))}, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Set-Cookie", self._session_cookie_header(token, auth_core.SESSION_IDLE_SECONDS))
+        self.end_headers()
+        self.wfile.write(out)
+
+    def _handle_logout(self):
+        token = self._cookie_token()
+        if token and investment_db is not None and DATABASE_URL:
+            try:
+                investment_db.auth_delete_session(DATABASE_URL, auth_core.token_digest(token))
+            except Exception as e:
+                print("  auth: ログアウトで例外", e)
+        out = json.dumps({"ok": True}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Set-Cookie", self._session_cookie_header("", 0))
+        self.end_headers()
+        self.wfile.write(out)
 
     def end_headers(self):
         # trade-cockpit.html等の静的配信はブラウザ側のキャッシュにより、コード修正後に
         # リロードしても古い見た目のままになることがあったため、常にキャッシュさせない。
         self.send_header("Cache-Control", "no-store, must-revalidate")
+        # 2026-09-26 MU-Multi：基本のセキュリティヘッダ（クリックジャッキング/型推測/リファラ漏れ対策）。
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "same-origin")
+        if self._is_https():
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
         super().end_headers()
 
     def do_GET(self):
+        if self._handle_public_get():
+            return
         if not self._authorized():
             return
         if self.path.startswith("/api/version"):
@@ -27578,7 +27838,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Location", "/trade-cockpit.html")
             self.end_headers()
         elif self.path.split("?", 1)[0] == "/trade-cockpit.html":
-            super().do_GET()  # 本体HTMLのみ静的配信。それ以外のファイル一覧・個別ファイルは
+            self._serve_app_html()  # 本体HTMLのみ配信（ログイン中ユーザー/CSRFを埋め込む）。それ以外のファイル一覧・個別ファイルは
             # 一切配信しない（ディレクトリ一覧表示や、認証情報ファイル(e_api_authid.txt・
             # e_api_private_key.pem・secrets.json)への直接アクセスを防ぐため。2026-08-20
             # 発覚：SimpleHTTPRequestHandlerはデフォルトでフォルダ内の全ファイルを静的配信・
@@ -27653,7 +27913,6 @@ class Handler(SimpleHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", "application/pdf")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(pdf)
 
@@ -27672,7 +27931,17 @@ class Handler(SimpleHTTPRequestHandler):
         self.do_POST()
 
     def do_POST(self):
+        _p = self.path.split("?", 1)[0]
+        if _p == "/api/auth/login":
+            self._handle_login()
+            return
         if not self._authorized():
+            return
+        if not self._csrf_ok():
+            self._send_json({"error": "csrf", "message": "不正なリクエストです。画面を再読み込みしてください"}, status=403)
+            return
+        if _p == "/api/auth/logout":
+            self._handle_logout()
             return
         # 本番DB書き込み安全ガード（2026-09-18新規、運用前確認：分離テスト環境が本番Neonへ
         # 誤って書き込んでいた事故の再発防止）。全POST（＝この実装の唯一の書き込み経路——
@@ -28993,6 +29262,16 @@ def main():
         try:
             investment_db.init_schema(DATABASE_URL)
             print("[投資判断ログ] DBスキーマ確認OK")
+            # 2026-09-26 MU-Multi 初回移行：旧USERS（平文）→ ハッシュ化してapp_usersへ（既存は触らない）。
+            try:
+                _migrated = migrate_legacy_users_to_db(DATABASE_URL)
+                if _migrated:
+                    print("[認証] 旧USERSのパスワードをハッシュ化してDBへ移行しました:", ", ".join(_migrated),
+                          "→ secrets.jsonの\"users\"（平文）は削除してください")
+                elif USERS:
+                    print("[認証] 警告: secrets.json/APP_USERSに平文パスワード(users)が残っています。移行済みなら削除してください")
+            except Exception as e:
+                print("[認証] 旧USERSの移行で例外", e)
         except Exception as e:
             print("[投資判断ログ] DB接続・スキーマ作成に失敗（この機能のみ利用不可。他機能には影響しません）", e)
         # Market Intelligence Phase12新規（指示書3・47・52番）：validation session保存・

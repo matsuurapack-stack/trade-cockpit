@@ -26,8 +26,8 @@ class WatchlistSharedPriceRefreshTests(unittest.TestCase):
     （2026-09-14）。ここではコード面で「読み込みはSHARED化されたが更新経路だけ個人スコープの
     まま」という回帰が今後起きないことを固定する。"""
 
-    def test_list_watchlist_ignores_caller_user_id(self):
-        # user_idに何を渡しても、内部的には_SHARED_SCOPEが使われる（MU-S1の設計）。
+    def test_list_watchlist_scopes_are_shared_plus_own_only(self):
+        # 2026-09-26 MU-Multi：system(_shared)＋本人のみ。第三者のuser_idは決して含まれない。
         pool = mock.Mock()
         cur = mock.MagicMock()
         cur.__enter__.return_value = cur
@@ -42,10 +42,10 @@ class WatchlistSharedPriceRefreshTests(unittest.TestCase):
             sql_matsuura, params_matsuura = cur.execute.call_args[0]
             investment_db.list_watchlist("dummy_url", "another_user_added_later")
             sql_other, params_other = cur.execute.call_args[0]
-        # どちらの呼び出しでも実際に絞り込みに使うuser_idは_SHARED_SCOPEで同一
-        self.assertEqual(params_matsuura[0], investment_db._SHARED_SCOPE)
-        self.assertEqual(params_other[0], investment_db._SHARED_SCOPE)
-        self.assertEqual(params_matsuura, params_other)
+        self.assertEqual(params_matsuura[0], [investment_db._SHARED_SCOPE, "matsuura"])
+        self.assertEqual(params_other[0], [investment_db._SHARED_SCOPE, "another_user_added_later"])
+        self.assertNotIn("another_user_added_later", params_matsuura[0])
+        self.assertNotIn("matsuura", params_other[0])
 
     def test_stock_quotes_pipeline_takes_watchlist_items_directly_no_user_scoping(self):
         # /api/stock-quotesが叩くget_stock_quotes()はuser_idを一切受け取らない

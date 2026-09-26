@@ -86,6 +86,9 @@ class _FakeHandler:
     def _authorized(self):
         return True
 
+    def _csrf_ok(self):  # 2026-09-26 MU-Multi：CSRF検証（認証後・write guard前）。このスタブでは常に通す。
+        return True
+
     def _send_json(self, obj, status=200):
         self.sent.append((status, obj))
         return None

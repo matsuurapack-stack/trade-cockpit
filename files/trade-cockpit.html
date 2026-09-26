@@ -3,12 +3,39 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<script>
+/* 2026-09-26 MU-Multi：ログイン(Cookieセッション)対応。同一オリジンのfetchにだけ
+   ①credentials=same-origin ②書き込み系にX-CSRF-Token(サーバーが<head>へ埋め込んだ値) を付け、
+   ③401(ログイン切れ)なら/loginへ戻す。他サイトへのfetchには一切付けない。 */
+(function(){
+  var tc=window.__TC__||{};
+  var of=window.fetch;
+  window.fetch=function(input,init){
+    init=init||{};
+    var url=(typeof input==='string')?input:((input&&input.url)||'');
+    var same=url.charAt(0)==='/'||url.indexOf(location.origin)===0;
+    var method=String(init.method||((typeof input!=='string'&&input&&input.method)||'GET')).toUpperCase();
+    if(same){
+      init.credentials='same-origin';
+      if(method!=='GET'&&method!=='HEAD'&&tc.csrf){
+        var h=new Headers(init.headers||((typeof input!=='string'&&input&&input.headers)||{}));
+        h.set('X-CSRF-Token',tc.csrf); init.headers=h;
+      }
+    }
+    return of.call(this,input,init).then(function(r){
+      if(same&&r.status===401&&tc.auth&&url.indexOf('/api/auth/login')<0){location.replace('/login');}
+      return r;
+    });
+  };
+})();
+</script>
 <title>トレード・コックピット</title>
 <!-- v3-9続き（2026-09-05・PHASE 7 MOBILE/PWA）：追加料金なしの最低限PWA対応。
      manifest.jsonのみ（service workerは今回入れない＝株価・ポジション等の最新データを
      古いキャッシュから誤表示する事故を避けるため。ユーザー指定：「複雑になるなら
      manifest中心でもよい」）。Basic Auth（server.py _authorized()）は今回変更しない。 -->
 <link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/trade_icon_512.png">
 <meta name="theme-color" content="#FFFFFF">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -223,6 +250,13 @@ body{padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bot
 @media (max-width:768px){
   .pos-judgment-grid{grid-template-columns:1fr}
 }
+
+/* 2026-09-26 MU-Multi：ログイン中表示＋ログアウト（iPhoneで押しやすい44px以上） */
+.user-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;margin-bottom:10px;
+  border:1px solid var(--line,#d9dee6);border-radius:10px;background:var(--panel,#fff);font-size:14px}
+.user-bar-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.user-bar-logout{min-height:44px;min-width:104px;padding:0 16px;font-size:16px;font-weight:700;border-radius:10px;
+  border:1.5px solid var(--line,#c9d0db);background:var(--panel,#fff);color:inherit;cursor:pointer;-webkit-tap-highlight-color:transparent}
 </style>
 </head>
 <body>
@@ -712,7 +746,20 @@ function NewsAlertToast({alert,onDismiss}){
 }
 const WD = ["日","月","火","水","木","金","土"];
 const MAX = 300;
-const KEY = "trade-cockpit-v1";
+/* 2026-09-26 MU-Multi：ブラウザ内の保存領域(localStorage)もユーザーごとに分ける（同じPC/スマホを
+   複数人で使っても、前の人の画面データが次の人に出ない）。従来のキー"trade-cockpit-v1"は、
+   ownerロールのユーザーが初めてログインした時だけ一度だけ引き継ぐ。 */
+const TC_BOOT = window.__TC__ || {};
+const KEY = (TC_BOOT.auth && TC_BOOT.user) ? ("trade-cockpit-v1:" + TC_BOOT.user) : "trade-cockpit-v1";
+try{
+  if(TC_BOOT.auth && TC_BOOT.user && TC_BOOT.role==="owner" && localStorage.getItem(KEY)==null && localStorage.getItem("trade-cockpit-v1")!=null){
+    localStorage.setItem(KEY, localStorage.getItem("trade-cockpit-v1"));
+  }
+}catch(e){}
+async function tcLogout(){
+  try{ await fetch("/api/auth/logout",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}); }catch(e){}
+  location.replace("/login");
+}
 const THEME_KEY = "trade-cockpit-theme"; // 3-1章：テーマ切り替えは登録銘柄等の本体データと別キーで保存する
 // 3-3章：保存済みの設定があればそれを優先し、なければOSのprefers-color-schemeを検出する
 const getInitialTheme=()=>{
@@ -13289,6 +13336,10 @@ function App(){
 
   return (
     <div className="wrap">
+      {TC_BOOT.auth && TC_BOOT.user && <div className="user-bar">
+        <span className="user-bar-name">ログイン中：<b>{TC_BOOT.user}</b></span>
+        <button className="user-bar-logout" onClick={tcLogout}>ログアウト</button>
+      </div>}
       <div className="head">
         <div><div className="kicker">Trade Cockpit</div><h1>トレード・コックピット</h1></div>
         <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>

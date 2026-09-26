@@ -1,4 +1,5 @@
 # Market-Wide Discovery（Phase E）のサーバー統合テスト：Broad→Real-time→dynamic watch、API負荷計測、鮮度、既存TOP5への影響ゼロ。
+# 2026-09-26 MU-Multi: Market Discoveryは全ユーザー共通(_shared)のpoolを使う（旧: ユーザー別 "u1"/"u9"）。
 #   cd files && python -m unittest test_market_discovery_server -v
 
 import datetime
@@ -49,7 +50,7 @@ class BroadRefreshTests(Base):
             rec = server.discovery_broad_refresh("url", "u1", fetcher=fetcher([raw("1111"), raw("2222"), raw("3333", price=955.0, prev=950.0,
                                                                                                        hi=960.0, lo=948.0, vol=350_000, avg=400_000)]),
                                                  now=at(0))
-        pool = server._DISCOVERY_POOL["u1"]
+        pool = server._DISCOVERY_POOL["_shared"]
         self.assertIn("2222", pool)
         self.assertNotIn("1111", pool)                                         # 登録済みは対象外
         self.assertNotIn("3333", pool)                                         # 1要素以下
@@ -66,7 +67,7 @@ class BroadRefreshTests(Base):
             server.discovery_broad_refresh("url", "u1", fetcher=fetcher([raw("2222", price=990.0, prev=940.0, hi=992.0, lo=985.0, vol=400_000, avg=5_000_000),
                                                                          raw("4444", price=955.0, prev=950.0, hi=960.0, lo=948.0, vol=400_000, avg=500_000)]),
                                             now=pre)
-        pool = server._DISCOVERY_POOL["u1"]
+        pool = server._DISCOVERY_POOL["_shared"]
         self.assertIn("2222", pool)                                           # 前日の急騰（+5%）＋前日の急騰銘柄タグ
         self.assertIn("前日の急騰銘柄", pool["2222"]["discovery_reason"])
         self.assertIn("4444", pool)                                           # IPOタグ＋前日タグ
@@ -81,10 +82,10 @@ class BroadRefreshTests(Base):
         rows = [raw(f"{i:04d}", price=1000.0 + i * 0.0, prev=930.0 - (i % 40)) for i in range(1, 420)]
         with mock.patch.object(server, "investment_db", None):
             server.discovery_broad_refresh("url", "u1", fetcher=fetcher(rows), now=at(0))
-            live = [e for e in server._DISCOVERY_POOL["u1"].values() if e["status"] != "EXPIRED"]
+            live = [e for e in server._DISCOVERY_POOL["_shared"].values() if e["status"] != "EXPIRED"]
             self.assertLessEqual(len(live), md.BROAD_MAX)
             server.discovery_broad_refresh("url", "u1", fetcher=fetcher([]), now=at(46 * 60))        # 45分超で全て失効
-        self.assertTrue(all(e["status"] == "EXPIRED" for e in server._DISCOVERY_POOL["u1"].values()))
+        self.assertTrue(all(e["status"] == "EXPIRED" for e in server._DISCOVERY_POOL["_shared"].values()))
 
 
 def q(price, vol, src="tachibana", **kw):
@@ -115,7 +116,7 @@ class RealtimeCycleTests(Base):
     def test_promotion_hot_and_load_stats_from_tachibana_quotes_only(self):
         self.seed()
         recs = self.run_cycles(self.ACCEL)
-        e = server._DISCOVERY_POOL["u1"]["2222"]
+        e = server._DISCOVERY_POOL["_shared"]["2222"]
         self.assertEqual(e["status"], "HOT")
         self.assertEqual(e["promoted_at"], at(420))
         self.assertEqual(e["hot_at"], at(420))
@@ -136,7 +137,7 @@ class RealtimeCycleTests(Base):
                 with mock.patch.object(server, "investment_db", None), mock.patch.object(server, "get_internal_intraday_bars", return_value={"bars": []}), \
                         mock.patch.object(server, "refresh_shadow_movement"):
                     server.discovery_realtime_cycle("u1" and "url", "u1", quote_fn=lambda w, pp=p, vv=v: ({"2222": q(pp, vv, src=src, is_stale=stale)}, {"tachibana": 0}), now=at(s))
-            self.assertEqual(server._DISCOVERY_POOL["u1"]["2222"]["status"], "BROAD", src)
+            self.assertEqual(server._DISCOVERY_POOL["_shared"]["2222"]["status"], "BROAD", src)
 
     def test_call_estimate_for_120_codes_and_error_counting(self):
         with mock.patch.object(server, "investment_db", None):
@@ -153,7 +154,7 @@ class RealtimeCycleTests(Base):
         self.seed()
         self.run_cycles(self.ACCEL)
         self.run_cycles([(420 + 21 * 60, 1010.0, 1_500_000)])            # 昇格から21分後：条件を満たさず再確認できない
-        e = server._DISCOVERY_POOL["u1"]["2222"]
+        e = server._DISCOVERY_POOL["_shared"]["2222"]
         self.assertEqual((e["status"], e["expire_reason"]), ("EXPIRED", "RT_STALE"))
 
 
@@ -170,12 +171,12 @@ class DynamicWatchIntegrationTests(_Base):
         existing = self.put_cache(pool)
         now = datetime.datetime.now(JST)
         with server._DISCOVERY_LOCK:
-            server._DISCOVERY_POOL["u9"] = {}
+            server._DISCOVERY_POOL["_shared"] = {}
             for code, status in (("P1", "PROMOTED"), ("H1", "HOT"), ("B1", "BROAD")):
                 e = md.new_entry(code, code, "YF_GAINERS", 60, ["前日比+5%"], now)
                 e.update({"status": status, "promoted_at": now if status != "BROAD" else None,
                           "eval": {"movement": 40, "rolling": "SINGLE_BAR_SURGE" if code == "H1" else "NONE"}})
-                server._DISCOVERY_POOL["u9"][code] = e
+                server._DISCOVERY_POOL["_shared"][code] = e
         with mock.patch.object(server, "investment_db") as db, mock.patch.object(server, "WRITE_E2E_ALLOWED", True), \
                 mock.patch.object(server, "_in_jp_session", return_value=True):
             db.load_dynamic_watch.return_value = {}
@@ -203,7 +204,7 @@ class DynamicWatchIntegrationTests(_Base):
                                               "added_at": now, "last_seen_at": now, "weak_since": None}}
         e = md.new_entry("X1", "X1", "YF_GAINERS", 60, [], now)
         md.expire_entry(e, now, "RT_STALE")
-        server._DISCOVERY_POOL["u9"] = {"X1": e}
+        server._DISCOVERY_POOL["_shared"] = {"X1": e}
         with mock.patch.object(server, "investment_db", None):
             shadow = server.refresh_shadow_movement("url", "u9")
         self.assertNotIn("X1", server._DYNAMIC_WATCH["u9"])
@@ -212,11 +213,11 @@ class DynamicWatchIntegrationTests(_Base):
     def test_discovery_caps_do_not_exceed_dynamic_and_hot_limits(self):
         self.put_cache([])
         now = datetime.datetime.now(JST)
-        server._DISCOVERY_POOL["u9"] = {}
+        server._DISCOVERY_POOL["_shared"] = {}
         for i in range(120):
             e = md.new_entry(f"D{i:03d}", "n", "YF_GAINERS", 50 + i % 40, [], now)
             e.update({"status": "HOT", "promoted_at": now, "hot_at": now, "eval": {"movement": 40}})
-            server._DISCOVERY_POOL["u9"][e["code"]] = e
+            server._DISCOVERY_POOL["_shared"][e["code"]] = e
         with mock.patch.object(server, "investment_db", None):
             shadow = server.refresh_shadow_movement("url", "u9")
         self.assertLessEqual(shadow["dynamicWatch"]["active"], dw.MAX_ACTIVE)

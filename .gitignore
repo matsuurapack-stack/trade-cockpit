@@ -27,3 +27,7 @@ files/secrets.json
 files/e_api_authid.txt
 files/e_api_private_key.pem
 files/position_decision_log.jsonl
+backups/
+docs/**/*.html
+files/e2e_multiuser_result.txt
+files/watchlist_audit_report.txt

@@ -78,6 +78,34 @@ _LEGACY_OWNER = "matsuura"
 # user_id列自体は削除しない（将来のscope再設計・ロールバックに備える）。
 _SHARED_SCOPE = "_shared"
 
+# ============================================================
+# データ範囲の台帳（2026-09-26 MU-Multi）：user_id列を持つ全テーブルを「個人」か「共有」に必ず分類する。
+# test_mu_multi_privacy.py が (1) 未分類テーブルが無いこと (2) PRIVATE_TABLESを触る関数が
+# _SHARED_SCOPE固定になっていないこと を機械的に検査する（新テーブル追加時に分類を強制するための仕組み）。
+#   PRIVATE  : 個人データ。他の利用者へは絶対に返さない（user_idで分離）。管理者にも閲覧機能は作らない。
+#   SHARED   : 全員共通の市場データ。_sharedで1回だけ計算・保存し、全員が同じものを見る。
+#   MIXED    : システム(_shared)行＋本人(user_id)行の合成（watchlist：システム自動監視＋本人が手動追加）。
+# ============================================================
+PRIVATE_TABLES = frozenset({
+    # ポジション・損益・売買
+    "portfolio", "portfolio_cash_balance", "position_risk_rules", "trade_history", "trade_candidates",
+    # トレード分析・学習・反省
+    "trade_reflections", "trade_experiences", "trade_outcome_evaluations", "trade_decision_context",
+    "trade_decision_events", "trade_rules", "trade_rule_history", "trade_playbook_user_stats",
+    "stock_behavior_profiles", "sector_behavior_profiles", "choruco_stories", "analysis_context_log",
+    # 今日の振り返り・個人メモ
+    "daily_reviews", "daily_log", "journal", "investment_profile", "investment_rules", "news_feedback",
+    # 個人の取り込み履歴・個人の監視/追跡状態・ポジション由来の警告
+    "chatgpt_imports", "watchlist_imports", "smart_import_sources", "morning_market_check_private_overlay",
+    "shadow_watch", "ipo_stocks", "dynamic_watchlist", "catalyst_snapshot_log", "chart_signal_log",
+})
+SHARED_TABLES = frozenset({
+    "market_events", "expert_views", "news_catalysts", "morning_market_checks", "market_intelligence_reports",
+    "entry_candidate_snapshots", "auto_signal_events", "limit_up_events", "theme_momentum_history",
+    "next_day_theme_candidates", "trade_playbooks", "market_discovery_pool",
+})
+MIXED_TABLES = frozenset({"watchlist", "stock_theses"})
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS daily_log (
     id               SERIAL PRIMARY KEY,
@@ -1936,6 +1964,7 @@ def init_schema(database_url):
         conn.execute(_MIGRATE_MARKET_NEWS_CONTEXT_SQL)
         conn.execute(_MIGRATE_MARKET_EVENT_SOURCE_TRACKING_SQL)
         conn.execute(_MIGRATE_EXTERNAL_INTELLIGENCE_CONTEXT_SQL)
+        conn.execute(_SCHEMA_AUTH_SQL)
         conn.execute(_MIGRATE_CENTRAL_BANK_EVENT_SYNC_SQL)
         conn.execute(_SCHEMA_TRADE_REFLECTIONS_SQL)
         conn.execute(_MIGRATE_PORTFOLIO_EXIT_ALERTS_SQL)
@@ -7844,6 +7873,37 @@ def list_recent_notifications(database_url, limit=100):
 # market_news_context（構造化された「今日の市場を動かしている材料」要約）を持たせるための
 # 列追加。記事本文の長文保存・転載はしない（title/URL/短いsummary相当の構造化情報のみ）。
 # ============================================================
+# ============================================================
+# ログイン認証（2026-09-26 MU-Multi）：Basic認証（パスワード平文）を廃止し、ハッシュ保存の
+# アカウント＋DBセッションへ。パスワードはPBKDF2（auth_core.py）、セッショントークンは
+# SHA-256のみ保存。これらのテーブルは認証専用で、業務データ（user_id列）とは無関係。
+# ============================================================
+_SCHEMA_AUTH_SQL = """
+CREATE TABLE IF NOT EXISTS app_users (
+    username             TEXT PRIMARY KEY,
+    password_hash        TEXT NOT NULL,
+    role                 TEXT NOT NULL DEFAULT 'user',     -- owner | user
+    display_name         TEXT,
+    enabled              BOOLEAN NOT NULL DEFAULT true,
+    must_change_password BOOLEAN NOT NULL DEFAULT false,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_login_at        TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS app_sessions (
+    token_hash   TEXT PRIMARY KEY,
+    username     TEXT NOT NULL,
+    csrf_token   TEXT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMPTZ NOT NULL,
+    user_agent   TEXT,
+    ip           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_app_sessions_user ON app_sessions(username);
+CREATE INDEX IF NOT EXISTS idx_app_sessions_expires ON app_sessions(expires_at);
+"""
+
 _MIGRATE_MARKET_NEWS_CONTEXT_SQL = """
 ALTER TABLE morning_market_checks ADD COLUMN IF NOT EXISTS market_news_context_json JSONB;
 ALTER TABLE market_intelligence_reports ADD COLUMN IF NOT EXISTS market_news_context_json JSONB;
@@ -9363,26 +9423,35 @@ def _watchlist_row_to_camel(row):
 
 
 def list_watchlist(database_url, user_id, market=None):
-    """呼び出しユーザーのwatchlist（active=trueのみ）をadded_at昇順で返す。marketを指定すると
-    JP/USで絞り込む。フロントのwatchlist配列とほぼ同じ形（tvSymbol等camelCase）で返す。
-    Phase MU-S1：watchlistはSHARED化済みのため、呼び出し元のuser_idは無視し全員共通のscopeを見る。"""
-    user_id = _SHARED_SCOPE
+    """監視銘柄（watchlist、active=true）を返す（added_at昇順、marketで絞り込み可）。
+    2026-09-26 MU-Multi：system/shared（_shared、システム自動登録・共通分析用）と
+    user（本人が手動追加）を分離。返すのは「_shared ∪ 本人」で、同じ(code, market)が両方に
+    あれば本人の行を優先する（本人の設定が共通行を上書きする）。他ユーザーの個人追加銘柄は
+    決して返さない。各行にscope（"system" | "user"）を付ける。"""
     pool = _get_pool(database_url)
     if pool is None:
         return []
-    where, params = ["user_id = %s", "active = true"], [user_id]
+    scopes = [_SHARED_SCOPE] if user_id in (None, _SHARED_SCOPE) else [_SHARED_SCOPE, user_id]
+    where, params = ["user_id = ANY(%s)", "active = true"], [scopes]
     if market:
         where.append("market = %s")
         params.append(market)
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(f"SELECT * FROM watchlist WHERE {' AND '.join(where)} ORDER BY added_at", params)
-            return [_watchlist_row_to_camel(r) for r in cur.fetchall()]
-
-
-_WATCHLIST_COLS = ["name", "sector", "kana", "tv_symbol", "theme", "watch", "note", "source", "added_reason",
-                    "tags", "priority"]
-_WATCHLIST_JSON_COLS = ("tags",)
+            rows = cur.fetchall()
+    by_key = {}
+    for r in rows:
+        key = (r.get("code"), r.get("market"))
+        prev = by_key.get(key)
+        if prev is None or (r.get("user_id") != _SHARED_SCOPE and prev.get("user_id") == _SHARED_SCOPE):
+            by_key[key] = r
+    out = []
+    for r in sorted(by_key.values(), key=lambda x: x.get("added_at") or 0):
+        item = _watchlist_row_to_camel(r)
+        item["scope"] = "system" if r.get("user_id") == _SHARED_SCOPE else "user"
+        out.append(item)
+    return out
 
 
 def _upsert_watchlist_item_conn(conn, user_id, item):
@@ -9412,7 +9481,7 @@ def upsert_watchlist_item(database_url, user_id, item):
     """itemは{code,market,name,sector,kana,tvSymbol,theme,watch,note,source,added_reason}の
     いずれかを含むdict（code必須、marketは省略時JP）。既存なら更新、無ければ新規作成。
     Phase MU-S1：watchlistはSHARED化済み。"""
-    user_id = _SHARED_SCOPE
+    # MU-Multi(2026-09-26): 手動追加/削除は本人のwatchlistのみ（system/sharedとは分離）
     pool = _get_pool(database_url)
     if pool is None:
         return False
@@ -9422,17 +9491,19 @@ def upsert_watchlist_item(database_url, user_id, item):
     return ok
 
 
+_WATCHLIST_COLS = ["name", "sector", "kana", "tv_symbol", "theme", "watch", "note", "source", "added_reason",
+                    "tags", "priority"]
+_WATCHLIST_JSON_COLS = ("tags",)
+
+
 def set_watch_target(database_url, user_id, code, market, value):
-    """「監視銘柄」タブの対象ON/OFF（従来のs.watchTargets）をDB側へ永続化する
-    （2026-09-17新規、スマホ3件表示バグの緊急修正）。Phase MU-S1と同じくSHARED scope。
-    対象行が存在しない場合は何もしない（watchlist本体に無い銘柄をwatch targetにはできない）。
-    2026-09-18修正：従来はUPDATEが実際に何行更新したかを見ず常にTrueを返していたため、
-    code/marketの不一致で0行しか更新されなかった場合でもフロント側は「成功」と誤認していた
-    （運用前確認：PC localStorage 73件がNeonへ反映されない不具合の調査で発覚）。
-    cursor.rowcountを見て、実際に1行以上更新できた場合のみTrueを返す。"""
-    user_id = _SHARED_SCOPE
+    """銘柄の表示対象ON/OFF（s.watchTargets相当）をDBへ保存する（2026-09-17新規）。
+    2026-09-26 MU-Multi：表示対象は利用者ごとの選択のため本人スコープ。本人の行が無く
+    system(_shared)の行だけがある場合は、その行を本人用にコピーして表示対象を設定する
+    （共通行は変更しない＝他の利用者に影響しない）。戻り値は従来どおり、対象行が
+    存在して更新できたかどうか（cursor.rowcountで判定、1件でも一致すればTrue）。"""
     pool = _get_pool(database_url)
-    if pool is None or not code:
+    if pool is None or not code or user_id in (None, _SHARED_SCOPE):
         return False
     market = market or "JP"
     with pool.connection() as conn:
@@ -9442,6 +9513,21 @@ def set_watch_target(database_url, user_id, code, market, value):
             [bool(value), user_id, code, market],
         )
         matched = cur.rowcount > 0
+        if not matched:
+            # 共通(system)行があれば本人用へコピー（is_watch_targetだけ本人の値）。
+            with conn.cursor(row_factory=dict_row) as c2:
+                c2.execute("SELECT * FROM watchlist WHERE user_id = %s AND code = %s AND market = %s",
+                           [_SHARED_SCOPE, code, market])
+                shared = c2.fetchone()
+            if shared:
+                cols = [k for k in shared.keys() if k not in ("id", "user_id", "is_watch_target", "added_at", "updated_at")]
+                vals = [shared[k] if not isinstance(shared[k], (dict, list)) else json.dumps(shared[k], ensure_ascii=False) for k in cols]
+                ph = ["%s::jsonb" if isinstance(shared[k], (dict, list)) else "%s" for k in cols]
+                conn.execute(
+                    f"INSERT INTO watchlist (user_id, is_watch_target, {', '.join(cols)}) "
+                    f"VALUES (%s, %s, {', '.join(ph)}) ON CONFLICT (user_id, code, market) DO NOTHING",
+                    [user_id, bool(value)] + vals)
+                matched = True
         conn.commit()
     return matched
 
@@ -9476,7 +9562,7 @@ def upsert_watch_stock_candidate(database_url, user_id, item):
       - priorityは最新の値で上書きする（唯一の値を持つ「現時点の監視優先度」ラベルであり、
         古い値を保持する意味がないため——他の3項目のような蓄積型マージ対象ではない）。
     戻り値：{"created": bool, "code": str, "market": str} または失敗時False。"""
-    user_id = _SHARED_SCOPE
+    # MU-Multi(2026-09-26): 手動追加/削除は本人のwatchlistのみ（system/sharedとは分離）
     pool = _get_pool(database_url)
     if pool is None or not (item or {}).get("code"):
         return False
@@ -9534,12 +9620,12 @@ def _trade_reflection_row_to_camel(row):
 
 def create_trade_reflection(database_url, user_id, item):
     """反省1件をINSERTする（上書き更新はupdate_trade_reflection側の役割、ここは常に新規行）。
-    Phase MU-S1と同じくSHARED scope。戻り値は保存済み行（camelCase）、失敗時はNone。
+    本人専用（2026-09-26 MU-Multiで旧SHARED固定を廃止、user_idで分離）。戻り値は保存済み行（camelCase）、失敗時はNone。
     2026-09-17追記（運用前確認・重複防止）：同一trade_date＋完全一致するreflection_textの
     行が既にあれば、新規INSERTせず既存行をそのまま返す（手動保存の二重クリック・同一内容の
     Smart Import再取り込み等による重複を防ぐ、最小実装——文面が違う場合は別トレードの
     反省として扱い、あえて重複判定しない）。"""
-    user_id = _SHARED_SCOPE
+    # MU-Multi(2026-09-26): 個人の反省メモ/教訓/trade_idを含むため本人専用（旧SHARED固定を廃止）
     pool = _get_pool(database_url)
     if pool is None or not (item or {}).get("reflection_text"):
         return None
@@ -9577,7 +9663,7 @@ def create_trade_reflection(database_url, user_id, item):
 
 def delete_trade_reflection(database_url, user_id, reflection_id):
     """反省1件の削除（運用前確認・重複整理用に新設。2026-09-17）。"""
-    user_id = _SHARED_SCOPE
+    # MU-Multi(2026-09-26): 個人の反省メモ/教訓/trade_idを含むため本人専用（旧SHARED固定を廃止）
     pool = _get_pool(database_url)
     if pool is None or not reflection_id:
         return False
@@ -9589,7 +9675,7 @@ def delete_trade_reflection(database_url, user_id, reflection_id):
 
 def update_trade_reflection(database_url, user_id, reflection_id, patch):
     """既存反省の編集（PHASE 3の「編集」要件）。渡されたフィールドだけを更新する。"""
-    user_id = _SHARED_SCOPE
+    # MU-Multi(2026-09-26): 個人の反省メモ/教訓/trade_idを含むため本人専用（旧SHARED固定を廃止）
     pool = _get_pool(database_url)
     if pool is None or not reflection_id:
         return None
@@ -9616,7 +9702,7 @@ def update_trade_reflection(database_url, user_id, reflection_id, patch):
 
 def list_trade_reflections(database_url, user_id, limit=60, event_type=None, tag=None, category=None):
     """一覧・フィルタ取得（trade_date降順）。event_type/tag/categoryはJSONB配列内の1件一致で絞り込む。"""
-    user_id = _SHARED_SCOPE
+    # MU-Multi(2026-09-26): 個人の反省メモ/教訓/trade_idを含むため本人専用（旧SHARED固定を廃止）
     pool = _get_pool(database_url)
     if pool is None:
         return []
@@ -9644,7 +9730,7 @@ def find_similar_reflections(database_url, user_id, event_types=None, tags=None,
     判定する。ノイズ警告を防ぐため、タグ1個一致だけでは類似とみなさない——
     (event_typesが1つ以上一致 AND tagsが1個以上追加一致) OR (tagsの一致数が2個以上)
     を満たす行だけを返す（Phase A規模のデータ量なのでSQLは広めに引いてPython側でフィルタする）。"""
-    user_id = _SHARED_SCOPE
+    # MU-Multi(2026-09-26): 個人の反省メモ/教訓/trade_idを含むため本人専用（旧SHARED固定を廃止）
     pool = _get_pool(database_url)
     if pool is None or (not event_types and not tags):
         return []
@@ -9681,7 +9767,7 @@ def upsert_watchlist_master_stocks(database_url, user_id, stocks, update_mode="a
                即削除せずinactive_candidate=trueにする（指示書：即削除しない）
     戻り値：{"added":N,"updated":N,"invalid":N,"inactive_candidates":N}。
     Phase MU-S1：watchlistはSHARED化済み。"""
-    user_id = _SHARED_SCOPE
+    # MU-Multi(2026-09-26): 手動追加/削除は本人のwatchlistのみ（system/sharedとは分離）
     pool = _get_pool(database_url)
     if pool is None:
         return {"added": 0, "updated": 0, "invalid": 0, "inactive_candidates": 0}
@@ -9840,7 +9926,9 @@ def cleanup_expired_auto_tags(database_url, user_id):
             return {"expired": 0, "deleted": 0}
         # 保有ポジション（portfolio.active=true）のコードは自動削除対象から除外する。
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT code, market FROM portfolio WHERE user_id = %s AND active = true", [user_id])
+            # 2026-09-26 MU-Multi：shared(system)行の自動削除は、誰か1人でも保有中なら見送る
+            # （銘柄コードの有無だけを判定に使い、誰が保有しているかは返さない＝情報は漏れない）。
+            cur.execute("SELECT DISTINCT code, market FROM portfolio WHERE active = true")
             held = {(r["code"], r["market"]) for r in cur.fetchall()}
         for row in rows:
             tags = row["auto_tags"] or {}
@@ -10633,7 +10721,7 @@ def delete_expert_view(database_url, user_id, view_id):
 
 def delete_watchlist_item(database_url, user_id, code, market=None):
     # Phase MU-S1：watchlistはSHARED化済み。
-    user_id = _SHARED_SCOPE
+    # MU-Multi(2026-09-26): 手動追加/削除は本人のwatchlistのみ（system/sharedとは分離）
     pool = _get_pool(database_url)
     if pool is None:
         return
@@ -10651,7 +10739,7 @@ def migrate_watchlist_from_client(database_url, user_id, items):
     2026-09-03判明：300件規模だと1件ごとに新規接続していては非常に遅い（Neonへの接続確立
     コストが件数分かかる）ため、1本の接続を使い回して処理する。
     Phase MU-S1：watchlistはSHARED化済み。"""
-    user_id = _SHARED_SCOPE
+    # MU-Multi(2026-09-26): 手動追加/削除は本人のwatchlistのみ（system/sharedとは分離）
     pool = _get_pool(database_url)
     if pool is None:
         return 0
@@ -11304,6 +11392,7 @@ _MDP_TS = ("discovered_at", "last_seen_at", "latest_quote_at", "rt_first_at", "p
 
 def upsert_market_discovery(database_url, user_id, entries):
     """market_discovery_pool（登録外から発見した銘柄。手動watchlist・dynamic_watchlistとは別テーブル）へ差分を保存する。"""
+    user_id = _SHARED_SCOPE  # 2026-09-26 MU-Multi：Market Discoveryは全ユーザー共通（_sharedで1回だけ計算・保存）
     pool = _get_pool(database_url)
     if pool is None or not entries:
         return 0
@@ -11330,6 +11419,7 @@ def upsert_market_discovery(database_url, user_id, entries):
 
 
 def list_market_discovery(database_url, user_id, trade_date):
+    user_id = _SHARED_SCOPE  # 2026-09-26 MU-Multi：Market Discoveryは全ユーザー共通（_sharedで1回だけ計算・保存）
     pool = _get_pool(database_url)
     if pool is None:
         return []
@@ -11552,3 +11642,139 @@ def find_trade_rule_by_source_type(database_url, user_id, source_type):
                 if any(isinstance(x, dict) and x.get("type") == source_type for x in sj):
                     return _trade_rule_row_to_json(r)
     return None
+
+
+# ============================================================
+# ログイン認証のDB関数（2026-09-26 MU-Multi）。パスワード検証・トークン生成は
+# auth_core.py、ここは保存・取得のみ。
+# ============================================================
+def auth_count_enabled_users(database_url):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        return conn.execute("SELECT count(*) FROM app_users WHERE enabled = true").fetchone()[0]
+
+
+def auth_get_user(database_url, username):
+    pool = _get_pool(database_url)
+    if pool is None or not username:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM app_users WHERE username = %s", [username])
+            return cur.fetchone()
+
+
+def auth_list_users(database_url):
+    """管理CLI用（password_hashは返さない）。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return []
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT username, role, display_name, enabled, must_change_password, created_at, "
+                        "last_login_at FROM app_users ORDER BY created_at, username")
+            return [_row_to_json(r) for r in cur.fetchall()]
+
+
+def auth_upsert_user(database_url, username, password_hash, role="user", display_name=None,
+                     must_change_password=False, create_only=False):
+    """アカウントを作成/パスワード更新。create_only=Trueで既存があれば何もしない（移行用）。
+    戻り値：True=作成/更新した、False=既存のためスキップ。パスワード変更時は既存セッションを全て失効させる。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return False
+    with pool.connection() as conn:
+        exists = conn.execute("SELECT 1 FROM app_users WHERE username = %s", [username]).fetchone()
+        if exists and create_only:
+            return False
+        if exists:
+            conn.execute("UPDATE app_users SET password_hash = %s, must_change_password = %s, updated_at = now() "
+                         "WHERE username = %s", [password_hash, bool(must_change_password), username])
+            conn.execute("DELETE FROM app_sessions WHERE username = %s", [username])
+        else:
+            conn.execute("INSERT INTO app_users (username, password_hash, role, display_name, must_change_password) "
+                         "VALUES (%s, %s, %s, %s, %s)",
+                         [username, password_hash, role, display_name, bool(must_change_password)])
+        conn.commit()
+    return True
+
+
+def auth_set_enabled(database_url, username, enabled):
+    """アカウントの有効/無効。無効化と同時に全セッションを失効させる。戻り値：対象が存在したか。"""
+    pool = _get_pool(database_url)
+    if pool is None:
+        return False
+    with pool.connection() as conn:
+        cur = conn.execute("UPDATE app_users SET enabled = %s, updated_at = now() WHERE username = %s",
+                           [bool(enabled), username])
+        found = cur.rowcount > 0
+        if not enabled:
+            conn.execute("DELETE FROM app_sessions WHERE username = %s", [username])
+        conn.commit()
+    return found
+
+
+def auth_touch_login(database_url, username):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return
+    with pool.connection() as conn:
+        conn.execute("UPDATE app_users SET last_login_at = now() WHERE username = %s", [username])
+        conn.commit()
+
+
+def auth_create_session(database_url, username, token_hash, csrf_token, expires_at_iso, user_agent=None, ip=None):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return False
+    with pool.connection() as conn:
+        conn.execute("INSERT INTO app_sessions (token_hash, username, csrf_token, expires_at, user_agent, ip) "
+                     "VALUES (%s, %s, %s, %s, %s, %s)",
+                     [token_hash, username, csrf_token, expires_at_iso, (user_agent or "")[:300], (ip or "")[:64]])
+        conn.commit()
+    return True
+
+
+def auth_get_session(database_url, token_hash):
+    """有効な(期限内・アカウント有効な)セッションだけを返す。それ以外はNone。"""
+    pool = _get_pool(database_url)
+    if pool is None or not token_hash:
+        return None
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT s.token_hash, s.username, s.csrf_token, s.created_at, s.expires_at, u.role, u.display_name, "
+                "u.must_change_password FROM app_sessions s JOIN app_users u ON u.username = s.username "
+                "WHERE s.token_hash = %s AND s.expires_at > now() AND u.enabled = true", [token_hash])
+            return cur.fetchone()
+
+
+def auth_touch_session(database_url, token_hash, expires_at_iso):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return
+    with pool.connection() as conn:
+        conn.execute("UPDATE app_sessions SET last_seen_at = now(), expires_at = %s WHERE token_hash = %s",
+                     [expires_at_iso, token_hash])
+        conn.commit()
+
+
+def auth_delete_session(database_url, token_hash):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return
+    with pool.connection() as conn:
+        conn.execute("DELETE FROM app_sessions WHERE token_hash = %s", [token_hash])
+        conn.commit()
+
+
+def auth_purge_expired_sessions(database_url):
+    pool = _get_pool(database_url)
+    if pool is None:
+        return 0
+    with pool.connection() as conn:
+        n = conn.execute("DELETE FROM app_sessions WHERE expires_at <= now()").rowcount
+        conn.commit()
+    return n

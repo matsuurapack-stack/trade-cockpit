@@ -64,6 +64,24 @@ class _FakeConn:
     def commit(self):
         self.committed = True
 
+    def cursor(self, row_factory=None):
+        # 2026-09-26 MU-Multi：本人行が無い場合のsystem行コピー用SELECT（既定=共通行なし）。
+        conn = self
+
+        class _Cur:
+            def __enter__(s):
+                return s
+
+            def __exit__(s, *a):
+                return False
+
+            def execute(s, sql, params=None):
+                conn.executed.append((sql, params))
+
+            def fetchone(s):
+                return getattr(conn, "shared_row", None)
+        return _Cur()
+
 
 class _FakePool:
     def __init__(self, conn):
@@ -109,13 +127,19 @@ class SetWatchTargetRowcountTests(unittest.TestCase):
         _sql, params = conn.executed[0]
         self.assertIn("JP", params)
 
-    def test_forces_shared_scope(self):
+    def test_uses_personal_scope_not_shared(self):
+        # 2026-09-26 MU-Multi：表示対象は本人ごと。共通(system)行は更新しない。
         conn = _FakeConn(rowcount=1)
         with mock.patch.object(investment_db, "_get_pool", return_value=_FakePool(conn)):
             investment_db.set_watch_target("dummy_url", "some_other_user", "1332", "JP", True)
         _sql, params = conn.executed[0]
-        self.assertIn(investment_db._SHARED_SCOPE, params)
-        self.assertNotIn("some_other_user", params)
+        self.assertIn("some_other_user", params)
+        self.assertNotIn(investment_db._SHARED_SCOPE, params)
+
+    def test_shared_scope_caller_is_rejected(self):
+        conn = _FakeConn(rowcount=1)
+        with mock.patch.object(investment_db, "_get_pool", return_value=_FakePool(conn)):
+            self.assertFalse(investment_db.set_watch_target("dummy_url", investment_db._SHARED_SCOPE, "1332", "JP", True))
 
 
 if __name__ == "__main__":
